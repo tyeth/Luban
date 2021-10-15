@@ -234,10 +234,10 @@ function ToolPathFastConfigurations(props) {
                 }
 
                 // Fiexd Power Enabled
-                if (option.fixedPower && option.fixedPower > 0) {
-                    option.fixedPowerEnabled = true;
-                } else {
+                if (option.fixedPower && option.fixedPower === 0) {
                     option.fixedPowerEnabled = false;
+                } else {
+                    option.fixedPowerEnabled = true;
                 }
             }
             const newToolPath = {

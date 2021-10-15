@@ -78,10 +78,10 @@ class LaserParameters extends PureComponent {
             }
 
             // Fiexd Power Enabled
-            if (option.fixedPower && option.fixedPower > 0) {
-                option.fixedPowerEnabled = true;
-            } else {
+            if (option.fixedPower && option.fixedPower === 0) {
                 option.fixedPowerEnabled = false;
+            } else {
+                option.fixedPowerEnabled = true;
             }
             this.props.updateGcodeConfig(option);
         }
