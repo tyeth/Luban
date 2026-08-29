@@ -4,6 +4,7 @@ import path from 'path';
 import program from 'commander';
 import isElectron from 'is-electron';
 import pkg from './package.json';
+import { formatTimeline as formatStartupTimeline, mark as startupMark } from './startup-timeline';
 
 const SERVER_DATA = 'serverData';
 // Defaults to 'production'
@@ -44,10 +45,15 @@ const launchServer = () => new Promise((resolve, reject) => {
         userDataDir: process.env.USER_DATA_DIR
     };
 
+    startupMark('server: child entry');
+
     // Change working directory to 'server' before require('./server')
     process.chdir(path.resolve(__dirname, 'server'));
 
-    require('./server').createServer({
+    const server = require('./server');
+    startupMark('server: bundle required');
+
+    server.createServer({
         port: options.port,
         host: options.host,
         backlog: options.backlog,
@@ -61,6 +67,9 @@ const launchServer = () => new Promise((resolve, reject) => {
             reject(err);
             return;
         }
+        startupMark('server: ready');
+        // eslint-disable-next-line no-console
+        console.log(`\n${formatStartupTimeline('Luban startup - server child')}`);
         process.send({ type: SERVER_DATA, ...data });
         resolve(data);
     });

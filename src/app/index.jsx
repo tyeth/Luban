@@ -20,7 +20,15 @@ import './styles/app.styl';
 import './styles/vendor.styl';
 import workerManager from './lib/manager/workerManager';
 import App from './ui/App';
+import { formatTimeline as formatStartupTimeline, mark as startupMark, markAt as startupMarkAt } from '../startup-timeline';
 
+
+// Marked here, at module scope, so the gap from navigation to the first line
+// of app code (bundle download + parse) is visible in the table.
+if (typeof performance !== 'undefined' && performance.timeOrigin) {
+    startupMarkAt('renderer: document start', performance.timeOrigin);
+}
+startupMark('renderer: script eval');
 
 function setupLog() {
     log.setLevel(settings.log.level);
@@ -50,6 +58,7 @@ async function setup() {
 
     // Setup i18n
     await setupI18next();
+    startupMark('renderer: i18n ready');
 
     // Setup worker
     setupWorkerManager();
@@ -67,9 +76,11 @@ series([
         const token = machineStore.get('session.token');
         user.signin({ token: token })
             .then(({ authenticated }) => {
+                startupMark('renderer: signin done');
                 if (authenticated) {
                     log.error('Create and establish a WebSocket connection');
                     controller.connect(() => {
+                        startupMark('renderer: socket connected');
                         next();
                     });
                     return;
@@ -111,6 +122,10 @@ series([
                 <App />
             </Provider>
         </ConfigProvider>,
-        container
+        container,
+        () => {
+            startupMark('renderer: first paint');
+            log.info(`\n${formatStartupTimeline('Luban startup - renderer')}`);
+        }
     );
 });
