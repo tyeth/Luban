@@ -2,6 +2,8 @@ import noop from 'lodash/noop';
 import io from 'socket.io-client';
 import { v4 as uuid } from 'uuid';
 
+import { getBackendOrigin } from './backend-origin';
+
 class SocketController {
     socket = null;
 
@@ -31,7 +33,7 @@ class SocketController {
 
         this.socket && this.socket.destroy();
 
-        this.socket = io.connect('', {
+        this.socket = io.connect(getBackendOrigin(), {
             query: `token=${token}`,
         });
 

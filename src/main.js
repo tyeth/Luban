@@ -65,6 +65,10 @@ const UPLOAD_WINDOWS = 'uploadWindows';
 
 const { CLIENT_PORT, SERVER_PORT } = pkg.config;
 
+// The renderer asks for this as soon as it boots, which can be before the server
+// is listening. Answering null is fine - 'server-origin' follows when it is up.
+ipcMain.handle('get-server-origin', () => loadUrl || null);
+
 
 function getBrowserWindowOptions() {
     const defaultOptions = {
@@ -284,6 +288,13 @@ const startToBegin = (data) => {
     updateHandle();
 
     loadUrl = `http://${address}:${port}`;
+
+    // Tell the renderer where the backend is. Sent now for a page that is already
+    // up, and again on load for one that is not.
+    mainWindow.webContents.send('server-origin', loadUrl);
+    mainWindow.webContents.on('did-finish-load', () => {
+        mainWindow.webContents.send('server-origin', loadUrl);
+    });
 
     // register file protocol
     protocol.registerFileProtocol(
