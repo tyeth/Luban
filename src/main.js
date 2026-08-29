@@ -65,6 +65,10 @@ const UPLOAD_WINDOWS = 'uploadWindows';
 
 const { CLIENT_PORT, SERVER_PORT } = pkg.config;
 
+// The app is served off disk through the luban:// handler, so the window no
+// longer has to wait for the server to be listening before it can load.
+const APP_URL = 'luban://127.0.0.1/';
+
 // The renderer asks for this as soon as it boots, which can be before the server
 // is listening. Answering null is fine - 'server-origin' follows when it is up.
 ipcMain.handle('get-server-origin', () => loadUrl || null);
@@ -280,30 +284,38 @@ if (process.platform === 'win32') {
     }
 }
 
-const startToBegin = (data) => {
-    serverData = data;
-    const { address, port } = data;
-    configureWindow(mainWindow);
+// Everything the window needs before it can load the app off disk. Runs once,
+// before the first navigation, and no longer waits on the server.
+let appEnvironmentReady = false;
+const prepareAppEnvironment = (window) => {
+    electronEnable(window.webContents);
 
-    updateHandle();
-
-    loadUrl = `http://${address}:${port}`;
-
-    // Tell the renderer where the backend is. Sent now for a page that is already
-    // up, and again on load for one that is not.
-    mainWindow.webContents.send('server-origin', loadUrl);
-    mainWindow.webContents.on('did-finish-load', () => {
-        mainWindow.webContents.send('server-origin', loadUrl);
-    });
+    if (appEnvironmentReady) {
+        return Promise.resolve();
+    }
+    appEnvironmentReady = true;
 
     // register file protocol
     protocol.registerFileProtocol(
         'luban',
         (request, callback) => {
-            console.log('file protocol URL:', request.url);
             const { pathname } = url.parse(request.url);
-            const p = pathname === '/' ? 'index.html' : pathname.substr(1);
+            let p = pathname === '/' ? 'index.html' : pathname.substr(1);
+
+            // The server mounts the app directory at both / and /worker, so a
+            // worker URL carries a prefix that is not part of the path on disk.
+            if (p.indexOf('worker/') === 0) {
+                p = p.substr('worker/'.length);
+            }
+
             const filePath = path.normalize(`${__dirname}/app/${p}`);
+
+            if (!fs.existsSync(filePath)) {
+                console.error('luban protocol: not found', filePath);
+                callback({ error: -6 }); // net::ERR_FILE_NOT_FOUND
+                return;
+            }
+
             callback(fs.createReadStream(filePath));
         },
         (error) => {
@@ -341,21 +353,31 @@ const startToBegin = (data) => {
     // Ignore proxy settings
     // https://electronjs.org/docs/api/session#sessetproxyconfig-callback
 
+
+
     electronRemoteMainInitialize();
 
-    const webContentsSession = mainWindow.webContents.session;
-    electronEnable(mainWindow.webContents);
+    // Ignore proxy settings
+    // https://electronjs.org/docs/api/session#sessetproxyconfig-callback
+    return window.webContents.session.setProxy({ proxyRules: 'direct://' });
+};
 
-    startupMark('main: navigate to app');
-    webContentsSession.setProxy({ proxyRules: 'direct://' })
-        .then(() => mainWindow.loadURL(loadUrl)
-            .then(() => {
-                startupMark('main: app page loaded');
-                log.info(`\n${formatStartupTimeline('Luban startup - main process')}`);
-            })
-            .catch(err => {
-                console.log('err', err.message);
-            }));
+const startToBegin = (data) => {
+    serverData = data;
+    const { address, port } = data;
+    configureWindow(mainWindow);
+
+    updateHandle();
+
+    loadUrl = `http://${address}:${port}`;
+
+    // Tell the renderer where the backend is. Sent now for a page that is already
+    // up, and again on load for one that is not.
+    mainWindow.webContents.send('server-origin', loadUrl);
+    mainWindow.webContents.on('did-finish-load', () => {
+        mainWindow.webContents.send('server-origin', loadUrl);
+    });
+
 
     try {
         // TODO: move to server
@@ -417,16 +439,21 @@ const showMainWindow = async () => {
                     startupMark('main: server ready');
                     startToBegin(data);
                 } else if (data.type === UPLOAD_WINDOWS) {
-                    window.loadURL(loadUrl).catch(err => {
+                    window.loadURL(APP_URL).catch(err => {
                         console.log('err', err.message);
                     });
                 }
             });
         }
         // window.webContents.openDevTools();
-        startupMark('main: splash requested');
-        window.loadURL(path.resolve(__dirname, 'app', 'loading.html'))
-            .then(() => window.setTitle(`Snapmaker Luban ${pkg.version}`))
+        startupMark('main: app load requested');
+        prepareAppEnvironment(window)
+            .then(() => window.loadURL(APP_URL))
+            .then(() => {
+                window.setTitle(`Snapmaker Luban ${pkg.version}`);
+                startupMark('main: app page loaded');
+                log.info(`\n${formatStartupTimeline('Luban startup - main process')}`);
+            })
             .catch(err => {
                 console.log('err', err.message);
             });
@@ -767,7 +794,17 @@ app.on('second-instance', (event, commandLine) => {
         }
     }
 });
-protocol.registerSchemesAsPrivileged([{ scheme: 'luban', privileges: { standard: true, corsEnabled: true } }]);
+protocol.registerSchemesAsPrivileged([{
+    scheme: 'luban',
+    privileges: {
+        standard: true,
+        corsEnabled: true,
+        // i18next and the worker pool fetch over this scheme now that the app is
+        // loaded from it. Not marked secure: the API still lives on plain http.
+        supportFetchAPI: true,
+        stream: true,
+    }
+}]);
 
 /**
  * when ready

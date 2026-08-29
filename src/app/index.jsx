@@ -11,7 +11,7 @@ import { Provider } from 'react-redux';
 
 import settings from './config/settings';
 import { controller } from './communication/socket-communication';
-import { listenForBackendOrigin } from './lib/backend-origin';
+import { listenForBackendOrigin, whenBackendOrigin } from './lib/backend-origin';
 import { initialize } from './lib/gaEvent';
 import log from './lib/log';
 import user from './lib/user';
@@ -131,19 +131,25 @@ function renderApp() {
 // once the server answers -- which used to mean an unreachable backend left the
 // user staring at the spinner for ever.
 function connectBackend() {
-    const token = machineStore.get('session.token');
+    // The page can be up before the server is, so wait to be told where it is
+    // rather than firing at a URL that would resolve to the file handler.
+    return whenBackendOrigin().then(() => {
+        startupMark('renderer: backend origin known');
 
-    return user.signin({ token: token })
-        .then(({ authenticated }) => {
-            startupMark('renderer: signin done');
-            if (!authenticated) {
-                log.warn('Not authenticated; socket not opened');
-                return;
-            }
-            controller.connect(() => {
-                startupMark('renderer: socket connected');
+        const token = machineStore.get('session.token');
+
+        return user.signin({ token: token })
+            .then(({ authenticated }) => {
+                startupMark('renderer: signin done');
+                if (!authenticated) {
+                    log.warn('Not authenticated; socket not opened');
+                    return;
+                }
+                controller.connect(() => {
+                    startupMark('renderer: socket connected');
+                });
             });
-        })
+    })
         .catch(err => log.error('Backend connect failed', err));
 }
 
