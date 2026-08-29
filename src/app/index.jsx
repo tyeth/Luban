@@ -1,9 +1,9 @@
 import { ConfigProvider } from 'antd';
 import 'antd/dist/antd.css';
-import series from 'async/series';
 import i18next from 'i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import i18nHttpApi from 'i18next-http-backend';
+import once from 'lodash/once';
 import React from 'react';
 import ReactDOM from 'react-dom';
 import { initReactI18next } from 'react-i18next';
@@ -34,15 +34,29 @@ function setupLog() {
     log.setLevel(settings.log.level);
 }
 
+// Translations are the one thing worth waiting for -- painting without them
+// shows raw keys. Capped so an unreachable backend delays the paint by at most
+// I18N_TIMEOUT; i18next carries on loading in the background either way.
+const I18N_TIMEOUT = 3000;
+
 async function setupI18next() {
     return new Promise((resolve) => {
+        const done = once(resolve);
+
         i18next
             .use(i18nHttpApi)
             .use(LanguageDetector)
             .use(initReactI18next)
             .init(settings.i18next, () => {
-                resolve();
+                done();
             });
+
+        setTimeout(() => {
+            if (!i18next.isInitialized) {
+                log.warn(`i18n not ready after ${I18N_TIMEOUT}ms, painting anyway`);
+            }
+            done();
+        }, I18N_TIMEOUT);
     });
 }
 
@@ -66,29 +80,7 @@ async function setup() {
     log.info('Bootstrap finished.');
 }
 
-series([
-    async (next) => {
-        // setup
-        await setup();
-        next();
-    },
-    (next) => {
-        const token = machineStore.get('session.token');
-        user.signin({ token: token })
-            .then(({ authenticated }) => {
-                startupMark('renderer: signin done');
-                if (authenticated) {
-                    log.error('Create and establish a WebSocket connection');
-                    controller.connect(() => {
-                        startupMark('renderer: socket connected');
-                        next();
-                    });
-                    return;
-                }
-                next();
-            });
-    },
-], () => {
+function renderApp() {
     log.info(`Launching Snapmaker Luban v${settings.version}...`);
 
     // Prevent browser from loading a drag-and-dropped file
@@ -128,4 +120,32 @@ series([
             log.info(`\n${formatStartupTimeline('Luban startup - renderer')}`);
         }
     );
-});
+}
+
+// Authenticate and open the socket. Deliberately not awaited: nothing on the
+// home screen needs a session, and controller.connect()'s callback only fires
+// once the server answers -- which used to mean an unreachable backend left the
+// user staring at the spinner for ever.
+function connectBackend() {
+    const token = machineStore.get('session.token');
+
+    return user.signin({ token: token })
+        .then(({ authenticated }) => {
+            startupMark('renderer: signin done');
+            if (!authenticated) {
+                log.warn('Not authenticated; socket not opened');
+                return;
+            }
+            controller.connect(() => {
+                startupMark('renderer: socket connected');
+            });
+        })
+        .catch(err => log.error('Backend connect failed', err));
+}
+
+setup()
+    .catch(err => log.error('Bootstrap failed', err))
+    .then(() => {
+        renderApp();
+        connectBackend();
+    });
