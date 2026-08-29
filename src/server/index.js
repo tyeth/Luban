@@ -15,11 +15,13 @@ import logger from './lib/logger';
 import { startServices } from './services';
 import config from './services/configstore';
 import monitor from './services/monitor';
+import { mark as startupMark } from '../startup-timeline';
 
 
 const log = logger('init');
 
 const createServer = (options, callback) => {
+    startupMark('server: createServer entry');
     options = { ...options };
 
     const profile = path.resolve(settings.rcfile);
@@ -79,12 +81,16 @@ const createServer = (options, callback) => {
     process.env.Tmpdir = DataStorage.tmpDir;
 
     const app = createApplication();
+    startupMark('server: application created');
 
     const { port = 0, host, backlog } = options;
     const server = http.createServer(app);
     server.listen(port, host, backlog, () => {
+        startupMark('server: listening');
+
         // Start socket service
         startServices(server);
+        startupMark('server: services started');
 
         // Deal with address bindings
         const realAddress = server.address().address;

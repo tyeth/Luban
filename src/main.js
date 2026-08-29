@@ -19,6 +19,7 @@ import DataStorage from './DataStorage';
 import MenuBuilder, { addRecentFile, cleanAllRecentFiles } from './electron-app/Menu';
 import { configureWindow } from './electron-app/window';
 import pkg from './package.json';
+import { ENV_KEY as STARTUP_EPOCH_KEY, epoch as startupEpoch, formatTimeline as formatStartupTimeline, mark as startupMark } from './startup-timeline';
 
 import * as Sentry from "@sentry/electron/main";
 
@@ -39,6 +40,9 @@ Sentry.init({
 });
 
 log.setLevel(log.levels.INFO);
+
+// One clock for main, the forked server and the renderer.
+process.env[STARTUP_EPOCH_KEY] = String(startupEpoch);
 
 const config = new Store();
 const userDataDir = app.getPath('userData');
@@ -331,10 +335,17 @@ const startToBegin = (data) => {
     const webContentsSession = mainWindow.webContents.session;
     electronEnable(mainWindow.webContents);
 
+    startupMark('main: navigate to app');
     webContentsSession.setProxy({ proxyRules: 'direct://' })
-        .then(() => mainWindow.loadURL(loadUrl).catch(err => {
-            console.log('err', err.message);
-        }));
+        .then(() => mainWindow.loadURL(loadUrl)
+            .then(() => {
+                startupMark('main: app page loaded');
+                log.info(`
+${formatStartupTimeline('Luban startup - main process')}`);
+            })
+            .catch(err => {
+                console.log('err', err.message);
+            }));
 
     try {
         // TODO: move to server
@@ -346,8 +357,10 @@ const startToBegin = (data) => {
 
 let serverProcess;
 const showMainWindow = async () => {
+    startupMark('main: app ready');
     const windowOptions = getBrowserWindowOptions();
     const window = new BrowserWindow(windowOptions);
+    startupMark('main: window created');
     mainWindow = window;
     // Monitor policy links, do not allow redirection
     window.webContents.on('did-attach-webview', (e, webContent)=>  {
@@ -377,6 +390,7 @@ const showMainWindow = async () => {
                 startToBegin({ ...data, port: CLIENT_PORT });
             });
         } else {
+            startupMark('main: server fork requested');
             serverProcess = childProcess.fork(
                 path.resolve(__dirname, 'server-cli.js'),
                 [],
@@ -390,6 +404,7 @@ const showMainWindow = async () => {
             );
             serverProcess.on('message', (data) => {
                 if (data.type === SERVER_DATA) {
+                    startupMark('main: server ready');
                     startToBegin(data);
                 } else if (data.type === UPLOAD_WINDOWS) {
                     window.loadURL(loadUrl).catch(err => {
@@ -399,6 +414,7 @@ const showMainWindow = async () => {
             });
         }
         // window.webContents.openDevTools();
+        startupMark('main: splash requested');
         window.loadURL(path.resolve(__dirname, 'app', 'loading.html'))
             .then(() => window.setTitle(`Snapmaker Luban ${pkg.version}`))
             .catch(err => {
