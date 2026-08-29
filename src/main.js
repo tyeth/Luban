@@ -340,8 +340,7 @@ const startToBegin = (data) => {
         .then(() => mainWindow.loadURL(loadUrl)
             .then(() => {
                 startupMark('main: app page loaded');
-                log.info(`
-${formatStartupTimeline('Luban startup - main process')}`);
+                log.info(`\n${formatStartupTimeline('Luban startup - main process')}`);
             })
             .catch(err => {
                 console.log('err', err.message);

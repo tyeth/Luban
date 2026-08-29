@@ -125,8 +125,7 @@ series([
         container,
         () => {
             startupMark('renderer: first paint');
-            log.info(`
-${formatStartupTimeline('Luban startup - renderer')}`);
+            log.info(`\n${formatStartupTimeline('Luban startup - renderer')}`);
         }
     );
 });

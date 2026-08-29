@@ -69,8 +69,7 @@ const launchServer = () => new Promise((resolve, reject) => {
         }
         startupMark('server: ready');
         // eslint-disable-next-line no-console
-        console.log(`
-${formatStartupTimeline('Luban startup - server child')}`);
+        console.log(`\n${formatStartupTimeline('Luban startup - server child')}`);
         process.send({ type: SERVER_DATA, ...data });
         resolve(data);
     });
