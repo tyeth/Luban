@@ -6,6 +6,7 @@ import * as meshHandlers from './channel-handlers/mesh';
 import configstore from './configstore';
 import { connectionManager } from './machine/ConnectionManager';
 import { textSerialChannel } from './machine/channels/TextSerialChannel';
+import { startMcpService } from './mcp';
 import monitor from './monitor';
 import { register as registerDiscoverHandlers } from './socket/discover-handlers';
 import { register as registerMachineHandlers } from './socket/machine-handlers';
@@ -70,6 +71,11 @@ function startServices(server) {
     socketServer.registerChannel('get-free-memory', system.getSystemFreeMemorySize);
 
     socketServer.start(server);
+
+    // ===============
+    // MCP server (off unless a port is configured)
+    // ===============
+    startMcpService();
 }
 
 function registerApis(app) {
