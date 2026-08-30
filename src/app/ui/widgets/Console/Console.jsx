@@ -48,6 +48,13 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
     // Verbose mode: also show machine heartbeat state and MCP tool activity
     const verboseRef = useRef(false);
     const lastVerboseLineRef = useRef('');
+    // Verbose lines are timestamped so the operator can measure real
+    // latencies (e.g. a commanded move vs the heartbeat reporting it).
+    const stamp = () => {
+        const now = new Date();
+        const ms = String(now.getMilliseconds()).padStart(3, '0');
+        return `${now.toTimeString().slice(0, 8)}.${ms} `;
+    };
     const prevProps = usePrevious({
         isConnected, port, server, clearRenderStamp, consoleLogs, minimized, isDefault
     });
@@ -81,10 +88,10 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
                 if (terminal) {
                     String(gcode).split(/\r?\n/).forEach((line) => {
                         line = line.trim();
-                        line && terminal.writeln(color.blackBright(`> ${line}`));
+                        line && terminal.writeln(color.blackBright(`${stamp()}> ${line}`));
                     });
                     if (err) {
-                        terminal.writeln(color.red(`error (${err}) executing the above`));
+                        terminal.writeln(color.red(`${stamp()}error (${err}) executing the above`));
                     }
                 }
             }
@@ -118,7 +125,7 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
             }
             lastVerboseLineRef.current = line;
             const terminal = terminalRef.current;
-            terminal && terminal.writeln(color.blackBright(line));
+            terminal && terminal.writeln(color.blackBright(stamp() + line));
         },
         // Exact gcode sent by MCP tools on the direct path, and the
         // controller's reply - shows which coordinate frame each move ran in.
@@ -134,11 +141,11 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
             if (gcode) {
                 String(gcode).split(/;?\r?\n/).forEach((line) => {
                     line = line.trim();
-                    line && terminal.writeln(color.magenta(`[mcp:${tool}] > ${line}`));
+                    line && terminal.writeln(color.magenta(`${stamp()}[mcp:${tool}] > ${line}`));
                 });
             }
             if (response) {
-                terminal.writeln(color.magenta(`[mcp:${tool}] < ${String(response).slice(0, 200)}`));
+                terminal.writeln(color.magenta(`${stamp()}[mcp:${tool}] < ${String(response).slice(0, 200)}`));
             }
         },
         // MCP tool activity mirrored from the server (verbose mode)
@@ -152,9 +159,9 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
                 return;
             }
             if (ok) {
-                terminal.writeln(color.cyan(`[mcp] ${tool} ok ${durationMs}ms`));
+                terminal.writeln(color.cyan(`${stamp()}[mcp] ${tool} ok ${durationMs}ms`));
             } else {
-                terminal.writeln(color.red(`[mcp] ${tool} failed ${durationMs}ms: ${String(error || '').slice(0, 160)}`));
+                terminal.writeln(color.red(`${stamp()}[mcp] ${tool} failed ${durationMs}ms: ${String(error || '').slice(0, 160)}`));
             }
         }
     };
