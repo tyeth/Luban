@@ -38,14 +38,14 @@ function rpcError(id: number | string | null, code: number, message: string): ob
 // Requests from browsers carry an Origin header; a permitted one is only
 // ever localhost (or the app's own luban:// scheme). Anything else is a
 // DNS-rebinding attempt on a loopback-only server, per MCP spec guidance.
-function isAllowedOrigin(origin: string | undefined): boolean {
+export function isAllowedOrigin(origin: string | undefined): boolean {
     if (!origin) {
         return true;
     }
     return /^(luban:\/\/|https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$)/.test(origin);
 }
 
-function isLoopback(address: string | undefined): boolean {
+export function isLoopback(address: string | undefined): boolean {
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 

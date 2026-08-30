@@ -624,6 +624,38 @@ class SstpHttpChannel extends Channel implements
             });
     };
 
+    /**
+     * Promise variants of startGcode/stopGcode for callers that need the
+     * result rather than a socket emit (MCP job gate).
+     */
+    public async startGcodeJob(): Promise<{ ok: boolean; code?: number; text?: string }> {
+        const api = `${this.host}/api/v1/start_print`;
+        return new Promise((resolve) => {
+            request
+                .post(api)
+                .timeout(120000)
+                .send(`token=${this.token}`)
+                .end((err, res) => {
+                    const { code, text, msg } = _getResult(err, res) || {};
+                    resolve({ ok: !err, code, text: text || msg });
+                });
+        });
+    }
+
+    public async stopGcodeJob(): Promise<{ ok: boolean; code?: number; text?: string }> {
+        const api = `${this.host}/api/v1/stop_print`;
+        return new Promise((resolve) => {
+            request
+                .post(api)
+                .timeout(120000)
+                .send(`token=${this.token}`)
+                .end((err, res) => {
+                    const { code, text, msg } = _getResult(err, res) || {};
+                    resolve({ ok: !err, code, text: text || msg });
+                });
+        });
+    }
+
     public resumeGcode = (options: EventOptions) => {
         const { eventName } = options;
         const api = `${this.host}/api/v1/resume_print`;

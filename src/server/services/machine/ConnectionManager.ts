@@ -144,6 +144,13 @@ class ConnectionManager {
     }
 
     /**
+     * The active channel, or null when disconnected. Read-only use (MCP).
+     */
+    public getCurrentChannel(): Channel | null {
+        return this.channel;
+    }
+
+    /**
      * Last heartbeat state from the active channel, or null when the channel
      * does not report one (no heartbeat yet, or unsupported channel type).
      */
