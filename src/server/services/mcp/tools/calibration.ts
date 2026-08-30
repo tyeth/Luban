@@ -25,12 +25,20 @@ function describeEntry(entry: CalibrationEntry): object {
 }
 
 export function registerCalibrationTools(registry: ToolRegistry): void {
+    // Divergence tripwire: a sign-flipped matrix makes each "correction" grow
+    // the error. Remember the last step per calibration+target and warn the
+    // moment the error fails to shrink - one wasted step instead of a manual
+    // catch several steps later.
+    let lastServoStep: { calibrationId: string; tu: number; tv: number; magnitude: number; at: number } | null = null;
     registry.register({
         name: 'set_camera_calibration',
         description: 'Persist a pixel-to-machine calibration, keyed by the machine Y it was '
             + 'derived at (the SM2 platform travels in Y, so a mapping is only valid at that Y). '
             + 'matrix maps a pixel delta [du, dv] to the machine XY move [dx, dy] in mm that '
-            + 'cancels it. Survives restarts.',
+            + 'cancels it - i.e. M = +J^-1 where J is the forward Jacobian (pixel shift per mm of '
+            + 'machine move), and visual_servo applies M to error = target - feature. VERIFY THE '
+            + 'SIGN before storing: J.(M.e) must reproduce +e, not -e - a flipped M silently '
+            + 'drives the servo away from the target. Survives restarts.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -121,11 +129,14 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
 
     registry.register({
         name: 'visual_servo',
-        description: 'One visual-servo correction step: turns a pixel error (target_pixel - '
-            + 'feature_pixel) into a machine XY move using a stored calibration, executes it '
-            + 'through the same guarded single-move path as move_and_capture, and returns the '
-            + 'new frame. The iteration loop belongs to the caller. Step size is clamped '
-            + `(max_step_mm, default ${DEFAULT_STEP_LIMIT_MM}, cap ${MAX_STEP_LIMIT_MM}).`,
+        description: 'One visual-servo correction step: computes error = target_pixel - '
+            + 'feature_pixel (this exact convention), applies the stored matrix to it, executes '
+            + 'the machine XY move through the same guarded single-move path as move_and_capture, '
+            + 'and returns the new frame. The iteration loop belongs to the caller. Step size is '
+            + `clamped (max_step_mm, default ${DEFAULT_STEP_LIMIT_MM}, cap ${MAX_STEP_LIMIT_MM}). `
+            + 'If the pixel error GROWS between consecutive steps with the same calibration and '
+            + 'target, the response warns of a likely sign-flipped matrix - stop and re-verify '
+            + 'rather than iterating.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -203,6 +214,19 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
             }
 
             const warnings: string[] = [];
+            const errorMagnitude = Math.hypot(du, dv);
+            const tu = Number(args.target_pixel?.u);
+            const tv = Number(args.target_pixel?.v);
+            if (lastServoStep
+                && lastServoStep.calibrationId === entry.id
+                && Math.abs(lastServoStep.tu - tu) < 5 && Math.abs(lastServoStep.tv - tv) < 5
+                && Date.now() - lastServoStep.at < 10 * 60 * 1000
+                && errorMagnitude >= lastServoStep.magnitude * 0.95) {
+                warnings.push('Pixel error did not shrink after the previous servo step with this calibration '
+                    + `(${lastServoStep.magnitude.toFixed(1)}px -> ${errorMagnitude.toFixed(1)}px). A sign-flipped or `
+                    + 'badly scaled matrix drives AWAY from the target: verify J.(M.e) reproduces +e before '
+                    + 'iterating further.');
+            }
             if (entryDistance !== null && entryDistance > DEFAULT_Y_TOLERANCE_MM) {
                 warnings.push(`Calibration ${entry.id} is ${entryDistance.toFixed(1)} mm from the current Y; scale may be off.`);
             }
@@ -217,6 +241,8 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                 feed_rate: args.feed_rate,
                 operator_confirmed_clearance: args.operator_confirmed_clearance,
             }) as { mcpContent: object[] };
+
+            lastServoStep = { calibrationId: entry.id, tu, tv, magnitude: errorMagnitude, at: Date.now() };
 
             // Splice servo metadata into the text part of the frame result.
             const servoMeta = {

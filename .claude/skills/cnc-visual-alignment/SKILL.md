@@ -107,8 +107,13 @@ Never compute a machine coordinate from one frame and drive to it. With the MCP:
    explicitly confirmed Z and path clearance (`operator_confirmed_clearance`, which you
    pass ONLY on the operator's word, never on your own judgment).
 3. Derive the 2×2 matrix at the working Y and Z: command 2–3 known small XY offsets with
-   `move_and_capture`, track one feature's pixel displacement, fit, store with
-   `set_camera_calibration` (record residuals in `notes`).
+   `move_and_capture`, track one feature's pixel displacement, fit the forward Jacobian J
+   (pixel shift per mm), and store M = +J⁻¹ with `set_camera_calibration` (residuals in
+   `notes`). **Verify the sign before storing**: the tool computes error = target − feature
+   (check `pixel_error` in a real response against your own numbers), and J·(M·e) must
+   reproduce +e — a flipped M drives every "correction" away from the target, and it looks
+   plausible right up until the error grows. The tool warns when consecutive steps fail to
+   shrink the error; treat that warning as "stop and re-derive", never "push through".
 4. Iterate `visual_servo` — each call is one clamped step and returns the frame; two or
    three passes converge. It auto-selects the nearest-Y calibration and warns when a step
    moves Y (self-invalidating) — re-derive or re-select when it does.
