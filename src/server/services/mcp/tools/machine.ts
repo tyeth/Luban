@@ -67,6 +67,7 @@ export interface PositionSnapshot {
     machineStatus: string | null;
     reportAgeMs: number;
     convention: string;
+    warnings: string[];
 }
 
 /**
@@ -105,6 +106,27 @@ export function getPositionSnapshot(): PositionSnapshot {
         z: work.z === null ? null : work.z - offset.z,
     };
 
+    // Hardware-observed failure mode: a bare G28 leaves the controller
+    // reporting positions in an unselected workspace, so derived machine
+    // coordinates land outside the build volume (e.g. Z 656 on a 325 mm
+    // machine). Flag it rather than let an agent trust it.
+    const warnings: string[] = [];
+    const size = getMachineSizeByIdentifier(status.machineIdentifier);
+    if (size) {
+        // Floors/headroom allow real overtravel: the A350 X home switch sits
+        // at machine -19, and Z/Y home a few mm past the nominal volume.
+        const outside = (['x', 'y', 'z'] as const).filter((axis) => {
+            const v = machine[axis];
+            return v !== null && (v < -25 || v > size[axis] + 40);
+        });
+        if (outside.length) {
+            warnings.push(`Derived machine ${outside.join('/')} is outside the build volume - the `
+                + 'controller is likely reporting positions in an unselected workspace (seen after a '
+                + 'bare G28). Verify the frame with query_firmware_position and do not trust work '
+                + 'coordinates for cutting until position reporting is coherent again.');
+        }
+    }
+
     return {
         work,
         machine,
@@ -115,6 +137,7 @@ export function getPositionSnapshot(): PositionSnapshot {
         machineStatus: (state as { status?: string }).status || null,
         reportAgeMs: Date.now() - state.timestamp,
         convention: 'machine = work - originOffset; heartbeat reports work coordinates',
+        warnings,
     };
 }
 
