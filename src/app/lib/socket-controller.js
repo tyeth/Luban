@@ -9,6 +9,13 @@ class SocketController {
 
     callbacks = {};
 
+    // Registrations made before connect(). The renderer now mounts before the
+    // socket exists, so on/once/channel have to survive a null socket and be
+    // replayed once there is one.
+    pending = [];
+
+    connectWaiters = [];
+
     get connected() {
         return !!(this.socket && this.socket.connected);
     }
@@ -34,6 +41,28 @@ class SocketController {
                 next = null;
             }
         });
+
+        const pending = this.pending;
+        this.pending = [];
+        for (const { method, args } of pending) {
+            this[method](...args);
+        }
+
+        const waiters = this.connectWaiters;
+        this.connectWaiters = [];
+        for (const resolve of waiters) {
+            resolve();
+        }
+    }
+
+    /** Resolves once a socket exists. Already-connected callers resolve immediately. */
+    whenSocketExists() {
+        if (this.socket) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+            this.connectWaiters.push(resolve);
+        });
     }
 
     disconnect() {
@@ -48,6 +77,10 @@ class SocketController {
     }
 
     on(eventName, callback) {
+        if (!this.socket) {
+            this.pending.push({ method: 'on', args: [eventName, callback] });
+            return;
+        }
         if (!this.callbacks[eventName]) {
             this.callbacks[eventName] = [];
         }
@@ -63,6 +96,10 @@ class SocketController {
     }
 
     once(eventName, callback) {
+        if (!this.socket) {
+            this.pending.push({ method: 'once', args: [eventName, callback] });
+            return this;
+        }
         this.socket.once(eventName, (...args) => {
             callback(...args);
         });
@@ -71,6 +108,9 @@ class SocketController {
     }
 
     channel(topic, params, onMessage) {
+        if (!this.socket) {
+            return this.whenSocketExists().then(() => this.channel(topic, params, onMessage));
+        }
         return new Promise((resolve, reject) => {
             const actionid = uuid();
             const listener = (_actionid, _STATUS_, result) => {
