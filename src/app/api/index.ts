@@ -127,6 +127,12 @@ const setState = defaultAPIFactory((options) => {
 
 const unsetState = defaultAPIFactory(({ key }) => request.delete('/api/state').query({ key }));
 
+//
+// MCP server
+//
+const getMcpStatus = defaultAPIFactory(() => request.get('/api/mcp'));
+const setMcpSettings = defaultAPIFactory((options) => request.post('/api/mcp').send(options));
+
 /**
  * Load G-code
  *
@@ -352,6 +358,10 @@ export default {
     getState,
     setState,
     unsetState,
+
+    // MCP server
+    getMcpStatus,
+    setMcpSettings,
 
     // G-code
     loadGCode,

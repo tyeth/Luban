@@ -19,20 +19,60 @@ const log = logger('service:mcp');
 // but never from the LAN the machine itself sits on.
 const PORT_ENV = 'LUBAN_MCP_PORT';
 const PORT_CONFIG_KEY = 'mcpPort';
+const ENABLED_CONFIG_KEY = 'mcpEnabled';
+const DEFAULT_PORT = 40889;
 
 let httpServer: http.Server | null = null;
+let runningPort: number | null = null;
+let registeredToolCount = 0;
 
-function resolvePort(): number | null {
-    const raw = process.env[PORT_ENV] || config.get(PORT_CONFIG_KEY);
-    if (!raw) {
-        return null;
-    }
+function validPort(raw: unknown): number | null {
     const port = Number(raw);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        log.error(`Ignoring invalid MCP port: ${raw}`);
         return null;
     }
     return port;
+}
+
+interface McpSettings {
+    enabled: boolean;
+    port: number;
+    source: 'env' | 'config';
+}
+
+function resolveSettings(): McpSettings {
+    const envRaw = process.env[PORT_ENV];
+    if (envRaw) {
+        const envPort = validPort(envRaw);
+        if (envPort === null) {
+            log.error(`Ignoring invalid ${PORT_ENV}: ${envRaw}`);
+        } else {
+            return { enabled: true, port: envPort, source: 'env' };
+        }
+    }
+
+    const configPort = validPort(config.get(PORT_CONFIG_KEY));
+    const enabledRaw = config.get(ENABLED_CONFIG_KEY);
+    // Legacy behaviour: before mcpEnabled existed, setting mcpPort enabled
+    // the service. Keep that when the flag is absent.
+    const enabled = (enabledRaw === undefined || enabledRaw === null)
+        ? configPort !== null
+        : !!enabledRaw;
+    return { enabled, port: configPort || DEFAULT_PORT, source: 'config' };
+}
+
+/**
+ * Status of the MCP service for this run. Settings changes apply at the
+ * next start; `running`/`port` describe what is actually live now.
+ */
+export function getMcpStatus() {
+    const settings = resolveSettings();
+    return {
+        running: !!httpServer,
+        port: runningPort,
+        toolCount: registeredToolCount,
+        settings,
+    };
 }
 
 export interface McpBroadcaster {
@@ -44,10 +84,11 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         return;
     }
 
-    const port = resolvePort();
-    if (port === null) {
+    const settings = resolveSettings();
+    if (!settings.enabled) {
         return;
     }
+    const port = settings.port;
 
     const registry = new ToolRegistry();
     registerStatusTools(registry);
@@ -55,6 +96,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerGcodeTools(registry, () => `http://127.0.0.1:${port}`);
     registerCameraTools(registry);
     registerCalibrationTools(registry);
+    registeredToolCount = registry.list().length;
 
     // Mirror tool activity to connected UI clients so the Workspace console
     // can show agent traffic (verbose toggle).
@@ -85,8 +127,10 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     httpServer.on('error', (err) => {
         log.error(`MCP server error: ${err.message}`);
         httpServer = null;
+        runningPort = null;
     });
     httpServer.listen(port, '127.0.0.1', () => {
+        runningPort = port;
         log.info(`MCP server listening at http://127.0.0.1:${port}/mcp`);
     });
 }
@@ -95,5 +139,6 @@ export function stopMcpService(): void {
     if (httpServer) {
         httpServer.close();
         httpServer = null;
+        runningPort = null;
     }
 }
