@@ -120,6 +120,27 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
             const terminal = terminalRef.current;
             terminal && terminal.writeln(color.blackBright(line));
         },
+        // Exact gcode sent by MCP tools on the direct path, and the
+        // controller's reply - shows which coordinate frame each move ran in.
+        'mcp:gcode': (options) => {
+            if (!verboseRef.current) {
+                return;
+            }
+            const terminal = terminalRef.current;
+            if (!terminal) {
+                return;
+            }
+            const { tool, gcode, response } = options || {};
+            if (gcode) {
+                String(gcode).split(/;?\r?\n/).forEach((line) => {
+                    line = line.trim();
+                    line && terminal.writeln(color.magenta(`[mcp:${tool}] > ${line}`));
+                });
+            }
+            if (response) {
+                terminal.writeln(color.magenta(`[mcp:${tool}] < ${String(response).slice(0, 200)}`));
+            }
+        },
         // MCP tool activity mirrored from the server (verbose mode)
         'mcp:activity': (options) => {
             if (!verboseRef.current) {
