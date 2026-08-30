@@ -3,8 +3,10 @@ import http from 'http';
 import pkg from '../../../package.json';
 import logger from '../../lib/logger';
 import config from '../configstore';
-import { McpServer } from './McpServer';
+import { McpServer, isAllowedOrigin, isLoopback } from './McpServer';
+import { jobManager } from './jobs';
 import { ToolRegistry } from './registry';
+import { registerGcodeTools } from './tools/gcode';
 import { registerMachineTools } from './tools/machine';
 import { registerStatusTools } from './tools/status';
 
@@ -44,10 +46,28 @@ export function startMcpService(): void {
     const registry = new ToolRegistry();
     registerStatusTools(registry);
     registerMachineTools(registry);
+    registerGcodeTools(registry, () => `http://127.0.0.1:${port}`);
 
     const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version);
 
-    httpServer = http.createServer(mcpServer.handleRequest);
+    httpServer = http.createServer((req, res) => {
+        // Same trust boundary for every route: local processes only, and no
+        // browser contexts other than localhost or the app's own scheme.
+        if (!isLoopback(req.socket.remoteAddress) || !isAllowedOrigin(req.headers.origin)) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'forbidden' }));
+            return;
+        }
+
+        const url = new URL(req.url, 'http://localhost');
+        if (url.pathname.startsWith('/confirm')) {
+            // Human job-confirmation pages (jobs.ts)
+            jobManager.handleConfirmRequest(req, res, url.pathname);
+            return;
+        }
+
+        mcpServer.handleRequest(req, res);
+    });
     httpServer.on('error', (err) => {
         log.error(`MCP server error: ${err.message}`);
         httpServer = null;
