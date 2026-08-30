@@ -71,6 +71,9 @@ class SocketCommunication {
         'machine:module-info': [],
         'machine:laser-status': [],
 
+        // MCP server activity (verbose console)
+        'mcp:activity': [],
+
         [SocketEvent.UploadFileProgress]: [],
         [SocketEvent.UploadFileCompressing]: [],
         [SocketEvent.UploadFileDecompressing]: [],

@@ -81,6 +81,13 @@ class SocketServer extends EventEmitter {
         // this.events = [];
     }
 
+    /**
+     * Emit to every connected client (server-initiated notifications).
+     */
+    public broadcast = (eventName: string, options?: object) => {
+        this.io && this.io.emit(eventName, options);
+    };
+
     // established a new socket connection
     public onConnection = (socket) => {
         const address = socket.handshake.address;

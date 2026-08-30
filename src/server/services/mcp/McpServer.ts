@@ -56,10 +56,18 @@ export class McpServer {
 
     private serverVersion: string;
 
-    public constructor(registry: ToolRegistry, serverName: string, serverVersion: string) {
+    private onActivity: ((activity: object) => void) | null;
+
+    public constructor(
+        registry: ToolRegistry,
+        serverName: string,
+        serverVersion: string,
+        onActivity?: (activity: object) => void
+    ) {
         this.registry = registry;
         this.serverName = serverName;
         this.serverVersion = serverVersion;
+        this.onActivity = onActivity || null;
     }
 
     public handleRequest = (req: http.IncomingMessage, res: http.ServerResponse): void => {
@@ -202,6 +210,7 @@ export class McpServer {
         try {
             const result = await this.registry.call(name, ((params && params.arguments) as object) || {});
             log.info(`tool ${name} ok in ${Date.now() - startedAt}ms`);
+            this.onActivity && this.onActivity({ tool: name, ok: true, durationMs: Date.now() - startedAt });
             // A tool that returns non-text content (e.g. an image) supplies
             // the MCP content array itself via mcpContent.
             const content = (result as { mcpContent?: object[] })?.mcpContent
@@ -215,6 +224,7 @@ export class McpServer {
             // calling the tool can read them.
             const text = err instanceof McpToolError ? err.message : `Tool failed: ${err.message}`;
             log.warn(`tool ${name} failed in ${Date.now() - startedAt}ms: ${text}`);
+            this.onActivity && this.onActivity({ tool: name, ok: false, durationMs: Date.now() - startedAt, error: text });
             return rpcResult(id, {
                 content: [{ type: 'text', text }],
                 isError: true,
