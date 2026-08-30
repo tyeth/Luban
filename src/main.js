@@ -7,11 +7,9 @@ import 'core-js';
 import { enable as electronEnable, initialize as electronRemoteMainInitialize } from '@electron/remote/main';
 import { app, BrowserWindow, dialog, ipcMain, Menu, powerSaveBlocker, protocol, screen, session, shell } from 'electron';
 import Store from 'electron-store';
-import { autoUpdater } from 'electron-updater';
 import fs from 'fs';
 import { debounce, isNull, isUndefined } from 'lodash';
 import log from 'loglevel';
-import fetch from 'node-fetch';
 import path from 'path';
 import url from 'url';
 
@@ -21,23 +19,43 @@ import { configureWindow } from './electron-app/window';
 import pkg from './package.json';
 import { ENV_KEY as STARTUP_EPOCH_KEY, epoch as startupEpoch, formatTimeline as formatStartupTimeline, mark as startupMark } from './startup-timeline';
 
-import * as Sentry from "@sentry/electron/main";
+const CRASH_REPORTING_KEY = 'enableCrashReporting';
 
-Sentry.init({
-  dsn: "https://cd2af28a126afbc7a8257a75b3b5d0ab@o4508125599563776.ingest.us.sentry.io/4508125605068800",
-  release: pkg.version,
-//   integrations: [new Sentry.Integrations.BrowserTracing()],
-  tracesSampleRate: 1.0,
-  debug: true,
-  beforeSend(event) {
-    log.info('Sentry event::: ', event);
-    // Log the error to the console
-    if (event.exception) {
-      console.error('Captured exception:', event.exception.values[0]);
+/*
+ * Crash reporting is opt-in and off by default.
+ *
+ * Sentry used to init at module scope, before the window existed: 21
+ * integrations, the Electron crashReporter, four OpenTelemetry globals and a
+ * read of its offline envelope store, all on the path to first paint, and all
+ * of it useless to someone offline or behind a VPN. It is now required only
+ * when the user has asked for it.
+ */
+const initCrashReporting = (store) => {
+    if (!store.get(CRASH_REPORTING_KEY, false)) {
+        log.info('Crash reporting disabled');
+        return;
     }
-    return event;
-  }
-});
+
+    try {
+        // eslint-disable-next-line global-require
+        const Sentry = require('@sentry/electron/main');
+
+        Sentry.init({
+            dsn: 'https://cd2af28a126afbc7a8257a75b3b5d0ab@o4508125599563776.ingest.us.sentry.io/4508125605068800',
+            release: pkg.version,
+            tracesSampleRate: 1.0,
+            beforeSend(event) {
+                if (event.exception) {
+                    log.error('Captured exception:', event.exception.values[0]);
+                }
+                return event;
+            }
+        });
+        log.info('Crash reporting enabled');
+    } catch (err) {
+        log.warn('Crash reporting failed to initialise', err);
+    }
+};
 
 log.setLevel(log.levels.INFO);
 
@@ -45,6 +63,8 @@ log.setLevel(log.levels.INFO);
 process.env[STARTUP_EPOCH_KEY] = String(startupEpoch);
 
 const config = new Store();
+
+initCrashReporting(config);
 const userDataDir = app.getPath('userData');
 global.luban = {
     userDataDir
@@ -72,6 +92,13 @@ const APP_URL = 'luban://127.0.0.1/';
 // The renderer asks for this as soon as it boots, which can be before the server
 // is listening. Answering null is fine - 'server-origin' follows when it is up.
 ipcMain.handle('get-server-origin', () => loadUrl || null);
+
+// Crash reporting is read once at startup, so a change applies on next start.
+ipcMain.handle('get-crash-reporting', () => config.get(CRASH_REPORTING_KEY, false));
+ipcMain.on('set-crash-reporting', (event, enabled) => {
+    config.set(CRASH_REPORTING_KEY, !!enabled);
+    log.info(`Crash reporting ${enabled ? 'enabled' : 'disabled'}, applies on next start`);
+});
 
 
 function getBrowserWindowOptions() {
@@ -151,6 +178,19 @@ function sendUpdateMessage(text) {
 }
 
 // handle update issue
+// Required on first use. Nothing checks for updates until the renderer asks,
+// and offline it is dead weight loaded before the window.
+let autoUpdaterInstance = null;
+const getAutoUpdater = () => {
+    if (!autoUpdaterInstance) {
+        // eslint-disable-next-line global-require
+        autoUpdaterInstance = require('electron-updater').autoUpdater;
+    }
+    return autoUpdaterInstance;
+};
+
+let autoUpdaterWired = false;
+
 function updateHandle() {
     const message = {
         error: 'key-settings_message-error',
@@ -158,95 +198,110 @@ function updateHandle() {
         updateAva: 'key-settings_message-updateAva',
         updateNotAva: 'key-settings_message-update_not_ava'
     };
-    // Official document: https://www.electron.build/auto-update.html
-    autoUpdater.autoDownload = false;
-    // Whether to automatically install a downloaded update on app quit. Applicable only on Windows and Linux.
-    autoUpdater.autoInstallOnAppQuit = false;
-
-    autoUpdater.on('error', (err) => {
-        sendUpdateMessage(message.error, err);
-    });
-    // Emitted when checking if an update has started.
-    autoUpdater.on('checking-for-update', () => {
-        sendUpdateMessage(message.checking);
-    });
-
-    // Emitted when there is an available update. The update is downloaded automatically if autoDownload is true.
-    autoUpdater.on('update-available', async (downloadInfo) => {
-        // {
-        //   version: string;
-        //   files: Array<{ url: string; sha512: string; size: number; }>;
-        //   path: string;
-        //   sha512: string;
-        //   releaseDate: string;
-        //   releaseNotes: string;
-        // }
-        log.debug('event: update-available');
-
-        sendUpdateMessage(message.updateAva);
-
-        // Get chinese version of release note for zh-CN locale
-        if (app.getLocale() === 'zh-CN') {
-            if (!downloadInfo.releaseNotes && process.platform !== 'linux') {
-                // for aliyuncs
-                const changelogUrl = `https://snapmaker.oss-cn-beijing.aliyuncs.com/snapmaker.com/download/luban/Snapmaker-Luban-${downloadInfo.version}.changelog.md`;
-                const result = await fetch(changelogUrl,
-                    {
-                        mode: 'cors',
-                        method: 'GET',
-                        headers: {
-                            'Content-Type': 'text/markdown'
-                        }
-                    })
-                    .then((response) => {
-                        response.headers['access-control-allow-origin'] = { value: '*' };
-                        return response.text();
-                    });
-
-                downloadInfo.releaseChangeLog = result;
-                downloadInfo.releaseName = `v${downloadInfo.version}`;
-            }
+    // Wired on first use so requiring electron-updater stays off the startup path.
+    const wireAutoUpdater = () => {
+        const updater = getAutoUpdater();
+        if (autoUpdaterWired) {
+            return updater;
         }
+        autoUpdaterWired = true;
 
-        mainWindow.webContents.send('update-available', { ...downloadInfo, prevVersion: app.getVersion() });
-    });
-    // Emitted when there is no available update.
-    autoUpdater.on('update-not-available', () => {
-        sendUpdateMessage(message.updateNotAva);
-    });
-    autoUpdater.on('download-progress', (progressObj) => {
-        mainWindow.setProgressBar(progressObj.percent / 100);
-    });
-    // downloadInfo — for generic and github providers
-    autoUpdater.on('update-downloaded', debounce((downloadInfo) => {
-        ipcMain.on('replaceAppNow', () => {
-            // some code here to handle event
-            try {
-                autoUpdater.quitAndInstall();
-            } catch (err) {
-                log.error('quitAndInstall get err', err);
-            }
+        // Official document: https://www.electron.build/auto-update.html
+        updater.autoDownload = false;
+        // Whether to automatically install a downloaded update on app quit. Applicable only on Windows and Linux.
+        updater.autoInstallOnAppQuit = false;
+
+        updater.on('error', (err) => {
+            sendUpdateMessage(message.error, err);
         });
-        mainWindow.webContents.send('is-replacing-app-now', downloadInfo);
-    }), 300);
+        // Emitted when checking if an update has started.
+        updater.on('checking-for-update', () => {
+            sendUpdateMessage(message.checking);
+        });
+
+        // Emitted when there is an available update. The update is downloaded automatically if autoDownload is true.
+        updater.on('update-available', async (downloadInfo) => {
+            // {
+            //   version: string;
+            //   files: Array<{ url: string; sha512: string; size: number; }>;
+            //   path: string;
+            //   sha512: string;
+            //   releaseDate: string;
+            //   releaseNotes: string;
+            // }
+            log.debug('event: update-available');
+
+            sendUpdateMessage(message.updateAva);
+
+            // Get chinese version of release note for zh-CN locale
+            if (app.getLocale() === 'zh-CN') {
+                if (!downloadInfo.releaseNotes && process.platform !== 'linux') {
+                    // for aliyuncs
+                    const changelogUrl = `https://snapmaker.oss-cn-beijing.aliyuncs.com/snapmaker.com/download/luban/Snapmaker-Luban-${downloadInfo.version}.changelog.md`;
+                    // eslint-disable-next-line global-require
+                    const fetch = require('node-fetch');
+                    const result = await fetch(changelogUrl,
+                        {
+                            mode: 'cors',
+                            method: 'GET',
+                            headers: {
+                                'Content-Type': 'text/markdown'
+                            }
+                        })
+                        .then((response) => {
+                            response.headers['access-control-allow-origin'] = { value: '*' };
+                            return response.text();
+                        });
+
+                    downloadInfo.releaseChangeLog = result;
+                    downloadInfo.releaseName = `v${downloadInfo.version}`;
+                }
+            }
+
+            mainWindow.webContents.send('update-available', { ...downloadInfo, prevVersion: app.getVersion() });
+        });
+        // Emitted when there is no available update.
+        updater.on('update-not-available', () => {
+            sendUpdateMessage(message.updateNotAva);
+        });
+        updater.on('download-progress', (progressObj) => {
+            mainWindow.setProgressBar(progressObj.percent / 100);
+        });
+        // downloadInfo — for generic and github providers
+        updater.on('update-downloaded', debounce((downloadInfo) => {
+            ipcMain.on('replaceAppNow', () => {
+                // some code here to handle event
+                try {
+                    updater.quitAndInstall();
+                } catch (err) {
+                    log.error('quitAndInstall get err', err);
+                }
+            });
+            mainWindow.webContents.send('is-replacing-app-now', downloadInfo);
+        }), 300);
+
+        return updater;
+    };
+
     // Emitted when the user agrees to download
     ipcMain.on('startingDownloadUpdate', () => {
         mainWindow.webContents.send('download-has-started');
-        autoUpdater.downloadUpdate();
+        wireAutoUpdater().downloadUpdate();
     });
     // Emitted when is ready to check for update
     ipcMain.on('checkForUpdate', async (event, autoUpdateProviderOptions) => {
+        const updater = wireAutoUpdater();
+
         // Set feed URL
         if (autoUpdateProviderOptions.provider === 'generic') {
             log.info(`Check for updates, feed URL: ${autoUpdateProviderOptions.url}`);
-            autoUpdater.setFeedURL(autoUpdateProviderOptions);
         } else {
             log.info(`Check for updates, provider: ${autoUpdateProviderOptions.provider}`);
-            autoUpdater.setFeedURL(autoUpdateProviderOptions);
         }
+        updater.setFeedURL(autoUpdateProviderOptions);
 
         try {
-            await autoUpdater.checkForUpdates();
+            await updater.checkForUpdates();
         } catch (e) {
             log.warn('Check for update failed', e);
         }
