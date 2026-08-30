@@ -120,6 +120,7 @@ export interface BoundedMoveArgs {
     coordinate_system?: string;
     feed_rate?: number;
     operator_confirmed_clearance?: boolean;
+    wait_until_moved?: boolean;
     // Internal (not exposed in any tool schema): lifts the per-call travel
     // limit for fixed, operator-set destinations like the work origin.
     unbounded_travel?: boolean;
@@ -186,6 +187,18 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     const executed = await sendGcodeVisible(channel, 'move', gcode);
     if (executed.result !== 0) {
         throw new McpToolError(`Move rejected by controller: ${executed.text || executed.result}`);
+    }
+
+    if (args.wait_until_moved === false) {
+        // Fire-and-return: no settle, no capture - the frame would not show
+        // the commanded position. Poll get_position before relying on it.
+        return {
+            commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
+            position: null,
+            position_verified: false,
+            note: 'wait_until_moved was false: move accepted but not awaited, and no frame was '
+                + 'captured (it would not show the commanded position). Poll get_position.',
+        };
     }
 
     // Wait for a post-move heartbeat that reports the target, twice,
@@ -389,8 +402,19 @@ export function registerCameraTools(registry: ToolRegistry): void {
             + 'fitted, G28 also homes B - stock indexed on the rotary WILL rotate (observed -45 to 0 '
             + 'on hardware); warn the operator first. Requires an idle machine with the toolhead '
             + 'off. Waits for the firmware to report homed.',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        handler: async () => {
+        inputSchema: {
+            type: 'object',
+            properties: {
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Default true: block ~15-20s until the firmware reports homed and '
+                        + 'settled. false returns right after G28 is accepted - poll get_position '
+                        + 'for isHomed before any motion.',
+                },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { wait_until_moved?: boolean }) => {
             const before = getPositionSnapshot();
             if (before.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${before.machineStatus || 'in an unknown state'}, not idle.`);
@@ -414,6 +438,16 @@ export function registerCameraTools(registry: ToolRegistry): void {
             const executed = await sendGcodeVisible(channel, 'home', 'G53;\nG28;\nG54;');
             if (executed.result !== 0) {
                 throw new McpToolError(`Homing rejected by controller: ${executed.text || executed.result}`);
+            }
+
+            if (args.wait_until_moved === false) {
+                return {
+                    homed: null,
+                    position_verified: false,
+                    note: 'wait_until_moved was false: G28 accepted but not awaited (homing takes '
+                        + '~15-20s). Poll get_position until isHomed is true and the position is '
+                        + 'stable before any motion.',
+                };
             }
 
             // Homing on the A350 takes tens of seconds; wait for TWO
@@ -476,10 +510,16 @@ export function registerCameraTools(registry: ToolRegistry): void {
                     description: 'Set true ONLY when the human operator has explicitly confirmed the '
                         + 'current Z and an obstacle-free path at this Z; skips the homed-first requirement.',
                 },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Default true: settle at the origin and capture there. false returns '
+                        + 'right after the controller accepts the move - no settle, no frame; poll '
+                        + 'get_position afterwards.',
+                },
             },
             additionalProperties: false,
         },
-        handler: async (args: { feed_rate?: number; operator_confirmed_clearance?: boolean }) => {
+        handler: async (args: { feed_rate?: number; operator_confirmed_clearance?: boolean; wait_until_moved?: boolean }) => {
             // The work origin is a fixed, operator-set destination, so the
             // per-call travel limit (meant to bound the blast radius of a
             // wrong coordinate) does not apply; every other guard does.
@@ -489,6 +529,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 coordinate_system: 'work',
                 feed_rate: args.feed_rate,
                 operator_confirmed_clearance: args.operator_confirmed_clearance,
+                wait_until_moved: args.wait_until_moved,
                 unbounded_travel: true,
             });
         },
@@ -516,6 +557,12 @@ export function registerCameraTools(registry: ToolRegistry): void {
                     type: 'boolean',
                     description: 'Set true ONLY when the human operator has explicitly confirmed the '
                         + 'current Z and an obstacle-free path at this Z; skips the homed-first requirement.',
+                },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Default true: settle at the target and capture there. false returns '
+                        + 'right after the controller accepts the move - no settle, NO FRAME, '
+                        + 'position_verified: false; poll get_position afterwards.',
                 },
             },
             additionalProperties: false,

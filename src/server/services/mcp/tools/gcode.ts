@@ -174,11 +174,17 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             properties: {
                 job_id: { type: 'string' },
                 confirm_token: { type: 'string', description: 'One-time code from the operator.' },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Direct jobs only. Default true: block until the heartbeat verifiably '
+                        + 'reports the move done. false returns immediately after the controller accepts '
+                        + 'the command, with position_verified: false - poll get_position afterwards.',
+                },
             },
             required: ['job_id', 'confirm_token'],
             additionalProperties: false,
         },
-        handler: async (args: { job_id?: string; confirm_token?: string }) => {
+        handler: async (args: { job_id?: string; confirm_token?: string; wait_until_moved?: boolean }) => {
             const job = jobManager.get(String(args.job_id || ''));
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
@@ -219,7 +225,17 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     job.error = `Controller rejected the move: ${executed.text || executed.result}`;
                     throw new McpToolError(job.error);
                 }
-                const settle = await waitForStableHeartbeat(issuedAt, parseZTarget(gcodeText));
+                const shouldWait = args.wait_until_moved !== undefined
+                    ? args.wait_until_moved !== false
+                    : job.waitUntilMoved !== false;
+                const settle = !shouldWait
+                    ? {
+                        position: null,
+                        verified: false,
+                        warning: 'wait_until_moved was false: the move was accepted but not awaited - '
+                            + 'poll get_position (or query_firmware_position) before relying on position.',
+                    }
+                    : await waitForStableHeartbeat(issuedAt, parseZTarget(gcodeText));
                 if (isBatch) {
                     job.nextStep += 1;
                     if (job.nextStep < job.steps.length) {
@@ -306,6 +322,13 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 },
                 feed_rate: { type: 'number', description: 'mm/min, default 300, max 600.' },
                 reason: { type: 'string', description: 'Shown to the operator: why this Z motion is needed.' },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Staged default for execution (start_gcode_job can override per call). '
+                        + 'Default true: each step blocks until the heartbeat verifiably reports the '
+                        + 'target Z. false: steps return on controller accept with '
+                        + 'position_verified: false - poll get_position.',
+                },
             },
             required: ['reason'],
             additionalProperties: false,
@@ -316,6 +339,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             coordinate_system?: string;
             feed_rate?: number;
             reason?: string;
+            wait_until_moved?: boolean;
         }) => {
             if ((args.z === undefined) === (args.z_targets === undefined)) {
                 throw new McpToolError('Provide exactly one of z or z_targets.');
@@ -372,6 +396,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
             const validation = validateGcode(reviewText);
             const job = jobManager.submit(reviewText, name, 'cnc', validation, 'direct', isBatch ? steps : undefined);
+            job.waitUntilMoved = args.wait_until_moved !== false;
 
             return {
                 job: jobManager.describe(job),

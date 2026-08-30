@@ -54,6 +54,9 @@ export interface McpJob {
     // steps and the series can be abandoned at any point.
     steps?: string[];
     nextStep?: number;
+    // Staged default for direct execution: whether start_gcode_job should
+    // block until the move verifiably settles (call-time arg overrides).
+    waitUntilMoved?: boolean;
 }
 
 function escapeHtml(text: string): string {
