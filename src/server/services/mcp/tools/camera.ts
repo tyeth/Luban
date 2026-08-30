@@ -121,6 +121,7 @@ export interface BoundedMoveArgs {
     feed_rate?: number;
     operator_confirmed_clearance?: boolean;
     wait_until_moved?: boolean;
+    capture?: boolean;
     // Internal (not exposed in any tool schema): lifts the per-call travel
     // limit for fixed, operator-set destinations like the work origin.
     unbounded_travel?: boolean;
@@ -169,10 +170,14 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         y: target.y - before.originOffset.y,
     };
     if (size) {
-        if (machineTarget.x < -0.5 || machineTarget.x > size.x + 0.5
-                    || machineTarget.y < -0.5 || machineTarget.y > size.y + 0.5) {
+        // Floors allow real overtravel: the A350 X home switch sits at
+        // machine -19, so "keep the current X while parked at home" must
+        // pass (a target at the machine's own resting position was being
+        // rejected live). Matches the position-sanity bounds.
+        if (machineTarget.x < -25 || machineTarget.x > size.x + 40
+                    || machineTarget.y < -25 || machineTarget.y > size.y + 40) {
             throw new McpToolError(`Target (machine ${machineTarget.x.toFixed(1)}, ${machineTarget.y.toFixed(1)}) `
-                        + `is outside the ${size.x}x${size.y} build area.`);
+                        + `is outside the ${size.x}x${size.y} build area (overtravel allowance -25..+40).`);
         }
     }
 
@@ -238,12 +243,21 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     }
 
     await sleep(POST_SETTLE_DWELL_MS);
+    if (args.capture === false) {
+        return {
+            commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
+            position: getPositionSnapshot(),
+            position_verified: true,
+            note: 'position is firmware-reported after settling; capture was false so no frame was taken',
+        };
+    }
     const frame = await captureFrame();
     const after = getPositionSnapshot();
 
     return frameContent(frame, {
         commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
         position: after,
+        position_verified: true,
         note: 'position is firmware-reported after settling, not the commanded target',
     });
 }
@@ -563,6 +577,12 @@ export function registerCameraTools(registry: ToolRegistry): void {
                     description: 'Default true: settle at the target and capture there. false returns '
                         + 'right after the controller accepts the move - no settle, NO FRAME, '
                         + 'position_verified: false; poll get_position afterwards.',
+                },
+                capture: {
+                    type: 'boolean',
+                    description: 'Default true. false still settles and verifies the position but '
+                        + 'skips the frame - a plain verified move. (The XY travel cap per call is '
+                        + 'the configstore key mcpMaxJogDistance, default 100mm.)',
                 },
             },
             additionalProperties: false,

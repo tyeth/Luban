@@ -145,7 +145,12 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
                 });
             }
             if (response) {
-                terminal.writeln(color.magenta(`${stamp()}[mcp:${tool}] < ${String(response).slice(0, 200)}`));
+                // Controller replies (e.g. M114 reports) are multi-line; one
+                // writeln with embedded newlines renders misaligned in xterm.
+                String(response).slice(0, 400).split(/\r?\n/).forEach((line) => {
+                    line = line.trim();
+                    line && terminal.writeln(color.magenta(`${stamp()}[mcp:${tool}] < ${line}`));
+                });
             }
         },
         // MCP tool activity mirrored from the server (verbose mode)
