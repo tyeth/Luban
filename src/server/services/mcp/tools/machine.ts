@@ -44,9 +44,78 @@ function findMachine(identifier: string) {
     return MACHINES.find((machine) => machine.identifier === identifier) || null;
 }
 
+/**
+ * Build volume of a machine by identifier, or null when unknown.
+ */
+export function getMachineSizeByIdentifier(identifier: string | null): { x: number; y: number; z: number } | null {
+    const machine = identifier ? findMachine(identifier) : null;
+    return machine ? machine.metadata.size : null;
+}
+
 function axisValue(value: unknown): number | null {
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
+}
+
+export interface PositionSnapshot {
+    work: { x: number | null; y: number | null; z: number | null };
+    machine: { x: number | null; y: number | null; z: number | null };
+    originOffset: { x: number; y: number; z: number };
+    b: number | null;
+    isFourAxis: boolean;
+    isHomed: boolean | null;
+    machineStatus: string | null;
+    reportAgeMs: number;
+    convention: string;
+}
+
+/**
+ * Position from the latest heartbeat, shared by get_position and the
+ * capture tools. Throws McpToolError when unavailable.
+ */
+export function getPositionSnapshot(): PositionSnapshot {
+    const status = connectionManager.getConnectionStatus();
+    if (!status.connected) {
+        throw new McpToolError('No machine connected.');
+    }
+
+    const state = connectionManager.getLatestMachineState();
+    if (!state) {
+        throw new McpToolError('No heartbeat received yet on this channel; position unknown.');
+    }
+
+    const pos = (state.pos || {}) as { x?: unknown; y?: unknown; z?: unknown; b?: unknown; isFourAxis?: boolean };
+    const originOffset = (state.originOffset || {}) as { x?: unknown; y?: unknown; z?: unknown };
+
+    // Heartbeat pos is the WORK position; Luban derives machine
+    // coordinates as work - originOffset (see DisplayPanel.jsx).
+    const work = {
+        x: axisValue(pos.x),
+        y: axisValue(pos.y),
+        z: axisValue(pos.z),
+    };
+    const offset = {
+        x: axisValue(originOffset.x) || 0,
+        y: axisValue(originOffset.y) || 0,
+        z: axisValue(originOffset.z) || 0,
+    };
+    const machine = {
+        x: work.x === null ? null : work.x - offset.x,
+        y: work.y === null ? null : work.y - offset.y,
+        z: work.z === null ? null : work.z - offset.z,
+    };
+
+    return {
+        work,
+        machine,
+        originOffset: offset,
+        b: axisValue(pos.b),
+        isFourAxis: !!pos.isFourAxis,
+        isHomed: (state as { isHomed?: boolean }).isHomed ?? null,
+        machineStatus: (state as { status?: string }).status || null,
+        reportAgeMs: Date.now() - state.timestamp,
+        convention: 'machine = work - originOffset; heartbeat reports work coordinates',
+    };
 }
 
 export function registerMachineTools(registry: ToolRegistry): void {
@@ -141,49 +210,6 @@ export function registerMachineTools(registry: ToolRegistry): void {
             properties: {},
             additionalProperties: false,
         },
-        handler: async () => {
-            const status = connectionManager.getConnectionStatus();
-            if (!status.connected) {
-                throw new McpToolError('No machine connected.');
-            }
-
-            const state = connectionManager.getLatestMachineState();
-            if (!state) {
-                throw new McpToolError('No heartbeat received yet on this channel; position unknown.');
-            }
-
-            const pos = (state.pos || {}) as { x?: unknown; y?: unknown; z?: unknown; b?: unknown; isFourAxis?: boolean };
-            const originOffset = (state.originOffset || {}) as { x?: unknown; y?: unknown; z?: unknown };
-
-            // Heartbeat pos is the WORK position; Luban derives machine
-            // coordinates as work - originOffset (see DisplayPanel.jsx).
-            const work = {
-                x: axisValue(pos.x),
-                y: axisValue(pos.y),
-                z: axisValue(pos.z),
-            };
-            const offset = {
-                x: axisValue(originOffset.x) || 0,
-                y: axisValue(originOffset.y) || 0,
-                z: axisValue(originOffset.z) || 0,
-            };
-            const machine = {
-                x: work.x === null ? null : work.x - offset.x,
-                y: work.y === null ? null : work.y - offset.y,
-                z: work.z === null ? null : work.z - offset.z,
-            };
-
-            return {
-                work,
-                machine,
-                originOffset: offset,
-                b: axisValue(pos.b),
-                isFourAxis: !!pos.isFourAxis,
-                isHomed: (state as { isHomed?: boolean }).isHomed ?? null,
-                machineStatus: (state as { status?: string }).status || null,
-                reportAgeMs: Date.now() - state.timestamp,
-                convention: 'machine = work - originOffset; heartbeat reports work coordinates',
-            };
-        },
+        handler: async () => getPositionSnapshot(),
     });
 }
