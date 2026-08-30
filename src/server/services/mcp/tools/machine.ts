@@ -1,0 +1,189 @@
+import {
+    SnapmakerA150Machine,
+    SnapmakerA250Machine,
+    SnapmakerA350Machine,
+    SnapmakerArtisanMachine,
+    SnapmakerJ1Machine,
+    SnapmakerOriginalExtendedMachine,
+    SnapmakerOriginalMachine,
+    SnapmakerRayMachine,
+} from '../../../../app/machines';
+import config from '../../configstore';
+import { connectionManager } from '../../machine/ConnectionManager';
+import { McpToolError, ToolRegistry } from '../registry';
+
+const MACHINES = [
+    SnapmakerOriginalMachine,
+    SnapmakerOriginalExtendedMachine,
+    SnapmakerA150Machine,
+    SnapmakerA250Machine,
+    SnapmakerA350Machine,
+    SnapmakerArtisanMachine,
+    SnapmakerJ1Machine,
+    SnapmakerRayMachine,
+];
+
+// Kinematics an agent must not guess. On the Snapmaker 2.0 gantry the
+// platform itself travels in Y while the toolhead moves in X and Z, so a
+// camera fixed to the machine frame or toolhead sees the platform move
+// under it: any pixel-to-machine mapping is only valid at the Y value it
+// was captured at.
+const SM2_KINEMATICS = {
+    movingElement: { x: 'toolhead', y: 'platform', z: 'toolhead' },
+    note: 'The platform travels in Y; the toolhead moves in X and Z. '
+        + 'A pixel-to-machine mapping is only valid at the Y it was captured at.',
+};
+
+const KINEMATICS_BY_IDENTIFIER: { [identifier: string]: object } = {
+    [SnapmakerA150Machine.identifier]: SM2_KINEMATICS,
+    [SnapmakerA250Machine.identifier]: SM2_KINEMATICS,
+    [SnapmakerA350Machine.identifier]: SM2_KINEMATICS,
+};
+
+function findMachine(identifier: string) {
+    return MACHINES.find((machine) => machine.identifier === identifier) || null;
+}
+
+function axisValue(value: unknown): number | null {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+export function registerMachineTools(registry: ToolRegistry): void {
+    registry.register({
+        name: 'get_machine_profile',
+        description: 'Machine profile: build volume, per-toolhead work ranges, and kinematics '
+            + '(which element moves per axis). Defaults to the connected machine. Read-only.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                identifier: {
+                    type: 'string',
+                    description: 'Machine identifier, e.g. "Snapmaker 2.0 A350". Omit for the connected machine.',
+                },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { identifier?: string }) => {
+            const status = connectionManager.getConnectionStatus();
+            const identifier = args.identifier || status.machineIdentifier;
+            if (!identifier) {
+                throw new McpToolError('No machine connected and no identifier given. '
+                    + `Known identifiers: ${MACHINES.map((m) => m.identifier).join(', ')}`);
+            }
+
+            const machine = findMachine(identifier);
+            if (!machine) {
+                throw new McpToolError(`Unknown machine identifier: ${identifier}. `
+                    + `Known identifiers: ${MACHINES.map((m) => m.identifier).join(', ')}`);
+            }
+
+            const state = connectionManager.getLatestMachineState();
+
+            // Add-on modules (quick-swap kit, bracing kit) translate the work
+            // envelope by workRangeOffset. Which ones are physically installed
+            // cannot be detected - the operator records it in configstore key
+            // mcpInstalledModules (array or comma-separated identifiers).
+            const modules = (machine.metadata.modules || []).map((module) => ({
+                identifier: module.identifier,
+                workRangeOffset: module.workRangeOffset || null,
+            }));
+            const installedRaw = config.get('mcpInstalledModules');
+            const installedModules = (Array.isArray(installedRaw)
+                ? installedRaw.map(String)
+                : String(installedRaw || '').split(',').map((s) => s.trim()).filter(Boolean))
+                .filter((id) => modules.some((module) => module.identifier === id));
+            const netOffset = [0, 0, 0];
+            for (const module of modules) {
+                if (installedModules.includes(module.identifier) && module.workRangeOffset) {
+                    netOffset[0] += module.workRangeOffset[0];
+                    netOffset[1] += module.workRangeOffset[1];
+                    netOffset[2] += module.workRangeOffset[2];
+                }
+            }
+            const hasOffset = netOffset.some((v) => v !== 0);
+
+            return {
+                identifier: machine.identifier,
+                fullName: machine.fullName,
+                machineType: machine.machineType,
+                size: machine.metadata.size,
+                toolHeads: machine.metadata.toolHeads.map((toolHead) => ({
+                    identifier: toolHead.identifier,
+                    workRange: toolHead.workRange || null,
+                    // Luban translates min and max alike by the module offset
+                    // (see src/app/flux/printing/index.ts).
+                    effectiveWorkRange: hasOffset && toolHead.workRange ? {
+                        min: toolHead.workRange.min.map((v, i) => v + netOffset[i]),
+                        max: toolHead.workRange.max.map((v, i) => v + netOffset[i]),
+                    } : null,
+                })),
+                modules,
+                installedModules,
+                netWorkRangeOffset: hasOffset ? netOffset : null,
+                // null means "not recorded" - do not guess kinematics.
+                kinematics: KINEMATICS_BY_IDENTIFIER[machine.identifier] || null,
+                connected: identifier === status.machineIdentifier,
+                connectedHead: state ? {
+                    headType: (state as { headType?: string }).headType || null,
+                    toolHead: (state as { toolHead?: string }).toolHead || null,
+                } : null,
+            };
+        },
+    });
+
+    registry.register({
+        name: 'get_position',
+        description: 'Current position from the machine heartbeat, in both work and machine '
+            + 'coordinates, with originOffset and the age of the report. Read-only.',
+        inputSchema: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+        },
+        handler: async () => {
+            const status = connectionManager.getConnectionStatus();
+            if (!status.connected) {
+                throw new McpToolError('No machine connected.');
+            }
+
+            const state = connectionManager.getLatestMachineState();
+            if (!state) {
+                throw new McpToolError('No heartbeat received yet on this channel; position unknown.');
+            }
+
+            const pos = (state.pos || {}) as { x?: unknown; y?: unknown; z?: unknown; b?: unknown; isFourAxis?: boolean };
+            const originOffset = (state.originOffset || {}) as { x?: unknown; y?: unknown; z?: unknown };
+
+            // Heartbeat pos is the WORK position; Luban derives machine
+            // coordinates as work - originOffset (see DisplayPanel.jsx).
+            const work = {
+                x: axisValue(pos.x),
+                y: axisValue(pos.y),
+                z: axisValue(pos.z),
+            };
+            const offset = {
+                x: axisValue(originOffset.x) || 0,
+                y: axisValue(originOffset.y) || 0,
+                z: axisValue(originOffset.z) || 0,
+            };
+            const machine = {
+                x: work.x === null ? null : work.x - offset.x,
+                y: work.y === null ? null : work.y - offset.y,
+                z: work.z === null ? null : work.z - offset.z,
+            };
+
+            return {
+                work,
+                machine,
+                originOffset: offset,
+                b: axisValue(pos.b),
+                isFourAxis: !!pos.isFourAxis,
+                isHomed: (state as { isHomed?: boolean }).isHomed ?? null,
+                machineStatus: (state as { status?: string }).status || null,
+                reportAgeMs: Date.now() - state.timestamp,
+                convention: 'machine = work - originOffset; heartbeat reports work coordinates',
+            };
+        },
+    });
+}

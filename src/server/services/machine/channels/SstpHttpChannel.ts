@@ -131,6 +131,10 @@ class SstpHttpChannel extends Channel implements
 
     private state: StateOptions = {};
 
+    // last heartbeat state, kept for status reporting (MCP); null until the
+    // first heartbeat arrives, stamped so readers can judge freshness
+    private latestMachineState: { [key: string]: unknown; timestamp: number } | null = null;
+
     private heartBeatWorker = null;
 
     private moduleSettings = null;
@@ -281,10 +285,18 @@ class SstpHttpChannel extends Channel implements
         });
     }
 
+    /**
+     * Last heartbeat state, or null before the first heartbeat / after close.
+     */
+    public getLatestMachineState(): { [key: string]: unknown; timestamp: number } | null {
+        return this.latestMachineState;
+    }
+
     public async connectionClose(options: { force: boolean }): Promise<boolean> {
         // TODO: cancel intervals on instance
         this.clearAllInterval();
         this.stopHeartBeat();
+        this.latestMachineState = null;
 
         const force = options?.force || false;
 
@@ -356,6 +368,7 @@ class SstpHttpChannel extends Channel implements
                     z: data.offsetZ,
                 }
             };
+            this.latestMachineState = { ...state, timestamp: Date.now() };
             if (waitConfirm) {
                 waitConfirm = false;
 

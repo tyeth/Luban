@@ -5,6 +5,7 @@ import logger from '../../lib/logger';
 import config from '../configstore';
 import { McpServer } from './McpServer';
 import { ToolRegistry } from './registry';
+import { registerMachineTools } from './tools/machine';
 import { registerStatusTools } from './tools/status';
 
 const log = logger('service:mcp');
@@ -42,6 +43,7 @@ export function startMcpService(): void {
 
     const registry = new ToolRegistry();
     registerStatusTools(registry);
+    registerMachineTools(registry);
 
     const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version);
 

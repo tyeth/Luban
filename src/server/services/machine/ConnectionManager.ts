@@ -144,6 +144,20 @@ class ConnectionManager {
     }
 
     /**
+     * Last heartbeat state from the active channel, or null when the channel
+     * does not report one (no heartbeat yet, or unsupported channel type).
+     */
+    public getLatestMachineState(): { [key: string]: unknown; timestamp: number } | null {
+        const channel = this.channel as unknown as {
+            getLatestMachineState?: () => { [key: string]: unknown; timestamp: number } | null;
+        };
+        if (channel && typeof channel.getLatestMachineState === 'function') {
+            return channel.getLatestMachineState();
+        }
+        return null;
+    }
+
+    /**
      * Read-only snapshot of the connection, for status reporting (MCP).
      */
     public getConnectionStatus() {
