@@ -263,7 +263,13 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 }
                 const reportTime = Date.now() - now.reportAgeMs;
                 if (reportTime > issuedAt && now.isHomed === true && now.machineStatus === 'idle') {
-                    return { homed: true, position: now };
+                    return {
+                        homed: true,
+                        position: now,
+                        note: 'Work origins are user-set per workspace and persist across homing. '
+                            + 'Check position.warnings, and if coordinates look wrong verify the frame '
+                            + 'with query_firmware_position before trusting work coordinates.',
+                    };
                 }
             }
             const last = positionOrNull();
