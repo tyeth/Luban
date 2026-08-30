@@ -11,6 +11,7 @@ import { Provider } from 'react-redux';
 
 import settings from './config/settings';
 import { controller } from './communication/socket-communication';
+import { listenForBackendOrigin } from './lib/backend-origin';
 import { initialize } from './lib/gaEvent';
 import log from './lib/log';
 import user from './lib/user';
@@ -69,6 +70,9 @@ async function setup() {
 
     // Setup log level
     setupLog();
+
+    // Find out where the backend is before anything asks for it
+    listenForBackendOrigin();
 
     // Setup i18n
     await setupI18next();

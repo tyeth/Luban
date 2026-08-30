@@ -4,11 +4,21 @@ import superagent from 'superagent';
 import TaskQueue from './TaskQueue';
 import { machineStore } from '../store/local-storage';
 import ensureArray from '../lib/ensure-array';
+import { getBackendOrigin } from '../lib/backend-origin';
 
 const bearer = (request) => {
     const token = machineStore.get('session.token');
     if (token) {
         request.set('Authorization', `Bearer ${token}`);
+    }
+};
+
+// Relative URLs only resolve while the page is served from the backend. Once it
+// is loaded off disk they need the origin spelling out.
+const backendOrigin = (request) => {
+    const origin = getBackendOrigin();
+    if (origin && typeof request.url === 'string' && request.url.charAt(0) === '/') {
+        request.url = origin + request.url;
     }
 };
 
@@ -25,6 +35,7 @@ const noCache = (request) => {
 
 const request = superagentUse(superagent);
 request.use(bearer);
+request.use(backendOrigin);
 request.use(noCache);
 
 
