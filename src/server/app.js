@@ -54,6 +54,9 @@ const verifyToken = (token) => {
 };
 const DEFAULT_FILE = 'index.html';
 
+// Origins allowed to call this server cross-origin: the app loaded off disk.
+const LUBAN_ORIGIN = /^luban:\/\//;
+
 const createApplication = () => {
     const app = express();
 
@@ -90,6 +93,32 @@ const createApplication = () => {
     ]); // The view directory path
 
     log.debug('app.settings: %j', app.settings);
+
+    // The renderer is served off disk over luban:// so that it need not wait for
+    // this server to start, which makes every call to it cross-origin. Only that
+    // scheme is allowed; it can only be produced by our own protocol handler.
+    app.use((req, res, next) => {
+        const origin = req.get('Origin');
+
+        if (origin && LUBAN_ORIGIN.test(origin)) {
+            res.setHeader('Access-Control-Allow-Origin', origin);
+            res.setHeader('Access-Control-Allow-Credentials', 'true');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+            res.setHeader(
+                'Access-Control-Allow-Headers',
+                'Authorization, Content-Type, Cache-Control, X-Requested-With'
+            );
+
+            // superagent sets Authorization and Cache-Control, so these are
+            // preflighted rather than simple requests.
+            if (req.method === 'OPTIONS') {
+                res.status(204).end();
+                return;
+            }
+        }
+
+        next();
+    });
 
     // Check if client's IP address is in the whitelist
     app.use((req, res, next) => {

@@ -35,7 +35,14 @@ class SocketServer extends EventEmitter {
             allowEIO3: true,
             pingTimeout: 180000, // 60s without pong to consider the connection closed
             path: '/socket.io',
-            maxHttpBufferSize: 1e8
+            maxHttpBufferSize: 1e8,
+            // The renderer may be served from luban:// rather than from this
+            // server, which makes the handshake cross-origin. socket.io v4
+            // rejects that by default.
+            cors: {
+                origin: (origin, callback) => callback(null, !origin || /^luban:\/\//.test(origin)),
+                credentials: true,
+            }
         });
 
         // JWT (JSON Web Tokens) support

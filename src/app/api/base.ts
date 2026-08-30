@@ -4,7 +4,7 @@ import superagent from 'superagent';
 import TaskQueue from './TaskQueue';
 import { machineStore } from '../store/local-storage';
 import ensureArray from '../lib/ensure-array';
-import { getBackendOrigin } from '../lib/backend-origin';
+import { getBackendOrigin, whenBackendOrigin } from '../lib/backend-origin';
 
 const bearer = (request) => {
     const token = machineStore.get('session.token');
@@ -44,21 +44,28 @@ const taskQueue = new TaskQueue(4);
 
 // Default API factory that performs the request, and then convert its result to `Promise`.
 const defaultAPIFactory = (genRequest) => {
-    return async (...args) => new Promise((resolve, reject) => {
-        taskQueue.push(
-            () => genRequest(...args),
-            (response, cb) => {
-                response.end((err, res) => {
-                    if (err) {
-                        reject(res);
-                    } else {
-                        resolve(res);
-                    }
-                    cb();
-                });
-            }
-        );
-    });
+    return async (...args) => {
+        // The window is up before the server is, and components start calling
+        // the API as soon as they mount. Hold each call until we know where the
+        // backend is, or it resolves against the luban:// handler instead.
+        await whenBackendOrigin();
+
+        return new Promise((resolve, reject) => {
+            taskQueue.push(
+                () => genRequest(...args),
+                (response, cb) => {
+                    response.end((err, res) => {
+                        if (err) {
+                            reject(res);
+                        } else {
+                            resolve(res);
+                        }
+                        cb();
+                    });
+                }
+            );
+        });
+    };
 };
 
 export {
