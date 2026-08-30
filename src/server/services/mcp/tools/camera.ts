@@ -423,6 +423,8 @@ export function registerCameraTools(registry: ToolRegistry): void {
             // (offset zeroed) before G54 reselects workspace 0, and returning
             // that transient produced a nonsense snapshot on hardware.
             const deadline = issuedAt + HOME_TIMEOUT_MS;
+            const initialFingerprint = JSON.stringify([before.work, before.originOffset]);
+            let sawChange = false;
             let previous: string | null = null;
             while (Date.now() < deadline) {
                 await sleep(HOME_POLL_MS);
@@ -434,7 +436,15 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 const fingerprint = JSON.stringify([now.work, now.originOffset]);
                 const stable = fingerprint === previous;
                 previous = fingerprint;
-                if (reportTime > issuedAt && stable && now.isHomed === true && now.machineStatus === 'idle') {
+                if (fingerprint !== initialFingerprint) {
+                    sawChange = true;
+                }
+                // The heartbeat lags ~1s, so two identical post-issue beats can
+                // both predate the motion. Require the position to have moved
+                // off its pre-G28 value at least once - homing always travels -
+                // before accepting stability (or 25s, if it started at home).
+                const changeOk = sawChange || Date.now() - issuedAt > 25000;
+                if (reportTime > issuedAt && stable && changeOk && now.isHomed === true && now.machineStatus === 'idle') {
                     return {
                         homed: true,
                         position: now,

@@ -36,12 +36,20 @@ function getJobChannel(): JobChannel {
 }
 
 /**
- * Wait for two consecutive identical heartbeats fresher than issuedAt, so a
- * direct move's returned position is settled firmware truth.
+ * Wait until the heartbeat is settled AND, when the executed gcode names an
+ * absolute Z target, until the reported Z actually matches it. Two identical
+ * post-issue beats alone are not enough: the heartbeat lags the controller
+ * by ~1s, so both can be pre-motion beats showing the old position (observed
+ * live: a -95 move "completed" while still reporting -85). Every returned
+ * position is either verified or flagged as not.
  */
-async function waitForStableHeartbeat(issuedAt: number): Promise<PositionSnapshot | null> {
-    const deadline = issuedAt + 30000;
+async function waitForStableHeartbeat(
+    issuedAt: number,
+    expect?: { frame: 'work' | 'machine'; z: number }
+): Promise<{ position: PositionSnapshot | null; verified: boolean; warning?: string }> {
+    const deadline = issuedAt + 45000;
     let previous: string | null = null;
+    let last: PositionSnapshot | null = null;
     while (Date.now() < deadline) {
         await new Promise((resolve) => {
             setTimeout(resolve, 500);
@@ -52,15 +60,43 @@ async function waitForStableHeartbeat(issuedAt: number): Promise<PositionSnapsho
         } catch (err) {
             continue;
         }
+        last = now;
         const reportTime = Date.now() - now.reportAgeMs;
         const fingerprint = JSON.stringify([now.work, now.originOffset]);
         const stable = fingerprint === previous;
         previous = fingerprint;
-        if (reportTime > issuedAt && stable && now.machineStatus === 'idle') {
-            return now;
+        if (reportTime <= issuedAt || !stable || now.machineStatus !== 'idle') {
+            continue;
         }
+        if (expect) {
+            const reportedZ = expect.frame === 'work' ? now.work.z : now.machine.z;
+            if (reportedZ === null || Math.abs(reportedZ - expect.z) > 0.15) {
+                continue; // settled, but not AT the target yet - keep waiting
+            }
+        }
+        return { position: now, verified: true };
     }
-    return null;
+    return {
+        position: last,
+        verified: false,
+        warning: expect
+            ? `Timed out waiting for the heartbeat to report ${expect.frame} Z ${expect.z}; the position `
+                + 'shown is the last read and may be stale - verify with query_firmware_position.'
+            : 'Timed out waiting for a settled heartbeat; the position shown may be stale - verify with '
+                + 'query_firmware_position.',
+    };
+}
+
+/**
+ * Absolute Z target of a direct-move gcode, for settle verification.
+ * G53-wrapped moves are machine-frame; plain ones are work-frame.
+ */
+function parseZTarget(gcode: string): { frame: 'work' | 'machine'; z: number } | undefined {
+    const match = gcode.match(/G0*1[^;\n]*?Z(-?\d+(?:\.\d+)?)/i);
+    if (!match) {
+        return undefined;
+    }
+    return { frame: gcode.includes('G53') ? 'machine' : 'work', z: Number(match[1]) };
 }
 
 function machineStatus(): string | null {
@@ -183,7 +219,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     job.error = `Controller rejected the move: ${executed.text || executed.result}`;
                     throw new McpToolError(job.error);
                 }
-                const position = await waitForStableHeartbeat(issuedAt);
+                const settle = await waitForStableHeartbeat(issuedAt, parseZTarget(gcodeText));
                 if (isBatch) {
                     job.nextStep += 1;
                     if (job.nextStep < job.steps.length) {
@@ -193,7 +229,9 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         job.state = 'started';
                         return {
                             job: jobManager.describe(job),
-                            position,
+                            position: settle.position,
+                            position_verified: settle.verified,
+                            warning: settle.warning,
                             remaining_steps: job.steps.length - job.nextStep,
                             note: 'Step executed and settled. Call start_gcode_job again with the same '
                                 + 'job_id and code for the next approved step; positions persist.',
@@ -203,8 +241,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 job.state = 'completed';
                 return {
                     job: jobManager.describe(job),
-                    position,
-                    note: 'Direct move executed and settled; the position persists (no end-of-job park).',
+                    position: settle.position,
+                    position_verified: settle.verified,
+                    warning: settle.warning,
+                    note: 'Direct move executed; the position persists (no end-of-job park).',
                 };
             }
 
