@@ -13,6 +13,9 @@ import { getPositionSnapshot } from './machine';
 const DEFAULT_STEP_LIMIT_MM = 5;
 const MAX_STEP_LIMIT_MM = 20;
 const DEFAULT_Y_TOLERANCE_MM = 2;
+// Auto-select gives up only beyond this - a single servo step routinely
+// drifts Y by 2-6mm, so the old hard 2mm cutoff forced explicit ids.
+const MAX_Y_DISTANCE_MM = 25;
 
 function isMatrix(value: unknown): value is [[number, number], [number, number]] {
     return Array.isArray(value) && value.length === 2
@@ -52,11 +55,20 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                     maxItems: 2,
                 },
                 notes: { type: 'string', description: 'Free-form provenance: grid used, residuals, tilt.' },
+                jacobian: {
+                    type: 'array',
+                    description: 'Optional 2x2 forward Jacobian J (pixel shift per mm) you fitted. When '
+                        + 'given, the tool checks M.J against +identity and REJECTS a sign-flipped matrix '
+                        + 'before it can reach hardware.',
+                    items: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2 },
+                    minItems: 2,
+                    maxItems: 2,
+                },
             },
             required: ['valid_at_y', 'z', 'matrix'],
             additionalProperties: false,
         },
-        handler: async (args: { valid_at_y?: number; z?: number; matrix?: unknown; notes?: string }) => {
+        handler: async (args: { valid_at_y?: number; z?: number; matrix?: unknown; notes?: string; jacobian?: unknown }) => {
             const validAtY = Number(args.valid_at_y);
             const z = Number(args.z);
             if (!Number.isFinite(validAtY) || !Number.isFinite(z)) {
@@ -65,13 +77,39 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
             if (!isMatrix(args.matrix)) {
                 throw new McpToolError('matrix must be a 2x2 array of numbers.');
             }
+
+            const warnings: string[] = [];
+            if (args.jacobian !== undefined) {
+                if (!isMatrix(args.jacobian)) {
+                    throw new McpToolError('jacobian must be a 2x2 array of numbers.');
+                }
+                // P = M.J should be +identity: -identity is the sign flip that
+                // drives the servo away from the target - reject it outright.
+                const m = args.matrix;
+                const j = args.jacobian;
+                const p = [
+                    [m[0][0] * j[0][0] + m[0][1] * j[1][0], m[0][0] * j[0][1] + m[0][1] * j[1][1]],
+                    [m[1][0] * j[0][0] + m[1][1] * j[1][0], m[1][0] * j[0][1] + m[1][1] * j[1][1]],
+                ];
+                const devPlus = Math.max(Math.abs(p[0][0] - 1), Math.abs(p[1][1] - 1), Math.abs(p[0][1]), Math.abs(p[1][0]));
+                const devMinus = Math.max(Math.abs(p[0][0] + 1), Math.abs(p[1][1] + 1), Math.abs(p[0][1]), Math.abs(p[1][0]));
+                if (devMinus < devPlus && devMinus < 0.5) {
+                    throw new McpToolError('REJECTED: matrix is sign-flipped - M.J is approximately -identity, '
+                        + 'so every correction would drive AWAY from the target. Store M = +J^-1, not -J^-1.');
+                }
+                if (devPlus > 0.25) {
+                    warnings.push(`M.J deviates from identity (max residual ${devPlus.toFixed(2)}) - the matrix `
+                        + 'may be inaccurate; expect slow or wandering convergence.');
+                }
+            }
+
             const entry = calibrationStore.add({
                 validAtY,
                 z,
                 matrix: args.matrix,
                 notes: args.notes ? String(args.notes) : null,
             });
-            return { entry: describeEntry(entry) };
+            return { entry: describeEntry(entry), warnings };
         },
     });
 
@@ -192,9 +230,9 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                 }
                 entryDistance = Math.abs(entry.validAtY - position.machine.y);
             } else {
-                const match = calibrationStore.findNearest(position.machine.y, DEFAULT_Y_TOLERANCE_MM);
+                const match = calibrationStore.findNearest(position.machine.y, MAX_Y_DISTANCE_MM);
                 if (!match) {
-                    throw new McpToolError(`No calibration within ${DEFAULT_Y_TOLERANCE_MM} mm of machine Y `
+                    throw new McpToolError(`No calibration within ${MAX_Y_DISTANCE_MM} mm of machine Y `
                         + `${position.machine.y.toFixed(1)}. Store one with set_camera_calibration, or pass calibration_id.`);
                 }
                 entry = match.entry;

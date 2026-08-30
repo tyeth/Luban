@@ -168,16 +168,38 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 // PERSISTS - the firmware parks back at the work origin when
                 // a file job completes, so a file job cannot hold a Z. The
                 // operator approved exactly this gcode on the confirm page.
+                // For a batch, each call executes ONE approved step; the
+                // token stays valid for the remaining steps (within its TTL).
                 job.state = 'starting';
-                job.startedAt = Date.now();
-                const gcodeText = fs.readFileSync(job.filePath, 'utf8');
+                const issuedAt = Date.now();
+                job.startedAt = job.startedAt || issuedAt;
+                const isBatch = Array.isArray(job.steps) && job.steps.length > 0;
+                const gcodeText = isBatch
+                    ? job.steps[job.nextStep]
+                    : fs.readFileSync(job.filePath, 'utf8');
                 const executed = await sendGcodeVisible(channel as GcodeChannel, `direct:${job.name}`, gcodeText);
                 if (executed.result !== 0) {
                     job.state = 'start_failed';
                     job.error = `Controller rejected the move: ${executed.text || executed.result}`;
                     throw new McpToolError(job.error);
                 }
-                const position = await waitForStableHeartbeat(job.startedAt);
+                const position = await waitForStableHeartbeat(issuedAt);
+                if (isBatch) {
+                    job.nextStep += 1;
+                    if (job.nextStep < job.steps.length) {
+                        // Same operator-approved list; keep the token usable
+                        // for the remaining steps.
+                        job.tokenUsed = false;
+                        job.state = 'started';
+                        return {
+                            job: jobManager.describe(job),
+                            position,
+                            remaining_steps: job.steps.length - job.nextStep,
+                            note: 'Step executed and settled. Call start_gcode_job again with the same '
+                                + 'job_id and code for the next approved step; positions persist.',
+                        };
+                    }
+                }
                 job.state = 'completed';
                 return {
                     job: jobManager.describe(job),
@@ -217,31 +239,54 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
     registry.register({
         name: 'move_z',
-        description: 'Request a SINGLE absolute Z move, executed on the direct path so the position '
-            + 'PERSISTS (file jobs park back at the work origin when they complete - firmware '
-            + 'behaviour). Every request goes to the operator confirm page showing current Z, '
-            + 'target, delta and feed; only their one-time code executes it. NOT door-interlocked - '
-            + 'the operator supervises. Spindle must be off; the toolhead always carries a tool.',
+        description: 'Request absolute Z motion, executed on the direct path so positions PERSIST '
+            + '(file jobs park back at the work origin when they complete - firmware behaviour). '
+            + 'Either one target (z) or an ordered list (z_targets, max 20) for a methodical search: '
+            + 'the operator approves the EXACT list once, and each start_gcode_job call then executes '
+            + 'one step, so you can capture between steps and abandon the series at any point. The '
+            + 'confirm page shows current Z, every target, deltas and feed; only the operator one-time '
+            + 'code executes anything. NOT door-interlocked - the operator supervises. Spindle must be '
+            + 'off; the toolhead always carries a tool.',
         inputSchema: {
             type: 'object',
             properties: {
-                z: { type: 'number', description: 'Absolute target Z.' },
+                z: { type: 'number', description: 'Absolute target Z (single move).' },
+                z_targets: {
+                    type: 'array',
+                    items: { type: 'number' },
+                    minItems: 1,
+                    maxItems: 20,
+                    description: 'Ordered absolute Z targets; one approval covers the exact list, '
+                        + 'one start_gcode_job call per step. Mutually exclusive with z.',
+                },
                 coordinate_system: {
                     type: 'string',
                     enum: ['work', 'machine'],
                     description: 'Which frame z is in. Default work.',
                 },
                 feed_rate: { type: 'number', description: 'mm/min, default 300, max 600.' },
-                reason: { type: 'string', description: 'Shown to the operator: why this Z move is needed.' },
+                reason: { type: 'string', description: 'Shown to the operator: why this Z motion is needed.' },
             },
-            required: ['z', 'reason'],
+            required: ['reason'],
             additionalProperties: false,
         },
-        handler: async (args: { z?: number; coordinate_system?: string; feed_rate?: number; reason?: string }) => {
-            const targetZ = Number(args.z);
-            if (!Number.isFinite(targetZ)) {
-                throw new McpToolError('z must be a finite number.');
+        handler: async (args: {
+            z?: number;
+            z_targets?: number[];
+            coordinate_system?: string;
+            feed_rate?: number;
+            reason?: string;
+        }) => {
+            if ((args.z === undefined) === (args.z_targets === undefined)) {
+                throw new McpToolError('Provide exactly one of z or z_targets.');
             }
+            const targets = args.z_targets !== undefined
+                ? args.z_targets.map(Number)
+                : [Number(args.z)];
+            if (!targets.length || targets.length > 20 || targets.some((t) => !Number.isFinite(t))) {
+                throw new McpToolError('Targets must be 1-20 finite numbers.');
+            }
+            const targetZ = targets[targets.length - 1];
             const coordinateSystem = args.coordinate_system || 'work';
             if (!['work', 'machine'].includes(coordinateSystem)) {
                 throw new McpToolError('coordinate_system must be "work" or "machine".');
@@ -265,34 +310,45 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (currentZ === null) {
                 throw new McpToolError('Current Z unknown; cannot describe the move to the operator.');
             }
-            const machineTargetZ = coordinateSystem === 'machine' ? targetZ : targetZ - position.originOffset.z;
             const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-            if (size && (machineTargetZ < -1 || machineTargetZ > size.z + 40)) {
-                throw new McpToolError(`Target (machine Z ${machineTargetZ.toFixed(1)}) is outside the `
-                    + `0..${size.z} travel.`);
+            for (const t of targets) {
+                const machineT = coordinateSystem === 'machine' ? t : t - position.originOffset.z;
+                if (size && (machineT < -1 || machineT > size.z + 40)) {
+                    throw new McpToolError(`Target ${coordinateSystem} Z ${t} (machine Z ${machineT.toFixed(1)}) `
+                        + `is outside the 0..${size.z} travel.`);
+                }
             }
 
-            const move = `G1 Z${targetZ.toFixed(3)} F${feedRate}`;
-            const gcode = coordinateSystem === 'machine'
-                ? `G90\nG53;\n${move};\nG54;`
-                : `G90\n${move}`;
+            const stepGcode = (t: number) => (coordinateSystem === 'machine'
+                ? `G90\nG53;\nG1 Z${t.toFixed(3)} F${feedRate};\nG54;`
+                : `G90\nG1 Z${t.toFixed(3)} F${feedRate}`);
+            const steps = targets.map(stepGcode);
+            const isBatch = targets.length > 1;
+            const reviewText = steps.join('\n; --- next approved step ---\n');
             const delta = targetZ - currentZ;
-            const name = `z-move ${coordinateSystem} Z${targetZ.toFixed(1)} (${delta >= 0 ? '+' : ''}${delta.toFixed(1)}mm) - ${String(args.reason).slice(0, 40)}`;
+            const name = isBatch
+                ? `z-series ${coordinateSystem} [${targets.map((t) => t.toFixed(1)).join(', ')}] - ${String(args.reason).slice(0, 40)}`
+                : `z-move ${coordinateSystem} Z${targetZ.toFixed(1)} (${delta >= 0 ? '+' : ''}${delta.toFixed(1)}mm) - ${String(args.reason).slice(0, 40)}`;
 
-            const validation = validateGcode(gcode);
-            const job = jobManager.submit(gcode, name, 'cnc', validation, 'direct');
+            const validation = validateGcode(reviewText);
+            const job = jobManager.submit(reviewText, name, 'cnc', validation, 'direct', isBatch ? steps : undefined);
 
             return {
                 job: jobManager.describe(job),
                 current_z: currentZ,
-                target_z: targetZ,
-                delta_mm: delta,
+                targets,
+                final_delta_mm: delta,
                 feed_rate: feedRate,
                 coordinate_system: coordinateSystem,
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
-                next_step: 'Ask the operator to open confirm_url, review the DIRECT-move banner '
-                    + '(current Z, target, delta, feed), and approve. Their one-time code passed to '
-                    + 'start_gcode_job executes the move; the position then persists.',
+                next_step: isBatch
+                    ? 'Ask the operator to open confirm_url, review the DIRECT-move banner and the full '
+                        + 'target list, and approve once. Then call start_gcode_job with the code once PER '
+                        + 'STEP - each call executes the next approved target and settles; capture between '
+                        + 'steps as needed. The series can be abandoned at any point.'
+                    : 'Ask the operator to open confirm_url, review the DIRECT-move banner '
+                        + '(current Z, target, delta, feed), and approve. Their one-time code passed to '
+                        + 'start_gcode_job executes the move; the position then persists.',
             };
         },
     });

@@ -258,6 +258,43 @@ export function registerCameraTools(registry: ToolRegistry): void {
     });
 
     registry.register({
+        name: 'set_tool_region',
+        description: 'Update the expectedToolRegion that every capture reports: the fractional box '
+            + 'where the endmill images (fixed camera-to-spindle geometry). Refine it from live '
+            + 'frames instead of round-tripping through configuration edits. Persists.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                u0: { type: 'number' },
+                v0: { type: 'number' },
+                u1: { type: 'number' },
+                v1: { type: 'number' },
+                note: { type: 'string', description: 'Provenance: how the box was determined.' },
+            },
+            required: ['u0', 'v0', 'u1', 'v1'],
+            additionalProperties: false,
+        },
+        handler: async (args: { u0?: number; v0?: number; u1?: number; v1?: number; note?: string }) => {
+            const box = [args.u0, args.v0, args.u1, args.v1].map(Number);
+            if (box.some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
+                throw new McpToolError('u0/v0/u1/v1 must be fractions in [0, 1].');
+            }
+            if (box[0] >= box[2] || box[1] >= box[3]) {
+                throw new McpToolError('Require u0 < u1 and v0 < v1.');
+            }
+            const region = {
+                u0: box[0],
+                v0: box[1],
+                u1: box[2],
+                v1: box[3],
+                note: args.note ? String(args.note) : undefined,
+            };
+            config.set('mcpToolRegion', region);
+            return { stored: region };
+        },
+    });
+
+    registry.register({
         name: 'track_feature',
         description: 'Template-match a patch between two cached frames (by the frameId each capture '
             + 'reports): give the pixel of a feature in one frame and get its measured pixel in the '

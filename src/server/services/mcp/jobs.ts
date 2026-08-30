@@ -49,6 +49,11 @@ export interface McpJob {
     tokenUsed: boolean;
     startedAt: number | null;
     error: string | null;
+    // Batch direct jobs: the operator approved this exact list; each
+    // start_gcode_job call executes ONE step, so captures can happen between
+    // steps and the series can be abandoned at any point.
+    steps?: string[];
+    nextStep?: number;
 }
 
 function escapeHtml(text: string): string {
@@ -76,7 +81,7 @@ export class JobManager {
         return this.jobsDir;
     }
 
-    public submit(gcode: string, name: string, headType: string, validation: GcodeValidationReport, kind: McpJobKind = 'file'): McpJob {
+    public submit(gcode: string, name: string, headType: string, validation: GcodeValidationReport, kind: McpJobKind = 'file', steps?: string[]): McpJob {
         const id = crypto.randomBytes(6).toString('hex');
         const safeName = (name || 'job').replace(/[^\w.-]/g, '_').slice(0, 64);
         const filePath = path.join(this.ensureJobsDir(), `${id}_${safeName}.nc`);
@@ -96,6 +101,8 @@ export class JobManager {
             tokenUsed: false,
             startedAt: null,
             error: null,
+            steps,
+            nextStep: steps ? 0 : undefined,
         };
         this.jobs.set(id, job);
         this.prune();
@@ -143,6 +150,8 @@ export class JobManager {
             approvedAt: job.approvedAt,
             startedAt: job.startedAt,
             error: job.error,
+            totalSteps: job.steps ? job.steps.length : undefined,
+            nextStep: job.steps ? job.nextStep : undefined,
             validation: job.validation,
         };
     }
