@@ -35,7 +35,11 @@ function resolvePort(): number | null {
     return port;
 }
 
-export function startMcpService(): void {
+export interface McpBroadcaster {
+    broadcast: (eventName: string, options?: object) => void;
+}
+
+export function startMcpService(socketServer?: McpBroadcaster): void {
     if (httpServer) {
         return;
     }
@@ -52,7 +56,13 @@ export function startMcpService(): void {
     registerCameraTools(registry);
     registerCalibrationTools(registry);
 
-    const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version);
+    // Mirror tool activity to connected UI clients so the Workspace console
+    // can show agent traffic (verbose toggle).
+    const onActivity = (activity: object) => {
+        socketServer && socketServer.broadcast('mcp:activity', activity);
+    };
+
+    const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version, onActivity);
 
     httpServer = http.createServer((req, res) => {
         // Same trust boundary for every route: local processes only, and no

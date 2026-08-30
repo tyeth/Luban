@@ -75,7 +75,7 @@ function startServices(server) {
     // ===============
     // MCP server (off unless a port is configured)
     // ===============
-    startMcpService();
+    startMcpService(socketServer);
 }
 
 function registerApis(app) {
