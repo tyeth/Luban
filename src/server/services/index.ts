@@ -99,6 +99,10 @@ function registerApis(app) {
     app.get(urljoin(settings.route, 'api/utils/fonts'), api.utils.getFonts);
     app.post(urljoin(settings.route, 'api/utils/font'), api.utils.uploadFont);
 
+    // MCP server (status is live; settings apply at next start)
+    app.get(urljoin(settings.route, 'api/mcp'), api.mcp.getStatus);
+    app.post(urljoin(settings.route, 'api/mcp'), api.mcp.updateSettings);
+
     // State
     // depecated?
     app.get(urljoin(settings.route, 'api/state'), api.state.get);
