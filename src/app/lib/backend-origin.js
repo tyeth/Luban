@@ -36,13 +36,29 @@ const setBackendOrigin = (value) => {
     }
 };
 
-/** Resolves once the backend origin is known. */
+// Long enough to cover a cold server start, short enough that a backend which
+// is never coming fails the call instead of queueing it for ever.
+const ORIGIN_TIMEOUT = 30000;
+
+/**
+ * Resolves once the backend origin is known.
+ *
+ * Rejects if it never arrives, so callers fail rather than hang.
+ */
 const whenBackendOrigin = () => {
     if (origin) {
         return Promise.resolve(origin);
     }
-    return new Promise((resolve) => {
-        waiters.push(resolve);
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+            () => reject(new Error(`Backend origin unknown after ${ORIGIN_TIMEOUT}ms`)),
+            ORIGIN_TIMEOUT
+        );
+
+        waiters.push((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        });
     });
 };
 
