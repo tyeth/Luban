@@ -120,6 +120,30 @@ Z positioning is not part of the servo: raise or lower Z via a one-line `submit_
 through the operator's confirm page. Refuse to servo from a height where parallax exceeds
 the tolerance you are claiming.
 
+## Reading a toolhead-camera frame (hardware-learned, the hard way)
+
+Two live-session failures came from misreading frames, not from geometry. Both are avoidable:
+
+**Identify by evidence, not by remembered composition.** Never assert "no board in view"
+because the frame fails to match a reference framing you were *told about* but do not have.
+Describe what IS in the frame and test it against context. On this machine the calibration
+board is a **yellow-brown surface with a printed black grid and alphanumeric cell labels
+(C1, L1, ...)** — a labeled coordinate grid is a calibration board, not a "cutting mat",
+however mat-like its colour. If you have no reference image, say so and reason from content.
+
+**The rig-mounted vs scene heuristic.** Anything whose frame position is **invariant across
+machine moves** is mounted to the same assembly as the camera — the endmill, the spindle
+housing — not part of the scene. Scene content (board, rail, bed) visibly shifts between
+captures. You always have multiple position-stamped frames; cross-reference before guessing.
+
+**The endmill's visual signature.** For a toolhead-mounted camera the tool sits millimetres
+from the lens: it images as an **oversized, extremely defocused shape entering from a frame
+edge at a fixed orientation** (here: from the bottom edge ~2/3 along, pointing diagonally
+toward top-left, ~20 % of frame height). That blur is diagnostic of near-lens distance —
+categorically different from the resolvable distance-blur of the scene. `capture_frame`
+reports the operator-configured `expectedToolRegion` box with every frame — check it before
+concluding anything about "an unidentified blurry shape".
+
 ## Datums: check the landmark is actually in frame
 
 A stated datum is worthless if it is outside the field of view. Verify visually before
