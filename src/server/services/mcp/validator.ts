@@ -23,6 +23,8 @@ export interface GcodeValidationReport {
         maxS: number | null;
     };
     usesRelativeMotion: boolean; // any G91 present
+    assumesDistanceMode: boolean; // motion before any G90/G91
+    endsInRelativeMode: boolean; // G91 still active at end of file
     usesArcs: boolean; // G2/G3 present (extents are approximated from endpoints)
     fourAxis: boolean; // any B-axis word
     minZWithSpindleOn: number | null;
@@ -79,6 +81,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     let usesRelativeMotion = false;
     let usesArcs = false;
     let relativeMode = false;
+    let distanceModeSet = false;
+    let motionBeforeDistanceMode = false;
     let spindleOn = false;
     let minZWithSpindleOn: number | null = null;
     const warnings: string[] = [];
@@ -91,9 +95,11 @@ export function validateGcode(gcode: string): GcodeValidationReport {
 
         if (code === 'G90') {
             relativeMode = false;
+            distanceModeSet = true;
         } else if (code === 'G91') {
             relativeMode = true;
             usesRelativeMotion = true;
+            distanceModeSet = true;
         } else if (code === 'M3' || code === 'M03' || code === 'M4' || code === 'M04') {
             onCommands += 1;
             spindleOn = true;
@@ -105,6 +111,9 @@ export function validateGcode(gcode: string): GcodeValidationReport {
             spindleOn = false;
         } else if (MOTION_RE.test(code)) {
             motionLineCount += 1;
+            if (!distanceModeSet) {
+                motionBeforeDistanceMode = true;
+            }
             if (code === 'G2' || code === 'G02' || code === 'G3' || code === 'G03') {
                 usesArcs = true;
             }
@@ -143,6 +152,19 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     if (minZWithSpindleOn !== null && minZWithSpindleOn < 0) {
         warnings.push(`Cutting below Z0 with spindle on (min Z ${minZWithSpindleOn}). Verify Z0 is the stock top.`);
     }
+    if (z !== null && z.min < 0 && minZWithSpindleOn === null) {
+        warnings.push(`Moves to absolute work Z below zero with the spindle off (min Z ${z.min}). `
+            + 'If a relative drop was intended, wrap the move in G91 ... G90 instead - an absolute '
+            + 'Z-20 is a position, not a distance. Verify the work origin either way.');
+    }
+    if (motionBeforeDistanceMode) {
+        warnings.push('Motion occurs before any G90/G91: the first move executes in whatever distance '
+            + 'mode the controller happens to be in. State the mode explicitly first.');
+    }
+    if (relativeMode) {
+        warnings.push('The file ends with G91 still active, leaving the controller in relative mode - '
+            + "Luban's convention is to restore G90 after relative moves.");
+    }
     if (motionLineCount === 0) {
         warnings.push('No motion commands found.');
     }
@@ -154,6 +176,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         feedRates: feed,
         spindle: { onCommands, offCommands, maxS },
         usesRelativeMotion,
+        assumesDistanceMode: motionBeforeDistanceMode,
+        endsInRelativeMode: relativeMode,
         usesArcs,
         fourAxis: b !== null,
         minZWithSpindleOn,
