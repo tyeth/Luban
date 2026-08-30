@@ -21,11 +21,35 @@ const log = logger('service:mcp:camera');
 const CAPTURE_TIMEOUT_MS = 15000;
 
 export interface CapturedFrame {
+    frameId: string;
     imageBase64: string;
     mimeType: string;
     provider: string;
     device: string | null;
     capturedAt: number;
+}
+
+// Recent frames kept in memory so track_feature can template-match between
+// them by id - the dominant field error source was hand-estimated pixel
+// coordinates, so measurement between cached frames replaces eyeballing.
+const FRAME_CACHE_LIMIT = 12;
+const frameCache = new Map<string, Buffer>();
+
+function cacheFrame(jpg: Buffer): string {
+    const frameId = crypto.randomBytes(4).toString('hex');
+    frameCache.set(frameId, jpg);
+    while (frameCache.size > FRAME_CACHE_LIMIT) {
+        frameCache.delete(frameCache.keys().next().value);
+    }
+    return frameId;
+}
+
+export function getCachedFrameIds(): string[] {
+    return [...frameCache.keys()];
+}
+
+export function getCachedFrame(frameId: string): Buffer | null {
+    return frameCache.get(frameId) || null;
 }
 
 function ffmpegBinary(): string {
@@ -82,6 +106,7 @@ async function captureViaHttp(url: string): Promise<CapturedFrame> {
                     return;
                 }
                 resolve({
+                    frameId: cacheFrame(body),
                     imageBase64: body.toString('base64'),
                     mimeType: contentType,
                     provider: 'http',
@@ -123,6 +148,7 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
         }
         const body = await fs.readFile(outPath);
         return {
+            frameId: cacheFrame(body),
             imageBase64: body.toString('base64'),
             mimeType: 'image/jpeg',
             provider: 'ffmpeg-dshow',
