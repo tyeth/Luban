@@ -85,6 +85,15 @@ const createServer = (options, callback) => {
             app(req, res);
             return;
         }
+        // socket.io handshakes must not be parked: on replay they would hit
+        // Express (404) because socket.io only attaches its own request
+        // interceptor once services start. A prompt 503 makes the client
+        // retry with backoff into the working server instead (issue #38).
+        if (req.url && req.url.startsWith('/socket.io/')) {
+            res.writeHead(503, { 'Retry-After': '2' });
+            res.end();
+            return;
+        }
         parked.push([req, res]);
     });
 
