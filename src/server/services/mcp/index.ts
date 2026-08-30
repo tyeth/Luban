@@ -6,6 +6,7 @@ import config from '../configstore';
 import { McpServer, isAllowedOrigin, isLoopback } from './McpServer';
 import { jobManager } from './jobs';
 import { ToolRegistry } from './registry';
+import { registerCameraTools } from './tools/camera';
 import { registerGcodeTools } from './tools/gcode';
 import { registerMachineTools } from './tools/machine';
 import { registerStatusTools } from './tools/status';
@@ -47,6 +48,7 @@ export function startMcpService(): void {
     registerStatusTools(registry);
     registerMachineTools(registry);
     registerGcodeTools(registry, () => `http://127.0.0.1:${port}`);
+    registerCameraTools(registry);
 
     const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version);
 

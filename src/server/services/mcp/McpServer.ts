@@ -202,8 +202,12 @@ export class McpServer {
         try {
             const result = await this.registry.call(name, ((params && params.arguments) as object) || {});
             log.info(`tool ${name} ok in ${Date.now() - startedAt}ms`);
+            // A tool that returns non-text content (e.g. an image) supplies
+            // the MCP content array itself via mcpContent.
+            const content = (result as { mcpContent?: object[] })?.mcpContent
+                || [{ type: 'text', text: JSON.stringify(result) }];
             return rpcResult(id, {
-                content: [{ type: 'text', text: JSON.stringify(result) }],
+                content,
                 isError: false,
             });
         } catch (err) {
