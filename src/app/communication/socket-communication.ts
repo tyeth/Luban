@@ -73,6 +73,7 @@ class SocketCommunication {
 
         // MCP server activity (verbose console)
         'mcp:activity': [],
+        'mcp:gcode': [],
 
         [SocketEvent.UploadFileProgress]: [],
         [SocketEvent.UploadFileCompressing]: [],

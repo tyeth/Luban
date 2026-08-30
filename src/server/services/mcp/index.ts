@@ -25,6 +25,15 @@ const DEFAULT_PORT = 40889;
 let httpServer: http.Server | null = null;
 let runningPort: number | null = null;
 let registeredToolCount = 0;
+let broadcaster: McpBroadcaster | null = null;
+
+/**
+ * Broadcast an MCP-related event to connected UI clients (verbose console).
+ * No-op until the service starts.
+ */
+export function mcpBroadcast(eventName: string, options?: object): void {
+    broadcaster && broadcaster.broadcast(eventName, options);
+}
 
 function validPort(raw: unknown): number | null {
     const port = Number(raw);
@@ -98,10 +107,12 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerCalibrationTools(registry);
     registeredToolCount = registry.list().length;
 
+    broadcaster = socketServer || null;
+
     // Mirror tool activity to connected UI clients so the Workspace console
     // can show agent traffic (verbose toggle).
     const onActivity = (activity: object) => {
-        socketServer && socketServer.broadcast('mcp:activity', activity);
+        mcpBroadcast('mcp:activity', activity);
     };
 
     const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version, onActivity);

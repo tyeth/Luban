@@ -1,6 +1,7 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
 import config from '../../configstore';
+import { mcpBroadcast } from '../index';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { CapturedFrame, captureFrame, listCameras } from '../camera';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -23,6 +24,18 @@ const HOME_POLL_MS = 1000;
 
 interface GcodeChannel {
     executeGcode?: (gcode: string) => Promise<{ result: number; text?: string }>;
+}
+
+/**
+ * Send gcode on the direct path AND mirror exactly what was sent (plus the
+ * controller's reply) to the UI console, so the operator can see which
+ * coordinate frame every MCP-issued command ran in.
+ */
+async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string): Promise<{ result: number; text?: string }> {
+    mcpBroadcast('mcp:gcode', { tool, gcode });
+    const executed = await channel.executeGcode(gcode);
+    mcpBroadcast('mcp:gcode', { tool, response: executed.text || (executed.result === 0 ? 'ok' : `result=${executed.result}`) });
+    return executed;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -148,7 +161,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     const move = `G0 X${target.x.toFixed(3)} Y${target.y.toFixed(3)} F${feedRate}`;
     const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : move;
     const issuedAt = Date.now();
-    const executed = await channel.executeGcode(gcode);
+    const executed = await sendGcodeVisible(channel, 'move', gcode);
     if (executed.result !== 0) {
         throw new McpToolError(`Move rejected by controller: ${executed.text || executed.result}`);
     }
@@ -223,12 +236,37 @@ export function registerCameraTools(registry: ToolRegistry): void {
     });
 
     registry.register({
+        name: 'query_firmware_position',
+        description: 'Ask the firmware directly for its position report (M114) and return the RAW '
+            + 'controller response alongside the heartbeat-derived view. This is the authoritative '
+            + 'way to establish which coordinate frame the controller is in when heartbeat-derived '
+            + 'machine coordinates look wrong (e.g. after homing). Read-only, no motion.',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        handler: async () => {
+            const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+            if (!channel || typeof channel.executeGcode !== 'function') {
+                throw new McpToolError('No machine connected, or the channel does not support direct commands.');
+            }
+            const executed = await sendGcodeVisible(channel, 'query_firmware_position', 'M114');
+            return {
+                raw: executed.text || null,
+                result: executed.result,
+                heartbeat: positionOrNull(),
+            };
+        },
+    });
+
+    registry.register({
         name: 'home',
         description: 'MACHINE home (G28): drives every axis to its limit switches - this is NOT the '
             + 'work origin; moving to work X0 Y0 is the separate goto_work_origin operation. Z rises '
             + 'first, making this the default first move after (re)connecting: it also clears any '
-            + 'stale position state between Luban and the machine. Requires an idle machine with the '
-            + 'toolhead off. Waits for the firmware to report homed.',
+            + 'stale position state between Luban and the machine, using the same G53;G28;G54 '
+            + 'sequence as Luban itself (home in the machine workspace, then reselect workspace 0). '
+            + 'WARNING: with the rotary module '
+            + 'fitted, G28 also homes B - stock indexed on the rotary WILL rotate (observed -45 to 0 '
+            + 'on hardware); warn the operator first. Requires an idle machine with the toolhead '
+            + 'off. Waits for the firmware to report homed.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         handler: async () => {
             const before = getPositionSnapshot();
@@ -247,14 +285,23 @@ export function registerCameraTools(registry: ToolRegistry): void {
             }
 
             const issuedAt = Date.now();
-            const executed = await channel.executeGcode('G28');
+            // Luban's own Home button sends G53; G28; G54 - home in the
+            // machine workspace, then reselect workspace 0. A bare G28 leaves
+            // the controller reporting positions in an unselected workspace
+            // (observed: derived machine Y 464/Z 656 on the A350).
+            const executed = await sendGcodeVisible(channel, 'home', 'G53;\nG28;\nG54;');
             if (executed.result !== 0) {
                 throw new McpToolError(`Homing rejected by controller: ${executed.text || executed.result}`);
             }
 
-            // Homing on the A350 takes tens of seconds; wait for a fresh
-            // post-command heartbeat that reports homed and idle again.
+            // Homing on the A350 takes tens of seconds; wait for TWO
+            // consecutive identical heartbeats (position AND offset) that
+            // report homed and idle. A single fresh heartbeat is not enough:
+            // mid-sequence the controller reports from the G53 workspace
+            // (offset zeroed) before G54 reselects workspace 0, and returning
+            // that transient produced a nonsense snapshot on hardware.
             const deadline = issuedAt + HOME_TIMEOUT_MS;
+            let previous: string | null = null;
             while (Date.now() < deadline) {
                 await sleep(HOME_POLL_MS);
                 const now = positionOrNull();
@@ -262,7 +309,10 @@ export function registerCameraTools(registry: ToolRegistry): void {
                     continue;
                 }
                 const reportTime = Date.now() - now.reportAgeMs;
-                if (reportTime > issuedAt && now.isHomed === true && now.machineStatus === 'idle') {
+                const fingerprint = JSON.stringify([now.work, now.originOffset]);
+                const stable = fingerprint === previous;
+                previous = fingerprint;
+                if (reportTime > issuedAt && stable && now.isHomed === true && now.machineStatus === 'idle') {
                     return {
                         homed: true,
                         position: now,
