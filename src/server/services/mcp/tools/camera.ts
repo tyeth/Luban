@@ -44,6 +44,25 @@ async function sleep(ms: number): Promise<void> {
     });
 }
 
+/**
+ * The camera-to-spindle offset is fixed hardware geometry, so where the
+ * endmill images is a constant of the rig, not something to re-discover by
+ * vision each frame. The operator records it once in configstore
+ * mcpToolRegion (fractional box {u0,v0,u1,v1}, optional note) and every
+ * frame carries it - turning tool identification into a lookup.
+ */
+function expectedToolRegion(): object | null {
+    const raw = config.get('mcpToolRegion');
+    if (!raw) {
+        return null;
+    }
+    try {
+        return typeof raw === 'string' ? JSON.parse(raw) : (raw as object);
+    } catch (err) {
+        return null;
+    }
+}
+
 function frameContent(frame: CapturedFrame, meta: object): object {
     return {
         mcpContent: [
@@ -56,6 +75,7 @@ function frameContent(frame: CapturedFrame, meta: object): object {
                         provider: frame.provider,
                         device: frame.device,
                         capturedAt: frame.capturedAt,
+                        expectedToolRegion: expectedToolRegion(),
                     },
                 }),
             },
