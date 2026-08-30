@@ -24,11 +24,21 @@ export type McpJobState =
     | 'starting'
     | 'started'
     | 'start_failed'
-    | 'stopped';
+    | 'stopped'
+    | 'completed';
+
+/**
+ * 'file' runs through prepare_print/start_print (door interlock applies, and
+ * the firmware parks at the work origin on completion). 'direct' executes
+ * over execute_code on approval - it persists position but is NOT subject to
+ * the door interlock, so the confirm page says so and the operator supervises.
+ */
+export type McpJobKind = 'file' | 'direct';
 
 export interface McpJob {
     id: string;
     name: string;
+    kind: McpJobKind;
     headType: string;
     filePath: string;
     createdAt: number;
@@ -66,7 +76,7 @@ export class JobManager {
         return this.jobsDir;
     }
 
-    public submit(gcode: string, name: string, headType: string, validation: GcodeValidationReport): McpJob {
+    public submit(gcode: string, name: string, headType: string, validation: GcodeValidationReport, kind: McpJobKind = 'file'): McpJob {
         const id = crypto.randomBytes(6).toString('hex');
         const safeName = (name || 'job').replace(/[^\w.-]/g, '_').slice(0, 64);
         const filePath = path.join(this.ensureJobsDir(), `${id}_${safeName}.nc`);
@@ -75,6 +85,7 @@ export class JobManager {
         const job: McpJob = {
             id,
             name: safeName,
+            kind,
             headType,
             filePath,
             createdAt: Date.now(),
@@ -125,6 +136,7 @@ export class JobManager {
         return {
             id: job.id,
             name: job.name,
+            kind: job.kind,
             headType: job.headType,
             state: job.state,
             createdAt: job.createdAt,
@@ -210,10 +222,18 @@ export class JobManager {
             ? `<ul>${v.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`
             : '<p>None.</p>';
 
+        const directBanner = job.kind === 'direct'
+            ? `<p style="background:#fff3cd;border:1px solid #b8860b;padding:10px">
+                   <strong>DIRECT MOVE</strong>: on start this executes over the realtime path so the
+                   position <em>persists</em> - but it does NOT run as a job, so the enclosure door
+                   interlock does not apply. Supervise it.</p>`
+            : '';
+
         return `
-            <h2>Confirm G-code job: ${escapeHtml(job.name)}</h2>
+            <h2>Confirm ${job.kind === 'direct' ? 'DIRECT move' : 'G-code job'}: ${escapeHtml(job.name)}</h2>
             <p>Submitted by an agent over MCP. Review before approving - approval mints a
-               one-time code the agent needs to start the job.</p>
+               one-time code the agent needs to start it.</p>
+            ${directBanner}
             <table border="1" cellpadding="6" style="border-collapse:collapse">
                 <tr><td>Head</td><td>${escapeHtml(job.headType)}</td></tr>
                 <tr><td>Lines / motion lines</td><td>${v.lineCount} / ${v.motionLineCount}</td></tr>

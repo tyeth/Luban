@@ -22,7 +22,7 @@ const POST_SETTLE_DWELL_MS = 300;
 const HOME_TIMEOUT_MS = 120000;
 const HOME_POLL_MS = 1000;
 
-interface GcodeChannel {
+export interface GcodeChannel {
     executeGcode?: (gcode: string) => Promise<{ result: number; text?: string }>;
 }
 
@@ -31,7 +31,7 @@ interface GcodeChannel {
  * controller's reply) to the UI console, so the operator can see which
  * coordinate frame every MCP-issued command ran in.
  */
-async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string): Promise<{ result: number; text?: string }> {
+export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string): Promise<{ result: number; text?: string }> {
     mcpBroadcast('mcp:gcode', { tool, gcode });
     const executed = await channel.executeGcode(gcode);
     mcpBroadcast('mcp:gcode', { tool, response: executed.text || (executed.result === 0 ? 'ok' : `result=${executed.result}`) });
