@@ -85,6 +85,9 @@ export interface BoundedMoveArgs {
     coordinate_system?: string;
     feed_rate?: number;
     operator_confirmed_clearance?: boolean;
+    // Internal (not exposed in any tool schema): lifts the per-call travel
+    // limit for fixed, operator-set destinations like the work origin.
+    unbounded_travel?: boolean;
 }
 
 /**
@@ -118,7 +121,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
 
     const travel = Math.hypot(target.x - current.x, target.y - current.y);
     const maxTravel = Number(config.get('mcpMaxJogDistance')) || DEFAULT_MAX_TRAVEL_MM;
-    if (travel > maxTravel) {
+    if (!args.unbounded_travel && travel > maxTravel) {
         throw new McpToolError(`Requested travel ${travel.toFixed(1)} mm exceeds the ${maxTravel} mm `
                     + 'per-call limit. Split the approach, or submit a gcode job.');
     }
@@ -221,10 +224,11 @@ export function registerCameraTools(registry: ToolRegistry): void {
 
     registry.register({
         name: 'home',
-        description: 'Home all axes (G28) via the direct path - the one compound action #23 allows '
-            + 'there. Z raises before XY, making this the default first move after (re)connecting: '
-            + 'it also clears any stale position state between Luban and the machine. Requires an '
-            + 'idle machine with the toolhead off. Waits for the firmware to report homed.',
+        description: 'MACHINE home (G28): drives every axis to its limit switches - this is NOT the '
+            + 'work origin; moving to work X0 Y0 is the separate goto_work_origin operation. Z rises '
+            + 'first, making this the default first move after (re)connecting: it also clears any '
+            + 'stale position state between Luban and the machine. Requires an idle machine with the '
+            + 'toolhead off. Waits for the firmware to report homed.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         handler: async () => {
             const before = getPositionSnapshot();
@@ -265,6 +269,40 @@ export function registerCameraTools(registry: ToolRegistry): void {
             const last = positionOrNull();
             throw new McpToolError(`Machine did not report homed within ${HOME_TIMEOUT_MS / 1000}s. `
                 + `Last state: ${JSON.stringify(last && { isHomed: last.isHomed, machineStatus: last.machineStatus })}`);
+        },
+    });
+
+    registry.register({
+        name: 'goto_work_origin',
+        description: 'Go to the WORK origin: one bounded XY move to work X0 Y0 at the CURRENT Z - '
+            + 'semantically distinct from home, which drives to the machine limit switches. Z is '
+            + 'deliberately not touched; position Z via submit_gcode_job first if needed. Same '
+            + 'guards as move_and_capture (idle, toolhead off, homed-first unless the operator '
+            + 'has confirmed clearance), and a frame is captured on arrival.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                feed_rate: { type: 'number', description: `mm/min, default ${DEFAULT_FEED_RATE}, max 3000.` },
+                operator_confirmed_clearance: {
+                    type: 'boolean',
+                    description: 'Set true ONLY when the human operator has explicitly confirmed the '
+                        + 'current Z and an obstacle-free path at this Z; skips the homed-first requirement.',
+                },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { feed_rate?: number; operator_confirmed_clearance?: boolean }) => {
+            // The work origin is a fixed, operator-set destination, so the
+            // per-call travel limit (meant to bound the blast radius of a
+            // wrong coordinate) does not apply; every other guard does.
+            return executeBoundedMoveAndCapture({
+                x: 0,
+                y: 0,
+                coordinate_system: 'work',
+                feed_rate: args.feed_rate,
+                operator_confirmed_clearance: args.operator_confirmed_clearance,
+                unbounded_travel: true,
+            });
         },
     });
 
