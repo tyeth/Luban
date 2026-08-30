@@ -120,6 +120,8 @@ export interface BoundedMoveArgs {
     coordinate_system?: string;
     feed_rate?: number;
     operator_confirmed_clearance?: boolean;
+    wait_until_moved?: boolean;
+    capture?: boolean;
     // Internal (not exposed in any tool schema): lifts the per-call travel
     // limit for fixed, operator-set destinations like the work origin.
     unbounded_travel?: boolean;
@@ -168,10 +170,14 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         y: target.y - before.originOffset.y,
     };
     if (size) {
-        if (machineTarget.x < -0.5 || machineTarget.x > size.x + 0.5
-                    || machineTarget.y < -0.5 || machineTarget.y > size.y + 0.5) {
+        // Floors allow real overtravel: the A350 X home switch sits at
+        // machine -19, so "keep the current X while parked at home" must
+        // pass (a target at the machine's own resting position was being
+        // rejected live). Matches the position-sanity bounds.
+        if (machineTarget.x < -25 || machineTarget.x > size.x + 40
+                    || machineTarget.y < -25 || machineTarget.y > size.y + 40) {
             throw new McpToolError(`Target (machine ${machineTarget.x.toFixed(1)}, ${machineTarget.y.toFixed(1)}) `
-                        + `is outside the ${size.x}x${size.y} build area.`);
+                        + `is outside the ${size.x}x${size.y} build area (overtravel allowance -25..+40).`);
         }
     }
 
@@ -186,6 +192,18 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     const executed = await sendGcodeVisible(channel, 'move', gcode);
     if (executed.result !== 0) {
         throw new McpToolError(`Move rejected by controller: ${executed.text || executed.result}`);
+    }
+
+    if (args.wait_until_moved === false) {
+        // Fire-and-return: no settle, no capture - the frame would not show
+        // the commanded position. Poll get_position before relying on it.
+        return {
+            commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
+            position: null,
+            position_verified: false,
+            note: 'wait_until_moved was false: move accepted but not awaited, and no frame was '
+                + 'captured (it would not show the commanded position). Poll get_position.',
+        };
     }
 
     // Wait for a post-move heartbeat that reports the target, twice,
@@ -225,12 +243,21 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     }
 
     await sleep(POST_SETTLE_DWELL_MS);
+    if (args.capture === false) {
+        return {
+            commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
+            position: getPositionSnapshot(),
+            position_verified: true,
+            note: 'position is firmware-reported after settling; capture was false so no frame was taken',
+        };
+    }
     const frame = await captureFrame();
     const after = getPositionSnapshot();
 
     return frameContent(frame, {
         commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
         position: after,
+        position_verified: true,
         note: 'position is firmware-reported after settling, not the commanded target',
     });
 }
@@ -254,6 +281,43 @@ export function registerCameraTools(registry: ToolRegistry): void {
         handler: async () => {
             const frame = await captureFrame();
             return frameContent(frame, { position: positionOrNull() });
+        },
+    });
+
+    registry.register({
+        name: 'set_tool_region',
+        description: 'Update the expectedToolRegion that every capture reports: the fractional box '
+            + 'where the endmill images (fixed camera-to-spindle geometry). Refine it from live '
+            + 'frames instead of round-tripping through configuration edits. Persists.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                u0: { type: 'number' },
+                v0: { type: 'number' },
+                u1: { type: 'number' },
+                v1: { type: 'number' },
+                note: { type: 'string', description: 'Provenance: how the box was determined.' },
+            },
+            required: ['u0', 'v0', 'u1', 'v1'],
+            additionalProperties: false,
+        },
+        handler: async (args: { u0?: number; v0?: number; u1?: number; v1?: number; note?: string }) => {
+            const box = [args.u0, args.v0, args.u1, args.v1].map(Number);
+            if (box.some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
+                throw new McpToolError('u0/v0/u1/v1 must be fractions in [0, 1].');
+            }
+            if (box[0] >= box[2] || box[1] >= box[3]) {
+                throw new McpToolError('Require u0 < u1 and v0 < v1.');
+            }
+            const region = {
+                u0: box[0],
+                v0: box[1],
+                u1: box[2],
+                v1: box[3],
+                note: args.note ? String(args.note) : undefined,
+            };
+            config.set('mcpToolRegion', region);
+            return { stored: region };
         },
     });
 
@@ -352,8 +416,19 @@ export function registerCameraTools(registry: ToolRegistry): void {
             + 'fitted, G28 also homes B - stock indexed on the rotary WILL rotate (observed -45 to 0 '
             + 'on hardware); warn the operator first. Requires an idle machine with the toolhead '
             + 'off. Waits for the firmware to report homed.',
-        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        handler: async () => {
+        inputSchema: {
+            type: 'object',
+            properties: {
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Default true: block ~15-20s until the firmware reports homed and '
+                        + 'settled. false returns right after G28 is accepted - poll get_position '
+                        + 'for isHomed before any motion.',
+                },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { wait_until_moved?: boolean }) => {
             const before = getPositionSnapshot();
             if (before.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${before.machineStatus || 'in an unknown state'}, not idle.`);
@@ -379,6 +454,16 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 throw new McpToolError(`Homing rejected by controller: ${executed.text || executed.result}`);
             }
 
+            if (args.wait_until_moved === false) {
+                return {
+                    homed: null,
+                    position_verified: false,
+                    note: 'wait_until_moved was false: G28 accepted but not awaited (homing takes '
+                        + '~15-20s). Poll get_position until isHomed is true and the position is '
+                        + 'stable before any motion.',
+                };
+            }
+
             // Homing on the A350 takes tens of seconds; wait for TWO
             // consecutive identical heartbeats (position AND offset) that
             // report homed and idle. A single fresh heartbeat is not enough:
@@ -386,6 +471,8 @@ export function registerCameraTools(registry: ToolRegistry): void {
             // (offset zeroed) before G54 reselects workspace 0, and returning
             // that transient produced a nonsense snapshot on hardware.
             const deadline = issuedAt + HOME_TIMEOUT_MS;
+            const initialFingerprint = JSON.stringify([before.work, before.originOffset]);
+            let sawChange = false;
             let previous: string | null = null;
             while (Date.now() < deadline) {
                 await sleep(HOME_POLL_MS);
@@ -397,7 +484,15 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 const fingerprint = JSON.stringify([now.work, now.originOffset]);
                 const stable = fingerprint === previous;
                 previous = fingerprint;
-                if (reportTime > issuedAt && stable && now.isHomed === true && now.machineStatus === 'idle') {
+                if (fingerprint !== initialFingerprint) {
+                    sawChange = true;
+                }
+                // The heartbeat lags ~1s, so two identical post-issue beats can
+                // both predate the motion. Require the position to have moved
+                // off its pre-G28 value at least once - homing always travels -
+                // before accepting stability (or 25s, if it started at home).
+                const changeOk = sawChange || Date.now() - issuedAt > 25000;
+                if (reportTime > issuedAt && stable && changeOk && now.isHomed === true && now.machineStatus === 'idle') {
                     return {
                         homed: true,
                         position: now,
@@ -429,10 +524,16 @@ export function registerCameraTools(registry: ToolRegistry): void {
                     description: 'Set true ONLY when the human operator has explicitly confirmed the '
                         + 'current Z and an obstacle-free path at this Z; skips the homed-first requirement.',
                 },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Default true: settle at the origin and capture there. false returns '
+                        + 'right after the controller accepts the move - no settle, no frame; poll '
+                        + 'get_position afterwards.',
+                },
             },
             additionalProperties: false,
         },
-        handler: async (args: { feed_rate?: number; operator_confirmed_clearance?: boolean }) => {
+        handler: async (args: { feed_rate?: number; operator_confirmed_clearance?: boolean; wait_until_moved?: boolean }) => {
             // The work origin is a fixed, operator-set destination, so the
             // per-call travel limit (meant to bound the blast radius of a
             // wrong coordinate) does not apply; every other guard does.
@@ -442,6 +543,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 coordinate_system: 'work',
                 feed_rate: args.feed_rate,
                 operator_confirmed_clearance: args.operator_confirmed_clearance,
+                wait_until_moved: args.wait_until_moved,
                 unbounded_travel: true,
             });
         },
@@ -469,6 +571,18 @@ export function registerCameraTools(registry: ToolRegistry): void {
                     type: 'boolean',
                     description: 'Set true ONLY when the human operator has explicitly confirmed the '
                         + 'current Z and an obstacle-free path at this Z; skips the homed-first requirement.',
+                },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Default true: settle at the target and capture there. false returns '
+                        + 'right after the controller accepts the move - no settle, NO FRAME, '
+                        + 'position_verified: false; poll get_position afterwards.',
+                },
+                capture: {
+                    type: 'boolean',
+                    description: 'Default true. false still settles and verifies the position but '
+                        + 'skips the frame - a plain verified move. (The XY travel cap per call is '
+                        + 'the configstore key mcpMaxJogDistance, default 100mm.)',
                 },
             },
             additionalProperties: false,

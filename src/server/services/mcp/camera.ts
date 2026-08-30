@@ -126,6 +126,11 @@ async function captureViaHttp(url: string): Promise<CapturedFrame> {
 }
 
 async function captureViaFfmpeg(): Promise<CapturedFrame> {
+    // Device choice is sticky: enumeration order is not stable across
+    // restarts, and a capture that silently falls back to a different
+    // (possibly dead virtual) camera is worse than an error. The last
+    // device that produced a frame is remembered and preferred; a missing
+    // device is an error, never a substitution.
     let device = config.get('mcpCameraDevice');
     if (!device) {
         const { devices } = await listCameras();
@@ -133,19 +138,39 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
             throw new McpToolError('No DirectShow video devices found. Set configstore key mcpCameraDevice, '
                 + 'or mcpCameraUrl for an HTTP snapshot source.');
         }
-        device = devices[0];
+        const lastGood = config.get('mcpCameraLastGood');
+        if (lastGood && devices.includes(String(lastGood))) {
+            device = lastGood;
+        } else if (lastGood) {
+            throw new McpToolError(`The last working camera ("${lastGood}") is not in the current device list `
+                + `(${devices.join(', ')}). Re-plug it and retry, or set mcpCameraDevice explicitly - refusing `
+                + 'to silently substitute a different device.');
+        } else {
+            device = devices[0];
+        }
     }
 
     const outPath = path.join(DataStorage.tmpDir, `mcp-frame-${crypto.randomBytes(4).toString('hex')}.jpg`);
     try {
-        const { code, stderr } = await runFfmpeg([
+        const ffmpegArgs = [
             '-hide_banner', '-loglevel', 'error',
             '-f', 'dshow', '-i', `video=${device}`,
             '-frames:v', '1', '-f', 'image2', '-y', outPath,
-        ]);
+        ];
+        let { code, stderr } = await runFfmpeg(ffmpegArgs);
         if (code !== 0 || !fs.existsSync(outPath)) {
-            throw new McpToolError(`ffmpeg capture failed: ${stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' ')}`);
+            // One retry after a beat: first-open flakiness on USB cameras is
+            // real and transient; a different device is never substituted.
+            await new Promise((resolve) => {
+                setTimeout(resolve, 1200);
+            });
+            ({ code, stderr } = await runFfmpeg(ffmpegArgs));
         }
+        if (code !== 0 || !fs.existsSync(outPath)) {
+            throw new McpToolError(`ffmpeg capture from "${device}" failed after retry: `
+                + `${stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' ')}`);
+        }
+        config.set('mcpCameraLastGood', String(device));
         const body = await fs.readFile(outPath);
         return {
             frameId: cacheFrame(body),
