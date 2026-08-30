@@ -78,6 +78,125 @@ function assertSafeToMove(position: PositionSnapshot, operatorConfirmedClearance
     }
 }
 
+
+export interface BoundedMoveArgs {
+    x?: number;
+    y?: number;
+    coordinate_system?: string;
+    feed_rate?: number;
+    operator_confirmed_clearance?: boolean;
+}
+
+/**
+ * The single bounded XY move + settle + capture behind move_and_capture,
+ * shared with visual_servo. Enforces every guard.
+ */
+export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promise<object> {
+    if (args.x === undefined && args.y === undefined) {
+        throw new McpToolError('Provide x and/or y.');
+    }
+    const coordinateSystem = args.coordinate_system || 'work';
+    if (!['work', 'machine'].includes(coordinateSystem)) {
+        throw new McpToolError('coordinate_system must be "work" or "machine".');
+    }
+    const feedRate = Math.min(Math.max(Number(args.feed_rate) || DEFAULT_FEED_RATE, 100), 3000);
+
+    const before = getPositionSnapshot();
+    assertSafeToMove(before, args.operator_confirmed_clearance === true);
+
+    const current = coordinateSystem === 'work' ? before.work : before.machine;
+    if (current.x === null || current.y === null) {
+        throw new McpToolError('Current position unknown; cannot bound the move.');
+    }
+    const target = {
+        x: args.x !== undefined ? Number(args.x) : current.x,
+        y: args.y !== undefined ? Number(args.y) : current.y,
+    };
+    if (!Number.isFinite(target.x) || !Number.isFinite(target.y)) {
+        throw new McpToolError('x/y must be finite numbers.');
+    }
+
+    const travel = Math.hypot(target.x - current.x, target.y - current.y);
+    const maxTravel = Number(config.get('mcpMaxJogDistance')) || DEFAULT_MAX_TRAVEL_MM;
+    if (travel > maxTravel) {
+        throw new McpToolError(`Requested travel ${travel.toFixed(1)} mm exceeds the ${maxTravel} mm `
+                    + 'per-call limit. Split the approach, or submit a gcode job.');
+    }
+
+    // Envelope check in machine coordinates when the build volume is known.
+    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+    const machineTarget = coordinateSystem === 'machine' ? target : {
+        x: target.x - before.originOffset.x,
+        y: target.y - before.originOffset.y,
+    };
+    if (size) {
+        if (machineTarget.x < -0.5 || machineTarget.x > size.x + 0.5
+                    || machineTarget.y < -0.5 || machineTarget.y > size.y + 0.5) {
+            throw new McpToolError(`Target (machine ${machineTarget.x.toFixed(1)}, ${machineTarget.y.toFixed(1)}) `
+                        + `is outside the ${size.x}x${size.y} build area.`);
+        }
+    }
+
+    const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+    if (!channel || typeof channel.executeGcode !== 'function') {
+        throw new McpToolError('The connected channel does not support direct moves.');
+    }
+
+    const move = `G0 X${target.x.toFixed(3)} Y${target.y.toFixed(3)} F${feedRate}`;
+    const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : move;
+    const issuedAt = Date.now();
+    const executed = await channel.executeGcode(gcode);
+    if (executed.result !== 0) {
+        throw new McpToolError(`Move rejected by controller: ${executed.text || executed.result}`);
+    }
+
+    // Wait for a post-move heartbeat that reports the target, twice,
+    // so the returned position is what the firmware says, not what
+    // was commanded (#11).
+    let settled: PositionSnapshot | null = null;
+    let stableReports = 0;
+    let lastTimestamp = 0;
+    const deadline = issuedAt + SETTLE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        await sleep(SETTLE_POLL_MS);
+        const now = getPositionSnapshot();
+        const reportTime = Date.now() - now.reportAgeMs;
+        if (reportTime <= issuedAt || reportTime === lastTimestamp) {
+            continue; // not a fresh post-move report
+        }
+        lastTimestamp = reportTime;
+        const reported = coordinateSystem === 'work' ? now.work : now.machine;
+        if (reported.x !== null && reported.y !== null
+                    && Math.abs(reported.x - target.x) <= SETTLE_TOLERANCE_MM
+                    && Math.abs(reported.y - target.y) <= SETTLE_TOLERANCE_MM) {
+            stableReports += 1;
+            if (stableReports >= 2) {
+                settled = now;
+                break;
+            }
+        } else {
+            stableReports = 0;
+        }
+    }
+    if (!settled) {
+        const last = positionOrNull();
+        throw new McpToolError('Move did not settle at the target within '
+                    + `${SETTLE_TIMEOUT_MS / 1000}s. Last reported position: ${JSON.stringify(last && {
+                        work: last.work, machine: last.machine,
+                    })}`);
+    }
+
+    await sleep(POST_SETTLE_DWELL_MS);
+    const frame = await captureFrame();
+    const after = getPositionSnapshot();
+
+    return frameContent(frame, {
+        commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
+        position: after,
+        note: 'position is firmware-reported after settling, not the commanded target',
+    });
+}
+
 export function registerCameraTools(registry: ToolRegistry): void {
     registry.register({
         name: 'list_cameras',
@@ -175,116 +294,6 @@ export function registerCameraTools(registry: ToolRegistry): void {
             },
             additionalProperties: false,
         },
-        handler: async (args: {
-            x?: number;
-            y?: number;
-            coordinate_system?: string;
-            feed_rate?: number;
-            operator_confirmed_clearance?: boolean;
-        }) => {
-            if (args.x === undefined && args.y === undefined) {
-                throw new McpToolError('Provide x and/or y.');
-            }
-            const coordinateSystem = args.coordinate_system || 'work';
-            if (!['work', 'machine'].includes(coordinateSystem)) {
-                throw new McpToolError('coordinate_system must be "work" or "machine".');
-            }
-            const feedRate = Math.min(Math.max(Number(args.feed_rate) || DEFAULT_FEED_RATE, 100), 3000);
-
-            const before = getPositionSnapshot();
-            assertSafeToMove(before, args.operator_confirmed_clearance === true);
-
-            const current = coordinateSystem === 'work' ? before.work : before.machine;
-            if (current.x === null || current.y === null) {
-                throw new McpToolError('Current position unknown; cannot bound the move.');
-            }
-            const target = {
-                x: args.x !== undefined ? Number(args.x) : current.x,
-                y: args.y !== undefined ? Number(args.y) : current.y,
-            };
-            if (!Number.isFinite(target.x) || !Number.isFinite(target.y)) {
-                throw new McpToolError('x/y must be finite numbers.');
-            }
-
-            const travel = Math.hypot(target.x - current.x, target.y - current.y);
-            const maxTravel = Number(config.get('mcpMaxJogDistance')) || DEFAULT_MAX_TRAVEL_MM;
-            if (travel > maxTravel) {
-                throw new McpToolError(`Requested travel ${travel.toFixed(1)} mm exceeds the ${maxTravel} mm `
-                    + 'per-call limit. Split the approach, or submit a gcode job.');
-            }
-
-            // Envelope check in machine coordinates when the build volume is known.
-            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-            const machineTarget = coordinateSystem === 'machine' ? target : {
-                x: target.x - before.originOffset.x,
-                y: target.y - before.originOffset.y,
-            };
-            if (size) {
-                if (machineTarget.x < -0.5 || machineTarget.x > size.x + 0.5
-                    || machineTarget.y < -0.5 || machineTarget.y > size.y + 0.5) {
-                    throw new McpToolError(`Target (machine ${machineTarget.x.toFixed(1)}, ${machineTarget.y.toFixed(1)}) `
-                        + `is outside the ${size.x}x${size.y} build area.`);
-                }
-            }
-
-            const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
-            if (!channel || typeof channel.executeGcode !== 'function') {
-                throw new McpToolError('The connected channel does not support direct moves.');
-            }
-
-            const move = `G0 X${target.x.toFixed(3)} Y${target.y.toFixed(3)} F${feedRate}`;
-            const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : move;
-            const issuedAt = Date.now();
-            const executed = await channel.executeGcode(gcode);
-            if (executed.result !== 0) {
-                throw new McpToolError(`Move rejected by controller: ${executed.text || executed.result}`);
-            }
-
-            // Wait for a post-move heartbeat that reports the target, twice,
-            // so the returned position is what the firmware says, not what
-            // was commanded (#11).
-            let settled: PositionSnapshot | null = null;
-            let stableReports = 0;
-            let lastTimestamp = 0;
-            const deadline = issuedAt + SETTLE_TIMEOUT_MS;
-            while (Date.now() < deadline) {
-                await sleep(SETTLE_POLL_MS);
-                const now = getPositionSnapshot();
-                const reportTime = Date.now() - now.reportAgeMs;
-                if (reportTime <= issuedAt || reportTime === lastTimestamp) {
-                    continue; // not a fresh post-move report
-                }
-                lastTimestamp = reportTime;
-                const reported = coordinateSystem === 'work' ? now.work : now.machine;
-                if (reported.x !== null && reported.y !== null
-                    && Math.abs(reported.x - target.x) <= SETTLE_TOLERANCE_MM
-                    && Math.abs(reported.y - target.y) <= SETTLE_TOLERANCE_MM) {
-                    stableReports += 1;
-                    if (stableReports >= 2) {
-                        settled = now;
-                        break;
-                    }
-                } else {
-                    stableReports = 0;
-                }
-            }
-            if (!settled) {
-                const last = positionOrNull();
-                throw new McpToolError('Move did not settle at the target within '
-                    + `${SETTLE_TIMEOUT_MS / 1000}s. Last reported position: ${JSON.stringify(last && {
-                        work: last.work, machine: last.machine,
-                    })}`);
-            }
-
-            await sleep(POST_SETTLE_DWELL_MS);
-            const frame = await captureFrame();
-            const after = getPositionSnapshot();
-
-            return frameContent(frame, {
-                commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
-                position: after,
-                note: 'position is firmware-reported after settling, not the commanded target',
-            });
-        },
+        handler: async (args: BoundedMoveArgs) => executeBoundedMoveAndCapture(args),
     });
 }
