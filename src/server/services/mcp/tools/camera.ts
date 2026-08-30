@@ -3,7 +3,8 @@
 import config from '../../configstore';
 import { mcpBroadcast } from '../index';
 import { connectionManager } from '../../machine/ConnectionManager';
-import { CapturedFrame, captureFrame, listCameras } from '../camera';
+import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCameras } from '../camera';
+import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
 
@@ -72,6 +73,7 @@ function frameContent(frame: CapturedFrame, meta: object): object {
                 text: JSON.stringify({
                     ...meta,
                     camera: {
+                        frameId: frame.frameId,
                         provider: frame.provider,
                         device: frame.device,
                         capturedAt: frame.capturedAt,
@@ -252,6 +254,69 @@ export function registerCameraTools(registry: ToolRegistry): void {
         handler: async () => {
             const frame = await captureFrame();
             return frameContent(frame, { position: positionOrNull() });
+        },
+    });
+
+    registry.register({
+        name: 'track_feature',
+        description: 'Template-match a patch between two cached frames (by the frameId each capture '
+            + 'reports): give the pixel of a feature in one frame and get its measured pixel in the '
+            + 'other, with an NCC confidence score. Use this instead of eyeballing pixel coordinates '
+            + 'when deriving calibrations or measuring servo error - hand-estimated pixels were the '
+            + 'dominant field error source. A small second-peak gap warns of repetitive-grid '
+            + 'ambiguity. No motion, no capture.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                template_frame_id: { type: 'string', description: 'Frame the feature pixel refers to.' },
+                search_frame_id: { type: 'string', description: 'Frame to locate the feature in.' },
+                point: {
+                    type: 'object',
+                    properties: { u: { type: 'number' }, v: { type: 'number' } },
+                    required: ['u', 'v'],
+                    description: 'Feature pixel in the template frame.',
+                },
+                patch_size: { type: 'number', description: 'Odd patch edge in px, default 41, max 101.' },
+                search_radius: { type: 'number', description: 'Search half-window in px, default 120, max 250.' },
+            },
+            required: ['template_frame_id', 'search_frame_id', 'point'],
+            additionalProperties: false,
+        },
+        handler: async (args: {
+            template_frame_id?: string;
+            search_frame_id?: string;
+            point?: { u?: number; v?: number };
+            patch_size?: number;
+            search_radius?: number;
+        }) => {
+            const templateJpg = getCachedFrame(String(args.template_frame_id || ''));
+            const searchJpg = getCachedFrame(String(args.search_frame_id || ''));
+            if (!templateJpg || !searchJpg) {
+                throw new McpToolError(`Unknown frame id. Cached frames: ${getCachedFrameIds().join(', ') || 'none'} `
+                    + '(the cache holds the last 12 captures of this session).');
+            }
+            const u = Math.round(Number(args.point?.u));
+            const v = Math.round(Number(args.point?.v));
+            if (!Number.isFinite(u) || !Number.isFinite(v)) {
+                throw new McpToolError('point.u and point.v must be numbers.');
+            }
+            let patch = Math.round(Number(args.patch_size) || 41);
+            patch = Math.min(Math.max(patch % 2 === 0 ? patch + 1 : patch, 11), 101);
+            const radius = Math.min(Math.max(Math.round(Number(args.search_radius) || 120), 20), 250);
+
+            const result = trackFeature(decodeToGray(templateJpg), decodeToGray(searchJpg), u, v, patch, radius);
+            return {
+                template_frame_id: args.template_frame_id,
+                search_frame_id: args.search_frame_id,
+                point: { u, v },
+                matched_point: result.matchedPoint,
+                pixel_shift: { du: result.du, dv: result.dv },
+                score: result.score,
+                second_peak_gap: result.secondPeakGap,
+                patch_size: patch,
+                search_radius: radius,
+                warnings: result.warnings,
+            };
         },
     });
 
