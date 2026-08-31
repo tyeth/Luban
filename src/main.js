@@ -62,6 +62,41 @@ log.setLevel(log.levels.INFO);
 // One clock for main, the forked server and the renderer.
 process.env[STARTUP_EPOCH_KEY] = String(startupEpoch);
 
+/*
+ * A force-killed session can leave the userData PATH occupied by a small
+ * Chromium HSTS/TransportSecurity state FILE (~200 bytes of {"sts":[...]})
+ * instead of the directory - observed live 2026-08-31: the network service
+ * flushes it to the userData root when it dies while the directory is gone.
+ * electron-store then throws EEXIST on mkdir, crashing boot (and blocking
+ * quit, whose winBounds save also mkdirs). Guard: rename the stray file
+ * aside and log; callable again before any late store write.
+ */
+const ensureUserDataDir = (label) => {
+    const dir = app.getPath('userData');
+    try {
+        const stat = fs.statSync(dir);
+        if (stat.isDirectory()) {
+            return;
+        }
+        const strayPath = `${dir}.stray-${Date.now()}`;
+        fs.renameSync(dir, strayPath);
+        log.warn(`[userData ${label}] path was a ${stat.size}-byte FILE, not a directory - moved to ${strayPath}`);
+    } catch (err) {
+        if (err.code !== 'ENOENT') {
+            log.warn(`[userData ${label}] guard failed: ${err.message}`);
+            return;
+        }
+        log.warn(`[userData ${label}] directory missing`);
+    }
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+        log.warn(`[userData ${label}] directory (re)created`);
+    } catch (err) {
+        log.warn(`[userData ${label}] mkdir failed: ${err.message}`);
+    }
+};
+
+ensureUserDataDir('boot');
 const config = new Store();
 
 initCrashReporting(config);
@@ -69,6 +104,53 @@ const userDataDir = app.getPath('userData');
 global.luban = {
     userDataDir
 };
+
+const childProcess = require('child_process');
+
+// Diagnostic watch (pre-fix forensics, cheap enough to keep): log STATE
+// TRANSITIONS of the userData entry itself (directory <-> file <-> missing;
+// writes inside the directory fire 'change' events on the entry, so raw
+// events are too noisy to log). On a flip to FILE - the stray-HSTS
+// signature - also capture the content head and which electron processes
+// exist at that instant, to attribute the writer. Race unreproduced as of
+// 2026-08-31 despite bare/populated/fresh-profile speed-run attempts; the
+// two live-caught occurrences were ~10s after the GitHub update-check
+// response (Chromium's delayed HSTS persist window).
+try {
+    let watchedState = 'directory';
+    fs.watch(path.dirname(userDataDir), (eventType, filename) => {
+        if (filename !== path.basename(userDataDir)) {
+            return;
+        }
+        let state = 'MISSING';
+        let isFile = false;
+        try {
+            const stat = fs.statSync(userDataDir);
+            isFile = !stat.isDirectory();
+            state = isFile ? `FILE (${stat.size} bytes)` : 'directory';
+        } catch (err) {
+            // keep MISSING
+        }
+        if (state === watchedState) {
+            return;
+        }
+        watchedState = state;
+        log.warn(`[userData watch] ${new Date().toISOString()} ${eventType}: path is now ${state}`);
+        if (isFile) {
+            try {
+                const head = fs.readFileSync(userDataDir, 'utf8').slice(0, 120);
+                log.warn(`[userData watch] stray content head: ${head}`);
+            } catch (err) {
+                log.warn(`[userData watch] could not read stray file: ${err.message}`);
+            }
+            childProcess.exec('tasklist /FI "IMAGENAME eq electron.exe" /FO CSV', (err, stdout) => {
+                log.warn(`[userData watch] electron processes at flip:\n${err ? err.message : stdout}`);
+            });
+        }
+    });
+} catch (err) {
+    log.warn(`[userData watch] could not watch: ${err.message}`);
+}
 let serverData = null;
 let mainWindow = null;
 let loadUrl = '';
@@ -77,8 +159,6 @@ const loadingMenu = [{
     id: 'file',
     label: '',
 }];
-
-const childProcess = require('child_process');
 
 const SERVER_DATA = 'serverData';
 const UPLOAD_WINDOWS = 'uploadWindows';
@@ -540,7 +620,14 @@ const showMainWindow = async () => {
             ...bounds
         };
 
-        config.set('winBounds', options);
+        // A failed save must never block quit (EEXIST here when the stray
+        // HSTS file has reoccupied the userData path mid-session).
+        try {
+            ensureUserDataDir('quit');
+            config.set('winBounds', options);
+        } catch (err) {
+            log.warn(`Skipping winBounds save on close: ${err.message}`);
+        }
         window.webContents.send('save-and-close');
 
         mainWindow = null;
