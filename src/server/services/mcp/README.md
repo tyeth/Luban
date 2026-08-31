@@ -47,7 +47,8 @@ mcp/
   mqtt.ts        minimal MQTT 3.1.1 client over net/tls (hand-rolled, no deps)
   probeFeed.ts   external probe sensor feed: config resolution (env->config),
                  last-reading cache per channel, overtravel tripwire latch
-  tools/         status, machine, gcode, camera, calibration, probe registrations
+  toolSetter.ts  tool height measurement: config, envelope planner, staged runner
+  tools/         status, machine, gcode, camera, calibration, probe, toolsetter
 ```
 
 External probe sensors (tool height setter, overtravel switch, CNC touch probe) report
@@ -113,10 +114,13 @@ and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whit
   calibration is keyed by machine Y AND Z. The board-viewing anchor pose is the pre-home
   park (machine X0/Y0), not machine home. The **gold cylinder at machine Y≈176–340 is the
   TOOL HEIGHT CHECKER** (operator-confirmed; was misidentified twice).
+- **Tool setter (operator-stated 2026-08-31): centre at machine (X79, Y293); it triggers at
+  machine Z176 with a 75 mm endmill in the holder** — so expected trigger Z for a bit of
+  length L is `176 + (L − 75)`. Seed `set_tool_setter_config` with these on first run.
 - Fleet: machine named "Snapmaker" @ 192.168.1.173 = the A350 CNC; "F350" @ .130 = the
   3D printer. Same Luban profile identifier — distinguish by NAME/address, never profile.
 
-## Tool surface (28)
+## Tool surface (31)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
@@ -134,7 +138,13 @@ surfaced on every capture) · `get_stored_state` (one-call orientation: calibrat
 landmarks, tool region, limits, camera config, connection, probe feed — call this first in
 a fresh session) · `get_probe_feed_status` · `connect_probe_feed` / `disconnect_probe_feed`
 (MQTT sensor feed; connecting arms the overtravel tripwire) · `clear_overtravel_alarm`
-(operator's explicit word only).
+(operator's explicit word only) · `set_/get_tool_setter_config` (setter centre, trigger Z
+with a reference bit, bit lengths — operator-stated) · `run_tool_setter` (tool height
+measurement: ONE operator approval covers a server-driven envelope-bounded routine — XY to
+centre, Z to `triggerZ + (longest−ref) + 50`, 1 mm sensor-gated descent, release, 0.1 mm
+approach, 0.3 mm backoff, ≥2 s/0.1 mm confirm pass, retreat; hard floor at expected
+trigger − margin; requires the probe feed connected and the toolsetter sensor readable
+and untriggered; `store_as_reference` locks the measured Z in as the new reference).
 
 ## Development workflow (learned the hard way)
 
@@ -166,3 +176,18 @@ a fresh session) · `get_probe_feed_status` · `connect_probe_feed` / `disconnec
   Seed the landmark registry with the tool height checker (machine Y≈176–340).
 - **#38 startup socket.io gap** — properly belongs in the startup stack; hotfixed here.
 - **#24 measurement systems, #25 collision watcher** — designed but not started.
+- **CNC touch probe (next)**: a normally-open touch probe in the spindle, reporting on the
+  probe feed channel (config already carries `mcpMqttFeedProbe`), combined with the camera
+  to measure work from the top and sides in any position including on the rotary axis.
+  Long term: a manual probe/inspection file driving a probing session, and a report
+  exportable to CAD/CAM (Fusion + free tools). The tool setter's staged
+  approach/release/confirm runner in `toolSetter.ts` is the motion template.
+- **Future probe transports (operator-stated 2026-08-31)**: MQTT may be replaced or joined
+  by hardwired USB-GPIO, or an HTTP service (e.g. a Pi running Python with a USB camera
+  plus GPIOs for the contact sensors). The transport contract is the `ProbeFeedService`
+  surface (`connect/disconnect/getReading/waitForReading/assertNoOvertravel/status`) —
+  consumers never see MQTT; a new backend implements that surface and feeds the same
+  reading cache and overtravel latch. Sensor latency is transport-dependent: local GPIO
+  would let `sensor_delay_ms` and the release timeouts collapse to near zero. The Pi's
+  camera half already fits `mcpCameraUrl` (any HTTP snapshot endpoint), so one box could
+  serve both.

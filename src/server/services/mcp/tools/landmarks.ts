@@ -6,6 +6,7 @@ import { calibrationStore } from '../calibration';
 import { Landmark, landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
+import { getToolSetterConfig } from '../toolSetter';
 
 // Named scene landmarks (#50) and the stored-state overview (#53): operator
 // knowledge captured once, surfaced every session, so no agent spends moves
@@ -114,6 +115,7 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 },
                 installedModules: config.get('mcpInstalledModules') || [],
                 probeFeed: probeFeedService.status(),
+                toolSetter: getToolSetterConfig(),
             };
         },
     });

@@ -207,6 +207,30 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 throw new McpToolError(verdict.reason || 'Confirmation failed.');
             }
 
+            if (job.kind === 'procedure') {
+                // Server-driven measurement routine (e.g. run_tool_setter):
+                // the operator approved the envelope; the runner steps within
+                // it against live sensor feedback and returns the result.
+                if (typeof job.runner !== 'function') {
+                    throw new McpToolError('Procedure job has no runner (was the server restarted since '
+                        + 'submission?). Submit it again.');
+                }
+                job.state = 'started';
+                job.startedAt = Date.now();
+                try {
+                    const outcome = await job.runner();
+                    job.state = 'completed';
+                    return {
+                        job: jobManager.describe(job),
+                        result: outcome,
+                    };
+                } catch (err) {
+                    job.state = 'start_failed';
+                    job.error = err.message;
+                    throw err;
+                }
+            }
+
             if (job.kind === 'direct') {
                 // Direct moves execute over the realtime path so position
                 // PERSISTS - the firmware parks back at the work origin when
