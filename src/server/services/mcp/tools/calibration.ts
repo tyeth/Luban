@@ -32,7 +32,18 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
     // the error. Remember the last step per calibration+target and warn the
     // moment the error fails to shrink - one wasted step instead of a manual
     // catch several steps later.
-    let lastServoStep: { calibrationId: string; tu: number; tv: number; magnitude: number; at: number } | null = null;
+    let lastServoStep: {
+        calibrationId: string;
+        tu: number;
+        tv: number;
+        magnitude: number;
+        du: number;
+        dv: number;
+        appliedDx: number;
+        appliedDy: number;
+        matrix: [[number, number], [number, number]];
+        at: number;
+    } | null = null;
     registry.register({
         name: 'set_camera_calibration',
         description: 'Persist a pixel-to-machine calibration, keyed by the machine Y it was '
@@ -55,6 +66,12 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                     maxItems: 2,
                 },
                 notes: { type: 'string', description: 'Free-form provenance: grid used, residuals, tilt.' },
+                surface: {
+                    type: 'string',
+                    description: 'Physical surface the calibration was derived on (e.g. "board", '
+                        + '"bracket"). A matrix is only valid on its own depth plane - cross-plane '
+                        + 'use read ~4x wrong on hardware.',
+                },
                 jacobian: {
                     type: 'array',
                     description: 'Optional 2x2 forward Jacobian J (pixel shift per mm) you fitted. When '
@@ -68,7 +85,7 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
             required: ['valid_at_y', 'z', 'matrix'],
             additionalProperties: false,
         },
-        handler: async (args: { valid_at_y?: number; z?: number; matrix?: unknown; notes?: string; jacobian?: unknown }) => {
+        handler: async (args: { valid_at_y?: number; z?: number; matrix?: unknown; notes?: string; surface?: string; jacobian?: unknown }) => {
             const validAtY = Number(args.valid_at_y);
             const z = Number(args.z);
             if (!Number.isFinite(validAtY) || !Number.isFinite(z)) {
@@ -107,6 +124,7 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                 validAtY,
                 z,
                 matrix: args.matrix,
+                surface: args.surface ? String(args.surface) : null,
                 notes: args.notes ? String(args.notes) : null,
             });
             return { entry: describeEntry(entry), warnings };
@@ -255,15 +273,41 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
             const errorMagnitude = Math.hypot(du, dv);
             const tu = Number(args.target_pixel?.u);
             const tv = Number(args.target_pixel?.v);
-            if (lastServoStep
+            const sameSeries = lastServoStep
                 && lastServoStep.calibrationId === entry.id
                 && Math.abs(lastServoStep.tu - tu) < 5 && Math.abs(lastServoStep.tv - tv) < 5
-                && Date.now() - lastServoStep.at < 10 * 60 * 1000
-                && errorMagnitude >= lastServoStep.magnitude * 0.95) {
+                && Date.now() - lastServoStep.at < 10 * 60 * 1000;
+            if (sameSeries && errorMagnitude >= lastServoStep.magnitude * 0.95) {
                 warnings.push('Pixel error did not shrink after the previous servo step with this calibration '
                     + `(${lastServoStep.magnitude.toFixed(1)}px -> ${errorMagnitude.toFixed(1)}px). A sign-flipped or `
                     + 'badly scaled matrix drives AWAY from the target: verify J.(M.e) reproduces +e before '
                     + 'iterating further.');
+            }
+            // Depth-plane / wrong-match cross-check (#51): predict this step
+            // error from the last one using J = inverse(M) and the applied
+            // move; sharp divergence means the tracked feature sits on a
+            // different physical surface than the calibration (parallax read
+            // ~4x wrong on hardware) or the match latched onto the wrong spot.
+            if (sameSeries) {
+                const m = lastServoStep.matrix;
+                const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+                if (Math.abs(det) > 1e-9) {
+                    const j = [
+                        [m[1][1] / det, -m[0][1] / det],
+                        [-m[1][0] / det, m[0][0] / det],
+                    ];
+                    const predDu = lastServoStep.du - (j[0][0] * lastServoStep.appliedDx + j[0][1] * lastServoStep.appliedDy);
+                    const predDv = lastServoStep.dv - (j[1][0] * lastServoStep.appliedDx + j[1][1] * lastServoStep.appliedDy);
+                    const expectedChange = Math.hypot(lastServoStep.du - predDu, lastServoStep.dv - predDv);
+                    const deviation = Math.hypot(du - predDu, dv - predDv);
+                    if (expectedChange > 3 && deviation > Math.max(0.5 * expectedChange, 5)) {
+                        warnings.push('Measured response diverges from the calibration prediction (expected error near '
+                            + `(${predDu.toFixed(0)}, ${predDv.toFixed(0)})px, measured (${du.toFixed(0)}, ${dv.toFixed(0)})px). `
+                            + 'Likely a depth-plane mismatch - the feature sits on a different surface than the calibration'
+                            + `${entry.surface ? ` (derived on "${entry.surface}")` : ''} - or the tracked match is wrong. `
+                            + 'Re-derive on the working surface before iterating.');
+                    }
+                }
             }
             if (entryDistance !== null && entryDistance > DEFAULT_Y_TOLERANCE_MM) {
                 warnings.push(`Calibration ${entry.id} is ${entryDistance.toFixed(1)} mm from the current Y; scale may be off.`);
@@ -280,7 +324,18 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                 operator_confirmed_clearance: args.operator_confirmed_clearance,
             }) as { mcpContent: object[] };
 
-            lastServoStep = { calibrationId: entry.id, tu, tv, magnitude: errorMagnitude, at: Date.now() };
+            lastServoStep = {
+                calibrationId: entry.id,
+                tu,
+                tv,
+                magnitude: errorMagnitude,
+                du,
+                dv,
+                appliedDx: dx,
+                appliedDy: dy,
+                matrix: entry.matrix,
+                at: Date.now(),
+            };
 
             // Splice servo metadata into the text part of the frame result.
             const servoMeta = {

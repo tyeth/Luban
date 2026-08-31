@@ -6,6 +6,7 @@ import { connectionManager } from '../../machine/ConnectionManager';
 import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCameras } from '../camera';
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
+import { landmarkStore } from '../landmarks';
 import { PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
@@ -64,6 +65,28 @@ function expectedToolRegion(): object | null {
     }
 }
 
+function positionOrNull(): PositionSnapshot | null {
+    try {
+        return getPositionSnapshot();
+    } catch (err) {
+        return null;
+    }
+}
+
+/**
+ * Landmarks near the current machine XY (#50): identities the operator has
+ * stated once, surfaced on every capture so they are never re-guessed.
+ */
+function nearbyLandmarks(): object[] {
+    const position = positionOrNull();
+    const x = position?.machine.x;
+    const y = position?.machine.y;
+    if (x === null || x === undefined || y === null || y === undefined) {
+        return [];
+    }
+    return landmarkStore.near(x, y, 120);
+}
+
 function frameContent(frame: CapturedFrame, meta: object): object {
     return {
         mcpContent: [
@@ -78,19 +101,12 @@ function frameContent(frame: CapturedFrame, meta: object): object {
                         device: frame.device,
                         capturedAt: frame.capturedAt,
                         expectedToolRegion: expectedToolRegion(),
+                        nearbyLandmarks: nearbyLandmarks(),
                     },
                 }),
             },
         ],
     };
-}
-
-function positionOrNull(): PositionSnapshot | null {
-    try {
-        return getPositionSnapshot();
-    } catch (err) {
-        return null;
-    }
 }
 
 function assertSafeToMove(position: PositionSnapshot, operatorConfirmedClearance: boolean): void {
@@ -342,6 +358,14 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 },
                 patch_size: { type: 'number', description: 'Odd patch edge in px, default 41, max 101.' },
                 search_radius: { type: 'number', description: 'Search half-window in px, default 120, max 250.' },
+                expected_shift: {
+                    type: 'object',
+                    properties: { du: { type: 'number' }, dv: { type: 'number' } },
+                    required: ['du', 'dv'],
+                    description: 'Optional predicted pixel shift (e.g. J x commanded move). Breaks '
+                        + 'ties among near-best candidates on repetitive grids; the response says '
+                        + 'when the expectation, not the raw score, chose the match.',
+                },
             },
             required: ['template_frame_id', 'search_frame_id', 'point'],
             additionalProperties: false,
@@ -352,6 +376,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
             point?: { u?: number; v?: number };
             patch_size?: number;
             search_radius?: number;
+            expected_shift?: { du?: number; dv?: number };
         }) => {
             const templateJpg = getCachedFrame(String(args.template_frame_id || ''));
             const searchJpg = getCachedFrame(String(args.search_frame_id || ''));
@@ -368,7 +393,17 @@ export function registerCameraTools(registry: ToolRegistry): void {
             patch = Math.min(Math.max(patch % 2 === 0 ? patch + 1 : patch, 11), 101);
             const radius = Math.min(Math.max(Math.round(Number(args.search_radius) || 120), 20), 250);
 
-            const result = trackFeature(decodeToGray(templateJpg), decodeToGray(searchJpg), u, v, patch, radius);
+            let expected: { du: number; dv: number } | undefined;
+            if (args.expected_shift) {
+                const edu = Number(args.expected_shift.du);
+                const edv = Number(args.expected_shift.dv);
+                if (!Number.isFinite(edu) || !Number.isFinite(edv)) {
+                    throw new McpToolError('expected_shift.du and .dv must be numbers.');
+                }
+                expected = { du: edu, dv: edv };
+            }
+
+            const result = trackFeature(decodeToGray(templateJpg), decodeToGray(searchJpg), u, v, patch, radius, expected);
             return {
                 template_frame_id: args.template_frame_id,
                 search_frame_id: args.search_frame_id,
@@ -377,6 +412,9 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 pixel_shift: { du: result.du, dv: result.dv },
                 score: result.score,
                 second_peak_gap: result.secondPeakGap,
+                chosen_by: result.chosenBy,
+                distance_from_expected: result.distanceFromExpected,
+                raw_best: result.rawBest,
                 patch_size: patch,
                 search_radius: radius,
                 warnings: result.warnings,

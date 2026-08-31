@@ -9,6 +9,7 @@ import { ToolRegistry } from './registry';
 import { registerCalibrationTools } from './tools/calibration';
 import { registerCameraTools } from './tools/camera';
 import { registerGcodeTools } from './tools/gcode';
+import { registerLandmarkTools } from './tools/landmarks';
 import { registerMachineTools } from './tools/machine';
 import { registerStatusTools } from './tools/status';
 
@@ -105,6 +106,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerGcodeTools(registry, () => `http://127.0.0.1:${port}`);
     registerCameraTools(registry);
     registerCalibrationTools(registry);
+    registerLandmarkTools(registry);
     registeredToolCount = registry.list().length;
 
     broadcaster = socketServer || null;

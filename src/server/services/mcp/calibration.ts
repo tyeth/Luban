@@ -22,6 +22,10 @@ export interface CalibrationEntry {
     validAtY: number; // machine Y the frame was captured at
     z: number; // machine Z the frame was captured at
     matrix: [[number, number], [number, number]];
+    // Physical surface the calibration was derived on (#51): a matrix is only
+    // valid for features on the same depth plane - applying a bracket-derived
+    // matrix to the board surface read ~4x wrong on hardware (parallax).
+    surface: string | null;
     notes: string | null;
     createdAt: number;
 }
