@@ -3,11 +3,21 @@
 // the run_tool_setter arguments verbatim).
 import logger from '../../lib/logger';
 import config from '../configstore';
-import { connectionManager } from '../machine/ConnectionManager';
 import { mcpBroadcast } from './index';
-import { probeFeedService } from './probeFeed';
+import { ProbeChannel, probeFeedService } from './probeFeed';
+import {
+    COARSE_FEED,
+    FINE_FEED,
+    MAX_RETREAT_MM,
+    ProcedureAbort,
+    TRAVEL_FEED,
+    assertChannelReady,
+    assertMachineReadyForProcedure,
+    moveMachineSettled,
+    senseAfter,
+    senseReleaseAfter,
+} from './probing';
 import { McpToolError } from './registry';
-import { GcodeChannel, sendGcodeVisible } from './tools/camera';
 import { getPositionSnapshot } from './tools/machine';
 
 const log = logger('service:mcp:tool-setter');
@@ -33,13 +43,7 @@ const log = logger('service:mcp:tool-setter');
 
 const CONFIG_KEY = 'mcpToolSetter';
 
-const TRAVEL_FEED = 600; // mm/min, matches the move_z cap
-const COARSE_FEED = 100;
-const FINE_FEED = 60;
-const SETTLE_TIMEOUT_MS = 30000;
-const SETTLE_POLL_MS = 250;
-const SETTLE_TOLERANCE_MM = 0.15;
-const MAX_RETREAT_MM = 5; // still triggered after this much retreat = stuck sensor
+// Motion/sensing engine shared with the CNC touch probe: probing.ts.
 
 export interface ToolSetterConfig {
     centerX: number; // machine coords of the setter's centre
@@ -160,6 +164,10 @@ export interface ToolSetterPlan {
     // current position (wizard returns the new tool over the setter).
     stayAtTrigger: boolean;
     startFromCurrent: boolean;
+    // Measuring the spindle TOUCH PROBE on the setter: the probe's own
+    // channel fires before the setter's switch, and pressing on would bend
+    // the probe - accept EITHER channel as the height confirmation.
+    acceptProbeContact: boolean;
 }
 
 /**
@@ -178,6 +186,7 @@ export function planToolSetterRun(args: {
     store_as_reference?: boolean;
     stay_at_trigger?: boolean;
     start_from_current?: boolean;
+    accept_probe_contact?: boolean;
 }): ToolSetterPlan {
     const cfg = getToolSetterConfig();
     if (!cfg) {
@@ -228,6 +237,7 @@ export function planToolSetterRun(args: {
         storeAsReference: args.store_as_reference === true,
         stayAtTrigger: args.stay_at_trigger === true,
         startFromCurrent: args.start_from_current === true,
+        acceptProbeContact: args.accept_probe_contact === true,
     };
 }
 
@@ -296,189 +306,6 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
     return lines.join('\n');
 }
 
-interface StepResult {
-    contact: boolean;
-    reading: { value: string; receivedAt: number } | null;
-}
-
-class ProcedureAbort extends Error {}
-
-function getDirectChannel(): GcodeChannel {
-    const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
-    if (!channel || typeof channel.executeGcode !== 'function') {
-        throw new ProcedureAbort('No machine channel with direct command support.');
-    }
-    return channel;
-}
-
-async function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-        setTimeout(resolve, ms);
-    });
-}
-
-/**
- * Issue one absolute machine-frame move and block until the heartbeat
- * verifiably reports it (same contract as move_z): report newer than issue,
- * two identical consecutive beats, machine idle, and axes at target.
- */
-async function moveMachineSettled(
-    tool: string,
-    target: { x?: number; y?: number; z?: number },
-    feed: number
-): Promise<void> {
-    probeFeedService.assertNoOvertravel();
-    const channel = getDirectChannel();
-    const words = [
-        target.x !== undefined ? `X${target.x.toFixed(3)}` : '',
-        target.y !== undefined ? `Y${target.y.toFixed(3)}` : '',
-        target.z !== undefined ? `Z${target.z.toFixed(3)}` : '',
-    ].filter(Boolean).join(' ');
-    const gcode = `G90\nG53;\nG1 ${words} F${feed};\nG54;`;
-
-    // When every commanded axis moves by well over the tolerance, a stale
-    // pre-move heartbeat cannot sit within tolerance of the target, so the
-    // FIRST post-issue beat at the target is already proof of arrival - no
-    // need to wait out a second identical beat (~1-1.5s/step saved on the
-    // coarse ladder). Small steps (fine/confirm, at or under the tolerance)
-    // keep the strict stable-double-beat rule. Judged from the position
-    // BEFORE the move is issued.
-    const before = getPositionSnapshot();
-    const bigMove = (['x', 'y', 'z'] as const).every((axis) => {
-        const want = target[axis];
-        if (want === undefined) {
-            return true;
-        }
-        const from = before.machine[axis];
-        return from !== null && Math.abs(want - from) > SETTLE_TOLERANCE_MM * 3;
-    });
-
-    const issuedAt = Date.now();
-    const executed = await sendGcodeVisible(channel, tool, gcode);
-    if (executed.result !== 0) {
-        throw new ProcedureAbort(`Controller rejected the move: ${executed.text || executed.result}`);
-    }
-
-    // Fast path: the HTTP channel executes gcode synchronously and its reply
-    // echoes the position after completion ("X:.. Y:.. Z:.." in WORK
-    // coordinates, hardware-observed to always match the exact target). An
-    // exact echo match (0.02 mm, tighter than one fine step) is proof of
-    // arrival with no heartbeat wait (~2s/step saved - the heartbeat only
-    // ticks ~2s on the wifi channel). Anything less falls through to the
-    // strict heartbeat settle below.
-    const echo = String(executed.text || '').match(/X:(-?\d+(?:\.\d+)?)\s+Y:(-?\d+(?:\.\d+)?)\s+Z:(-?\d+(?:\.\d+)?)/);
-    if (echo) {
-        const offset = before.originOffset;
-        const echoMachine = {
-            x: Number(echo[1]) - offset.x,
-            y: Number(echo[2]) - offset.y,
-            z: Number(echo[3]) - offset.z,
-        };
-        const exact = (['x', 'y', 'z'] as const).every((axis) => {
-            const want = target[axis];
-            return want === undefined || Math.abs(echoMachine[axis] - want) <= 0.02;
-        });
-        if (exact) {
-            return;
-        }
-    }
-
-    const deadline = issuedAt + SETTLE_TIMEOUT_MS;
-    let previous: string | null = null;
-    while (Date.now() < deadline) {
-        await sleep(SETTLE_POLL_MS);
-        probeFeedService.assertNoOvertravel();
-        let now;
-        try {
-            now = getPositionSnapshot();
-        } catch (err) {
-            continue;
-        }
-        const reportTime = Date.now() - now.reportAgeMs;
-        const fingerprint = JSON.stringify([now.work, now.originOffset]);
-        const stable = fingerprint === previous;
-        previous = fingerprint;
-        if (reportTime <= issuedAt || now.machineStatus !== 'idle') {
-            continue;
-        }
-        if (!bigMove && !stable) {
-            continue;
-        }
-        const atTarget = (['x', 'y', 'z'] as const).every((axis) => {
-            const want = target[axis];
-            const have = now.machine[axis];
-            return want === undefined || (have !== null && Math.abs(have - want) <= SETTLE_TOLERANCE_MM);
-        });
-        if (atTarget) {
-            return;
-        }
-    }
-    throw new ProcedureAbort(`Timed out waiting for the heartbeat to verify the move to ${words}.`);
-}
-
-/**
- * After a settled step, give the sensor's report time to arrive (early-exits
- * when a fresh reading lands), then judge contact from the LAST KNOWN state -
- * the sensor publishes on change, so silence means unchanged.
- *
- * This short window is for CONTACT detection while descending, where a late
- * message merely costs one extra step before detection (self-correcting).
- */
-async function senseAfter(stepIssuedAt: number, delayMs: number): Promise<StepResult> {
-    const fresh = await probeFeedService.waitForReading('toolsetter', stepIssuedAt, delayMs);
-    const state = fresh || probeFeedService.getReading('toolsetter');
-    return {
-        contact: !!(state && state.triggered),
-        reading: state ? { value: state.value, receivedAt: state.receivedAt } : null,
-    };
-}
-
-/**
- * RELEASE detection needs different patience: a stale "triggered" here is a
- * false abort (live-hit on run 2: the cloud round-trip of the release
- * message exceeded the 200 ms contact window). Wait until the last known
- * state reads untriggered, early-exiting on fresh readings, up to timeoutMs;
- * only then is "still triggered" believed.
- */
-async function senseReleaseAfter(stepIssuedAt: number, timeoutMs: number): Promise<StepResult> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const state = probeFeedService.getReading('toolsetter');
-        if (state && !state.triggered) {
-            return { contact: false, reading: { value: state.value, receivedAt: state.receivedAt } };
-        }
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) {
-            return {
-                contact: !!(state && state.triggered),
-                reading: state ? { value: state.value, receivedAt: state.receivedAt } : null,
-            };
-        }
-        await probeFeedService.waitForReading(
-            'toolsetter',
-            state ? state.receivedAt : stepIssuedAt,
-            Math.min(remaining, 250)
-        );
-    }
-}
-
-function assertFeedReady(): void {
-    probeFeedService.assertNoOvertravel();
-    if (!probeFeedService.isConnected()) {
-        throw new McpToolError('Probe feed is not connected - connect_probe_feed first. The overtravel '
-            + 'tripwire MUST be armed for a tool setter run.');
-    }
-    const setter = probeFeedService.getReading('toolsetter');
-    if (!setter) {
-        throw new McpToolError('No reading has ever arrived on the toolsetter feed - cannot trust the '
-            + 'sensor. Ask the operator to trigger the setter by hand and watch get_probe_feed_status '
-            + 'until the touch shows up.');
-    }
-    if (setter.triggered) {
-        throw new McpToolError(`The toolsetter feed already reads triggered ("${setter.value}") before `
-            + 'any approach - the sensor is stuck or something is resting on it. Resolve physically first.');
-    }
-}
 
 export interface ToolSetterResult {
     measuredTriggerZ: number;
@@ -498,20 +325,12 @@ export interface ToolSetterResult {
  * any abort retreats to the start height when the machine still answers.
  */
 export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<object> {
-    assertFeedReady();
+    const contactChannels: ProbeChannel[] = plan.acceptProbeContact ? ['toolsetter', 'probe'] : ['toolsetter'];
+    for (const channel of contactChannels) {
+        assertChannelReady(channel, 'tool setter');
+    }
+    assertMachineReadyForProcedure();
     const position = getPositionSnapshot();
-    if (position.machineStatus !== 'idle') {
-        throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
-    }
-    if (position.isHomed !== true) {
-        throw new McpToolError('Machine does not report homed; the tool setter centre is only valid '
-            + 'after homing. Call home first.');
-    }
-    const state = connectionManager.getLatestMachineState() as { headStatus?: unknown; headPower?: unknown } | null;
-    const headPower = Number(state && state.headPower);
-    if ((Number.isFinite(headPower) && headPower > 0) || (state && (state.headStatus === true || state.headStatus === 'on'))) {
-        throw new McpToolError('Toolhead appears to be on; refusing to run the tool setter.');
-    }
 
     const phases: { phase: string; z: number; note?: string }[] = [];
     const c = plan.config;
@@ -560,7 +379,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             const stepStart = Date.now();
             currentZ = Math.max(currentZ - plan.coarseStepMm, plan.coarseFloorZ);
             await moveMachineSettled('toolsetter:coarse', { z: currentZ }, COARSE_FEED);
-            const sensed = await senseAfter(stepStart, plan.sensorDelayMs);
+            const sensed = await senseAfter(contactChannels, stepStart, plan.sensorDelayMs);
             if (sensed.contact) {
                 coarseContactZ = currentZ;
                 announce('coarse-contact', currentZ,
@@ -582,7 +401,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
                 const stepStart = Date.now();
                 currentZ += plan.coarseStepMm;
                 await moveMachineSettled('toolsetter:release', { z: currentZ }, COARSE_FEED);
-                const sensed = await senseReleaseAfter(stepStart, releaseTimeoutMs);
+                const sensed = await senseReleaseAfter(contactChannels, stepStart, releaseTimeoutMs);
                 if (!sensed.contact) {
                     releasedZ = currentZ;
                     announce('released', currentZ);
@@ -604,10 +423,10 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             const stepStart = Date.now();
             currentZ -= plan.fineStepMm;
             await moveMachineSettled('toolsetter:fine', { z: currentZ }, FINE_FEED);
-            const sensed = await senseAfter(stepStart, plan.sensorDelayMs);
+            const sensed = await senseAfter(contactChannels, stepStart, plan.sensorDelayMs);
             if (sensed.contact) {
                 fineContactZ = currentZ;
-                announce('fine-contact', currentZ, `sensor "${sensed.reading?.value}"`);
+                announce('fine-contact', currentZ, `${sensed.channel} sensor "${sensed.reading?.value}"`);
                 break;
             }
         }
@@ -630,7 +449,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             const liftIssuedAt = Date.now();
             currentZ = referenceContactZ + plan.backoffMm;
             await moveMachineSettled('toolsetter:backoff', { z: currentZ }, FINE_FEED);
-            const liftSense = await senseReleaseAfter(liftIssuedAt, releaseTimeoutMs);
+            const liftSense = await senseReleaseAfter(contactChannels, liftIssuedAt, releaseTimeoutMs);
             if (liftSense.contact) {
                 throw new ProcedureAbort(`Sensor still triggered ${releaseTimeoutMs} ms after backing off `
                     + `${plan.backoffMm} mm - trigger hysteresis exceeds the backoff. Rerun with a larger backoff_mm.`);
@@ -640,7 +459,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
                 const stepStart = Date.now();
                 currentZ -= plan.fineStepMm;
                 await moveMachineSettled('toolsetter:confirm', { z: currentZ }, FINE_FEED);
-                const sensed = await senseAfter(stepStart, plan.sensorDelayMs);
+                const sensed = await senseAfter(contactChannels, stepStart, plan.sensorDelayMs);
                 if (sensed.contact) {
                     passContact = currentZ;
                     break;
@@ -666,7 +485,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             const holdIssuedAt = Date.now();
             currentZ = measuredZ;
             await moveMachineSettled('toolsetter:hold', { z: currentZ }, FINE_FEED);
-            await probeFeedService.waitForReading('toolsetter', holdIssuedAt, plan.sensorDelayMs);
+            await senseAfter(contactChannels, holdIssuedAt, plan.sensorDelayMs);
             announce('holding-at-trigger', measuredZ, 'NOT retreating - touchscreen wizard takes over');
         } else {
             await moveMachineSettled('toolsetter:retreat', { z: plan.startZ }, TRAVEL_FEED);

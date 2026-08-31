@@ -204,12 +204,29 @@ export class McpServer {
             return rpcError(id, JSONRPC_INVALID_PARAMS, `Unknown tool: ${name}`);
         }
 
-        // One line per call, arguments elided (they can carry whole gcode
-        // files); enough to follow agent activity from the server log.
+        // Every call logs its arguments and a result summary (truncated -
+        // args can carry whole gcode files, results whole images), so the
+        // server log alone tells the story of an agent session.
+        const summarize = (value: unknown, limit: number): string => {
+            let text: string;
+            try {
+                text = JSON.stringify(value, (key, v) => {
+                    if (typeof v === 'string' && v.length > 300) {
+                        return `${v.slice(0, 120)}...<${v.length} chars>`;
+                    }
+                    return v;
+                }) || 'undefined';
+            } catch (err) {
+                text = String(value);
+            }
+            return text.length > limit ? `${text.slice(0, limit)}...<truncated>` : text;
+        };
+        const args = ((params && params.arguments) as object) || {};
         const startedAt = Date.now();
+        log.info(`tool ${name} <- ${summarize(args, 600)}`);
         try {
-            const result = await this.registry.call(name, ((params && params.arguments) as object) || {});
-            log.info(`tool ${name} ok in ${Date.now() - startedAt}ms`);
+            const result = await this.registry.call(name, args);
+            log.info(`tool ${name} ok in ${Date.now() - startedAt}ms -> ${summarize(result, 900)}`);
             this.onActivity && this.onActivity({ tool: name, ok: true, durationMs: Date.now() - startedAt });
             // A tool that returns non-text content (e.g. an image) supplies
             // the MCP content array itself via mcpContent.

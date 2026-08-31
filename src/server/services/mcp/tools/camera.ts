@@ -1,5 +1,6 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
+import logger from '../../../lib/logger';
 import config from '../../configstore';
 import { mcpBroadcast } from '../index';
 import { connectionManager } from '../../machine/ConnectionManager';
@@ -29,15 +30,21 @@ export interface GcodeChannel {
     executeGcode?: (gcode: string) => Promise<{ result: number; text?: string }>;
 }
 
+const gcodeLog = logger('service:mcp:gcode');
+
 /**
  * Send gcode on the direct path AND mirror exactly what was sent (plus the
- * controller's reply) to the UI console, so the operator can see which
- * coordinate frame every MCP-issued command ran in.
+ * controller's reply) to the UI console AND the server log - the console
+ * broadcast is invisible to anyone reading the process log, and a headless
+ * session debugging "controller said ok but nothing moved" needs the reply.
  */
 export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string): Promise<{ result: number; text?: string }> {
     mcpBroadcast('mcp:gcode', { tool, gcode });
+    gcodeLog.info(`[${tool}] > ${gcode.replace(/\r?\n/g, ' | ')}`);
     const executed = await channel.executeGcode(gcode);
-    mcpBroadcast('mcp:gcode', { tool, response: executed.text || (executed.result === 0 ? 'ok' : `result=${executed.result}`) });
+    const response = executed.text || (executed.result === 0 ? 'ok' : `result=${executed.result}`);
+    mcpBroadcast('mcp:gcode', { tool, response });
+    gcodeLog.info(`[${tool}] < ${String(response).replace(/\r?\n/g, ' | ')}`);
     return executed;
 }
 
