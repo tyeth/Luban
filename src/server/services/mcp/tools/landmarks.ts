@@ -4,6 +4,7 @@ import config from '../../configstore';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { calibrationStore } from '../calibration';
 import { Landmark, landmarkStore } from '../landmarks';
+import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 
 // Named scene landmarks (#50) and the stored-state overview (#53): operator
@@ -112,6 +113,7 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                     lastGoodDevice: config.get('mcpCameraLastGood') || null,
                 },
                 installedModules: config.get('mcpInstalledModules') || [],
+                probeFeed: probeFeedService.status(),
             };
         },
     });

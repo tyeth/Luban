@@ -21,6 +21,7 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 | `mcpMaxJogDistance` | Per-call XY travel cap for direct moves, default 100 mm. `goto_work_origin` is exempt (fixed operator-set destination). |
 | `mcpToolRegion` | Fractional box where the endmill images (fixed camera-to-spindle geometry); returned with every frame; settable via the `set_tool_region` tool. |
 | `mcpInstalledModules` | e.g. `["snapmaker-2.0-bracing-kit-module"]` — feeds effective work ranges in `get_machine_profile`. |
+| `mcpMqtt*` | Probe sensor feed (MQTT): `Host`, `Port` (default 8883 = TLS, 1883 = plain), `User`, `Pass`, `ClientId` (default = username + MAC bytes), `FeedToolsetter`, `FeedOvertravel`, `FeedProbe` (Adafruit IO feed key, or a full topic when it contains `/`), `Inverted` (comma-separated channels whose sensor idles HIGH and reads low on contact — the operator's CNC touch probe is normally open, so `"probe"`). Env `LUBAN_MCP_MQTT_HOST/PORT/USER/PASS/CLIENT_ID/FEED_TOOLSETTER/FEED_OVERTRAVEL/FEED_PROBE/INVERTED` override field-by-field. |
 
 A project-scope `.mcp.json` at the repo root points Claude Code sessions at
 `http://127.0.0.1:40889/mcp` automatically.
@@ -43,8 +44,26 @@ mcp/
   camera.ts      capture providers, frame cache (last 12, frameId), sticky device
   tracking.ts    zero-mean NCC template matching between cached frames
   calibration.ts Y/Z-keyed pixel->mm calibration store (userDataDir, persists)
-  tools/         status, machine, gcode, camera, calibration registrations
+  mqtt.ts        minimal MQTT 3.1.1 client over net/tls (hand-rolled, no deps)
+  probeFeed.ts   external probe sensor feed: config resolution (env->config),
+                 last-reading cache per channel, overtravel tripwire latch
+  tools/         status, machine, gcode, camera, calibration, probe registrations
 ```
+
+External probe sensors (tool height setter, overtravel switch, CNC touch probe) report
+over a message feed, not the controller. The transport is abstracted behind
+`ProbeFeedService`; the first implementation is MQTT (built for Adafruit IO:
+`{user}/feeds/{key}` topics, TLS on 8883, and a `<topic>/get` publish primes the last
+value on connect). The feed auto-connects at service start when fully configured, and
+verified against public brokers over both plain TCP and TLS.
+
+**Overtravel tripwire**: any triggered reading on the overtravel channel immediately
+stops the running job, force-closes the machine connection, latches an alarm that blocks
+every motion tool (`assertNoOvertravel` in `assertSafeToMove`, `home`, `move_z`,
+`start_gcode_job`), and reports to the operator. The latch clears only via
+`clear_overtravel_alarm` on the operator's explicit word (refused while the feed still
+reads triggered) or an application restart. `disconnect_probe_feed` disarms the tripwire
+— never disconnect while a probing procedure could run.
 
 UI integration: verbose console toggle (Workspace) mirrors heartbeat position changes,
 every MCP-sent gcode line and controller reply (`[mcp:home] > G28` / `< X:-19.00 ...`),
@@ -97,7 +116,7 @@ and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whit
 - Fleet: machine named "Snapmaker" @ 192.168.1.173 = the A350 CNC; "F350" @ .130 = the
   3D printer. Same Luban profile identifier — distinguish by NAME/address, never profile.
 
-## Tool surface (24)
+## Tool surface (28)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
@@ -112,8 +131,10 @@ step per call; trips when the error fails to shrink OR when the measured respons
 from the calibration prediction — the depth-plane parallax signature) ·
 `set_landmark` / `delete_landmark` (named scene features by machine extent; nearby ones are
 surfaced on every capture) · `get_stored_state` (one-call orientation: calibrations,
-landmarks, tool region, limits, camera config, connection — call this first in a fresh
-session).
+landmarks, tool region, limits, camera config, connection, probe feed — call this first in
+a fresh session) · `get_probe_feed_status` · `connect_probe_feed` / `disconnect_probe_feed`
+(MQTT sensor feed; connecting arms the overtravel tripwire) · `clear_overtravel_alarm`
+(operator's explicit word only).
 
 ## Development workflow (learned the hard way)
 

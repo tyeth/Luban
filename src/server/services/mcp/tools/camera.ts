@@ -7,6 +7,7 @@ import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCam
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { landmarkStore } from '../landmarks';
+import { probeFeedService } from '../probeFeed';
 import { PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
@@ -110,6 +111,7 @@ function frameContent(frame: CapturedFrame, meta: object): object {
 }
 
 function assertSafeToMove(position: PositionSnapshot, operatorConfirmedClearance: boolean): void {
+    probeFeedService.assertNoOvertravel();
     if (position.machineStatus !== 'idle') {
         throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
     }
@@ -467,6 +469,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
             additionalProperties: false,
         },
         handler: async (args: { wait_until_moved?: boolean }) => {
+            probeFeedService.assertNoOvertravel();
             const before = getPositionSnapshot();
             if (before.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${before.machineStatus || 'in an unknown state'}, not idle.`);
