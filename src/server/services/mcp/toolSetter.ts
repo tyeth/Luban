@@ -48,15 +48,51 @@ export interface ToolSetterConfig {
     referenceBitLengthMm: number;
     longestBitLengthMm: number;
     floorMarginMm: number; // how far below the expected trigger Z to allow
+    // Tool-change park position (machine coords), operator preference: on
+    // this setup Z = the homing height and X = the far end; Y is free (null
+    // = leave the current Y alone).
+    changeX: number | null;
+    changeY: number | null;
+    changeZ: number | null;
     notes: string | null;
 }
 
-export function getToolSetterConfig(): ToolSetterConfig | null {
+/** One completed tool setter measurement, kept for tool-change offsets. */
+export interface ToolMeasurement {
+    measuredTriggerZ: number;
+    bitLengthMm: number;
+    spreadMm: number;
+    at: number;
+}
+
+function rawConfig(): { [key: string]: unknown } {
     const raw = config.get(CONFIG_KEY);
+    return raw && typeof raw === 'object' ? (raw as { [key: string]: unknown }) : {};
+}
+
+function numberOrNull(value: unknown): number | null {
+    return Number.isFinite(Number(value)) && value !== null && value !== '' && value !== undefined
+        ? Number(value) : null;
+}
+
+function parseMeasurement(raw: unknown): ToolMeasurement | null {
     if (!raw || typeof raw !== 'object') {
         return null;
     }
-    const cfg = raw as { [key: string]: unknown };
+    const m = raw as { [key: string]: unknown };
+    if (!Number.isFinite(Number(m.measuredTriggerZ)) || !Number.isFinite(Number(m.at))) {
+        return null;
+    }
+    return {
+        measuredTriggerZ: Number(m.measuredTriggerZ),
+        bitLengthMm: Number(m.bitLengthMm),
+        spreadMm: Number(m.spreadMm) || 0,
+        at: Number(m.at),
+    };
+}
+
+export function getToolSetterConfig(): ToolSetterConfig | null {
+    const cfg = rawConfig();
     const numbers = ['centerX', 'centerY', 'triggerZ', 'referenceBitLengthMm', 'longestBitLengthMm'];
     if (numbers.some((key) => !Number.isFinite(Number(cfg[key])))) {
         return null;
@@ -68,14 +104,36 @@ export function getToolSetterConfig(): ToolSetterConfig | null {
         referenceBitLengthMm: Number(cfg.referenceBitLengthMm),
         longestBitLengthMm: Number(cfg.longestBitLengthMm),
         floorMarginMm: Number.isFinite(Number(cfg.floorMarginMm)) ? Number(cfg.floorMarginMm) : 3,
+        changeX: numberOrNull(cfg.changeX),
+        changeY: numberOrNull(cfg.changeY),
+        changeZ: numberOrNull(cfg.changeZ),
         notes: cfg.notes ? String(cfg.notes) : null,
     };
 }
 
+/** Merge-write: measurement history and unknown fields survive config edits. */
 export function setToolSetterConfig(cfg: ToolSetterConfig): void {
-    config.set(CONFIG_KEY, cfg);
+    config.set(CONFIG_KEY, { ...rawConfig(), ...cfg });
     log.info(`Tool setter config stored: centre (${cfg.centerX}, ${cfg.centerY}), `
         + `trigger Z ${cfg.triggerZ} with ${cfg.referenceBitLengthMm} mm reference bit`);
+}
+
+export function getMeasurements(): { last: ToolMeasurement | null; previous: ToolMeasurement | null } {
+    const cfg = rawConfig();
+    return {
+        last: parseMeasurement(cfg.lastMeasurement),
+        previous: parseMeasurement(cfg.previousMeasurement),
+    };
+}
+
+/** Record a completed measurement, shifting the old one down a slot. */
+export function recordMeasurement(measurement: ToolMeasurement): void {
+    const cfg = rawConfig();
+    config.set(CONFIG_KEY, {
+        ...cfg,
+        previousMeasurement: cfg.lastMeasurement || null,
+        lastMeasurement: measurement,
+    });
 }
 
 export interface ToolSetterPlan {
@@ -97,6 +155,11 @@ export interface ToolSetterPlan {
     sensorDelayMs: number;
     confirmPasses: number;
     storeAsReference: boolean;
+    // Touchscreen manual-swap wizard support: hold at the measured trigger
+    // (in contact) instead of retreating, and/or start the descent from the
+    // current position (wizard returns the new tool over the setter).
+    stayAtTrigger: boolean;
+    startFromCurrent: boolean;
 }
 
 /**
@@ -113,6 +176,8 @@ export function planToolSetterRun(args: {
     start_clearance_mm?: number;
     slow_zone_mm?: number;
     store_as_reference?: boolean;
+    stay_at_trigger?: boolean;
+    start_from_current?: boolean;
 }): ToolSetterPlan {
     const cfg = getToolSetterConfig();
     if (!cfg) {
@@ -161,6 +226,8 @@ export function planToolSetterRun(args: {
         sensorDelayMs,
         confirmPasses,
         storeAsReference: args.store_as_reference === true,
+        stayAtTrigger: args.stay_at_trigger === true,
+        startFromCurrent: args.start_from_current === true,
     };
 }
 
@@ -186,9 +253,16 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
         '; overtravel feed trips -> job stop + connection close + latched alarm',
         'G90',
         'G53;',
-        `G0 X${c.centerX.toFixed(3)} Y${c.centerY.toFixed(3)}; XY to setter centre at current (post-home) Z`,
-        `G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; travel to start height`,
     ];
+    if (plan.startFromCurrent) {
+        lines.push('; START FROM CURRENT POSITION (verified over the setter centre within 1.5 mm);',
+            '; no travel moves - the descent below begins at the current Z (capped at the start height).');
+    } else {
+        lines.push(
+            `G0 X${c.centerX.toFixed(3)} Y${c.centerY.toFixed(3)}; XY to setter centre at current (post-home) Z`,
+            `G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; travel to start height`,
+        );
+    }
     let z = plan.startZ;
     let step = 0;
     while (z - plan.coarseStepMm >= plan.coarseFloorZ - 1e-9) {
@@ -211,9 +285,14 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
         `; ...on contact: ${plan.confirmPasses} quick confirm cycles, each = lift ${plan.backoffMm} mm, wait for the`,
         `; sensor to release, re-approach in ${plan.fineStepMm} mm steps to contact. Result = median of the`,
         '; cycle contacts (spread reported); a cycle never descends more than 0.5 mm below first contact.',
-        `G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; retreat to start height when done (also on any abort)`,
-        'G54;',
     );
+    if (plan.stayAtTrigger) {
+        lines.push('; HOLD AT TRIGGER when done: the tip stays in contact for the touchscreen manual-swap',
+            `; wizard - NO final retreat. (Any ABORT still retreats to Z ${plan.startZ.toFixed(3)}.)`);
+    } else {
+        lines.push(`G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; retreat to start height when done (also on any abort)`);
+    }
+    lines.push('G54;');
     return lines.join('\n');
 }
 
@@ -443,13 +522,33 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
 
     let currentZ = plan.startZ;
     try {
-        // Phase 1: position over the centre, then travel down to start height.
-        // XY first at the current (post-home, high) Z, so the bit never sweeps
-        // across the bed at approach height.
-        announce('travel-xy', position.machine.z ?? plan.startZ, `XY to (${c.centerX}, ${c.centerY})`);
-        await moveMachineSettled('toolsetter:travel', { x: c.centerX, y: c.centerY }, TRAVEL_FEED);
-        announce('travel-z', plan.startZ);
-        await moveMachineSettled('toolsetter:travel', { z: plan.startZ }, TRAVEL_FEED);
+        if (plan.startFromCurrent) {
+            // Touchscreen-wizard flow: the machine is already positioned over
+            // the setter (the wizard returns it there after the swap). Verify
+            // rather than trust, then descend from where we are.
+            const { x, y, z } = position.machine;
+            if (x === null || y === null || z === null) {
+                throw new ProcedureAbort('start_from_current: current machine position unknown.');
+            }
+            if (Math.abs(x - c.centerX) > 1.5 || Math.abs(y - c.centerY) > 1.5) {
+                throw new ProcedureAbort(`start_from_current: machine XY (${x.toFixed(1)}, ${y.toFixed(1)}) `
+                    + `is not over the setter centre (${c.centerX}, ${c.centerY}) within 1.5 mm.`);
+            }
+            if (z <= plan.floorZ) {
+                throw new ProcedureAbort(`start_from_current: machine Z ${z.toFixed(2)} is at or below the `
+                    + `hard floor ${plan.floorZ.toFixed(2)}.`);
+            }
+            currentZ = Math.min(z, plan.startZ);
+            announce('start-from-current', currentZ, 'skipping travel; descending from the current position');
+        } else {
+            // Phase 1: position over the centre, then travel down to start
+            // height. XY first at the current (post-home, high) Z, so the bit
+            // never sweeps across the bed at approach height.
+            announce('travel-xy', position.machine.z ?? plan.startZ, `XY to (${c.centerX}, ${c.centerY})`);
+            await moveMachineSettled('toolsetter:travel', { x: c.centerX, y: c.centerY }, TRAVEL_FEED);
+            announce('travel-z', plan.startZ);
+            await moveMachineSettled('toolsetter:travel', { z: plan.startZ }, TRAVEL_FEED);
+        }
 
         // Phase 2: coarse descent, sensor-checked after every settled step,
         // ONLY down to the slow zone above the expected trigger. Contact in
@@ -560,11 +659,27 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         const spreadMm = Number((sorted[sorted.length - 1] - sorted[0]).toFixed(3));
         announce('measured', measuredZ, `median of [${passContacts.join(', ')}], spread ${spreadMm} mm`);
 
-        // Phase 6: retreat to the start height and report.
-        await moveMachineSettled('toolsetter:retreat', { z: plan.startZ }, TRAVEL_FEED);
-        announce('retreated', plan.startZ);
+        // Phase 6: retreat to the start height - unless the touchscreen
+        // manual-swap wizard needs the tip HELD at the trigger so the
+        // operator can confirm the matched position there.
+        if (plan.stayAtTrigger) {
+            const holdIssuedAt = Date.now();
+            currentZ = measuredZ;
+            await moveMachineSettled('toolsetter:hold', { z: currentZ }, FINE_FEED);
+            await probeFeedService.waitForReading('toolsetter', holdIssuedAt, plan.sensorDelayMs);
+            announce('holding-at-trigger', measuredZ, 'NOT retreating - touchscreen wizard takes over');
+        } else {
+            await moveMachineSettled('toolsetter:retreat', { z: plan.startZ }, TRAVEL_FEED);
+            announce('retreated', plan.startZ);
+        }
 
         const derivedBitLengthMm = c.referenceBitLengthMm + (measuredZ - c.triggerZ);
+        recordMeasurement({
+            measuredTriggerZ: measuredZ,
+            bitLengthMm: plan.bitLengthMm,
+            spreadMm,
+            at: Date.now(),
+        });
         let storedAsReference = false;
         if (plan.storeAsReference) {
             setToolSetterConfig({
@@ -587,7 +702,10 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             note: `Trigger at machine Z ${measuredZ.toFixed(3)} - median of ${plan.confirmPasses} confirm `
                 + `passes [${passContacts.join(', ')}], spread ${spreadMm} mm (+/- ${plan.fineStepMm} mm step `
                 + 'resolution). The derived bit length assumes the stored reference is exact; report it '
-                + 'with that uncertainty.',
+                + `with that uncertainty.${plan.stayAtTrigger
+                    ? ' HOLDING AT THE TRIGGER (in contact, no retreat): the operator confirms on the '
+                        + 'touchscreen wizard from here - send no other motion until they say the swap flow is done.'
+                    : ''}`,
             warning: spreadMm > plan.fineStepMm + 1e-9
                 ? `Confirm passes spread ${spreadMm} mm exceeds one fine step - feed timing was unstable; `
                     + 'consider more confirm_passes or a longer sensor_delay_ms.'

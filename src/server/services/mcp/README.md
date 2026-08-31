@@ -102,7 +102,9 @@ and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whit
 - Controller has **G53 (machine workspace) and G54+ (numbered workspaces)**; the heartbeat
   `pos` is in the *currently selected* workspace. Convention everywhere:
   `machine = work − originOffset`.
-- **Machine home = (−19, 342, 328)**; homing = `G53;G28;G54` exactly like Luban's button
+- **Machine home = (−19, 342, 328)**; **firmware X limit = 339** (sweep-verified 2026-09-01:
+  tracks requests exactly through 330, clamps a 340 request at 339 — the tool-change park X);
+  homing = `G53;G28;G54` exactly like Luban's button
   (a bare G28 leaves reporting in an unselected workspace → impossible derived coords like
   Y 464/Z 656). Homing takes ~15–20 s and **also homes B — stock on the rotary rotates**.
 - **Work origins are operator-set per workspace and persist across homing.**
@@ -120,7 +122,7 @@ and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whit
 - Fleet: machine named "Snapmaker" @ 192.168.1.173 = the A350 CNC; "F350" @ .130 = the
   3D printer. Same Luban profile identifier — distinguish by NAME/address, never profile.
 
-## Tool surface (31)
+## Tool surface (33)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
@@ -144,7 +146,30 @@ measurement: ONE operator approval covers a server-driven envelope-bounded routi
 centre, Z to `triggerZ + (longest−ref) + 50`, 1 mm sensor-gated descent, release, 0.1 mm
 approach, 0.3 mm backoff, ≥2 s/0.1 mm confirm pass, retreat; hard floor at expected
 trigger − margin; requires the probe feed connected and the toolsetter sensor readable
-and untriggered; `store_as_reference` locks the measured Z in as the new reference).
+and untriggered; `store_as_reference` locks the measured Z in as the new reference;
+`stay_at_trigger` / `start_from_current` support the touchscreen swap wizard) ·
+`goto_tool_change_position` (two approved steps: Z up, then X/Y to the operator-set park) ·
+`apply_tool_length_offset` (confirmed G92 shifting work-origin Z by the measured
+new−old tool length difference — flow A only).
+
+## Tool change workflows
+
+**A — MCP-managed offset**: measure old tool (`run_tool_setter`) →
+`goto_tool_change_position` (operator-set park: machine Z at homing height, X at the far
+end, Y free — stored via `set_tool_setter_config` `tool_change_x/y/z`) → operator swaps by
+hand → measure new tool → `apply_tool_length_offset` stages a single
+`G92 Z(current work Z − (new−old))` for confirmation: nothing moves, the work frame shifts
+so work Z 0 stays on the same physical plane. Measurement history (last/previous) persists
+in the config; deltas over 50 mm are refused.
+
+**B — touchscreen manual-swap wizard**: the firmware matches tip positions itself, so MCP
+applies NO offset. `run_tool_setter` with `stay_at_trigger: true` measures and HOLDS the
+tip in contact for the operator to confirm on the touchscreen; after the swap the wizard
+returns the tool over the setter, and the second run adds `start_from_current: true`
+(skips travel, verified over the centre within 1.5 mm). Never combine flow B with
+`apply_tool_length_offset` — it would double-apply.
+
+Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
 
 ## Development workflow (learned the hard way)
 
