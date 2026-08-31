@@ -32,8 +32,11 @@ export type McpJobState =
  * the firmware parks at the work origin on completion). 'direct' executes
  * over execute_code on approval - it persists position but is NOT subject to
  * the door interlock, so the confirm page says so and the operator supervises.
+ * 'procedure' is a server-driven measurement routine (e.g. the tool setter):
+ * the operator approves a motion ENVELOPE and the runner steps within it
+ * against live sensor feedback - also on the direct path, not interlocked.
  */
-export type McpJobKind = 'file' | 'direct';
+export type McpJobKind = 'file' | 'direct' | 'procedure';
 
 export interface McpJob {
     id: string;
@@ -57,6 +60,9 @@ export interface McpJob {
     // Staged default for direct execution: whether start_gcode_job should
     // block until the move verifiably settles (call-time arg overrides).
     waitUntilMoved?: boolean;
+    // Procedure jobs: the server-side runner start_gcode_job invokes after
+    // the operator's token is consumed. Never serialised or described.
+    runner?: () => Promise<object>;
 }
 
 function escapeHtml(text: string): string {
@@ -234,15 +240,23 @@ export class JobManager {
             ? `<ul>${v.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`
             : '<p>None.</p>';
 
-        const directBanner = job.kind === 'direct'
-            ? `<p style="background:#fff3cd;border:1px solid #b8860b;padding:10px">
+        let directBanner = '';
+        if (job.kind === 'direct') {
+            directBanner = `<p style="background:#fff3cd;border:1px solid #b8860b;padding:10px">
                    <strong>DIRECT MOVE</strong>: on start this executes over the realtime path so the
                    position <em>persists</em> - but it does NOT run as a job, so the enclosure door
-                   interlock does not apply. Supervise it.</p>`
-            : '';
+                   interlock does not apply. Supervise it.</p>`;
+        } else if (job.kind === 'procedure') {
+            directBanner = `<p style="background:#fff3cd;border:1px solid #b8860b;padding:10px">
+                   <strong>SERVER-DRIVEN PROCEDURE</strong>: on start the server steps the machine
+                   within the envelope below, gated by live probe-sensor feedback - it stops early on
+                   contact and can never exceed the extents shown. It runs on the realtime path, so
+                   the enclosure door interlock does NOT apply, and the overtravel tripwire must be
+                   armed. Supervise it.</p>`;
+        }
 
         return `
-            <h2>Confirm ${job.kind === 'direct' ? 'DIRECT move' : 'G-code job'}: ${escapeHtml(job.name)}</h2>
+            <h2>Confirm ${{ direct: 'DIRECT move', procedure: 'SERVER-DRIVEN procedure', file: 'G-code job' }[job.kind]}: ${escapeHtml(job.name)}</h2>
             <p>Submitted by an agent over MCP. Review before approving - approval mints a
                one-time code the agent needs to start it.</p>
             ${directBanner}

@@ -14,6 +14,7 @@ import { registerLandmarkTools } from './tools/landmarks';
 import { registerMachineTools } from './tools/machine';
 import { registerProbeTools } from './tools/probe';
 import { registerStatusTools } from './tools/status';
+import { registerToolSetterTools } from './tools/toolsetter';
 
 const log = logger('service:mcp');
 
@@ -110,6 +111,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerCalibrationTools(registry);
     registerLandmarkTools(registry);
     registerProbeTools(registry);
+    registerToolSetterTools(registry, () => `http://127.0.0.1:${port}`);
     registeredToolCount = registry.list().length;
 
     broadcaster = socketServer || null;
