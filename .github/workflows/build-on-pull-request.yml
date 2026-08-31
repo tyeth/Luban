@@ -2,13 +2,30 @@ name: Build on PR
 
 on:
     workflow_dispatch:
+        inputs:
+            platforms:
+                description: 'Platforms to build'
+                type: choice
+                default: all
+                options:
+                    - windows
+                    - macos
+                    - linux
+                    - all
     push:
         branches:
             - main
             - release/*
+
+# Repeat dispatches on the same ref supersede the previous run.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
 jobs:
     build-windows:
         name: Build Windows Packages
+        if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'windows' || inputs.platforms == 'all'
         runs-on: windows-2022
         steps:
             -   name: Prepare VC++ Runtime
@@ -17,7 +34,7 @@ jobs:
             -   name: Checkout Code
                 uses: actions/checkout@v4
                 with:
-                    token: ${{ secrets.SACP_TOKEN }}
+                    token: ${{ secrets.SACP_TOKEN || github.token }}
                     submodules: 'true'
 
             -   name: Checkout submodules
@@ -68,6 +85,7 @@ jobs:
                     path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-win-x64.exe
 
             -   name: Deploy Windows release
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                     overwrite: true
@@ -81,6 +99,7 @@ jobs:
 
     build-macos:
        name: Build macOS Packages
+       if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'macos' || inputs.platforms == 'all'
 
        # macos-11.7
        runs-on: macos-latest
@@ -89,7 +108,7 @@ jobs:
            -   name: Checkout Code
                uses: actions/checkout@v4
                with:
-                   token: ${{ secrets.SACP_TOKEN }}
+                   token: ${{ secrets.SACP_TOKEN || github.token }}
                    submodules: 'true'
 
            -   name: Checkout submodules
@@ -147,6 +166,7 @@ jobs:
                    path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-mac-arm64.dmg
 
            -    name: Deploy mac-arm64-dmg nightly
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                    upload_url: https://uploads.github.com/repos/Snapmaker/Luban/releases/190586441/assets{?name,label}
@@ -163,6 +183,7 @@ jobs:
                    name: ${{ env.SM_RELEASE }}-mac-arm64.zip
                    path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-mac-arm64.zip
            -    name: Deploy mac-arm64-zip nightly
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                    upload_url: https://uploads.github.com/repos/Snapmaker/Luban/releases/190586441/assets{?name,label}
@@ -181,6 +202,7 @@ jobs:
                    name: ${{ env.SM_RELEASE }}-mac-x64.dmg
                    path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-mac-x64.dmg
            -    name: Deploy mac-x64-dmg nightly
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                    upload_url: https://uploads.github.com/repos/Snapmaker/Luban/releases/190586441/assets{?name,label}
@@ -197,6 +219,7 @@ jobs:
                    name: ${{ env.SM_RELEASE }}-mac-x64.zip
                    path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-mac-x64.zip
            -    name: Deploy mac-x64-dmg nightly
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                    upload_url: https://uploads.github.com/repos/Snapmaker/Luban/releases/190586441/assets{?name,label}
@@ -209,6 +232,7 @@ jobs:
 
     build-linux:
         name: Build Linux Packages
+        if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'linux' || inputs.platforms == 'all'
 
         # Ubuntu 20.04: ubuntu-latest or ubuntu-20.04
         runs-on: ubuntu-latest
@@ -216,7 +240,7 @@ jobs:
             -   name: Checkout Code
                 uses: actions/checkout@v4
                 with:
-                    token: ${{ secrets.SACP_TOKEN }}
+                    token: ${{ secrets.SACP_TOKEN || github.token }}
                     submodules: 'true'
 
             -   name: Checkout submodules
@@ -271,6 +295,7 @@ jobs:
                     name: ${{ env.SM_RELEASE }}-linux-amd64.deb
                     path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-linux-amd64.deb
             -   name: Deploy Linux-deb nightly
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                     upload_url: https://uploads.github.com/repos/Snapmaker/Luban/releases/190586441/assets{?name,label}
@@ -288,6 +313,7 @@ jobs:
                     name: ${{ env.SM_RELEASE }}-linux.x86_64.rpm
                     path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-linux.x86_64.rpm
             -   name: Deploy Linux-rpm nightly
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                     upload_url: https://uploads.github.com/repos/Snapmaker/Luban/releases/190586441/assets{?name,label}
@@ -306,6 +332,7 @@ jobs:
                     path: ${{ github.workspace }}/output/${{ env.SM_RELEASE }}-linux-x64.tar.gz
 
             -   name: Deploy Linux-tar nightly
+                if: github.repository == 'Snapmaker/Luban'
                 uses: WebFreak001/deploy-nightly@v3.2.0
                 with:
                     upload_url: https://uploads.github.com/repos/Snapmaker/Luban/releases/190586441/assets{?name,label}
