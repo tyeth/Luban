@@ -158,12 +158,20 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
             if (!verboseRef.current) {
                 return;
             }
-            const { tool, ok, durationMs, error } = options || {};
+            const { tool, ok, durationMs, error, phase, ...rest } = options || {};
             const terminal = terminalRef.current;
             if (!terminal) {
                 return;
             }
-            if (ok) {
+            if (phase !== undefined) {
+                // Event-style activity (probe feed readings, procedure phase
+                // announcements) - not a tool call, so no ok/duration.
+                const detail = Object.entries(rest)
+                    .map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`)
+                    .join(' ');
+                const line = `${stamp()}[mcp] ${tool} ${phase}${detail ? ` ${detail}` : ''}`;
+                terminal.writeln(phase === 'OVERTRAVEL_ALARM' ? color.red(line) : color.cyan(line));
+            } else if (ok) {
                 terminal.writeln(color.cyan(`${stamp()}[mcp] ${tool} ok ${durationMs}ms`));
             } else {
                 terminal.writeln(color.red(`${stamp()}[mcp] ${tool} failed ${durationMs}ms: ${String(error || '').slice(0, 160)}`));

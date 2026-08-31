@@ -4,6 +4,7 @@ import * as fs from 'fs-extra';
 
 import { connectionManager } from '../../machine/ConnectionManager';
 import { jobManager } from '../jobs';
+import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 import { validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
@@ -185,6 +186,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             additionalProperties: false,
         },
         handler: async (args: { job_id?: string; confirm_token?: string; wait_until_moved?: boolean }) => {
+            probeFeedService.assertNoOvertravel();
             const job = jobManager.get(String(args.job_id || ''));
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
@@ -341,6 +343,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             reason?: string;
             wait_until_moved?: boolean;
         }) => {
+            probeFeedService.assertNoOvertravel();
             if ((args.z === undefined) === (args.z_targets === undefined)) {
                 throw new McpToolError('Provide exactly one of z or z_targets.');
             }

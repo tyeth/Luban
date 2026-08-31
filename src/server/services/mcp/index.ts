@@ -5,12 +5,14 @@ import logger from '../../lib/logger';
 import config from '../configstore';
 import { McpServer, isAllowedOrigin, isLoopback } from './McpServer';
 import { jobManager } from './jobs';
+import { probeFeedService, resolveProbeFeedConfig } from './probeFeed';
 import { ToolRegistry } from './registry';
 import { registerCalibrationTools } from './tools/calibration';
 import { registerCameraTools } from './tools/camera';
 import { registerGcodeTools } from './tools/gcode';
 import { registerLandmarkTools } from './tools/landmarks';
 import { registerMachineTools } from './tools/machine';
+import { registerProbeTools } from './tools/probe';
 import { registerStatusTools } from './tools/status';
 
 const log = logger('service:mcp');
@@ -107,6 +109,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerCameraTools(registry);
     registerCalibrationTools(registry);
     registerLandmarkTools(registry);
+    registerProbeTools(registry);
     registeredToolCount = registry.list().length;
 
     broadcaster = socketServer || null;
@@ -146,6 +149,15 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         runningPort = port;
         log.info(`MCP server listening at http://127.0.0.1:${port}/mcp`);
     });
+
+    // Arm the external probe feed (and its overtravel tripwire) without any
+    // agent involvement when it is fully configured. Failure is logged and
+    // retried by the feed's own backoff; it must never break startup.
+    if (resolveProbeFeedConfig().configured) {
+        probeFeedService.connect().catch((err: Error) => {
+            log.error(`Probe feed auto-connect failed: ${err.message}`);
+        });
+    }
 }
 
 export function stopMcpService(): void {
