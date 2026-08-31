@@ -11,6 +11,13 @@ module.exports = async function notarizing(context) {
         return;
     }
 
+    // Forks build unsigned: skip notarization when the Apple credentials are
+    // not configured instead of crashing the whole package step.
+    if (!process.env.APPLEID || !process.env.APPLEIDPASS || !process.env.TEAMID) {
+        console.log('Skipping notarization: Apple signing credentials are not configured.');
+        return;
+    }
+
     // Notarize only when running on Travis-CI and has a tag.
     console.log('Notarizing application...');
 
