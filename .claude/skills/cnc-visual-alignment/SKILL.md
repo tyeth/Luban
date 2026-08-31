@@ -107,13 +107,23 @@ Never compute a machine coordinate from one frame and drive to it. With the MCP:
    explicitly confirmed Z and path clearance (`operator_confirmed_clearance`, which you
    pass ONLY on the operator's word, never on your own judgment).
 3. Derive the 2×2 matrix at the working Y and Z: command 2–3 known small XY offsets with
-   `move_and_capture`, track one feature's pixel displacement, fit the forward Jacobian J
+   `move_and_capture`, measure the feature's pixel displacement with `track_feature`
+   (never by eye - hand-estimated pixels caused a ~50% calibration error live; on
+   repetitive grids the second_peak_gap is a SOFT signal, ~0.17-0.25 even for correct
+   matches, so verify low-gap matches against the Jacobian prediction), fit the forward Jacobian J
    (pixel shift per mm), and store M = +J⁻¹ with `set_camera_calibration` (residuals in
    `notes`). **Verify the sign before storing**: the tool computes error = target − feature
    (check `pixel_error` in a real response against your own numbers), and J·(M·e) must
    reproduce +e — a flipped M drives every "correction" away from the target, and it looks
    plausible right up until the error grows. The tool warns when consecutive steps fail to
    shrink the error; treat that warning as "stop and re-derive", never "push through".
+3b. **Calibrations are depth-plane-specific.** The matrix is only valid for features on
+   the same physical surface it was derived from: applying a bracket-screw calibration to
+   a feature on the board (different height under a close, tilted camera) predicted ~4×
+   wrong — real parallax, not a bug. Derive on the surface you will servo on, record the
+   surface in `notes`, and before trusting any tracked shift, sanity-check it against the
+   Jacobian prediction (J·Δmachine ≈ Δpixel); a sharp divergence means wrong plane, wrong
+   match, or both (automatic cross-check planned as fork issue #51).
 4. Iterate `visual_servo` — each call is one clamped step and returns the frame; two or
    three passes converge. It auto-selects the nearest-Y calibration and warns when a step
    moves Y (self-invalidating) — re-derive or re-select when it does.
@@ -148,6 +158,14 @@ toward top-left, ~20 % of frame height). That blur is diagnostic of near-lens di
 categorically different from the resolvable distance-blur of the scene. `capture_frame`
 reports the operator-configured `expectedToolRegion` box with every frame — check it before
 concluding anything about "an unidentified blurry shape".
+
+**Landmark identity is operator truth, not visual analogy.** A recurring unidentified
+object must not be assigned an identity from what it sits near ("beside jaw-shaped blocks,
+so chuck-related") — on this machine the gold cylinder at machine Y≈176–340 is the **tool
+height checker**, misidentified twice by analogy before the operator corrected it. If the
+operator has named a landmark, use that; if not, ask — never assert a guess as resolved
+fact. (A named-landmark registry is planned as fork issue #50; until it exists, landmark
+identities live in this paragraph and the operator's word.)
 
 ## Datums: check the landmark is actually in frame
 
