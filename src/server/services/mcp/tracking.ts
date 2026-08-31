@@ -51,6 +51,9 @@ export interface TrackResult {
     dv: number;
     score: number;
     secondPeakGap: number;
+    chosenBy: 'score' | 'expectation';
+    distanceFromExpected: number | null;
+    rawBest: { u: number; v: number; score: number } | null;
     warnings: string[];
 }
 
@@ -67,7 +70,8 @@ export function trackFeature(
     u: number,
     v: number,
     patchSize: number,
-    searchRadius: number
+    searchRadius: number,
+    expected?: { du: number; dv: number }
 ): TrackResult {
     const half = Math.floor(patchSize / 2);
     const warnings: string[] = [];
@@ -147,6 +151,50 @@ export function trackFeature(
         }
     }
 
+    // Expectation tie-breaking (#52): on a repetitive grid several
+    // intersections score within noise of each other and the raw best can be
+    // the wrong one. Given an expected shift (from the running Jacobian),
+    // choose the near-best candidate closest to it instead - and always say
+    // which rule chose.
+    const rawBest = { u: bestU, v: bestV, score: best };
+    let chosenBy: 'score' | 'expectation' = 'score';
+    let distanceFromExpected: number | null = null;
+    if (expected && best > -1) {
+        const eu = u + expected.du;
+        const ev = v + expected.dv;
+        const threshold = best - 0.08;
+        let candU = bestU;
+        let candV = bestV;
+        let candScore = best;
+        let candDist = Math.hypot(bestU - eu, bestV - ev);
+        for (let sv = vMin; sv <= vMax; sv++) {
+            for (let su = uMin; su <= uMax; su++) {
+                const score = scores[sv - vMin][su - uMin];
+                if (score < threshold) {
+                    continue;
+                }
+                const dist = Math.hypot(su - eu, sv - ev);
+                if (dist < candDist) {
+                    candDist = dist;
+                    candU = su;
+                    candV = sv;
+                    candScore = score;
+                }
+            }
+        }
+        distanceFromExpected = candDist;
+        if (candU !== bestU || candV !== bestV) {
+            chosenBy = 'expectation';
+            warnings.push(`Expectation override: the raw best match at (${bestU}, ${bestV}) `
+                + `(NCC ${best.toFixed(2)}) was replaced by a near-best candidate at (${candU}, ${candV}) `
+                + `(NCC ${candScore.toFixed(2)}) closer to the expected shift - typical on repetitive `
+                + 'grids. If the expectation itself is suspect, re-run without expected_shift.');
+            bestU = candU;
+            bestV = candV;
+            best = candScore;
+        }
+    }
+
     if (best < 0.5) {
         warnings.push(`Low match confidence (NCC ${best.toFixed(2)}); the feature may have left the frame `
             + 'or changed appearance (lighting, focus, Z change).');
@@ -163,6 +211,9 @@ export function trackFeature(
         dv: bestV - v,
         score: best,
         secondPeakGap: gap,
+        chosenBy,
+        distanceFromExpected,
+        rawBest: chosenBy === 'expectation' ? rawBest : null,
         warnings,
     };
 }

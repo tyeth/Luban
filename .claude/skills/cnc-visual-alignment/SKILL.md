@@ -123,7 +123,8 @@ Never compute a machine coordinate from one frame and drive to it. With the MCP:
    wrong — real parallax, not a bug. Derive on the surface you will servo on, record the
    surface in `notes`, and before trusting any tracked shift, sanity-check it against the
    Jacobian prediction (J·Δmachine ≈ Δpixel); a sharp divergence means wrong plane, wrong
-   match, or both (automatic cross-check planned as fork issue #51).
+   match, or both - visual_servo also performs this cross-check automatically and warns
+   on divergence; tag calibrations with their `surface` so the warning can name it.
 4. Iterate `visual_servo` — each call is one clamped step and returns the frame; two or
    three passes converge. It auto-selects the nearest-Y calibration and warns when a step
    moves Y (self-invalidating) — re-derive or re-select when it does.
@@ -164,8 +165,9 @@ object must not be assigned an identity from what it sits near ("beside jaw-shap
 so chuck-related") — on this machine the gold cylinder at machine Y≈176–340 is the **tool
 height checker**, misidentified twice by analogy before the operator corrected it. If the
 operator has named a landmark, use that; if not, ask — never assert a guess as resolved
-fact. (A named-landmark registry is planned as fork issue #50; until it exists, landmark
-identities live in this paragraph and the operator's word.)
+fact. Landmark identities persist in the registry: call `get_stored_state` first in any
+session, and record new operator-stated identities with `set_landmark` - captures then
+carry `nearbyLandmarks` automatically.
 
 ## Datums: check the landmark is actually in frame
 

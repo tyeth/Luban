@@ -97,7 +97,7 @@ and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whit
 - Fleet: machine named "Snapmaker" @ 192.168.1.173 = the A350 CNC; "F350" @ .130 = the
   3D printer. Same Luban profile identifier — distinguish by NAME/address, never profile.
 
-## Tool surface (21)
+## Tool surface (24)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
@@ -106,9 +106,14 @@ and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whit
 `z_targets` batch) · `home` · `goto_work_origin` · `move_and_capture` · `list_cameras` ·
 `capture_frame` (position-stamped, `frameId`, `expectedToolRegion`) · `set_tool_region` ·
 `track_feature` (NCC between cached frames — use instead of eyeballing pixels) ·
-`set_/get_/delete_camera_calibration` (Y/Z-keyed; optional `jacobian` REJECTS sign-flipped
-matrices, M·J ≈ −I) · `visual_servo` (one clamped step per call; trips when the error
-fails to shrink).
+`set_/get_/delete_camera_calibration` (Y/Z-keyed; optional `surface` depth-plane tag;
+optional `jacobian` REJECTS sign-flipped matrices, M·J ≈ −I) · `visual_servo` (one clamped
+step per call; trips when the error fails to shrink OR when the measured response diverges
+from the calibration prediction — the depth-plane parallax signature) ·
+`set_landmark` / `delete_landmark` (named scene features by machine extent; nearby ones are
+surfaced on every capture) · `get_stored_state` (one-call orientation: calibrations,
+landmarks, tool region, limits, camera config, connection — call this first in a fresh
+session).
 
 ## Development workflow (learned the hard way)
 
@@ -133,14 +138,10 @@ fails to shrink).
 
 ## Open threads
 
-- **#50 named-landmark registry** — `expectedToolRegion` for scene landmarks (tool height
-  checker, rotary span), set once, surfaced near their coordinates.
-- **#51 depth-plane calibration tag + Jacobian-mismatch warning** — a calibration from one
-  surface applied to another depth read ~4× wrong (parallax); tools should cross-check the
-  early measured shift against the Jacobian prediction automatically.
-- **#52 expected-shift hint for `track_feature`** — second-peak gap is a soft signal on
-  repetitive patterns; a Jacobian-derived expectation should break ties.
-- **#53 stored-state overview call** — one call returning calibrations + landmarks + tool
-  region so a fresh session orients without motion.
+- **#50–#53 implemented** in `mcp/22-stored-state`: landmark registry (`set_landmark`,
+  surfaced as `nearbyLandmarks` on captures within 120 mm), calibration `surface` tag +
+  automatic Jacobian-prediction divergence warning in `visual_servo`, `expected_shift`
+  tie-breaking in `track_feature` (reports `chosen_by`/`raw_best`), and `get_stored_state`.
+  Seed the landmark registry with the tool height checker (machine Y≈176–340).
 - **#38 startup socket.io gap** — properly belongs in the startup stack; hotfixed here.
 - **#24 measurement systems, #25 collision watcher** — designed but not started.
