@@ -149,6 +149,12 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                         + '(verified over the setter centre within 1.5 mm) - for when the touchscreen '
                         + 'wizard has already returned the new tool over the setter.',
                 },
+                accept_probe_contact: {
+                    type: 'boolean',
+                    description: 'REQUIRED when the fitted tool is the spindle TOUCH PROBE: its own '
+                        + 'channel fires before the setter switch and pressing on would bend it, so '
+                        + 'EITHER channel counts as the height confirmation (the result notes which).',
+                },
                 reason: { type: 'string', description: 'Shown to the operator: why this measurement is needed.' },
             },
             required: ['bit_length_mm', 'reason'],
@@ -187,6 +193,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                     store_as_reference: plan.storeAsReference,
                     stay_at_trigger: plan.stayAtTrigger,
                     start_from_current: plan.startFromCurrent,
+                    accept_probe_contact: plan.acceptProbeContact,
                 },
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: 'Ask the operator to open confirm_url, review the SERVER-DRIVEN PROCEDURE '

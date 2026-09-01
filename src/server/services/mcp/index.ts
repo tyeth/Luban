@@ -13,6 +13,7 @@ import { registerGcodeTools } from './tools/gcode';
 import { registerLandmarkTools } from './tools/landmarks';
 import { registerMachineTools } from './tools/machine';
 import { registerProbeTools } from './tools/probe';
+import { registerProbingTools } from './tools/probing';
 import { registerStatusTools } from './tools/status';
 import { registerToolSetterTools } from './tools/toolsetter';
 
@@ -112,6 +113,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerLandmarkTools(registry);
     registerProbeTools(registry);
     registerToolSetterTools(registry, () => `http://127.0.0.1:${port}`);
+    registerProbingTools(registry, () => `http://127.0.0.1:${port}`);
     registeredToolCount = registry.list().length;
 
     broadcaster = socketServer || null;
