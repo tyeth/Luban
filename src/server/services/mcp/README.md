@@ -92,6 +92,15 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    same machinery as overtravel; `clear_overtravel_alarm` clears either kind on the
    operator's explicit word. Feed readings and all gcode traffic are logged server-side.
 6. The approved-code page re-shows the exact gcode next to the one-time code.
+7. **Use tools for their purpose** — `move_and_capture` is a vision reposition, not a
+   transport primitive (its `reason` is required and shown to the operator); sequences of
+   motion belong in the staged, operator-approved mechanisms (`survey_bed`, `move_z`
+   batches, procedures, `submit_gcode_job`). Enforced: rapid sequential direct moves are
+   warned then refused (pacing guard) — scripting a motion loop around the direct tools is
+   an unsupervised procedure without a confirm page, which is what the crash was.
+8. **The MCP surface is the only interface** — no agent may touch the machine, its
+   configstore, or the backend APIs directly while the app runs; every guard lives in the
+   tools, so bypassing them bypasses all of it.
 
 ## Safety model (operator-defined, non-negotiable)
 

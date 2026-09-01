@@ -320,6 +320,7 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                 x: position.machine.x + dx,
                 y: position.machine.y + dy,
                 coordinate_system: 'machine',
+                reason: 'visual servo correction step',
                 feed_rate: args.feed_rate,
                 operator_confirmed_clearance: args.operator_confirmed_clearance,
             }) as { mcpContent: object[] };
