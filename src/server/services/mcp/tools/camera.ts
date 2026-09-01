@@ -9,7 +9,7 @@ import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
-import { PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
+import { PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
 // action only. move_and_capture performs ONE bounded XY move at the current
@@ -41,7 +41,16 @@ const gcodeLog = logger('service:mcp:gcode');
 export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string): Promise<{ result: number; text?: string }> {
     mcpBroadcast('mcp:gcode', { tool, gcode });
     gcodeLog.info(`[${tool}] > ${gcode.replace(/\r?\n/g, ' | ')}`);
-    const executed = await channel.executeGcode(gcode);
+    // Crash-guard bracket: the HTTP channel executes synchronously, so the
+    // await spans the motion window - a contact-sensor trigger inside it
+    // that no procedure expects is treated as a collision (probeFeed).
+    probeFeedService.motionBegin();
+    let executed;
+    try {
+        executed = await channel.executeGcode(gcode);
+    } finally {
+        probeFeedService.motionEnd();
+    }
     const response = executed.text || (executed.result === 0 ? 'ok' : `result=${executed.result}`);
     mcpBroadcast('mcp:gcode', { tool, response });
     gcodeLog.info(`[${tool}] < ${String(response).replace(/\r?\n/g, ' | ')}`);
@@ -194,6 +203,35 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         x: target.x - before.originOffset.x,
         y: target.y - before.originOffset.y,
     };
+
+    // OPERATOR LAW (2026-09-01, after the probe crash): X/Y traverses happen
+    // at top gantry height. An XY move below the safe traverse Z, or one
+    // whose path crosses an obstacle landmark below its clearance height, is
+    // refused unless the operator has EXPLICITLY confirmed this corridor -
+    // never on the model's own judgment, never derived from assumptions
+    // about what is on the bed.
+    const machineZ = before.machine.z;
+    if (args.operator_confirmed_clearance !== true && machineZ !== null) {
+        const traverseFloor = safeTraverseZ();
+        if (machineZ < traverseFloor) {
+            throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the safe `
+                + `traverse height ${traverseFloor} (top gantry). Retreat Z first (move_z, operator-`
+                + 'confirmed), then traverse, then descend at the destination. Only the operator\'s '
+                + 'explicit word (operator_confirmed_clearance: true) authorises a lower corridor.');
+        }
+        const machineFrom = { x: before.machine.x, y: before.machine.y };
+        if (machineFrom.x !== null && machineFrom.y !== null) {
+            const obstacles = landmarkStore.obstaclesOnPath(
+                machineFrom.x, machineFrom.y, machineTarget.x, machineTarget.y, machineZ
+            );
+            if (obstacles.length) {
+                throw new McpToolError('XY move refused: the path crosses obstacle landmark(s) '
+                    + `${obstacles.map((l) => `"${l.name}" (clearance Z ${l.clearanceZ})`).join(', ')} `
+                    + `while at machine Z ${machineZ.toFixed(1)}. Raise Z above the clearance, or get the `
+                    + 'operator\'s explicit confirmation for this corridor.');
+            }
+        }
+    }
     if (size) {
         // Floors allow real overtravel: the A350 X home switch sits at
         // machine -19, so "keep the current X while parked at home" must

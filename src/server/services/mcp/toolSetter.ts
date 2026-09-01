@@ -18,7 +18,7 @@ import {
     senseReleaseAfter,
 } from './probing';
 import { McpToolError } from './registry';
-import { getPositionSnapshot } from './tools/machine';
+import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
 
 const log = logger('service:mcp:tool-setter');
 
@@ -329,6 +329,9 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
     for (const channel of contactChannels) {
         assertChannelReady(channel, 'tool setter');
     }
+    // This procedure EXPECTS these channels to touch; anything else firing
+    // mid-motion is a collision (crash guard). Cleared in the finally.
+    probeFeedService.setExpectedContact(contactChannels);
     assertMachineReadyForProcedure();
     const position = getPositionSnapshot();
 
@@ -361,9 +364,15 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             announce('start-from-current', currentZ, 'skipping travel; descending from the current position');
         } else {
             // Phase 1: position over the centre, then travel down to start
-            // height. XY first at the current (post-home, high) Z, so the bit
-            // never sweeps across the bed at approach height.
-            announce('travel-xy', position.machine.z ?? plan.startZ, `XY to (${c.centerX}, ${c.centerY})`);
+            // height. XY first, and ONLY at top gantry height (operator law
+            // after the 2026-09-01 probe crash) - the bit never sweeps across
+            // the bed below the safe traverse Z.
+            const z = position.machine.z;
+            if (z === null || z < safeTraverseZ()) {
+                throw new ProcedureAbort(`XY travel to the setter refused at machine Z ${z === null ? 'unknown' : z.toFixed(1)} - `
+                    + `below the safe traverse height ${safeTraverseZ()}. Raise Z first (move_z, operator-confirmed).`);
+            }
+            announce('travel-xy', z, `XY to (${c.centerX}, ${c.centerY})`);
             await moveMachineSettled('toolsetter:travel', { x: c.centerX, y: c.centerY }, TRAVEL_FEED);
             announce('travel-z', plan.startZ);
             await moveMachineSettled('toolsetter:travel', { z: plan.startZ }, TRAVEL_FEED);
@@ -548,5 +557,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
                 + `Phases completed: ${JSON.stringify(phases)}`);
         }
         throw err;
+    } finally {
+        probeFeedService.clearExpectedContact();
     }
 }

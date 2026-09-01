@@ -33,6 +33,12 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 y0: { type: 'number' },
                 x1: { type: 'number' },
                 y1: { type: 'number' },
+                clearance_z: {
+                    type: 'number',
+                    description: 'Marks this landmark as an OBSTACLE: minimum safe toolhead machine Z '
+                        + 'when an XY path crosses its box (operator accounts for tool length). Direct '
+                        + 'XY moves below it across the box are refused. Omit for non-obstacles.',
+                },
                 notes: { type: 'string' },
             },
             required: ['name', 'description', 'x0', 'y0', 'x1', 'y1'],
@@ -45,6 +51,7 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
             y0?: number;
             x1?: number;
             y1?: number;
+            clearance_z?: number;
             notes?: string;
         }) => {
             const name = String(args.name || '').trim();
@@ -56,10 +63,15 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
             if (box.some((v) => !Number.isFinite(v)) || box[0] >= box[2] || box[1] >= box[3]) {
                 throw new McpToolError('Require finite machine coordinates with x0 < x1 and y0 < y1.');
             }
+            const clearanceZ = args.clearance_z !== undefined ? Number(args.clearance_z) : null;
+            if (clearanceZ !== null && !Number.isFinite(clearanceZ)) {
+                throw new McpToolError('clearance_z must be a finite machine Z when given.');
+            }
             const landmark = landmarkStore.add({
                 name,
                 description,
                 machine: { x0: box[0], y0: box[1], x1: box[2], y1: box[3] },
+                clearanceZ,
                 notes: args.notes ? String(args.notes) : null,
             });
             return { landmark: describeLandmark(landmark) };

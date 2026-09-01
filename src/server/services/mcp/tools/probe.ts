@@ -55,10 +55,11 @@ export function registerProbeTools(registry: ToolRegistry): void {
 
     registry.register({
         name: 'clear_overtravel_alarm',
-        description: 'Clear the latched overtravel alarm that is blocking all motion. ONLY on the '
-            + 'operator\'s explicit word, after they have physically inspected the machine and the '
-            + 'overtravel mechanism: pass operator_confirmed: true and repeat their words in reason. '
-            + 'Refused while the overtravel feed still reports triggered.',
+        description: 'Clear the latched safety alarm (overtravel OR crash - a contact sensor firing '
+            + 'during motion that expected no contact) that is blocking all motion. ONLY on the '
+            + 'operator\'s explicit word, after they have physically inspected the machine: pass '
+            + 'operator_confirmed: true and repeat their words in reason. Refused while the tripped '
+            + 'channel still reports triggered.',
         inputSchema: {
             type: 'object',
             properties: {

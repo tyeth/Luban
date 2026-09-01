@@ -12,14 +12,13 @@ import { describeProbePlanAsGcode, planProbePoint, runProbePointProcedure } from
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
+import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
 // survey: the survey gives the agent visual context ("measure the stock on
 // the rotary axis"), the probe turns that context into millimetres.
 
-const SURVEY_MIN_MACHINE_Z = 250;
 
 export function registerProbingTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
@@ -122,10 +121,11 @@ export function registerProbingTools(registry: ToolRegistry, getConfirmBaseUrl: 
             if (x === null || y === null || z === null) {
                 throw new McpToolError('Current machine position unknown.');
             }
-            if (z < SURVEY_MIN_MACHINE_Z && args.operator_confirmed_clearance !== true) {
-                throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the survey height floor `
-                    + `${SURVEY_MIN_MACHINE_Z} - raise Z (move_z), or pass operator_confirmed_clearance: `
-                    + 'true only on the operator\'s explicit word that this Z clears everything on the bed.');
+            if (z < safeTraverseZ() && args.operator_confirmed_clearance !== true) {
+                throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the safe traverse height `
+                    + `${safeTraverseZ()} (top gantry - operator law for all X/Y motion) - raise Z `
+                    + '(move_z), or pass operator_confirmed_clearance: true only on the operator\'s '
+                    + 'explicit word that this Z clears everything on the bed.');
             }
             const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
             if (!size) {
