@@ -57,6 +57,18 @@ function axisValue(value: unknown): number | null {
     return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * The minimum toolhead machine Z for X/Y traverses - OPERATOR LAW after the
+ * 2026-09-01 probe crash: "always retreat to top gantry height (home
+ * effectively) before x/y moves". Default 320 (home Z is 328 on the A350);
+ * override via configstore mcpSafeTraverseZ. Anything lower needs the
+ * operator's explicit clearance for that specific corridor.
+ */
+export function safeTraverseZ(): number {
+    const raw = Number(config.get('mcpSafeTraverseZ'));
+    return Number.isFinite(raw) && raw > 0 ? raw : 320;
+}
+
 export interface PositionSnapshot {
     work: { x: number | null; y: number | null; z: number | null };
     machine: { x: number | null; y: number | null; z: number | null };

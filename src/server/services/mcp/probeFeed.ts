@@ -170,7 +170,9 @@ export interface ProbeReading {
     topic: string;
 }
 
-interface OvertravelTrip {
+interface SafetyTrip {
+    kind: 'overtravel' | 'crash';
+    channel: ProbeChannel;
     at: number;
     value: string;
     actions: string[];
@@ -186,7 +188,15 @@ export class ProbeFeedService {
 
     private readings = new Map<ProbeChannel, ProbeReading>();
 
-    private trip: OvertravelTrip | null = null;
+    private trip: SafetyTrip | null = null;
+
+    // Crash guard (added after the 2026-09-01 probe crash): while any
+    // sensor-visible motion is in flight, a triggered reading on a contact
+    // channel that is NOT expected to touch anything is a collision - same
+    // response as overtravel. Procedures declare their expected channels.
+    private motionCount = 0;
+
+    private expectedContact = new Set<ProbeChannel>();
 
     private reconnectTimer: NodeJS.Timeout | null = null;
 
@@ -264,7 +274,7 @@ export class ProbeFeedService {
         });
     }
 
-    public getTrip(): OvertravelTrip | null {
+    public getTrip(): SafetyTrip | null {
         return this.trip;
     }
 
@@ -274,20 +284,40 @@ export class ProbeFeedService {
      */
     public assertNoOvertravel(): void {
         if (this.trip) {
-            throw new McpToolError(`OVERTRAVEL ALARM latched at ${new Date(this.trip.at).toISOString()} `
-                + `(sensor value "${this.trip.value}"). All motion is blocked. The operator must inspect `
+            throw new McpToolError(`${this.trip.kind === 'crash' ? 'CRASH' : 'OVERTRAVEL'} ALARM latched at `
+                + `${new Date(this.trip.at).toISOString()} (${this.trip.channel} sensor value "${this.trip.value}"). `
+                + 'All motion is blocked. The operator must inspect '
                 + 'the machine and explicitly clear the alarm (clear_overtravel_alarm) or restart Luban.');
         }
     }
 
     /** Operator-authorised alarm clear; refuses while still reporting triggered. */
     public clearTrip(): void {
-        const reading = this.readings.get('overtravel');
+        const channel = this.trip ? this.trip.channel : 'overtravel';
+        const reading = this.readings.get(channel);
         if (reading && reading.triggered) {
-            throw new McpToolError('The overtravel feed still reports triggered; refusing to clear the alarm.');
+            throw new McpToolError(`The ${channel} feed still reports triggered; refusing to clear the alarm.`);
         }
         this.trip = null;
-        log.warn('Overtravel alarm cleared by operator authority.');
+        log.warn('Safety alarm cleared by operator authority.');
+    }
+
+    /** Motion-in-flight bracket for the crash guard. Always pair with motionEnd. */
+    public motionBegin(): void {
+        this.motionCount += 1;
+    }
+
+    public motionEnd(): void {
+        this.motionCount = Math.max(0, this.motionCount - 1);
+    }
+
+    /** Declare which channels a probing procedure EXPECTS to touch. */
+    public setExpectedContact(channels: ProbeChannel[]): void {
+        this.expectedContact = new Set(channels);
+    }
+
+    public clearExpectedContact(): void {
+        this.expectedContact.clear();
     }
 
     public status(): object {
@@ -319,7 +349,7 @@ export class ProbeFeedService {
             clientId: cfg.clientId,
             configSources: cfg.sources,
             feeds,
-            overtravelTrip: this.trip,
+            safetyTrip: this.trip,
             reconnectAttempts: this.reconnectAttempts,
             lastError: this.lastError,
         };
@@ -436,8 +466,15 @@ export class ProbeFeedService {
                 value: payload,
                 triggered: reading.triggered,
             });
-            if (channel === 'overtravel' && reading.triggered && !this.trip) {
-                this.tripOvertravel(reading);
+            log.info(`reading ${channel}=${payload} triggered=${reading.triggered}`);
+            if (!this.trip && reading.triggered) {
+                if (channel === 'overtravel') {
+                    this.tripSafety('overtravel', channel, reading);
+                } else if (this.motionCount > 0 && !this.expectedContact.has(channel)) {
+                    // A contact sensor fired during motion that expected no
+                    // contact: collision. Stop everything.
+                    this.tripSafety('crash', channel, reading);
+                }
             }
             return;
         }
@@ -448,35 +485,35 @@ export class ProbeFeedService {
      * machine connection, latch the alarm, tell the operator. Best-effort on
      * every step - a failed stop must not prevent the disconnect.
      */
-    private tripOvertravel(reading: ProbeReading): void {
+    private tripSafety(kind: 'overtravel' | 'crash', channel: ProbeChannel, reading: ProbeReading): void {
         const actions: string[] = [];
-        this.trip = { at: reading.receivedAt, value: reading.value, actions };
-        log.error(`OVERTRAVEL reported by probe feed (value "${reading.value}") - aborting all jobs and connections`);
+        this.trip = { kind, channel, at: reading.receivedAt, value: reading.value, actions };
+        log.error(`${kind.toUpperCase()} reported by ${channel} feed (value "${reading.value}") - aborting all jobs and connections`);
 
-        const channel = connectionManager.getCurrentChannel() as unknown as {
+        const machineChannel = connectionManager.getCurrentChannel() as unknown as {
             stopGcodeJob?: () => Promise<unknown>;
             connectionClose?: (options: { force: boolean }) => Promise<unknown>;
         } | null;
-        if (channel) {
+        if (machineChannel) {
             (async () => {
-                if (typeof channel.stopGcodeJob === 'function') {
+                if (typeof machineChannel.stopGcodeJob === 'function') {
                     try {
-                        await channel.stopGcodeJob();
+                        await machineChannel.stopGcodeJob();
                         actions.push('stop_gcode_job sent');
-                        log.error('Overtravel abort: stop sent to the machine');
+                        log.error(`${kind} abort: stop sent to the machine`);
                     } catch (err) {
                         actions.push(`stop_gcode_job failed: ${err.message}`);
-                        log.error(`Overtravel abort: stop failed: ${err.message}`);
+                        log.error(`${kind} abort: stop failed: ${err.message}`);
                     }
                 }
-                if (typeof channel.connectionClose === 'function') {
+                if (typeof machineChannel.connectionClose === 'function') {
                     try {
-                        await channel.connectionClose({ force: true });
+                        await machineChannel.connectionClose({ force: true });
                         actions.push('connection force-closed');
-                        log.error('Overtravel abort: machine connection force-closed');
+                        log.error(`${kind} abort: machine connection force-closed`);
                     } catch (err) {
                         actions.push(`connection close failed: ${err.message}`);
-                        log.error(`Overtravel abort: close failed: ${err.message}`);
+                        log.error(`${kind} abort: close failed: ${err.message}`);
                     }
                 }
             })();
@@ -486,10 +523,11 @@ export class ProbeFeedService {
 
         mcpBroadcast('mcp:activity', {
             tool: 'probe_feed',
-            phase: 'OVERTRAVEL_ALARM',
+            phase: kind === 'crash' ? 'CRASH_ALARM' : 'OVERTRAVEL_ALARM',
             value: reading.value,
-            message: 'Overtravel sensor tripped: running job stopped, machine connection force-closed, '
-                + 'all MCP motion blocked until the operator clears the alarm.',
+            message: `${kind === 'crash' ? `Collision: ${channel} sensor fired during motion that expected no contact` : 'Overtravel sensor tripped'}: `
+                + 'running job stopped, machine connection force-closed, all MCP motion blocked '
+                + 'until the operator clears the alarm.',
         });
     }
 }

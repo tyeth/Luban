@@ -210,11 +210,21 @@ export class JobManager {
             job.approvedAt = Date.now();
             job.state = 'approved';
             log.info(`MCP job ${job.id} approved by operator`);
+            // The gcode is shown AGAIN next to the code (operator request
+            // after the 2026-09-01 probe crash): the last thing seen before
+            // handing over the code is exactly what the code will run.
+            const approvedGcode = fs.readFileSync(job.filePath, 'utf8');
+            const approvedLines = approvedGcode.split(/\r?\n/);
+            const approvedPreview = approvedLines.length > 80
+                ? [...approvedLines.slice(0, 40), `... ${approvedLines.length - 80} lines elided ...`, ...approvedLines.slice(-40)].join('\n')
+                : approvedGcode;
             this.page(res, 200, `
                 <h2>Approved</h2>
                 <p>Give this one-time code to the agent to start <strong>${escapeHtml(job.name)}</strong>:</p>
                 <p style="font-size:2em;font-family:monospace;letter-spacing:0.2em">${job.confirmToken}</p>
-                <p>It expires in 15 minutes and works once.</p>`);
+                <p>It expires in 15 minutes and works once.</p>
+                <h3>This code will run exactly:</h3>
+                <pre style="background:#f6f6f6;padding:12px;overflow:auto;max-height:300px">${escapeHtml(approvedPreview)}</pre>`);
             return;
         }
         if (req.method === 'POST' && action === 'reject') {

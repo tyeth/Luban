@@ -19,6 +19,13 @@ export interface Landmark {
     description: string;
     // Machine-coordinate XY extent of the feature on/over the bed.
     machine: { x0: number; y0: number; x1: number; y1: number };
+    // Obstacle clearance: minimum safe TOOLHEAD machine Z when the XY path
+    // crosses this landmark's box (operator accounts for tool length when
+    // setting it). null = not an obstacle. Enforced by the direct XY move
+    // guard - added after the 2026-09-01 probe crash, where a traverse at a
+    // fabricated "clearance" height crossed the rotary and destroyed the
+    // fitted touch probe.
+    clearanceZ: number | null;
     notes: string | null;
     createdAt: number;
 }
@@ -45,7 +52,9 @@ export class LandmarkStore {
         }
         try {
             const raw = fs.readJsonSync(this.file());
-            this.cache = { landmarks: Array.isArray(raw?.landmarks) ? raw.landmarks : [] };
+            const landmarks = (Array.isArray(raw?.landmarks) ? raw.landmarks : [])
+                .map((l: Landmark) => ({ ...l, clearanceZ: Number.isFinite(Number(l.clearanceZ)) ? Number(l.clearanceZ) : null }));
+            this.cache = { landmarks };
         } catch (err) {
             this.cache = { landmarks: [] };
         }
@@ -88,6 +97,51 @@ export class LandmarkStore {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Obstacle landmarks (clearanceZ set) whose box - inflated by margin -
+     * the straight XY segment from (x0,y0) to (x1,y1) touches, and whose
+     * clearanceZ the given toolhead machine Z is BELOW. These are collisions
+     * waiting to happen; the direct XY guard refuses them.
+     */
+    public obstaclesOnPath(
+        x0: number, y0: number, x1: number, y1: number,
+        toolheadZ: number, marginMm = 5
+    ): Landmark[] {
+        return this.load().landmarks.filter((l) => {
+            if (l.clearanceZ === null || toolheadZ >= l.clearanceZ) {
+                return false;
+            }
+            const bx0 = l.machine.x0 - marginMm;
+            const by0 = l.machine.y0 - marginMm;
+            const bx1 = l.machine.x1 + marginMm;
+            const by1 = l.machine.y1 + marginMm;
+            // 2D segment-vs-AABB slab test.
+            const dx = x1 - x0;
+            const dy = y1 - y0;
+            let tMin = 0;
+            let tMax = 1;
+            for (const [p, d, lo, hi] of [[x0, dx, bx0, bx1], [y0, dy, by0, by1]] as [number, number, number, number][]) {
+                if (Math.abs(d) < 1e-12) {
+                    if (p < lo || p > hi) {
+                        return false;
+                    }
+                } else {
+                    let t1 = (lo - p) / d;
+                    let t2 = (hi - p) / d;
+                    if (t1 > t2) {
+                        [t1, t2] = [t2, t1];
+                    }
+                    tMin = Math.max(tMin, t1);
+                    tMax = Math.min(tMax, t2);
+                    if (tMin > tMax) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        });
     }
 
     /**

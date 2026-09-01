@@ -71,6 +71,28 @@ every MCP-sent gcode line and controller reply (`[mcp:home] > G28` / `< X:-19.00
 and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whitelisted in
 `socket-communication.ts`).
 
+## Motion laws (operator law after the 2026-09-01 probe crash)
+
+An XY traverse at a fabricated "clearance" height (Z200, derived from assumptions about
+the rotary stock's geometry — wrong twice over) destroyed the fitted touch probe. The
+step had also been chained onto an approved Z move in one command, executing 117 ms after
+it with no decision point, when the operator had authorised "step 1" only. Laws:
+
+1. **One motion per instruction** — never chain motion tool calls in a single command or
+   turn; each motion gets its own decision point. Enumerated steps run one at a time.
+2. **X/Y traverses at top gantry height** — direct XY moves below `mcpSafeTraverseZ`
+   (default 320) are refused without `operator_confirmed_clearance`. Retreat, traverse,
+   descend — in that order.
+3. **No fabricated clearances** — only measured or operator-stated heights count. Visual
+   inference finds things; it never clears them.
+4. **Landmarks are obstacles** — `clearance_z` on a landmark refuses XY paths crossing its
+   box below that height.
+5. **Contact sensors are crash sensors** — a probe/toolsetter trigger during motion that no
+   procedure declared as expected trips a CRASH alarm (stop + force-close + latch), the
+   same machinery as overtravel; `clear_overtravel_alarm` clears either kind on the
+   operator's explicit word. Feed readings and all gcode traffic are logged server-side.
+6. The approved-code page re-shows the exact gcode next to the one-time code.
+
 ## Safety model (operator-defined, non-negotiable)
 
 - **Compound motion and all cutting goes out as gcode FILES** through the same
@@ -116,9 +138,29 @@ and tool activity — all timestamped. Events: `mcp:activity`, `mcp:gcode` (whit
   calibration is keyed by machine Y AND Z. The board-viewing anchor pose is the pre-home
   park (machine X0/Y0), not machine home. The **gold cylinder at machine Y≈176–340 is the
   TOOL HEIGHT CHECKER** (operator-confirmed; was misidentified twice).
-- **Tool setter (operator-stated 2026-08-31): centre at machine (X79, Y293); it triggers at
-  machine Z176 with a 75 mm endmill in the holder** — so expected trigger Z for a bit of
-  length L is `176 + (L − 75)`. Seed `set_tool_setter_config` with these on first run.
+- **Tool setter: centre at machine (X79, Y293), top-left of bed. MEASURED trigger Z 175.500
+  with the 75 mm reference endmill (three confirm passes agreed, spread 0)** — so the setter
+  SURFACE is machine Z 100.5, and expected trigger Z for a bit of length L is
+  `175.5 + (L − 75)`. Config + measurement history live in `mcpToolSetter`.
+- **Touch probe (measured 2026-09-01): effective length 71.1 mm** (trigger on the setter at
+  machine Z 171.6 ⇒ any surface = probe contact toolhead Z − 71.1). The probe's AXIAL
+  spring is stiffer than the setter's switch, so on the setter the SETTER fires first —
+  measuring the probe there is safe with `accept_probe_contact: true` (either channel
+  confirms). Probe feed latency, hardware-measured: **~120–150 ms** sensor→feed on a local
+  bump test (trigger message 452 ms after move issue incl. ~330 ms motion) — the 200 ms
+  contact windows are correctly sized.
+- **Camera offset**: the toolhead camera looks roughly **90–150 mm in −X** of the toolhead
+  (setup-specific — verify per rig): features at machine X appear in frames taken from
+  toolhead X+90..150. The far-X column of a bed survey is therefore the only view of the
+  bed centre-right.
+- **Bed map (operator-stated + survey 25c4f87a, 2026-09-01)**: rotary module along the bed
+  centre at **machine X≈170**, axis along Y, chuck at the back (~Y250–320), yellow tailstock
+  at the front; tool setter top-left. Both stored as landmarks (`rotary-axis`,
+  `tool-setter`).
+- **Silent non-motion signature**: the controller can reply `ok` to a direct move and not
+  move at all (settle times out with position unchanged; observed once 2026-09-01, suspected
+  enclosure door open — unconfirmed). The verified-settle contract catches it; do not trust
+  an `ok` alone.
 - Fleet: machine named "Snapmaker" @ 192.168.1.173 = the A350 CNC; "F350" @ .130 = the
   3D printer. Same Luban profile identifier — distinguish by NAME/address, never profile.
 

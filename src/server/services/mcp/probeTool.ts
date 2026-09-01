@@ -151,6 +151,9 @@ export interface ProbePointResult {
 export async function runProbePointProcedure(plan: ProbePointPlan): Promise<object> {
     assertChannelReady('probe', 'touch probe');
     assertMachineReadyForProcedure();
+    // The probe is EXPECTED to touch during this procedure; the toolsetter
+    // firing instead would be a collision (crash guard). Cleared in finally.
+    probeFeedService.setExpectedContact(['probe']);
 
     const position = getPositionSnapshot();
     const here = position.machine;
@@ -312,5 +315,7 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
             throw new McpToolError(`Probe run aborted: ${err.message} Phases completed: ${JSON.stringify(phases)}`);
         }
         throw err;
+    } finally {
+        probeFeedService.clearExpectedContact();
     }
 }
