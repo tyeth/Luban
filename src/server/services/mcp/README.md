@@ -78,8 +78,11 @@ the rotary stock's geometry — wrong twice over) destroyed the fitted touch pro
 step had also been chained onto an approved Z move in one command, executing 117 ms after
 it with no decision point, when the operator had authorised "step 1" only. Laws:
 
-1. **One motion per instruction** — never chain motion tool calls in a single command or
-   turn; each motion gets its own decision point. Enumerated steps run one at a time.
+1. **One motion per instruction, no inferred approvals** — never chain motion tool calls
+   in a single command or turn; each motion gets its own decision point. Enumerated steps
+   run one at a time. Only an explicit imperative in the operator's latest message
+   authorizes a motion; a motion mentioned in passing ("before homing", "then we'll…",
+   a previously approved plan) is context, not a command — announce and wait.
 2. **X/Y traverses at top gantry height** — direct XY moves below `mcpSafeTraverseZ`
    (default 320) are refused without `operator_confirmed_clearance`. Retreat, traverse,
    descend — in that order.
@@ -92,6 +95,11 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    same machinery as overtravel; `clear_overtravel_alarm` clears either kind on the
    operator's explicit word. Feed readings and all gcode traffic are logged server-side.
 6. The approved-code page re-shows the exact gcode next to the one-time code.
+   **Chat is not a motion gate — the staged job is** (operator, 2026-09-02): deliberate
+   traverses/descents go through staged jobs so authorization is the one-time code against
+   the literal gcode, not a model's reading of chat wording. A "go" in chat only permits
+   staging. Re-prove position (home) before a traverse when state is in any doubt,
+   including after any motion that wasn't part of the agreed sequence.
 7. **Use tools for their purpose** — `move_and_capture` is a vision reposition, not a
    transport primitive (its `reason` is required and shown to the operator); sequences of
    motion belong in the staged, operator-approved mechanisms (`survey_bed`, `move_z`
@@ -139,8 +147,12 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
   (a bare G28 leaves reporting in an unselected workspace → impossible derived coords like
   Y 464/Z 656). Homing takes ~15–20 s and **also homes B — stock on the rotary rotates**.
 - **Work origins are operator-set per workspace and persist across homing.**
-- **The firmware parks at the work origin when a file job COMPLETES** — file jobs cannot
-  hold a position; that is why `move_z` exists on the direct path.
+- **The machine interpreter returns to Z top at the job's finish position when a file job
+  COMPLETES** (operator-clarified 2026-09-02; supersedes the earlier "parks at the work
+  origin" reading — Z top and this setup's work-origin Z are both 328, which hid the
+  difference). XY holds; Z does not — that is why `move_z` exists on the direct path.
+  The job-concept split that matters: machine-interpreter (file) jobs get the door-detector
+  emergency stop; MCP direct single-command ops do NOT.
 - Heartbeat period ~1 s; a settled-looking heartbeat can predate the motion (hence the
   verified-settle contract). `query_firmware_position` (M114) is the authoritative check.
 - Camera is **toolhead-mounted** (rides X/Z; the platform moves under it in Y): pixel→mm

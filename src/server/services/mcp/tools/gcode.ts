@@ -2,8 +2,9 @@
 // MCP tool arguments are snake_case by convention.
 import * as fs from 'fs-extra';
 
+import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
-import { jobManager } from '../jobs';
+import { McpJob, jobManager } from '../jobs';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 import { validateGcode } from '../validator';
@@ -103,6 +104,69 @@ function parseZTarget(gcode: string): { frame: 'work' | 'machine'; z: number } |
 function machineStatus(): string | null {
     const state = connectionManager.getLatestMachineState();
     return state ? ((state as { status?: string }).status || null) : null;
+}
+
+const log = logger('service:mcp:gcode-jobs');
+
+// File jobs run on the machine's own interpreter, which reports progress only
+// through the heartbeat - nothing calls back when the job ends, so a started
+// file job previously stayed "started" forever (observed 2026-09-02, job
+// b3f4ef467a93: a 10s job, heartbeat back to idle, state never moved). Watch
+// the heartbeat: once the job has been seen active, a debounced return to
+// idle is completion. A job too short to ever show as active is completed
+// after the heartbeat holds idle for a longer fallback window.
+const FILE_JOB_POLL_MS = 1000;
+const FILE_JOB_IDLE_DEBOUNCE_POLLS = 3;
+const FILE_JOB_NEVER_SEEN_ACTIVE_IDLE_POLLS = 20;
+const FILE_JOB_UNREADABLE_POLLS_GIVE_UP = 120;
+const FILE_JOB_ACTIVE_STATUSES = ['running', 'paused', 'pausing', 'stopping', 'resuming'];
+
+function watchFileJobCompletion(job: McpJob): void {
+    let sawActive = false;
+    let idleStreak = 0;
+    let unreadableStreak = 0;
+    const timer = setInterval(() => {
+        if (job.state !== 'started') {
+            // Stopped (or otherwise finalised) through another path.
+            clearInterval(timer);
+            return;
+        }
+        const status = machineStatus();
+        if (status === null) {
+            unreadableStreak += 1;
+            idleStreak = 0;
+            if (unreadableStreak >= FILE_JOB_UNREADABLE_POLLS_GIVE_UP) {
+                clearInterval(timer);
+                job.error = 'Completion unverified: machine state became unreadable after the job '
+                    + 'started (connection lost?). The job may still be running on the machine.';
+                log.warn(`MCP file job ${job.id}: ${job.error}`);
+            }
+            return;
+        }
+        unreadableStreak = 0;
+        if (FILE_JOB_ACTIVE_STATUSES.includes(status)) {
+            sawActive = true;
+            idleStreak = 0;
+            return;
+        }
+        if (status === 'idle') {
+            idleStreak += 1;
+            const needed = sawActive ? FILE_JOB_IDLE_DEBOUNCE_POLLS : FILE_JOB_NEVER_SEEN_ACTIVE_IDLE_POLLS;
+            if (idleStreak >= needed) {
+                clearInterval(timer);
+                job.state = 'completed';
+                job.endedAt = Date.now();
+                log.info(`MCP file job ${job.id} completed: heartbeat idle for ${idleStreak}s`
+                    + `${sawActive ? '' : ' (job too short for an active heartbeat to be observed)'}`);
+            }
+            return;
+        }
+        // Unknown status string: treat as activity of some kind, keep waiting.
+        idleStreak = 0;
+    }, FILE_JOB_POLL_MS);
+    if (typeof timer.unref === 'function') {
+        timer.unref();
+    }
 }
 
 export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
@@ -220,6 +284,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 try {
                     const outcome = await job.runner();
                     job.state = 'completed';
+                    job.endedAt = Date.now();
                     return {
                         job: jobManager.describe(job),
                         result: outcome,
@@ -233,8 +298,9 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
             if (job.kind === 'direct') {
                 // Direct moves execute over the realtime path so position
-                // PERSISTS - the firmware parks back at the work origin when
-                // a file job completes, so a file job cannot hold a Z. The
+                // PERSISTS - the machine interpreter raises Z to top at the
+                // finish position when a file job completes, so a file job
+                // cannot hold a working Z (XY holds). The
                 // operator approved exactly this gcode on the confirm page.
                 // For a batch, each call executes ONE approved step; the
                 // token stays valid for the remaining steps (within its TTL).
@@ -281,6 +347,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     }
                 }
                 job.state = 'completed';
+                job.endedAt = Date.now();
                 return {
                     job: jobManager.describe(job),
                     position: settle.position,
@@ -311,10 +378,12 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
             job.state = 'started';
             job.startedAt = Date.now();
+            watchFileJobCompletion(job);
             return {
                 job: jobManager.describe(job),
                 note: 'Job started. Poll get_gcode_job_status; the controller, its door interlock '
-                    + 'and the machine UI remain in control.',
+                    + 'and the machine UI remain in control. The job is marked completed when the '
+                    + 'heartbeat settles back to idle.',
             };
         },
     });
@@ -322,7 +391,8 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
     registry.register({
         name: 'move_z',
         description: 'Request absolute Z motion, executed on the direct path so positions PERSIST '
-            + '(file jobs park back at the work origin when they complete - firmware behaviour). '
+            + '(the machine interpreter raises Z to top at the finish position when a file job '
+            + 'completes, so a file job cannot hold a working Z - firmware behaviour). '
             + 'Either one target (z) or an ordered list (z_targets, max 20) for a methodical search: '
             + 'the operator approves the EXACT list once, and each start_gcode_job call then executes '
             + 'one step, so you can capture between steps and abandon the series at any point. The '
@@ -494,6 +564,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             const stopped = await channel.stopGcodeJob();
             if (stopped.ok) {
                 job.state = 'stopped';
+                job.endedAt = Date.now();
             }
             return {
                 ok: stopped.ok,
