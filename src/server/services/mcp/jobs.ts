@@ -132,7 +132,15 @@ export class JobManager {
      * Verify a human-supplied confirm token for a job. Single-use, expiring.
      */
     public consumeToken(job: McpJob, token: string): { ok: boolean; reason?: string } {
-        if (job.state !== 'approved' || !job.confirmToken) {
+        // A batch direct job mid-series reads 'started' with steps remaining
+        // and its token re-armed; the operator's one approval covers the
+        // exact list, so the same code keeps working (bug found live
+        // 2026-09-02: step 2 of a 9-step ladder was refused).
+        const batchMidSeries = job.state === 'started'
+            && Array.isArray(job.steps)
+            && (job.nextStep || 0) < job.steps.length
+            && !job.tokenUsed;
+        if ((job.state !== 'approved' && !batchMidSeries) || !job.confirmToken) {
             return { ok: false, reason: `Job is ${job.state}, not approved.` };
         }
         if (job.tokenUsed) {
@@ -204,6 +212,15 @@ export class JobManager {
         const action = match[3];
 
         if (req.method === 'GET' && !action) {
+            // Revisiting an approved job re-shows its code while it is still
+            // valid (unused, unexpired) - losing the tab must not dead-end
+            // the approval (operator request 2026-09-02). MCP still never
+            // sees the code; this is the loopback browser only.
+            if (job.state === 'approved' && job.confirmToken && !job.tokenUsed
+                && Date.now() - (job.approvedAt || 0) <= CONFIRM_TOKEN_TTL_MS) {
+                this.page(res, 200, this.approvedPage(job));
+                return;
+            }
             this.page(res, 200, this.reviewPage(job));
             return;
         }
@@ -216,21 +233,7 @@ export class JobManager {
             job.approvedAt = Date.now();
             job.state = 'approved';
             log.info(`MCP job ${job.id} approved by operator`);
-            // The gcode is shown AGAIN next to the code (operator request
-            // after the 2026-09-01 probe crash): the last thing seen before
-            // handing over the code is exactly what the code will run.
-            const approvedGcode = fs.readFileSync(job.filePath, 'utf8');
-            const approvedLines = approvedGcode.split(/\r?\n/);
-            const approvedPreview = approvedLines.length > 80
-                ? [...approvedLines.slice(0, 40), `... ${approvedLines.length - 80} lines elided ...`, ...approvedLines.slice(-40)].join('\n')
-                : approvedGcode;
-            this.page(res, 200, `
-                <h2>Approved</h2>
-                <p>Give this one-time code to the agent to start <strong>${escapeHtml(job.name)}</strong>:</p>
-                <p style="font-size:2em;font-family:monospace;letter-spacing:0.2em">${job.confirmToken}</p>
-                <p>It expires in 15 minutes and works once.</p>
-                <h3>This code will run exactly:</h3>
-                <pre style="background:#f6f6f6;padding:12px;overflow:auto;max-height:300px">${escapeHtml(approvedPreview)}</pre>`);
+            this.page(res, 200, this.approvedPage(job));
             return;
         }
         if (req.method === 'POST' && action === 'reject') {
@@ -242,6 +245,28 @@ export class JobManager {
         }
         res.writeHead(405, { Allow: 'GET, POST' });
         res.end();
+    }
+
+    /**
+     * The gcode is shown AGAIN next to the code (operator request after the
+     * 2026-09-01 probe crash): the last thing seen before handing over the
+     * code is exactly what the code will run. Re-rendered on GET while the
+     * code is still valid, so a lost tab does not dead-end the approval.
+     */
+    private approvedPage(job: McpJob): string {
+        const approvedGcode = fs.readFileSync(job.filePath, 'utf8');
+        const approvedLines = approvedGcode.split(/\r?\n/);
+        const approvedPreview = approvedLines.length > 80
+            ? [...approvedLines.slice(0, 40), `... ${approvedLines.length - 80} lines elided ...`, ...approvedLines.slice(-40)].join('\n')
+            : approvedGcode;
+        return `
+            <h2>Approved</h2>
+            <p>Give this one-time code to the agent to start <strong>${escapeHtml(job.name)}</strong>:</p>
+            <p style="font-size:2em;font-family:monospace;letter-spacing:0.2em">${job.confirmToken}</p>
+            <p>It expires 15 minutes after approval and works once
+               (a batch of moves: once per approved step).</p>
+            <h3>This code will run exactly:</h3>
+            <pre style="background:#f6f6f6;padding:12px;overflow:auto;max-height:300px">${escapeHtml(approvedPreview)}</pre>`;
     }
 
     private reviewPage(job: McpJob): string {
