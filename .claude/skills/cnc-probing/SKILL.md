@@ -34,6 +34,14 @@ height drove the probe into the rotary stock and destroyed it.
    probe channel that no procedure declared as expected trips a CRASH alarm:
    job stopped, connection closed, motion latched until the operator clears
    it. Do not disconnect the probe feed while anything might move.
+6. **Use tools for their purpose, through the MCP surface only.**
+   `move_and_capture` is a vision reposition, not a goto — its required
+   `reason` is shown to the operator, and rapid sequential direct moves are
+   refused (pacing guard). A script looping motion calls is an unsupervised
+   procedure without a confirm page: use `survey_bed`, `move_z` batches,
+   probing procedures, or `submit_gcode_job` instead. Never touch the
+   backend, configstore, or machine directly while the app runs — the
+   guards live in the tools.
 
 ## Probe calibration (do once per probe fitting)
 

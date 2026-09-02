@@ -153,6 +153,9 @@ export interface BoundedMoveArgs {
     y?: number;
     coordinate_system?: string;
     feed_rate?: number;
+    // Why this move is happening - required, shown in the console/log, so a
+    // motion whose real goal is transport rather than vision is visible.
+    reason?: string;
     operator_confirmed_clearance?: boolean;
     wait_until_moved?: boolean;
     capture?: boolean;
@@ -161,6 +164,14 @@ export interface BoundedMoveArgs {
     unbounded_travel?: boolean;
 }
 
+// Pacing guard (2026-09-01, interface-respect): direct XY moves are single
+// supervised actions, not a scripting primitive. Rapid sequences belong in
+// the staged, operator-approved mechanisms (survey_bed, batch move_z,
+// procedures). Timestamps of recent SENT direct moves:
+const recentDirectMoves: number[] = [];
+const PACING_WINDOW_MS = 15000;
+const PACING_REFUSE_AT = 4; // the 4th move inside the window is refused
+
 /**
  * The single bounded XY move + settle + capture behind move_and_capture,
  * shared with visual_servo. Enforces every guard.
@@ -168,6 +179,12 @@ export interface BoundedMoveArgs {
 export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promise<object> {
     if (args.x === undefined && args.y === undefined) {
         throw new McpToolError('Provide x and/or y.');
+    }
+    const reason = String(args.reason || '').trim();
+    if (!reason) {
+        throw new McpToolError('reason is required: say why this XY move is needed (it is shown to the '
+            + 'operator). Direct XY moves are single supervised actions - sequences belong in staged, '
+            + 'operator-approved mechanisms (survey_bed, move_z batches, probing procedures).');
     }
     const coordinateSystem = args.coordinate_system || 'work';
     if (!['work', 'machine'].includes(coordinateSystem)) {
@@ -249,10 +266,29 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         throw new McpToolError('The connected channel does not support direct moves.');
     }
 
+    // Pacing: warn on the 2nd+ direct move inside the window; refuse from
+    // the 4th unless the operator explicitly confirmed the sequence.
+    const pacingNow = Date.now();
+    while (recentDirectMoves.length && pacingNow - recentDirectMoves[0] > PACING_WINDOW_MS) {
+        recentDirectMoves.shift();
+    }
+    if (recentDirectMoves.length >= PACING_REFUSE_AT - 1 && args.operator_confirmed_clearance !== true) {
+        throw new McpToolError(`Refused: this is direct XY move number ${recentDirectMoves.length + 1} within `
+            + `${PACING_WINDOW_MS / 1000}s. Direct moves are single supervised actions, not a scripting `
+            + 'primitive - use a staged operator-approved mechanism (survey_bed, move_z batch, a probing '
+            + 'procedure, or submit_gcode_job), or pass operator_confirmed_clearance: true only when the '
+            + 'operator explicitly directed this sequence.');
+    }
+    const pacingWarning = recentDirectMoves.length >= 1
+        ? `Direct-move pacing: ${recentDirectMoves.length + 1} moves in ${PACING_WINDOW_MS / 1000}s - sequences `
+            + 'belong in staged, operator-approved mechanisms.'
+        : undefined;
+    recentDirectMoves.push(pacingNow);
+
     const move = `G0 X${target.x.toFixed(3)} Y${target.y.toFixed(3)} F${feedRate}`;
     const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : move;
     const issuedAt = Date.now();
-    const executed = await sendGcodeVisible(channel, 'move', gcode);
+    const executed = await sendGcodeVisible(channel, `move - ${reason.slice(0, 60)}`, gcode);
     if (executed.result !== 0) {
         throw new McpToolError(`Move rejected by controller: ${executed.text || executed.result}`);
     }
@@ -264,6 +300,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
             commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
             position: null,
             position_verified: false,
+            pacing_warning: pacingWarning,
             note: 'wait_until_moved was false: move accepted but not awaited, and no frame was '
                 + 'captured (it would not show the commanded position). Poll get_position.',
         };
@@ -311,6 +348,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
             commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
             position: getPositionSnapshot(),
             position_verified: true,
+            pacing_warning: pacingWarning,
             note: 'position is firmware-reported after settling; capture was false so no frame was taken',
         };
     }
@@ -321,6 +359,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
         position: after,
         position_verified: true,
+        pacing_warning: pacingWarning,
         note: 'position is firmware-reported after settling, not the commanded target',
     });
 }
@@ -599,11 +638,12 @@ export function registerCameraTools(registry: ToolRegistry): void {
         description: 'Go to the WORK origin: one bounded XY move to work X0 Y0 at the CURRENT Z - '
             + 'semantically distinct from home, which drives to the machine limit switches. Z is '
             + 'deliberately not touched; position Z via submit_gcode_job first if needed. Same '
-            + 'guards as move_and_capture (idle, toolhead off, homed-first unless the operator '
-            + 'has confirmed clearance), and a frame is captured on arrival.',
+            + 'guards as move_and_capture (idle, toolhead off, homed-first, safe traverse height, '
+            + 'obstacle landmarks, pacing), and a frame is captured on arrival.',
         inputSchema: {
             type: 'object',
             properties: {
+                reason: { type: 'string', description: 'Why this move is needed; shown to the operator.' },
                 feed_rate: { type: 'number', description: `mm/min, default ${DEFAULT_FEED_RATE}, max 3000.` },
                 operator_confirmed_clearance: {
                     type: 'boolean',
@@ -617,9 +657,10 @@ export function registerCameraTools(registry: ToolRegistry): void {
                         + 'get_position afterwards.',
                 },
             },
+            required: ['reason'],
             additionalProperties: false,
         },
-        handler: async (args: { feed_rate?: number; operator_confirmed_clearance?: boolean; wait_until_moved?: boolean }) => {
+        handler: async (args: { reason?: string; feed_rate?: number; operator_confirmed_clearance?: boolean; wait_until_moved?: boolean }) => {
             // The work origin is a fixed, operator-set destination, so the
             // per-call travel limit (meant to bound the blast radius of a
             // wrong coordinate) does not apply; every other guard does.
@@ -627,6 +668,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 x: 0,
                 y: 0,
                 coordinate_system: 'work',
+                reason: args.reason,
                 feed_rate: args.feed_rate,
                 operator_confirmed_clearance: args.operator_confirmed_clearance,
                 wait_until_moved: args.wait_until_moved,
@@ -637,16 +679,19 @@ export function registerCameraTools(registry: ToolRegistry): void {
 
     registry.register({
         name: 'move_and_capture',
-        description: 'ONE bounded XY move at the current Z via the direct path, wait for the '
-            + 'firmware-reported position to settle, then capture a frame stamped with that '
-            + 'position. No Z parameter by design: Z changes and compound motion must go through '
-            + 'submit_gcode_job (door interlock). Requires an idle machine with the toolhead off. '
-            + `Travel per call is limited (configstore mcpMaxJogDistance, default ${DEFAULT_MAX_TRAVEL_MM} mm).`,
+        description: 'ONE vision-driven XY reposition at the current Z: move, settle-verify, and '
+            + 'capture a position-stamped frame. This is NOT a transport primitive - travel and '
+            + 'sequences belong in staged operator-approved mechanisms (survey_bed, move_z batches, '
+            + 'probing procedures, submit_gcode_job), and rapid sequential calls are refused '
+            + '(pacing guard). XY happens at top gantry height (safe traverse guard) with obstacle '
+            + 'landmarks enforced. No Z parameter by design. Requires an idle machine, toolhead '
+            + `off, a stated reason. Travel per call is capped (mcpMaxJogDistance, default ${DEFAULT_MAX_TRAVEL_MM} mm).`,
         inputSchema: {
             type: 'object',
             properties: {
                 x: { type: 'number', description: 'Target X. Omit to keep current X.' },
                 y: { type: 'number', description: 'Target Y. Omit to keep current Y.' },
+                reason: { type: 'string', description: 'Why this move is needed; shown to the operator.' },
                 coordinate_system: {
                     type: 'string',
                     enum: ['work', 'machine'],
@@ -671,6 +716,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
                         + 'the configstore key mcpMaxJogDistance, default 100mm.)',
                 },
             },
+            required: ['reason'],
             additionalProperties: false,
         },
         handler: async (args: BoundedMoveArgs) => executeBoundedMoveAndCapture(args),
