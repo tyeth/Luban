@@ -9,7 +9,7 @@ import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 import { validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
-import { PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
+import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
 
 // Motion policy (#23): compound motion leaves this process only as a G-code
 // file submitted through the same prepare/start path as "Start on Luban",
@@ -256,8 +256,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 throw new McpToolError('Unknown job_id.');
             }
 
-            // Connectivity and idleness are checked before the token is
-            // consumed, so an offline attempt does not waste an approval.
+            // Connectivity, heartbeat freshness and idleness are checked
+            // before the token is consumed, so an offline attempt does not
+            // waste an approval.
+            assertFreshHeartbeat('starting a job');
             const channel = getJobChannel();
             const status = machineStatus();
             if (status !== 'idle') {
@@ -465,6 +467,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             }
             const feedRate = Math.min(Math.max(Number(args.feed_rate) || 300, 50), 600);
 
+            assertFreshHeartbeat('staging a Z move');
             const position = getPositionSnapshot();
             if (position.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);

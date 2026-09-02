@@ -82,6 +82,30 @@ export interface PositionSnapshot {
     warnings: string[];
 }
 
+// Heartbeat period is ~1s; a report older than this means the machine
+// connection has likely dropped without the server noticing (observed live
+// 2026-09-02: 5.7 minutes of stale state served as truth while the machine
+// was disconnected).
+export const HEARTBEAT_STALE_MS = 10000;
+
+/**
+ * Refuse to act on a stale heartbeat. Every motion-adjacent path (staging,
+ * procedure preconditions, direct execution) must call this: a position the
+ * machine reported minutes ago is not a position.
+ */
+export function assertFreshHeartbeat(what: string): void {
+    const state = connectionManager.getLatestMachineState();
+    if (!state) {
+        throw new McpToolError('No heartbeat received yet on this channel; position unknown.');
+    }
+    const age = Date.now() - state.timestamp;
+    if (age > HEARTBEAT_STALE_MS) {
+        throw new McpToolError(`Refusing ${what}: the last heartbeat is ${(age / 1000).toFixed(0)}s old `
+            + '(period ~1s) - the machine connection has likely dropped without the server noticing. '
+            + 'Reconnect the machine, verify get_position reports a fresh, correct position, then retry.');
+    }
+}
+
 /**
  * Position from the latest heartbeat, shared by get_position and the
  * capture tools. Throws McpToolError when unavailable.
@@ -123,6 +147,13 @@ export function getPositionSnapshot(): PositionSnapshot {
     // coordinates land outside the build volume (e.g. Z 656 on a 325 mm
     // machine). Flag it rather than let an agent trust it.
     const warnings: string[] = [];
+    const reportAgeMs = Date.now() - state.timestamp;
+    if (reportAgeMs > HEARTBEAT_STALE_MS) {
+        warnings.push(`STALE: the last heartbeat is ${(reportAgeMs / 1000).toFixed(0)}s old `
+            + `(period ~1s) - the machine connection has likely dropped without the server `
+            + 'noticing (observed live 2026-09-02). Do NOT trust this position; reconnect and '
+            + 're-verify before any motion.');
+    }
     const size = getMachineSizeByIdentifier(status.machineIdentifier);
     if (size) {
         // Floors/headroom allow real overtravel: the A350 X home switch sits
@@ -147,7 +178,7 @@ export function getPositionSnapshot(): PositionSnapshot {
         isFourAxis: !!pos.isFourAxis,
         isHomed: (state as { isHomed?: boolean }).isHomed ?? null,
         machineStatus: (state as { status?: string }).status || null,
-        reportAgeMs: Date.now() - state.timestamp,
+        reportAgeMs,
         convention: 'machine = work - originOffset; heartbeat reports work coordinates',
         warnings,
     };
