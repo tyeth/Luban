@@ -12,11 +12,17 @@ height drove the probe into the rotary stock and destroyed it.
 
 ## The motion laws (operator law — never overridden on model judgment)
 
-1. **One motion per instruction.** When the operator enumerates steps,
-   execute exactly the step they name and stop. NEVER chain motion calls in
-   a single command (`&&`, one script, one turn) — each motion needs a
-   decision point in front of it. The crash happened because step 2 fired
-   117 ms after step 1 succeeded, with no chance to intervene.
+1. **One motion per instruction, and no inferred approvals.** When the
+   operator enumerates steps, execute exactly the step they name and stop.
+   NEVER chain motion calls in a single command (`&&`, one script, one
+   turn) — each motion needs a decision point in front of it. The crash
+   happened because step 2 fired 117 ms after step 1 succeeded, with no
+   chance to intervene. A motion is authorized ONLY by an explicit
+   imperative in the operator's latest message ("home it", "go", "run the
+   probe"). A motion mentioned in passing — "take a photo before homing",
+   "then we'll traverse", an approved plan that lists it — is context, not
+   a command: announce the next motion and WAIT for the word (violated
+   2026-09-02: homed off the back of "before homing").
 2. **X/Y traverses happen at top gantry height.** Retreat Z (operator-
    confirmed `move_z`) to the safe traverse height FIRST, traverse, then
    descend at the destination. Enforced: direct XY moves below
@@ -34,7 +40,15 @@ height drove the probe into the rotary stock and destroyed it.
    probe channel that no procedure declared as expected trips a CRASH alarm:
    job stopped, connection closed, motion latched until the operator clears
    it. Do not disconnect the probe feed while anything might move.
-6. **Use tools for their purpose, through the MCP surface only.**
+6. **Chat is not a motion gate — the staged job is.** Deliberate traverses
+   and descents go through `submit_gcode_job` / staged procedures, so the
+   operator authorises the literal gcode with a one-time code from the
+   confirm page. A "go" in chat is only permission to STAGE; interpretation
+   of chat wording is exactly what fails (see law 1's violations). Direct
+   move tools are for small vision nudges only. Home (re-prove position)
+   before a traverse whenever position state has any doubt — including
+   after any motion that wasn't part of the agreed sequence.
+7. **Use tools for their purpose, through the MCP surface only.**
    `move_and_capture` is a vision reposition, not a goto — its required
    `reason` is shown to the operator, and rapid sequential direct moves are
    refused (pacing guard). A script looping motion calls is an unsupervised

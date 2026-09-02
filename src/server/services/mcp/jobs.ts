@@ -29,9 +29,11 @@ export type McpJobState =
 
 /**
  * 'file' runs through prepare_print/start_print (door interlock applies, and
- * the firmware parks at the work origin on completion). 'direct' executes
- * over execute_code on approval - it persists position but is NOT subject to
- * the door interlock, so the confirm page says so and the operator supervises.
+ * the machine interpreter returns to Z top at the job's finish position on
+ * completion - XY holds, Z does not; operator-clarified 2026-09-02). 'direct'
+ * executes over execute_code on approval - it persists position but is NOT
+ * subject to the door interlock, so the confirm page says so and the operator
+ * supervises.
  * 'procedure' is a server-driven measurement routine (e.g. the tool setter):
  * the operator approves a motion ENVELOPE and the runner steps within it
  * against live sensor feedback - also on the direct path, not interlocked.
@@ -51,6 +53,8 @@ export interface McpJob {
     approvedAt: number | null;
     tokenUsed: boolean;
     startedAt: number | null;
+    // Set when the job reaches a terminal state (completed / stopped).
+    endedAt: number | null;
     error: string | null;
     // Batch direct jobs: the operator approved this exact list; each
     // start_gcode_job call executes ONE step, so captures can happen between
@@ -109,6 +113,7 @@ export class JobManager {
             approvedAt: null,
             tokenUsed: false,
             startedAt: null,
+            endedAt: null,
             error: null,
             steps,
             nextStep: steps ? 0 : undefined,
@@ -158,6 +163,7 @@ export class JobManager {
             createdAt: job.createdAt,
             approvedAt: job.approvedAt,
             startedAt: job.startedAt,
+            endedAt: job.endedAt,
             error: job.error,
             totalSteps: job.steps ? job.steps.length : undefined,
             nextStep: job.steps ? job.nextStep : undefined,
