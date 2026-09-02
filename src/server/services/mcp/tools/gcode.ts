@@ -311,7 +311,18 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 const gcodeText = isBatch
                     ? job.steps[job.nextStep]
                     : fs.readFileSync(job.filePath, 'utf8');
-                const executed = await sendGcodeVisible(channel as GcodeChannel, `direct:${job.name}`, gcodeText);
+                // The staged text carries a human-facing comment header for
+                // the confirm page; the realtime execute path must get pure
+                // commands - the controller never replied to a payload led by
+                // comment lines (hung live, 2026-09-02, job e34b19a913ff).
+                const executable = gcodeText
+                    .split(/\r?\n/)
+                    .filter((line) => {
+                        const trimmed = line.trim();
+                        return trimmed.length > 0 && !trimmed.startsWith(';');
+                    })
+                    .join('\n');
+                const executed = await sendGcodeVisible(channel as GcodeChannel, `direct:${job.name}`, executable);
                 if (executed.result !== 0) {
                     job.state = 'start_failed';
                     job.error = `Controller rejected the move: ${executed.text || executed.result}`;
@@ -327,7 +338,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         warning: 'wait_until_moved was false: the move was accepted but not awaited - '
                             + 'poll get_position (or query_firmware_position) before relying on position.',
                     }
-                    : await waitForStableHeartbeat(issuedAt, parseZTarget(gcodeText));
+                    : await waitForStableHeartbeat(issuedAt, parseZTarget(executable));
                 if (isBatch) {
                     job.nextStep += 1;
                     if (job.nextStep < job.steps.length) {
@@ -485,8 +496,40 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 : `G90\nG1 Z${t.toFixed(3)} F${feedRate}`);
             const steps = targets.map(stepGcode);
             const isBatch = targets.length > 1;
-            const reviewText = steps.join('\n; --- next approved step ---\n');
             const delta = targetZ - currentZ;
+            // The gcode preview must let the operator validate the numbers
+            // without trusting chat: state the reason, the frame, where the
+            // machine is now and the delta of every step (operator request
+            // 2026-09-02). Sensors: no contact is expected during a Z move.
+            const wrapText = (text: string, width: number): string[] => {
+                const words = String(text).split(/\s+/);
+                const rows: string[] = [];
+                let row = '';
+                for (const word of words) {
+                    if (row && (row.length + word.length + 1) > width) {
+                        rows.push(row);
+                        row = word;
+                    } else {
+                        row = row ? `${row} ${word}` : word;
+                    }
+                }
+                if (row) {
+                    rows.push(row);
+                }
+                return rows;
+            };
+            const header = [
+                ...wrapText(`reason: ${args.reason}`, 90).map((row) => `; ${row}`),
+                `; frame: ${coordinateSystem} coords; current ${coordinateSystem} Z ${currentZ.toFixed(3)}`,
+                ...targets.map((t, i) => {
+                    const from = i === 0 ? currentZ : targets[i - 1];
+                    const d = t - from;
+                    return `; step ${i + 1}: Z ${from.toFixed(3)} -> ${t.toFixed(3)} (${d >= 0 ? '+' : ''}${d.toFixed(3)} mm) F${feedRate}`;
+                }),
+                '; sensors: NO contact expected during these moves - a probe/toolsetter trigger',
+                '; while moving latches the CRASH alarm (probe feed must be armed).',
+            ].join('\n');
+            const reviewText = `${header}\n${steps.join('\n; --- next approved step ---\n')}`;
             const name = isBatch
                 ? `z-series ${coordinateSystem} [${targets.map((t) => t.toFixed(1)).join(', ')}] - ${String(args.reason).slice(0, 40)}`
                 : `z-move ${coordinateSystem} Z${targetZ.toFixed(1)} (${delta >= 0 ? '+' : ''}${delta.toFixed(1)}mm) - ${String(args.reason).slice(0, 40)}`;

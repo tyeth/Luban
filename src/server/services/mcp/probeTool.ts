@@ -16,7 +16,7 @@ import {
     senseReleaseAfter,
 } from './probing';
 import { McpToolError } from './registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot } from './tools/machine';
+import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
 import { connectionManager } from '../machine/ConnectionManager';
 
 // Point probing with the spindle-mounted touch probe (normally-open, probe
@@ -131,8 +131,12 @@ export function describeProbePlanAsGcode(plan: ProbePointPlan): string {
         `; steps to contact, then ${plan.confirmPasses} quick confirm cycles (lift ${plan.backoffMm} mm, wait for release,`,
         `; re-approach). Result = median contact ${word} (spread reported).`,
         `G1 ${word}${plan.start[plan.axis].toFixed(3)} F${TRAVEL_FEED}; retreat to the start ${word} when done (also on any abort)`,
-        'G54;',
     );
+    const traverse = safeTraverseZ();
+    if (plan.start.z < traverse) {
+        lines.push(`G1 Z${traverse.toFixed(3)} F${TRAVEL_FEED}; finish at the safe traverse height (motion law 2)`);
+    }
+    lines.push('G54;');
     return lines.join('\n');
 }
 
@@ -277,9 +281,16 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         const spreadMm = Number((sorted[sorted.length - 1] - sorted[0]).toFixed(3));
         announce('measured', measured, `median of [${passContacts.join(', ')}], spread ${spreadMm} mm`);
 
-        // Retreat along the probed axis to the start coordinate.
+        // Retreat along the probed axis to the start coordinate, then finish
+        // at the safe traverse height (operator request 2026-09-02) so no
+        // separate staged lift is needed before the next reposition.
         await move('probe:retreat', startCoord, TRAVEL_FEED);
         announce('retreated', startCoord);
+        const traverse = safeTraverseZ();
+        if (plan.start.z < traverse) {
+            await moveMachineSettled('probe:raise', { z: traverse }, TRAVEL_FEED);
+            announce('raised', traverse, 'safe traverse height');
+        }
 
         const contactMachine = { ...plan.start, [plan.axis]: measured };
         const after = getPositionSnapshot();
@@ -306,6 +317,12 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
             try {
                 await move('probe:abort-retreat', startCoord, TRAVEL_FEED);
                 announce('abort-retreated', startCoord);
+                const traverse = safeTraverseZ();
+                const reading = probeFeedService.getReading('probe');
+                if (plan.start.z < traverse && (!reading || !reading.triggered)) {
+                    await moveMachineSettled('probe:abort-raise', { z: traverse }, TRAVEL_FEED);
+                    announce('abort-raised', traverse, 'safe traverse height');
+                }
             } catch (retreatErr) {
                 // The abort itself already reports; retreat failure is logged
                 // by the activity stream.

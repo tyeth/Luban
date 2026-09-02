@@ -83,9 +83,13 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    run one at a time. Only an explicit imperative in the operator's latest message
    authorizes a motion; a motion mentioned in passing ("before homing", "then we'll…",
    a previously approved plan) is context, not a command — announce and wait.
-2. **X/Y traverses at top gantry height** — direct XY moves below `mcpSafeTraverseZ`
-   (default 320) are refused without `operator_confirmed_clearance`. Retreat, traverse,
-   descend — in that order.
+2. **X/Y traverses at top gantry height — ALL of them** (operator, 2026-09-02: "x/y motion
+   over 1mm is never below gantry height"). Any XY move over 1 mm is planned at the safe
+   traverse height — no local hops above a measured feature, no other "measured safe"
+   heights. Retreat, traverse, descend — in that order. Sub-gantry XY is only fine
+   positioning <= 1 mm (touch nudges, probe march steps). Enforced: direct XY below
+   `mcpSafeTraverseZ` (default 320) refused without `operator_confirmed_clearance`, which
+   is for emergencies on the operator's explicit words, not a planning device.
 3. **No fabricated clearances** — only measured or operator-stated heights count. Visual
    inference finds things; it never clears them.
 4. **Landmarks are obstacles** — `clearance_z` on a landmark refuses XY paths crossing its
@@ -146,7 +150,10 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
   homing = `G53;G28;G54` exactly like Luban's button
   (a bare G28 leaves reporting in an unselected workspace → impossible derived coords like
   Y 464/Z 656). Homing takes ~15–20 s and **also homes B — stock on the rotary rotates**.
-- **Work origins are operator-set per workspace and persist across homing.**
+- **Work origins are operator-set per workspace and persist across homing — but NOT across
+  machine reboots** (operator, 2026-09-02): a rebooted machine gets a new work origin, so
+  never assume it carries over between sessions; re-verify `originOffset` after every
+  (re)connect before trusting work coordinates.
 - **The machine interpreter returns to Z top at the job's finish position when a file job
   COMPLETES** (operator-clarified 2026-09-02; supersedes the earlier "parks at the work
   origin" reading — Z top and this setup's work-origin Z are both 328, which hid the

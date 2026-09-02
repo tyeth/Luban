@@ -8,7 +8,9 @@ import DataStorage from '../../../DataStorage';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { captureFrame } from '../camera';
 import { jobManager } from '../jobs';
+import { describeProbeCirclePlanAsGcode, planProbeCircle, runProbeCircleProcedure } from '../probeCircle';
 import { describeProbePlanAsGcode, planProbePoint, runProbePointProcedure } from '../probeTool';
+import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -56,7 +58,8 @@ export function registerProbingTools(registry: ToolRegistry, getConfirmBaseUrl: 
             }
             probeFeedService.assertNoOvertravel();
             const plan = planProbePoint(args as Parameters<typeof planProbePoint>[0]);
-            const envelope = describeProbePlanAsGcode(plan);
+            const envelope = `; reason: ${String(args.reason).trim()}
+${describeProbePlanAsGcode(plan)}`;
             const validation = validateGcode(envelope);
             const job = jobManager.submit(
                 envelope,
@@ -74,6 +77,144 @@ export function registerProbingTools(registry: ToolRegistry, getConfirmBaseUrl: 
                 next_step: 'Ask the operator to open confirm_url, review the envelope (anchored to the '
                     + 'current position), and approve. Their one-time code passed to start_gcode_job '
                     + 'runs the march and returns the contact coordinate.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'probe_vector',
+        description: 'Stage a touch-probe march along an ARBITRARY direction for human confirmation: '
+            + 'from the CURRENT position along the given (dx, dy, dz) heading - any XY direction, '
+            + 'optionally angled downward, never upward. Same staged mechanics as probe_point '
+            + '(coarse steps to contact, retreat to release, fine steps, lift-and-retest confirm '
+            + 'cycles); the march is parametrized along the unit vector so every commanded position '
+            + 'lies on the approved segment. Returns the median contact as machine XYZ plus the '
+            + 'distance along the vector. probe_point is the axis-aligned special case; use this '
+            + 'for angled edges, chamfers, polygon faces, and inside-a-hole checks. Position first '
+            + '(top-gantry traverse, operator-confirmed descent), then stage.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                dx: { type: 'number', description: 'Direction X component (machine frame). Magnitude ignored.' },
+                dy: { type: 'number', description: 'Direction Y component.' },
+                dz: { type: 'number', description: 'Direction Z component; must be <= 0 (downward or level).' },
+                max_travel_mm: {
+                    type: 'number',
+                    description: 'REQUIRED hard travel limit (1-150) along the vector: the march aborts '
+                        + 'there without contact. Clamped so the whole segment stays in the machine envelope.',
+                },
+                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-2).' },
+                fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 0.5.' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 200.' },
+                confirm_passes: { type: 'number', description: 'Lift-and-retest cycles, default 3 (1-10).' },
+                reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
+            },
+            required: ['max_travel_mm', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            if (!String(args.reason || '').trim()) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeVector(args as Parameters<typeof planProbeVector>[0]);
+            const envelope = `; reason: ${String(args.reason).trim()}
+${describeProbeVectorPlanAsGcode(plan)}`;
+            const validation = validateGcode(envelope);
+            const job = jobManager.submit(
+                envelope,
+                `probe-vector (${plan.unit.x},${plan.unit.y},${plan.unit.z}) ${plan.maxTravelMm}mm `
+                    + `- ${String(args.reason).slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeVectorProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan,
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url, review the envelope (anchored to the '
+                    + 'current position), and approve. Their one-time code passed to start_gcode_job '
+                    + 'runs the march and returns the contact coordinate.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'probe_circle',
+        description: 'Stage an N-point circle measurement of a roughly-round vertical feature (post, '
+            + 'boss, pin) for human confirmation: radial sensor-gated marches from evenly spaced '
+            + 'azimuths, then a least-squares circle fit. Requires the operator\'s MIN and MAX '
+            + 'diameter estimates - they bound every march (start beyond max/2, abort at min/2 '
+            + 'without contact) - and a MEASURED top height (top_z_machine). Yields the fitted '
+            + 'centre and the COMBINED diameter (feature + probe tip, inseparable without one '
+            + 'known), with residuals exposing an out-of-round tip or feature. Repositioning between '
+            + 'points obeys motion law 2: lift to the safe traverse height, hop, descend; a probe '
+            + 'touch during a hop or descent latches the CRASH alarm.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                center_x: { type: 'number', description: 'Estimated feature centre X, machine coords.' },
+                center_y: { type: 'number', description: 'Estimated feature centre Y, machine coords.' },
+                diameter_min_mm: {
+                    type: 'number',
+                    description: 'Operator\'s LOWER bound on the feature diameter: marches abort at this '
+                        + 'radius without contact instead of pressing on.',
+                },
+                diameter_max_mm: {
+                    type: 'number',
+                    description: 'Operator\'s UPPER bound on the feature diameter: approaches start '
+                        + 'approach_clearance_mm beyond this radius.',
+                },
+                top_z_machine: {
+                    type: 'number',
+                    description: 'Toolhead machine Z at which the probe tip touches the feature TOP - '
+                        + 'measured (probe_point -Z) or operator-stated, never guessed.',
+                },
+                probe_depth_mm: { type: 'number', description: 'Side contacts this far below the top, default 3 (0.5-20).' },
+                points: { type: 'number', description: 'Contact points around the circle, default 8 (4-16).' },
+                approach_clearance_mm: {
+                    type: 'number',
+                    description: 'Start-radius margin beyond max/2, default 5 (1-20). Must exceed the '
+                        + 'probe tip radius plus a safety margin.',
+                },
+                coarse_step_mm: { type: 'number', description: 'Coarse radial step, default 0.5 (0.2-2).' },
+                fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 0.5.' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 200.' },
+                confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per point, default 2 (1-5).' },
+                reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
+            },
+            required: ['center_x', 'center_y', 'diameter_min_mm', 'diameter_max_mm', 'top_z_machine', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            if (!String(args.reason || '').trim()) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeCircle(args as Parameters<typeof planProbeCircle>[0]);
+            const envelope = `; reason: ${String(args.reason).trim()}
+${describeProbeCirclePlanAsGcode(plan)}`;
+            const validation = validateGcode(envelope);
+            const job = jobManager.submit(
+                envelope,
+                `probe-circle ${plan.points.length}pts d${plan.diameterMinMm}-${plan.diameterMaxMm} `
+                    + `- ${String(args.reason).slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeCircleProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan,
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url, review the full envelope (all marches, '
+                    + 'hops and depths), and approve. Their one-time code passed to start_gcode_job runs '
+                    + 'the whole star and returns the circle fit.',
             };
         },
     });

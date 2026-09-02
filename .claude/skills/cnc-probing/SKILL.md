@@ -23,12 +23,17 @@ height drove the probe into the rotary stock and destroyed it.
    "then we'll traverse", an approved plan that lists it — is context, not
    a command: announce the next motion and WAIT for the word (violated
    2026-09-02: homed off the back of "before homing").
-2. **X/Y traverses happen at top gantry height.** Retreat Z (operator-
-   confirmed `move_z`) to the safe traverse height FIRST, traverse, then
-   descend at the destination. Enforced: direct XY moves below
-   `mcpSafeTraverseZ` (default 320) are refused without
-   `operator_confirmed_clearance` — which only the operator's explicit words
-   authorise.
+2. **X/Y traverses happen at top gantry height — ALL of them.** Any XY move
+   over 1 mm is planned at the safe traverse height, with no exceptions: not
+   between probe points, not "local hops" above a measured feature top, not
+   at any other "measured safe" height (operator, 2026-09-02: "x/y motion
+   over 1mm is never below gantry height"). Retreat Z FIRST, traverse, then
+   descend at the destination. The only sub-gantry XY motion is fine
+   positioning of <= 1 mm (touch-test nudges, probe march steps). Enforced:
+   direct XY moves below `mcpSafeTraverseZ` (default 320) are refused
+   without `operator_confirmed_clearance` — which only the operator's
+   explicit words authorise, and which is for emergencies, not for planning
+   around this law.
 3. **Never fabricate clearance.** Only measured numbers or operator-stated
    numbers count for heights. Visual inference from survey frames is for
    FINDING things, not for clearing them — the crash analysis misread the
@@ -82,6 +87,19 @@ tip-radius before the tip centre — correct for it.
 Feed latency (hardware-measured, Adafruit IO): trigger message ~120–150 ms
 after physical contact; 200 ms contact windows are right. Release messages
 lag ~1 s — release checks are patient by design; never shorten them.
+
+## Circle probing
+
+`probe_circle` measures a roughly-round vertical feature (post, boss, pin):
+N radial marches from evenly spaced azimuths, one staged envelope, then a
+least-squares circle fit. It REQUIRES the operator's min/max diameter
+estimates (marches start beyond max/2 and abort at min/2 without contact)
+and a MEASURED top height. Physics: every contact adds the tip's effective
+radius, so the fit yields the COMBINED diameter — feature and tip are
+inseparable unless one is known. Direction-dependent residuals expose an
+out-of-round tip (the post-unbending health check). Repositioning between
+points obeys law 2 in full: lift to the safe traverse height, hop, descend;
+a probe touch during a hop or descent latches the CRASH alarm.
 
 ## Bed survey
 
