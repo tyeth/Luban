@@ -52,11 +52,11 @@ jobs:
             -   name: Use Node.js 16
                 uses: actions/setup-node@v3
                 with:
-                    node-version: 16
+                    node-version: 22
 
             -   name: install
                 run: |
-                    npm install -g npm@^9
+                    npm install -g npm
                     npm install
             -   name: build
                 run: npm run build
@@ -126,12 +126,12 @@ jobs:
            -   name: Use Node.js 16
                uses: actions/setup-node@v3
                with:
-                   node-version: 16
+                   node-version: 22
 
            # install setuptools to reintroduce distutils missing in Python 3.12
            # https://github.com/nodejs/node-gyp/issues/2869
            -   run: pip install setuptools
-           -   run: npm install -g npm@^9
+           # -   run: npm install -g npm@^9
            -   run: npm install
 
            -   run: npm run build
@@ -264,9 +264,9 @@ jobs:
             -   name: Use Node.js 16
                 uses: actions/setup-node@v3
                 with:
-                    node-version: 16
+                    node-version: 22
 
-            -   run: npm install -g npm@^9 --unsafe-perm
+            # -   run: npm install -g npm@^9 --unsafe-perm
             -   run: npm install --unsafe-perm
 
             -   run: npm run build
