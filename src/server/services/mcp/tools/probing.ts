@@ -10,6 +10,7 @@ import { captureFrame } from '../camera';
 import { jobManager } from '../jobs';
 import { describeProbeCirclePlanAsGcode, planProbeCircle, runProbeCircleProcedure } from '../probeCircle';
 import { describeProbePlanAsGcode, planProbePoint, runProbePointProcedure } from '../probeTool';
+import { describeProbeSequencePlanAsGcode, planProbeSequence, runProbeSequenceProcedure } from '../probeSequence';
 import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
@@ -44,8 +45,8 @@ export function registerProbingTools(registry: ToolRegistry, getConfirmBaseUrl: 
                 },
                 coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-2).' },
                 fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
-                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 0.5.' },
-                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 200.' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300.' },
                 confirm_passes: { type: 'number', description: 'Lift-and-retest cycles, default 3 (1-10).' },
                 reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
             },
@@ -105,8 +106,8 @@ ${describeProbePlanAsGcode(plan)}`;
                 },
                 coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-2).' },
                 fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
-                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 0.5.' },
-                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 200.' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300.' },
                 confirm_passes: { type: 'number', description: 'Lift-and-retest cycles, default 3 (1-10).' },
                 reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
             },
@@ -138,6 +139,81 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
                 next_step: 'Ask the operator to open confirm_url, review the envelope (anchored to the '
                     + 'current position), and approve. Their one-time code passed to start_gcode_job '
                     + 'runs the march and returns the contact coordinate.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'probe_sequence',
+        description: 'Stage a whole measurement CIRCUIT as ONE operator approval: an ordered list of '
+            + 'steps - hop (XY traverse; the runner always raises to the safe traverse height first), '
+            + 'descend (absolute Z at current XY), probe (named sensor-gated march along +/-X/+/-Y/-Z '
+            + 'or any downward vector, with the proven coarse/release/fine/confirm mechanics). The '
+            + 'plan is simulated at staging so the confirm page enumerates every commanded move with '
+            + 'concrete numbers; the runner re-verifies the machine matches the simulation before '
+            + 'every march. Contact is expected ONLY during marches - a touch during any hop, raise '
+            + 'or descent latches the CRASH alarm. Every number must be measured or operator-stated. '
+            + 'Ends raised at the traverse height. Results keyed by march name, machine coords only.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                steps: {
+                    type: 'array',
+                    minItems: 1,
+                    maxItems: 60,
+                    description: 'Ordered circuit steps.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            kind: { type: 'string', enum: ['hop', 'descend', 'probe'] },
+                            x: { type: 'number', description: 'hop: target machine X.' },
+                            y: { type: 'number', description: 'hop: target machine Y.' },
+                            z: { type: 'number', description: 'descend: absolute machine Z.' },
+                            name: { type: 'string', description: 'probe: unique result key.' },
+                            dx: { type: 'number', description: 'probe: direction X component.' },
+                            dy: { type: 'number', description: 'probe: direction Y component.' },
+                            dz: { type: 'number', description: 'probe: direction Z component (<= 0).' },
+                            max_travel_mm: { type: 'number', description: 'probe: hard travel limit (1-150).' },
+                        },
+                        required: ['kind'],
+                        additionalProperties: false,
+                    },
+                },
+                coarse_step_mm: { type: 'number', description: 'Coarse step for all marches, default 1 (0.2-2).' },
+                fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300.' },
+                confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per march, default 3 (1-10).' },
+                reason: { type: 'string', description: 'Shown to the operator: what the circuit measures and why.' },
+            },
+            required: ['steps', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            if (!String(args.reason || '').trim()) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeSequence(args as Parameters<typeof planProbeSequence>[0]);
+            const envelope = `; reason: ${String(args.reason).trim()}
+${describeProbeSequencePlanAsGcode(plan)}`;
+            const validation = validateGcode(envelope);
+            const marches = plan.steps.filter((s) => s.kind === 'probe').length;
+            const job = jobManager.submit(
+                envelope,
+                `probe-sequence ${plan.steps.length}steps/${marches}marches - ${String(args.reason).slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeSequenceProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan,
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url, review the ENTIRE circuit (every hop, '
+                    + 'descent and march is enumerated), and approve once. Their one-time code passed to '
+                    + 'start_gcode_job runs the whole circuit and returns all named contacts.',
             };
         },
     });
@@ -191,8 +267,8 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
                 },
                 coarse_step_mm: { type: 'number', description: 'Coarse radial step, default 0.5 (0.2-2).' },
                 fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
-                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 0.5.' },
-                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 200.' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300.' },
                 confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per point, default 2 (1-5).' },
                 reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
             },

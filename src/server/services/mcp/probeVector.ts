@@ -117,8 +117,8 @@ export function planProbeVector(args: {
         },
         coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 2),
         fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 0.5, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 200, 100), 10000),
+        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
+        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
         confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
     };
 }
@@ -213,7 +213,7 @@ export async function runProbeVectorProcedure(plan: ProbeVectorPlan): Promise<ob
         phases.push({ phase, s: Number(s.toFixed(3)), note });
         mcpBroadcast('mcp:activity', { tool: 'probe_vector', phase, s: Number(s.toFixed(3)), note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 2500);
+    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
     const move = async (tool: string, s: number, feed: number) => {
         await moveMachineSettled(tool, moveWords(plan, s), feed);
     };
@@ -276,7 +276,7 @@ export async function runProbeVectorProcedure(plan: ProbeVectorPlan): Promise<ob
 
         // Quick lift-and-retest confirm cycles; median wins, spread reported.
         const passContacts: number[] = [];
-        const cycleLimit = Math.min(fineContactS + 0.5, plan.maxTravelMm);
+        const cycleLimit = Math.min(fineContactS + Math.max(0.5, plan.backoffMm), plan.maxTravelMm);
         let reference = fineContactS;
         for (let pass = 1; pass <= plan.confirmPasses; pass++) {
             const liftIssuedAt = Date.now();
