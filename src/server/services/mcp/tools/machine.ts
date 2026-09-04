@@ -1,3 +1,5 @@
+import * as fs from 'fs-extra';
+import path from 'path';
 import {
     SnapmakerA150Machine,
     SnapmakerA250Machine,
@@ -8,6 +10,8 @@ import {
     SnapmakerOriginalMachine,
     SnapmakerRayMachine,
 } from '../../../../app/machines';
+
+import DataStorage from '../../../DataStorage';
 import config from '../../configstore';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -42,6 +46,45 @@ const KINEMATICS_BY_IDENTIFIER: { [identifier: string]: object } = {
 
 function findMachine(identifier: string) {
     return MACHINES.find((machine) => machine.identifier === identifier) || null;
+}
+
+export interface AppMachineSettings {
+    /** Machine identifier as selected in Luban, e.g. "Snapmaker 2.0 A350". */
+    series: string | null;
+    /** Selected toolhead per function: printingToolhead / laserToolhead / cncToolhead. */
+    toolHead: { [kind: string]: string };
+    /** Installed add-on module identifiers, e.g. "snapmaker-2.0-bracing-kit-module". */
+    modules: string[];
+}
+
+/**
+ * The machine the OPERATOR selected in Luban's Machine Settings - series,
+ * toolheads and add-on modules (quick-swap kit, bracing kit). Read fresh from
+ * the app's own persisted store (userData/machine.json, state.machine) on
+ * every call, so a settings change - the app returns to its home page when
+ * the machine config changes - is honoured immediately. This is the single
+ * source of truth for what is installed; nothing is duplicated in the
+ * server configstore.
+ */
+export function readAppMachineSettings(): AppMachineSettings | null {
+    try {
+        const file = path.join(DataStorage.userDataDir, 'machine.json');
+        if (!fs.existsSync(file)) {
+            return null;
+        }
+        const store = fs.readJsonSync(file);
+        const machine = store && store.state && store.state.machine;
+        if (!machine || typeof machine !== 'object') {
+            return null;
+        }
+        return {
+            series: typeof machine.series === 'string' ? machine.series : null,
+            toolHead: machine.toolHead && typeof machine.toolHead === 'object' ? machine.toolHead : {},
+            modules: Array.isArray(machine.modules) ? machine.modules.map(String) : [],
+        };
+    } catch (err) {
+        return null;
+    }
 }
 
 /**
@@ -150,7 +193,7 @@ export function getPositionSnapshot(): PositionSnapshot {
     const reportAgeMs = Date.now() - state.timestamp;
     if (reportAgeMs > HEARTBEAT_STALE_MS) {
         warnings.push(`STALE: the last heartbeat is ${(reportAgeMs / 1000).toFixed(0)}s old `
-            + `(period ~1s) - the machine connection has likely dropped without the server `
+            + '(period ~1s) - the machine connection has likely dropped without the server '
             + 'noticing (observed live 2026-09-02). Do NOT trust this position; reconnect and '
             + 're-verify before any motion.');
     }
@@ -188,7 +231,9 @@ export function registerMachineTools(registry: ToolRegistry): void {
     registry.register({
         name: 'get_machine_profile',
         description: 'Machine profile: build volume, per-toolhead work ranges, and kinematics '
-            + '(which element moves per axis). Defaults to the connected machine. Read-only.',
+            + '(which element moves per axis). Defaults to the connected machine, else the one '
+            + 'selected in Luban Machine Settings; installed add-on modules (bracing kit, quick-swap) '
+            + 'come from those same settings. Read-only.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -201,10 +246,11 @@ export function registerMachineTools(registry: ToolRegistry): void {
         },
         handler: async (args: { identifier?: string }) => {
             const status = connectionManager.getConnectionStatus();
-            const identifier = args.identifier || status.machineIdentifier;
+            const appSettings = readAppMachineSettings();
+            const identifier = args.identifier || status.machineIdentifier || (appSettings && appSettings.series) || '';
             if (!identifier) {
-                throw new McpToolError('No machine connected and no identifier given. '
-                    + `Known identifiers: ${MACHINES.map((m) => m.identifier).join(', ')}`);
+                throw new McpToolError('No machine connected, none selected in Luban Machine Settings, and no '
+                    + `identifier given. Known identifiers: ${MACHINES.map((m) => m.identifier).join(', ')}`);
             }
 
             const machine = findMachine(identifier);
@@ -216,17 +262,14 @@ export function registerMachineTools(registry: ToolRegistry): void {
             const state = connectionManager.getLatestMachineState();
 
             // Add-on modules (quick-swap kit, bracing kit) translate the work
-            // envelope by workRangeOffset. Which ones are physically installed
-            // cannot be detected - the operator records it in configstore key
-            // mcpInstalledModules (array or comma-separated identifiers).
+            // envelope by workRangeOffset. Which ones are installed cannot be
+            // detected from the machine - it is whatever the operator selected
+            // in Luban's Machine Settings (readAppMachineSettings).
             const modules = (machine.metadata.modules || []).map((module) => ({
                 identifier: module.identifier,
                 workRangeOffset: module.workRangeOffset || null,
             }));
-            const installedRaw = config.get('mcpInstalledModules');
-            const installedModules = (Array.isArray(installedRaw)
-                ? installedRaw.map(String)
-                : String(installedRaw || '').split(',').map((s) => s.trim()).filter(Boolean))
+            const installedModules = (appSettings ? appSettings.modules : [])
                 .filter((id) => modules.some((module) => module.identifier === id));
             const netOffset = [0, 0, 0];
             for (const module of modules) {
@@ -255,6 +298,8 @@ export function registerMachineTools(registry: ToolRegistry): void {
                 })),
                 modules,
                 installedModules,
+                installedModulesSource: appSettings ? 'Luban Machine Settings (machine.json)' : 'unavailable - machine.json not found',
+                machineSettings: appSettings,
                 netWorkRangeOffset: hasOffset ? netOffset : null,
                 // null means "not recorded" - do not guess kinematics.
                 kinematics: KINEMATICS_BY_IDENTIFIER[machine.identifier] || null,

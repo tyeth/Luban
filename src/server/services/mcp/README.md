@@ -20,7 +20,7 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 | `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg capture — DirectShow on Windows (device = friendly name), v4l2 on Linux (device = a `list_cameras` entry, preferably the stable `/dev/v4l/by-id/… (Name)` form; a bare `/dev/videoN` works but renumbers on replug). Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. |
 | `mcpMaxJogDistance` | Per-call XY travel cap for direct moves, default 100 mm. `goto_work_origin` is exempt (fixed operator-set destination). |
 | `mcpToolRegion` | Fractional box where the endmill images (fixed camera-to-spindle geometry); returned with every frame; settable via the `set_tool_region` tool. |
-| `mcpInstalledModules` | e.g. `["snapmaker-2.0-bracing-kit-module"]` — feeds effective work ranges in `get_machine_profile`. |
+| *(machine, toolheads, modules)* | **Not MCP keys.** `get_machine_profile` / `get_stored_state` read the machine, toolheads and installed add-on modules (bracing kit, quick-swap) from Luban's own **Machine Settings** (`userData/machine.json`, `state.machine`) on every call — change them in the app (it returns to its home page) and the MCP follows. `mcpInstalledModules` is gone (2026-09-05). |
 | `mcpMqtt*` | Probe sensor feed (MQTT): `Host`, `Port` (default 8883 = TLS, 1883 = plain), `User`, `Pass`, `ClientId` (default = username + MAC bytes), `FeedToolsetter`, `FeedOvertravel`, `FeedProbe` (Adafruit IO feed key, or a full topic when it contains `/`), `Inverted` (comma-separated channels whose sensor idles HIGH and reads low on contact — the operator's CNC touch probe is normally open, so `"probe"`). Env `LUBAN_MCP_MQTT_HOST/PORT/USER/PASS/CLIENT_ID/FEED_TOOLSETTER/FEED_OVERTRAVEL/FEED_PROBE/INVERTED` override field-by-field. |
 | `mcpProbeTransport` | Which probe feed backend: `mqtt` or `gpio`. Unset = auto: `mqtt`, unless only the GPIO side is configured. Env `LUBAN_MCP_PROBE_TRANSPORT` overrides. |
 | `mcpGpio*` | Probe sensor feed (direct GPIO via Adafruit Blinka, default over U2IF — a Pi Pico as USB GPIO bridge): `PinToolsetter`, `PinOvertravel`, `PinProbe` (Blinka pin name with optional pull suffix, e.g. `GP6:up`, `GP7:down`, `GP8` = floating), `Inverted` (same semantics as the MQTT field — a pull-up NO switch idles `1`, so its channel goes here), `Python` (interpreter with `adafruit-blinka` installed, e.g. the venv's; default `python3`/`python`), `PollMs` (default 10, clamp 2–1000), `BlinkaEnv` (NAME=VALUE pairs handed to the monitor so Blinka picks the board — default `BLINKA_U2IF=1`; `BLINKA_MCP2221=1`, `BLINKA_FT232H=1`, `BLINKA_FORCEBOARD=…`, or `native` for on-board GPIO). Env `LUBAN_MCP_GPIO_PIN_TOOLSETTER/PIN_OVERTRAVEL/PIN_PROBE/INVERTED/PYTHON/POLL_MS/BLINKA_ENV` override field-by-field. All of it is editable on Settings → MCP Server, which also flags active env overrides. |
@@ -271,6 +271,29 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
   an `ok` alone.
 - Fleet: machine named "Snapmaker" @ 192.168.1.173 = the A350 CNC; "F350" @ .130 = the
   3D printer. Same Luban profile identifier — distinguish by NAME/address, never profile.
+- Fleet, continued: a Snapmaker **Ray** exists but rarely comes online. Machine tokens are
+  also backed up in other configs in the Luban user data folder.
+- **Rotary stock (measured 2026-09-02, 71.2 mm probe, machine coords)**: square wooden stock
+  in the chuck, flat side up at B0. Top 207.7 at (170, 195) — physical 136.5 — rising ~+0.9
+  toward the free end (207.3–207.5 at Y250; 208.0–208.2 at Y140; 207.1/206.7 at Y270, 1 mm
+  from the chuck jaws — **jaws reach ~Y269**). Sides E≈205.4 / W≈133.5 (width ≈69.5,
+  centre X≈169.5); end face contact Y128.9 (exposed span ~Y130–300). The W side at Y140 was
+  flaky (twice lost the confirm re-contact — local chamfer/fibre?). Stock-top figures are
+  B-dependent (square stock rotates with B).
+- **Chuck fixed hole (probe_circle INSIDE mode, 8 points, rms 0.021, max residual 0.041)**:
+  centre (168.974, 290.969), hole − tip 3.734. Cross-feature constraint: air-blast post
+  diameter + hole diameter = **10.41 mm exactly** (tip-independent); the operator estimates
+  (post ~6, tip ~2.5, hole 5–9) were mutually inconsistent by ~1.8 — one caliper measurement
+  pins all three.
+- **Standing operator rules not enforced in code** (state them, don't infer around them):
+  the endmill is **always left in the spindle** — never assume an empty collet, even for
+  "safe" test moves; **home first is the default** before direct motion after (re)connecting
+  (G28 raises Z first and clears stale position state) unless the operator explicitly
+  confirms current Z and a clear path; **"Home" ALWAYS means machine home** (G28), moving to
+  work X0 Y0 is the distinct "Goto Work Origin"; quote every position with its coordinate
+  system; and **browser-approval delegation never carries forward** — if the operator lets
+  the agent click Approve for one bounded series of moves, that authority ends with that
+  series ("no approvals carry forwards in CNC work").
 
 ## Tool surface (33)
 
@@ -332,7 +355,9 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   operator to close their copy. The build dirties `src/package.json` and
   `MaterialTestGcodeParams.jsx` — revert before staging.
 - **Stack**: stacked single-commit PRs `mcp/N-*`, each targeting the previous branch
-  (#15 → #49 as of writing; origin = Snapmaker/Luban is NEVER pushed). Mid-stack changes:
+  (#15 → #73 as of 2026-09-04: tip `mcp/39-linux-mac-packaging`, next `mcp/40`; #70 stale-
+  heartbeat, #71 probe_sequence, #72 GPIO probe feed, #73 Linux/mac packaging; origin =
+  Snapmaker/Luban is NEVER pushed). Mid-stack changes:
   amend + rebase the chain. commitlint enforces `Type: Sentence-case subject` (20–100
   chars).
 - **Credentials**: active gh account is `tyeth-ai-assisted` (no push). Per-command
@@ -342,6 +367,66 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
 - eslint judged against baseline (pre-existing errors in ConnectionManager/SstpHttpChannel
   stay); `npx tsc -p tsconfig-server.json --noEmit` filtered to `services/mcp` must be
   clean.
+- **Claude Code caches MCP tool schemas at session start**: after a server rebuild that adds
+  or changes tool arguments, the client strips the new args (`additionalProperties: false`)
+  until Claude Code restarts — or use a raw JSON-RPC helper
+  (`C:/dev/software/snapmaker/.tools/mcp-call.js`, or a urllib one-liner against
+  `http://127.0.0.1:40889/mcp` on the box) in the meantime.
+- **Where operator state lives** (per machine running Luban — it does NOT sync between
+  rigs): configstore `~/.snapmaker-luban.json` (`mcp*` keys incl. `mcpToolSetter`,
+  `mcpToolRegion`, `mcpSafeTraverseZ`, `mcpMaxJogDistance`); userData
+  (`%APPDATA%/snapmaker-luban` or `~/.config/snapmaker-luban`): `machine.json` (the app's
+  Machine Settings), `mcp-landmarks.json`, `mcp-camera-calibration.json`, `mcp-surveys/`.
+  While Luban runs, change state only through the MCP tools (`set_tool_setter_config`,
+  `set_landmark`, `set_tool_region`, `set_camera_calibration`) or the app UI — the
+  configstore file is rewritten on save. Migrating a second rig = replaying those tool calls
+  and copying `mcp-surveys/`.
+- **Startup facts**: cold services-ready was ~13 s → ~6 s post-reboot after the server bundle
+  (#57), ~0.7 s warm; the remaining cold cost is the keep-external packages. A Chromium HSTS
+  file can replace the userData directory ~11 s after launch (boot/quit guards rename it
+  aside, #63). Dev runs report app version 15.5.7 to the updater (Electron's own version —
+  benign).
+- **Assistant-tooling gotchas**: on Windows Git Bash, python passed through a Bash heredoc
+  gets its backslashes halved (a written `\r` arrives as a real CR) — build escapes with
+  `chr(92)` or use the editor tools, and always re-read the patched line. skill-creator's
+  scripts (validator/packager) read files in the locale codepage — run them with
+  `PYTHONUTF8=1`; the canonical skill-creator source is `anthropics/skills` (takes external
+  PRs), while `anthropics/claude-plugins-official` is a mirror that auto-closes external PRs;
+  the UTF-8 fix already has open PRs upstream (#1591 et al.) — don't add another.
+
+## Deployment notes: the Ubuntu MCP box (2026-09-04)
+
+The second rig (x86_64 Ubuntu 24.04, Celeron N4020, hostname `pi-iOTA-Flo-360`, user `pi`,
+LAN 192.168.1.153 — not a Raspberry Pi) runs the `.deb` with the GPIO probe transport and the
+toolhead camera. Everything a fresh install needs:
+
+- **Sensor bridge**: an Adafruit **KB2040** running U2IF (`239a:0105`, Blinka board id
+  `KB2040_U2IF`, pin names `D*`/`A*`). Wiring (operator, bump-tested 2026-09-04): probe
+  **A0** (idles driven HIGH → `inverted`), tool setter contact **D2** (idles LOW), setter
+  overtravel **D3** (idles LOW); all three lines are actively driven, so pulls are a
+  don't-care in operation — configured fail-safe (`A0:down`, `D2:up`, `D3:up`: a broken wire
+  reads *triggered*). Pushing the setter plunger ~1 s past contact trips overtravel.
+- **udev**: pip `hidapi` uses the **libusb** backend, so the rule must open the USB device,
+  not just hidraw — `/etc/udev/rules.d/99-u2if.rules`:
+  `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="239a", ATTRS{idProduct}=="0105", MODE="0660", GROUP="plugdev", TAG+="uaccess"`
+  and the same line with `SUBSYSTEM=="usb"`; then `udevadm control --reload-rules &&
+  udevadm trigger`. Symptom without it: `OSError: open failed` from `hid.device.open`.
+- **Verify wiring** with `.venv/bin/python src/server/services/mcp/gpio_bumptest.py --seconds 90`
+  (reads the configstore, prints raw → idle/TRIGGERED, flags a resting-state-triggered
+  channel = wrong polarity).
+- **Cameras**: two are attached. The **toolhead camera is the Sonix "USB 2.0 Camera"**
+  (pinned by `/dev/v4l/by-id/usb-Sonix_…-video-index0`); at the homed position it looks
+  straight at the enclosure's aluminium extrusion, which reads as a near-field silver strut
+  on a dark textured background — that IS the toolhead view, not a stray camera. The
+  icspring camera (wide, warm view of the MDF wasteboard) is the other one. `/dev/videoN`
+  numbers reshuffle on replug; always pin the by-id entry.
+- **Launching**: Ubuntu 24.04 needs the AppArmor `userns` profile the `.deb` postinst
+  installs (see Installing); until then `snapmaker-luban --no-sandbox`. To launch into the
+  operator's GNOME/RDP session from ssh, borrow `DISPLAY`/`XAUTHORITY`/`WAYLAND_DISPLAY`
+  from a session process's `/proc/<pid>/environ`.
+- **State**: a fresh box has NO operator state — replay it through the MCP tools (see
+  "Where operator state lives" above); this bit us on 2026-09-04 when an agent correctly
+  refused to run the tool setter because the reference was empty.
 
 ## Open threads
 
@@ -366,3 +451,14 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   GPIO the `sensor_delay_ms` contact windows and release timeouts can collapse to near
   zero — the defaults are still MQTT-sized, so tighten them per-call when running on
   gpio.
+
+- **Procedure results only travel on the `start_gcode_job` response** — a client timeout
+  loses them (recovered once from the motion log; `probe_sequence` aborts also drop
+  completed results into the error text). Store the runner outcome on the job record.
+- **`traverse_xy` staged batch tool** (law-2-compliant XY transport twin of `move_z`): hops
+  currently need `submit_gcode_job` file jobs or `probe_sequence` hop steps.
+- **Console bug**: MCP gcode broadcasts leak into the Workspace console INPUT element with
+  raw ANSI codes.
+- **#60 install size**: bundle/asar the main process, squeeze the remaining server externals.
+- **`sensor_delay_ms` defaults are MQTT-sized** (200–300 ms); on the GPIO transport they can
+  drop to ~50 ms — per call for now, a transport-aware default later.
