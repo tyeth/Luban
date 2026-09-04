@@ -156,6 +156,42 @@ export function resolveProbeFeedConfig(): ProbeFeedConfig {
 }
 
 /**
+ * Which sensors the operator has enabled (Settings -> MCP Server; env
+ * LUBAN_MCP_TOOLSETTER_ENABLED / LUBAN_MCP_PROBE_ENABLED override). Default
+ * on. A disabled sensor's channel is left UNBOUND on every transport: no
+ * topic/pin is subscribed, no readings, no pill, and every procedure that
+ * needs it refuses with a clear message. Overtravel belongs to the tool
+ * setter (same mechanism) and follows its flag.
+ */
+export interface SensorEnabled {
+    toolsetter: boolean;
+    overtravel: boolean;
+    probe: boolean;
+}
+
+function readEnabledFlag(env: string, key: string): boolean {
+    const envRaw = process.env[env];
+    if (envRaw !== undefined && String(envRaw).trim() !== '') {
+        return !['0', 'false', 'no', 'off'].includes(String(envRaw).trim().toLowerCase());
+    }
+    const configRaw = config.get(key);
+    if (configRaw === undefined || configRaw === null) {
+        return true;
+    }
+    return !(configRaw === false || ['0', 'false', 'no', 'off'].includes(String(configRaw).trim().toLowerCase()));
+}
+
+export function resolveSensorEnabled(): SensorEnabled {
+    const toolsetter = readEnabledFlag('LUBAN_MCP_TOOLSETTER_ENABLED', 'mcpToolSetterEnabled');
+    const probe = readEnabledFlag('LUBAN_MCP_PROBE_ENABLED', 'mcpProbeToolEnabled');
+    return { toolsetter, overtravel: toolsetter, probe };
+}
+
+export function sensorLabel(channel: ProbeChannel): string {
+    return channel === 'probe' ? 'touch probe' : 'tool setter';
+}
+
+/**
  * Which transport backend the probe feed uses. Explicit setting wins
  * (LUBAN_MCP_PROBE_TRANSPORT env, then mcpProbeTransport config); with
  * nothing stated the default is mqtt, unless only the GPIO side is
@@ -184,24 +220,56 @@ export interface ActiveProbeConfig {
     /** Per channel: the MQTT topic or GPIO pin label bound to it, if any. */
     channels: { [channel in ProbeChannel]: string | null };
     inverted: { [channel in ProbeChannel]: boolean };
+    /** Channels the operator switched off in Settings (never bound). */
+    disabled: ProbeChannel[];
     /** Where the operator fixes a missing configuration, for error messages. */
     settingsHint: string;
+}
+
+/**
+ * Apply the sensor enable flags to a transport's channel bindings: a
+ * disabled channel is unbound, and "configured" is re-judged on what is
+ * left so a rig with only disabled sensors bound does not try to connect.
+ */
+function applySensorFlags(
+    channels: { [channel in ProbeChannel]: string | null },
+    missing: string[]
+): { channels: { [channel in ProbeChannel]: string | null }; missing: string[]; disabled: ProbeChannel[] } {
+    const enabled = resolveSensorEnabled();
+    const disabled = PROBE_CHANNELS.filter((channel) => !enabled[channel]);
+    const filtered = {} as { [channel in ProbeChannel]: string | null };
+    for (const channel of PROBE_CHANNELS) {
+        filtered[channel] = enabled[channel] ? channels[channel] : null;
+    }
+    const remaining = missing.filter((item) => !/^at least one (feed topic|pin)/.test(item));
+    if (!PROBE_CHANNELS.some((channel) => filtered[channel])) {
+        if (disabled.length === PROBE_CHANNELS.length) {
+            remaining.push('every sensor is disabled in Settings -> MCP Server');
+        } else if (PROBE_CHANNELS.some((channel) => channels[channel])) {
+            remaining.push('the only configured sensors are disabled in Settings -> MCP Server');
+        } else {
+            remaining.push(`at least one ${resolveProbeTransportKind() === 'gpio' ? 'pin' : 'feed topic'} for an enabled sensor`);
+        }
+    }
+    return { channels: filtered, missing: remaining, disabled };
 }
 
 export function resolveActiveProbeConfig(): ActiveProbeConfig {
     const kind = resolveProbeTransportKind();
     if (kind === 'gpio') {
         const cfg = resolveGpioFeedConfig();
-        const channels = {} as { [channel in ProbeChannel]: string | null };
+        const bound = {} as { [channel in ProbeChannel]: string | null };
         for (const channel of PROBE_CHANNELS) {
-            channels[channel] = describePin(cfg.pins[channel]);
+            bound[channel] = describePin(cfg.pins[channel]);
         }
+        const applied = applySensorFlags(bound, cfg.missing);
         return {
             kind,
-            configured: cfg.configured,
-            missing: cfg.missing,
-            channels,
+            configured: applied.missing.length === 0,
+            missing: applied.missing,
+            channels: applied.channels,
             inverted: cfg.inverted,
+            disabled: applied.disabled,
             settingsHint: 'Set LUBAN_MCP_GPIO_PIN_TOOLSETTER/_OVERTRAVEL/_PROBE (Blinka pin name with an '
                 + 'optional :up/:down/:float pull suffix, e.g. "GP6:up"), plus LUBAN_MCP_GPIO_PYTHON, '
                 + '_INVERTED, _POLL_MS, _BLINKA_ENV as needed - or the matching mcpGpio* config keys '
@@ -209,12 +277,14 @@ export function resolveActiveProbeConfig(): ActiveProbeConfig {
         };
     }
     const cfg = resolveProbeFeedConfig();
+    const applied = applySensorFlags(cfg.topics, cfg.missing);
     return {
         kind,
-        configured: cfg.configured,
-        missing: cfg.missing,
-        channels: cfg.topics,
+        configured: applied.missing.length === 0,
+        missing: applied.missing,
+        channels: applied.channels,
         inverted: cfg.inverted,
+        disabled: applied.disabled,
         settingsHint: 'Set the MQTT fields on Settings -> MCP Server or the LUBAN_MCP_MQTT_* '
             + 'environment variables.',
     };
@@ -390,11 +460,29 @@ class MqttProbeTransport extends EventEmitter implements ProbeTransport {
     }
 }
 
-/** Build a fresh transport for the kind from freshly resolved configuration. */
+/**
+ * Build a fresh transport for the kind from freshly resolved configuration,
+ * with disabled sensors' channels removed so they are never subscribed or
+ * polled.
+ */
 function buildTransport(kind: ProbeTransportKind): ProbeTransport {
-    return kind === 'gpio'
-        ? new GpioProbeTransport(resolveGpioFeedConfig())
-        : new MqttProbeTransport(resolveProbeFeedConfig());
+    const enabled = resolveSensorEnabled();
+    if (kind === 'gpio') {
+        const cfg = resolveGpioFeedConfig();
+        for (const channel of PROBE_CHANNELS) {
+            if (!enabled[channel]) {
+                cfg.pins[channel] = null;
+            }
+        }
+        return new GpioProbeTransport(cfg);
+    }
+    const cfg = resolveProbeFeedConfig();
+    for (const channel of PROBE_CHANNELS) {
+        if (!enabled[channel]) {
+            cfg.topics[channel] = null;
+        }
+    }
+    return new MqttProbeTransport(cfg);
 }
 
 export class ProbeFeedService {
@@ -553,6 +641,7 @@ export class ProbeFeedService {
         for (const channel of PROBE_CHANNELS) {
             const reading = this.readings.get(channel);
             feeds[channel] = {
+                enabled: !cfg.disabled.includes(channel),
                 source: cfg.channels[channel],
                 inverted: cfg.inverted[channel],
                 last: reading ? {
@@ -569,6 +658,12 @@ export class ProbeFeedService {
             missing: cfg.missing,
             connected: this.isConnected(),
             connecting: this.connecting,
+            disabledSensors: cfg.disabled,
+            // A feed that is configured but cannot reach its hardware (the
+            // USB sensor bridge unplugged, the broker down) is "unavailable":
+            // the UI shows unknown pills, procedures refuse, and the service
+            // keeps retrying quietly in the background.
+            unavailable: cfg.configured && !this.isConnected() && !this.connecting && this.reconnectAttempts > 0,
             ...(this.transport ? this.transport.describe() : describeTransportConfig(cfg.kind)),
             feeds,
             safetyTrip: this.trip,
@@ -589,8 +684,12 @@ export class ProbeFeedService {
         transport.on('reading', (channel: ProbeChannel, value: string) => this.onReading(channel, value, false));
         transport.on('refresh', (channel: ProbeChannel, value: string) => this.onReading(channel, value, true));
         transport.on('error', (err: Error) => {
+            // An unplugged sensor bridge produces the same error on every
+            // retry - log a new message once, then stay quiet about repeats.
+            if (err.message !== this.lastError) {
+                log.error(`Probe feed error: ${err.message}`);
+            }
             this.lastError = err.message;
-            log.error(`Probe feed error: ${err.message}`);
         });
         transport.on('close', () => {
             this.connecting = false;
@@ -613,6 +712,9 @@ export class ProbeFeedService {
             mcpBroadcast('mcp:activity', { tool: 'probe_feed', phase: 'connected', transport: cfg.kind });
         } catch (err) {
             this.connecting = false;
+            if (err.message !== this.lastError) {
+                log.error(`Probe feed connect failed: ${err.message}`);
+            }
             this.lastError = err.message;
             throw err;
         }
@@ -624,7 +726,10 @@ export class ProbeFeedService {
         }
         this.reconnectAttempts += 1;
         const delay = Math.min(RECONNECT_BASE_MS * (2 ** Math.min(this.reconnectAttempts - 1, 4)), RECONNECT_MAX_MS);
-        log.info(`Probe feed reconnect ${this.reconnectAttempts} in ${delay}ms`);
+        if (this.reconnectAttempts <= 3 || this.reconnectAttempts % 10 === 0) {
+            const why = this.lastError ? ` (last error: ${this.lastError})` : '';
+            log.info(`Probe feed reconnect ${this.reconnectAttempts} in ${delay}ms${why}`);
+        }
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
             const cfg = resolveActiveProbeConfig();

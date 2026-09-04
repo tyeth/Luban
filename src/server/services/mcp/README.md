@@ -16,6 +16,8 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 | Key | Meaning |
 |---|---|
 | `mcpEnabled`, `mcpPort` | Start the server on 127.0.0.1:port (default 40889). Legacy: `mcpPort` alone enables when `mcpEnabled` was never written. |
+| `mcpAllowLan` | Default off = loopback only. On: bind every interface but accept only clients (and browser origins) on this machine's own IPv4 subnets; confirm-page links use the LAN address. **No authentication exists** — anyone on that subnet can command the machine; the pane warns in red. Env `LUBAN_MCP_ALLOW_LAN` overrides. Applies at the next start. |
+| `mcpToolSetterEnabled`, `mcpProbeToolEnabled` | Default on. Off = that sensor's channel is never bound on any transport (overtravel follows the tool setter): no pill, no readings, and procedures needing it refuse with a clear message. Use when the sensor or the USB bridge is not fitted. Env `LUBAN_MCP_TOOLSETTER_ENABLED` / `LUBAN_MCP_PROBE_ENABLED` override. |
 | `mcpCameraUrl` | HTTP(S) snapshot URL; takes precedence over ffmpeg. |
 | `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg capture — DirectShow on Windows (device = friendly name), v4l2 on Linux (device = a `list_cameras` entry, preferably the stable `/dev/v4l/by-id/… (Name)` form; a bare `/dev/videoN` works but renumbers on replug). Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. |
 | `mcpMaxJogDistance` | Per-call XY travel cap for direct moves, default 100 mm. `goto_work_origin` is exempt (fixed operator-set destination). |
@@ -68,7 +70,8 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
 
 ## Architecture
 
-Own `http.Server` bound strictly to loopback — NOT a route on Luban's Express app (whose
+Own `http.Server` bound to loopback by default (`mcpAllowLan` widens it to this machine's own IPv4
+subnets, with the same-subnet check on every request) — NOT a route on Luban's Express app (whose
 `/api` carries the renderer session JWT and whose IP whitelist is LAN-wide). The MCP
 transport is hand-rolled stateless Streamable HTTP (JSON-RPC over `POST /mcp`): Electron 15
 embeds Node 16 and the official SDK needs ≥ 18. Zero added dependencies anywhere —
@@ -116,7 +119,13 @@ backends exist, selected by `mcpProbeTransport` / `LUBAN_MCP_PROBE_TRANSPORT`:
   PICO_U2IF (board detect, pulls, heartbeats) and a stubbed Blinka (change detection,
   fatal paths incl. unknown-pin reporting the board's available pins).
 
-The feed auto-connects at service start when fully configured.
+The feed auto-connects at service start when fully configured. **Tolerance**: if the sensor
+bridge is unplugged (Blinka: "BLINKA_U2IF … no compatible device found") the GPIO transport
+reports `bridge: not detected`, the service retries with backoff but logs each distinct error
+once (attempt logs thin out after the third), `get_probe_feed_status` shows
+`unavailable: true`, pills stay yellow, and every sensor-gated procedure refuses via
+`assertChannelReady`. Operators who know a sensor is absent switch it off instead
+(`mcpToolSetterEnabled` / `mcpProbeToolEnabled`): a disabled channel is unbound everywhere.
 
 **Overtravel tripwire**: while a sensor-gated procedure is running (the tool setter /
 probing runners declare expected contacts for their whole run) or MCP direct motion is in

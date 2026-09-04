@@ -267,6 +267,8 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
 
     private boardId: string | null = null;
 
+    private bridgeMissing = false;
+
     private stallTimer: NodeJS.Timeout | null = null;
 
     private ended = false;
@@ -414,6 +416,7 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
             blinkaEnv: this.cfg.blinkaEnvText,
             pollMs: this.cfg.pollMs,
             board: this.boardId,
+            bridge: this.bridgeState(),
             monitorPid: this.child ? this.child.pid : null,
             configSources: this.cfg.sources,
         };
@@ -448,7 +451,18 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
             return;
         }
         if (message.t === 'fatal') {
-            this.lastFatal = String(message.error || 'unknown fatal error');
+            const raw = String(message.error || 'unknown fatal error');
+            // Blinka's wording when BLINKA_U2IF is set and no bridge is on USB,
+            // or the device node vanished mid-session: the operator simply has
+            // not plugged the sensor bridge in. Say that, not "import failed".
+            if (/no compatible device found|open failed|No such device|device disconnected/i.test(raw)) {
+                this.bridgeMissing = true;
+                this.lastFatal = 'sensor bridge not detected on USB (U2IF board unplugged?) - '
+                    + 'the feed will keep retrying quietly; plug it in or disable the sensors in Settings';
+            } else {
+                this.bridgeMissing = false;
+                this.lastFatal = raw;
+            }
             if (message.available) {
                 this.lastFatal += ` - available pins: ${(message.available as string[]).join(', ')}`;
             }
@@ -499,6 +513,13 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
                 // Already dead; nothing to do.
             }
         }
+    }
+
+    private bridgeState(): 'connected' | 'not detected' | 'unknown' {
+        if (this.ready) {
+            return 'connected';
+        }
+        return this.bridgeMissing ? 'not detected' : 'unknown';
     }
 
     private detailSuffix(): string {
