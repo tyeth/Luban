@@ -144,20 +144,28 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
 
     registry.register({
         name: 'probe_circle',
-        description: 'Stage an N-point circle measurement of a roughly-round vertical feature (post, '
-            + 'boss, pin) for human confirmation: radial sensor-gated marches from evenly spaced '
-            + 'azimuths, then a least-squares circle fit. Requires the operator\'s MIN and MAX '
-            + 'diameter estimates - they bound every march (start beyond max/2, abort at min/2 '
-            + 'without contact) - and a MEASURED top height (top_z_machine). Yields the fitted '
-            + 'centre and the COMBINED diameter (feature + probe tip, inseparable without one '
-            + 'known), with residuals exposing an out-of-round tip or feature. Repositioning between '
-            + 'points obeys motion law 2: lift to the safe traverse height, hop, descend; a probe '
-            + 'touch during a hop or descent latches the CRASH alarm.',
+        description: 'Stage an N-point circle measurement of a roughly-round vertical feature for '
+            + 'human confirmation: radial sensor-gated marches from evenly spaced azimuths, then a '
+            + 'least-squares circle fit. OUTSIDE mode (post/boss/pin, default): marches step inward; '
+            + 'requires the estimated centre and a MEASURED top height; yields the COMBINED diameter '
+            + '(feature + tip). INSIDE mode (inside: true, a HOLE): the operator first positions the '
+            + 'tip INSIDE the hole at the measuring depth; marches step OUTWARD from that staged '
+            + 'position to the wall, no hops, ending with a vertical raise out along the entry path; '
+            + 'yields hole diameter MINUS tip. Both need the operator\'s MIN and MAX diameter '
+            + 'estimates - they bound every march so a wrong guess aborts instead of pressing on. '
+            + 'Residuals expose an out-of-round tip or feature. Outside repositioning obeys motion '
+            + 'law 2 (traverse-height hops); a probe touch during a hop or descent latches CRASH. '
+            + 'All results in MACHINE coordinates.',
         inputSchema: {
             type: 'object',
             properties: {
-                center_x: { type: 'number', description: 'Estimated feature centre X, machine coords.' },
-                center_y: { type: 'number', description: 'Estimated feature centre Y, machine coords.' },
+                inside: {
+                    type: 'boolean',
+                    description: 'true = measure a HOLE from inside (tip already positioned in it at '
+                        + 'depth); false/omitted = measure a feature from outside.',
+                },
+                center_x: { type: 'number', description: 'OUTSIDE mode: estimated feature centre X, machine coords. Ignored inside (the staged position is the march origin).' },
+                center_y: { type: 'number', description: 'OUTSIDE mode: estimated feature centre Y, machine coords.' },
                 diameter_min_mm: {
                     type: 'number',
                     description: 'Operator\'s LOWER bound on the feature diameter: marches abort at this '
@@ -170,8 +178,9 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
                 },
                 top_z_machine: {
                     type: 'number',
-                    description: 'Toolhead machine Z at which the probe tip touches the feature TOP - '
-                        + 'measured (probe_point -Z) or operator-stated, never guessed.',
+                    description: 'OUTSIDE mode (required there): toolhead machine Z at which the probe '
+                        + 'tip touches the feature TOP - measured (probe_point -Z) or operator-stated, '
+                        + 'never guessed. Optional record-keeping inside.',
                 },
                 probe_depth_mm: { type: 'number', description: 'Side contacts this far below the top, default 3 (0.5-20).' },
                 points: { type: 'number', description: 'Contact points around the circle, default 8 (4-16).' },
@@ -187,7 +196,7 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
                 confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per point, default 2 (1-5).' },
                 reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
             },
-            required: ['center_x', 'center_y', 'diameter_min_mm', 'diameter_max_mm', 'top_z_machine', 'reason'],
+            required: ['diameter_min_mm', 'diameter_max_mm', 'reason'],
             additionalProperties: false,
         },
         handler: async (args: { [key: string]: unknown }) => {
@@ -201,7 +210,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
             const validation = validateGcode(envelope);
             const job = jobManager.submit(
                 envelope,
-                `probe-circle ${plan.points.length}pts d${plan.diameterMinMm}-${plan.diameterMaxMm} `
+                `probe-circle${plan.inside ? ' INSIDE' : ''} ${plan.points.length}pts d${plan.diameterMinMm}-${plan.diameterMaxMm} `
                     + `- ${String(args.reason).slice(0, 40)}`,
                 'cnc',
                 validation,

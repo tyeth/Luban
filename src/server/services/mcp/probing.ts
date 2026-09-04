@@ -2,7 +2,7 @@ import { connectionManager } from '../machine/ConnectionManager';
 import { ProbeChannel, probeFeedService } from './probeFeed';
 import { McpToolError } from './registry';
 import { GcodeChannel, sendGcodeVisible } from './tools/camera';
-import { getPositionSnapshot } from './tools/machine';
+import { assertFreshHeartbeat, getPositionSnapshot } from './tools/machine';
 
 // The shared sensor-gated motion engine: settled single moves on the direct
 // path, contact/release sensing against a probe feed channel, and the
@@ -230,6 +230,7 @@ export function assertChannelReady(channel: ProbeChannel, what: string): void {
 
 /** Machine idle, homed, toolhead off - the common motion preconditions. */
 export function assertMachineReadyForProcedure(): void {
+    assertFreshHeartbeat('a probing procedure');
     const position = getPositionSnapshot();
     if (position.machineStatus !== 'idle') {
         throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);

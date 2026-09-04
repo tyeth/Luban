@@ -62,6 +62,18 @@ height drove the probe into the rotary stock and destroyed it.
    backend, configstore, or machine directly while the app runs — the
    guards live in the tools.
 
+## Recording rules
+
+- **Machine coordinates only** (operator, 2026-09-02): datums, landmarks and
+  measurements are recorded in the machine frame. Work origins are volatile —
+  a machine reboot mints a new one — so saved work coordinates are meaningless
+  later. Re-verify `originOffset` after every (re)connect.
+- **Heartbeat freshness is a precondition**: a stale report (>10 s; period is
+  ~1 s) means the connection dropped without the server noticing (seen live —
+  5.7 min of stale state served as truth). Motion and staging refuse on
+  staleness; an M114 that returns no position text is a dead connection, not
+  a success.
+
 ## Probe calibration (do once per probe fitting)
 
 `run_tool_setter` with `accept_probe_contact: true` and a conservative

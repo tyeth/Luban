@@ -9,7 +9,7 @@ import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
-import { PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import { assertFreshHeartbeat, PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
 // action only. move_and_capture performs ONE bounded XY move at the current
@@ -128,6 +128,7 @@ function frameContent(frame: CapturedFrame, meta: object): object {
 
 function assertSafeToMove(position: PositionSnapshot, operatorConfirmedClearance: boolean): void {
     probeFeedService.assertNoOvertravel();
+    assertFreshHeartbeat('a direct move');
     if (position.machineStatus !== 'idle') {
         throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
     }
@@ -521,10 +522,44 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 throw new McpToolError('No machine connected, or the channel does not support direct commands.');
             }
             const executed = await sendGcodeVisible(channel, 'query_firmware_position', 'M114');
+            const raw = executed.text || null;
+            if (!raw || !/X:-?\d/.test(raw)) {
+                // An "ok" with no position text is not a position report - it
+                // is the dead-connection signature (observed live 2026-09-02:
+                // the machine had disconnected without the server noticing).
+                throw new McpToolError('M114 returned no position text - the connection is likely dead '
+                    + 'even though the channel accepted the command. Reconnect the machine and verify '
+                    + `get_position is fresh before trusting anything. (raw: ${JSON.stringify(raw)}, `
+                    + `result: ${executed.result})`);
+            }
+            // M114 reports WORK coordinates in the currently selected
+            // workspace (operator-clarified 2026-09-02) - it is primarily a
+            // liveness/frame check. Machine coordinates are DERIVED here via
+            // the heartbeat's originOffset; if the frames disagree (e.g.
+            // after a bare G28) the derived values are the thing to distrust.
+            const heartbeat = positionOrNull();
+            const match = raw.match(/X:(-?\d+(?:\.\d+)?)\s+Y:(-?\d+(?:\.\d+)?)\s+Z:(-?\d+(?:\.\d+)?)/);
+            const firmwareWork = match
+                ? { x: Number(match[1]), y: Number(match[2]), z: Number(match[3]) }
+                : null;
+            const offset = heartbeat ? heartbeat.originOffset : null;
+            const derivedMachine = firmwareWork && offset
+                ? {
+                    x: Number((firmwareWork.x - offset.x).toFixed(3)),
+                    y: Number((firmwareWork.y - offset.y).toFixed(3)),
+                    z: Number((firmwareWork.z - offset.z).toFixed(3)),
+                }
+                : null;
             return {
-                raw: executed.text || null,
+                raw,
                 result: executed.result,
-                heartbeat: positionOrNull(),
+                firmware_work: firmwareWork,
+                derived_machine: derivedMachine,
+                note: 'M114 reports WORK coordinates in the selected workspace - primarily a '
+                    + 'liveness/frame check. derived_machine = firmware work - heartbeat originOffset; '
+                    + 'work origins are volatile (reset on machine reboot), so record MACHINE '
+                    + 'coordinates only.',
+                heartbeat,
             };
         },
     });
