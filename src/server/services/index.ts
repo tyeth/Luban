@@ -102,6 +102,7 @@ function registerApis(app) {
     // MCP server (status is live; settings apply at next start)
     app.get(urljoin(settings.route, 'api/mcp'), api.mcp.getStatus);
     app.post(urljoin(settings.route, 'api/mcp'), api.mcp.updateSettings);
+    app.post(urljoin(settings.route, 'api/mcp/clear-alarm'), api.mcp.clearAlarm);
 
     // State
     // depecated?

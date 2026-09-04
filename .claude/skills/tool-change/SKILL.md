@@ -13,8 +13,13 @@ shifted exactly, without ever re-touching the stock.
 
 ## Preconditions
 
-- Probe feed connected (`get_probe_feed_status` — this also arms the overtravel
-  tripwire) and the machine homed and idle.
+- Probe feed connected (`get_probe_feed_status` to check; `connect_probe_feed`
+  if not - the feed auto-connects at start when configured) and the machine
+  homed and idle. The tool setter's overtravel switch is a tripwire ONLY while
+  this procedure (or other MCP motion) is running: pushing the setter past
+  contact mid-run latches the alarm; by hand with the machine idle it just
+  flashes the Workspace pill. The Workspace -> Connection pills (Tool Setter /
+  Setter Overtravel) should both read green before you start.
 - Tool setter reference and the tool-change park position stored
   (`get_tool_setter_config`; the operator sets them once with
   `set_tool_setter_config` — on this machine the park is Z at the homing
@@ -74,5 +79,7 @@ operator raises it slightly from the touchscreen first.
   declared). Pass `old_trigger_z`/`new_trigger_z` explicitly from known-good
   values instead of loosening anything.
 - If the overtravel alarm latches at any point, everything stops until the
-  operator physically inspects and explicitly clears it
-  (`clear_overtravel_alarm`).
+  operator physically inspects and explicitly clears it - the Clear alarm
+  button on the ALARM pill in Workspace -> Connection, or
+  `clear_overtravel_alarm` with their words as `reason`. Both refuse while the
+  sensor still reads triggered.

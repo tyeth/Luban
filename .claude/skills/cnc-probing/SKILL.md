@@ -41,10 +41,18 @@ height drove the probe into the rotary stock and destroyed it.
    or measure from a proven-safe height with `probe_point`.
 4. **Landmarks are obstacles.** Give bed fixtures a `clearance_z` in
    `set_landmark`; XY paths crossing their box below it are refused.
-5. **Contact sensors are crash sensors.** During any motion, a trigger on a
-   probe channel that no procedure declared as expected trips a CRASH alarm:
-   job stopped, connection closed, motion latched until the operator clears
-   it. Do not disconnect the probe feed while anything might move.
+5. **Contact sensors are crash sensors.** While MCP motion is in flight (every
+   procedure move via `moveMachineSettled`, and `move_and_capture`), a trigger
+   on a probe channel that no procedure declared as expected trips a CRASH
+   alarm: job stopped, connection closed, motion latched until the operator
+   clears it. The overtravel switch latches the same way, but ONLY while a
+   procedure or MCP motion is in progress (operator rule, 2026-09-04) - the
+   operator pressing it by hand with the machine idle just flashes the
+   Workspace pill red and logs `overtravel_unarmed`; it is not an alarm. A
+   latched alarm shows as an ALARM pill in Workspace -> Connection; the
+   operator clears it there (Clear alarm button) or via
+   `clear_overtravel_alarm` - never you on your own judgment. Do not
+   disconnect the probe feed while anything might move.
 6. **Chat is not a motion gate — the staged job is.** Deliberate traverses
    and descents go through `submit_gcode_job` / staged procedures, so the
    operator authorises the literal gcode with a one-time code from the
@@ -96,9 +104,17 @@ operator-confirmed descent), stage, operator approves, run. Results: median
 of lift-and-retest passes, spread as the trust metric. Side probes touch one
 tip-radius before the tip centre — correct for it.
 
-Feed latency (hardware-measured, Adafruit IO): trigger message ~120–150 ms
-after physical contact; 200 ms contact windows are right. Release messages
-lag ~1 s — release checks are patient by design; never shorten them.
+Feed latency is TRANSPORT-dependent - read `transport` from
+`get_probe_feed_status` first. MQTT (Adafruit IO, hardware-measured): trigger
+message ~120-150 ms after physical contact; the default 200-300 ms contact
+windows are right, and release messages lag ~1 s, so release checks are patient
+by design - never shorten them on MQTT. GPIO (Blinka/U2IF, the Ubuntu box):
+readings are polled every 10 ms locally, so `sensor_delay_ms` can drop to
+~50 ms and releases are seen immediately; the defaults still work, they are
+just slower than necessary. Before any sensor-gated run, sanity-check the
+sensors: the Workspace -> Connection pills (Probe / Tool Setter / Setter
+Overtravel) must all be green (yellow = no reading or feed down), and
+`get_probe_feed_status` must show the channel untriggered with a fresh age.
 
 ## Circle probing
 

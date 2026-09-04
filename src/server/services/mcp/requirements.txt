@@ -1,0 +1,21 @@
+# Python dependencies for the probe feed GPIO transport ONLY (gpioFeed.ts
+# spawns a Blinka monitor subprocess under the interpreter named by
+# LUBAN_MCP_GPIO_PYTHON / mcpGpioPython). Nothing else in Luban needs Python
+# at runtime. Install into a venv and point the config at it:
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r src/server/services/mcp/requirements.txt
+#   export LUBAN_MCP_GPIO_PYTHON=$PWD/.venv/bin/python
+#
+# (Windows: .venv\Scripts\pip and .venv\Scripts\python.exe)
+#
+# Version floors are what the transport was verified against (2026-09-03,
+# real PICO_U2IF on Windows).
+
+Adafruit-Blinka>=9.2.0
+
+# U2IF (BLINKA_U2IF=1 - the default Blinka environment; a Pico/KB2040 as USB
+# GPIO bridge) talks over USB HID. Not needed with Blinka environment
+# "native" (on-board GPIO, e.g. a Pi header); other bridges (BLINKA_MCP2221=1,
+# BLINKA_FT232H=1) bring their own extra packages - see the Blinka docs.
+hidapi>=0.15.0

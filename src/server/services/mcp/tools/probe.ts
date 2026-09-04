@@ -1,19 +1,20 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
 import { McpToolError, ToolRegistry } from '../registry';
-import { probeFeedService, resolveProbeFeedConfig } from '../probeFeed';
+import { probeFeedService, resolveActiveProbeConfig } from '../probeFeed';
 
 // External probe sensors (tool height setter, CNC touch probe, overtravel
-// switch) report over a message feed (MQTT / Adafruit IO). These tools manage
-// the feed connection; the sensors themselves are read by the measurement
-// procedures that consume them.
+// switch) report over a sensor feed - MQTT (Adafruit IO) or direct GPIO
+// (Blinka/U2IF), chosen by LUBAN_MCP_PROBE_TRANSPORT / mcpProbeTransport.
+// These tools manage the feed connection; the sensors themselves are read by
+// the measurement procedures that consume them.
 
 export function registerProbeTools(registry: ToolRegistry): void {
     registry.register({
         name: 'get_probe_feed_status',
-        description: 'State of the external probe sensor feed (MQTT): configuration, connection, '
-            + 'the last reading per channel (toolsetter / overtravel / probe) with its age, and '
-            + 'whether the overtravel alarm is latched. Read-only.',
+        description: 'State of the external probe sensor feed (transport mqtt or gpio): configuration, '
+            + 'connection, the last reading per channel (toolsetter / overtravel / probe) with its age, '
+            + 'and whether the overtravel alarm is latched. Read-only.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         handler: async () => probeFeedService.status(),
     });
@@ -21,16 +22,18 @@ export function registerProbeTools(registry: ToolRegistry): void {
     registry.register({
         name: 'connect_probe_feed',
         description: 'Connect (or reconnect) to the probe sensor feed using the current settings '
-            + '(environment variables first, then the Settings -> MCP Server MQTT fields). '
-            + 'Subscribes to the configured toolsetter/overtravel/probe topics and arms the '
-            + 'overtravel tripwire. Idempotent.',
+            + '(environment variables first, then the Settings -> MCP Server fields) over the '
+            + 'configured transport - MQTT topics, or direct GPIO pins polled through a Blinka '
+            + 'monitor subprocess. Binds the configured toolsetter/overtravel/probe channels and '
+            + 'arms the overtravel tripwire (which latches only while a sensor-gated procedure or '
+            + 'MCP motion is in progress). Idempotent.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         handler: async () => {
-            const cfg = resolveProbeFeedConfig();
+            const cfg = resolveActiveProbeConfig();
             if (!cfg.configured) {
-                throw new McpToolError(`Probe feed is not configured: missing ${cfg.missing.join(', ')}. `
-                    + 'Ask the operator to fill in the MQTT fields on Settings -> MCP Server '
-                    + '(or set LUBAN_MCP_MQTT_* environment variables) and restart or retry.');
+                throw new McpToolError(`Probe feed (${cfg.kind} transport) is not configured: `
+                    + `missing ${cfg.missing.join(', ')}. Ask the operator: ${cfg.settingsHint} `
+                    + 'Then retry.');
             }
             try {
                 await probeFeedService.connect();

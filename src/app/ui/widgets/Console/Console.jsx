@@ -170,7 +170,7 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
                     .map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`)
                     .join(' ');
                 const line = `${stamp()}[mcp] ${tool} ${phase}${detail ? ` ${detail}` : ''}`;
-                terminal.writeln(phase === 'OVERTRAVEL_ALARM' ? color.red(line) : color.cyan(line));
+                terminal.writeln(phase === 'OVERTRAVEL_ALARM' || phase === 'CRASH_ALARM' ? color.red(line) : color.cyan(line));
             } else if (ok) {
                 terminal.writeln(color.cyan(`${stamp()}[mcp] ${tool} ok ${durationMs}ms`));
             } else {

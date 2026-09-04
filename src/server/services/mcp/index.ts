@@ -5,7 +5,7 @@ import logger from '../../lib/logger';
 import config from '../configstore';
 import { McpServer, isAllowedOrigin, isLoopback } from './McpServer';
 import { jobManager } from './jobs';
-import { probeFeedService, resolveProbeFeedConfig } from './probeFeed';
+import { probeFeedService, resolveActiveProbeConfig } from './probeFeed';
 import { ToolRegistry } from './registry';
 import { registerCalibrationTools } from './tools/calibration';
 import { registerCameraTools } from './tools/camera';
@@ -86,6 +86,9 @@ export function getMcpStatus() {
         port: runningPort,
         toolCount: registeredToolCount,
         settings,
+        // Sensor feed snapshot for the Workspace connection pills; live
+        // updates arrive over mcp:activity (tool 'probe_feed').
+        probeFeed: probeFeedService.status(),
     };
 }
 
@@ -157,7 +160,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     // Arm the external probe feed (and its overtravel tripwire) without any
     // agent involvement when it is fully configured. Failure is logged and
     // retried by the feed's own backoff; it must never break startup.
-    if (resolveProbeFeedConfig().configured) {
+    if (resolveActiveProbeConfig().configured) {
         probeFeedService.connect().catch((err: Error) => {
             log.error(`Probe feed auto-connect failed: ${err.message}`);
         });
