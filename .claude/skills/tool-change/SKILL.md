@@ -15,7 +15,11 @@ shifted exactly, without ever re-touching the stock.
 
 - Probe feed connected (`get_probe_feed_status` to check; `connect_probe_feed`
   if not - the feed auto-connects at start when configured) and the machine
-  homed and idle. The tool setter's overtravel switch is a tripwire ONLY while
+  homed and idle. If the status shows `unavailable: true` / `bridge: not
+  detected`, the USB sensor bridge is unplugged - tell the operator, do not
+  work around it. If a tool refuses with "the tool setter is disabled
+  (Settings -> MCP Server)", the operator switched that sensor off in the app;
+  ask them to enable it - never proceed without the sensor. The tool setter's overtravel switch is a tripwire ONLY while
   this procedure (or other MCP motion) is running: pushing the setter past
   contact mid-run latches the alarm; by hand with the machine idle it just
   flashes the Workspace pill. The Workspace -> Connection pills (Tool Setter /

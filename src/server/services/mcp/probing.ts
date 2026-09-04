@@ -1,5 +1,5 @@
 import { connectionManager } from '../machine/ConnectionManager';
-import { ProbeChannel, probeFeedService } from './probeFeed';
+import { ProbeChannel, probeFeedService, resolveSensorEnabled, sensorLabel } from './probeFeed';
 import { McpToolError } from './registry';
 import { GcodeChannel, sendGcodeVisible } from './tools/camera';
 import { assertFreshHeartbeat, getPositionSnapshot } from './tools/machine';
@@ -232,6 +232,10 @@ export async function senseReleaseAfter(
  */
 export function assertChannelReady(channel: ProbeChannel, what: string): void {
     probeFeedService.assertNoOvertravel();
+    if (!resolveSensorEnabled()[channel]) {
+        throw new McpToolError(`The ${sensorLabel(channel)} is disabled (Settings -> MCP Server -> Probe sensor feed). `
+            + `Ask the operator to enable it before a ${what} run.`);
+    }
     if (!probeFeedService.isConnected()) {
         throw new McpToolError('Probe feed is not connected - connect_probe_feed first. The overtravel '
             + `tripwire MUST be armed for a ${what} run.`);

@@ -1,7 +1,7 @@
 import config from '../configstore';
 import { getMcpStatus } from '../mcp';
 import { DEFAULT_BLINKA_ENV, resolveGpioFeedConfig } from '../mcp/gpioFeed';
-import { probeFeedService, resolveProbeFeedConfig, resolveProbeTransportKind } from '../mcp/probeFeed';
+import { probeFeedService, resolveProbeFeedConfig, resolveProbeTransportKind, resolveSensorEnabled } from '../mcp/probeFeed';
 
 const ERR_BAD_REQUEST = 400;
 
@@ -100,6 +100,19 @@ function gpioSettings() {
     };
 }
 
+function sensorSettings() {
+    const enabled = resolveSensorEnabled();
+    return {
+        toolSetter: enabled.toolsetter,
+        probe: enabled.probe,
+        stored: {
+            toolSetter: config.get('mcpToolSetterEnabled'),
+            probe: config.get('mcpProbeToolEnabled'),
+        },
+        envOverrides: ['LUBAN_MCP_TOOLSETTER_ENABLED', 'LUBAN_MCP_PROBE_ENABLED'].filter((name) => !!(process.env[name] || '').trim()),
+    };
+}
+
 function transportSettings() {
     return {
         // What the operator stored (may be empty = auto), and what is live.
@@ -110,7 +123,7 @@ function transportSettings() {
 }
 
 export const getStatus = (req, res) => {
-    res.send({ ...getMcpStatus(), transport: transportSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
+    res.send({ ...getMcpStatus(), transport: transportSettings(), sensors: sensorSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
 };
 
 /**
@@ -142,7 +155,7 @@ export const clearAlarm = (req, res) => {
  * omitted field is left unchanged (the pane omits an untouched password).
  */
 export const updateSettings = (req, res) => {
-    const { enabled, port, mqtt, gpio, transport } = req.body || {};
+    const { enabled, port, allowLan, sensors, mqtt, gpio, transport } = req.body || {};
 
     if (port !== undefined) {
         const value = Number(port);
@@ -154,6 +167,19 @@ export const updateSettings = (req, res) => {
     }
     if (enabled !== undefined) {
         config.set('mcpEnabled', !!enabled);
+    }
+    if (allowLan !== undefined) {
+        // Applies at the next start (bind address). No authentication exists:
+        // the pane carries the warning; here we only persist the choice.
+        config.set('mcpAllowLan', !!allowLan);
+    }
+    if (sensors && typeof sensors === 'object') {
+        if (sensors.toolSetter !== undefined) {
+            config.set('mcpToolSetterEnabled', !!sensors.toolSetter);
+        }
+        if (sensors.probe !== undefined) {
+            config.set('mcpProbeToolEnabled', !!sensors.probe);
+        }
     }
 
     if (mqtt && typeof mqtt === 'object') {
@@ -214,5 +240,5 @@ export const updateSettings = (req, res) => {
         }
     }
 
-    res.send({ ...getMcpStatus(), transport: transportSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
+    res.send({ ...getMcpStatus(), transport: transportSettings(), sensors: sensorSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
 };

@@ -114,7 +114,12 @@ readings are polled every 10 ms locally, so `sensor_delay_ms` can drop to
 just slower than necessary. Before any sensor-gated run, sanity-check the
 sensors: the Workspace -> Connection pills (Probe / Tool Setter / Setter
 Overtravel) must all be green (yellow = no reading or feed down), and
-`get_probe_feed_status` must show the channel untriggered with a fresh age.
+`get_probe_feed_status` must show the channel untriggered with a fresh age. Two
+non-error states you may meet: `unavailable: true` / `bridge: not detected` means
+the USB sensor bridge is unplugged (the feed retries quietly - tell the operator);
+a tool refusing with "the touch probe / tool setter is disabled (Settings -> MCP
+Server)" means the operator switched that sensor off in the app - ask, never
+bypass. Sensors the operator has disabled have no pill at all.
 
 ## Circle probing
 

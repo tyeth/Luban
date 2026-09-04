@@ -49,6 +49,12 @@ interface McpTransportSettings {
     active: 'mqtt' | 'gpio';
 }
 
+interface McpSensorSettings {
+    toolSetter: boolean;
+    probe: boolean;
+    envOverrides: string[];
+}
+
 interface McpStatus {
     running: boolean;
     port: number | null;
@@ -57,8 +63,12 @@ interface McpStatus {
         enabled: boolean;
         port: number;
         source: 'env' | 'config';
+        allowLan: boolean;
+        allowLanSource: 'env' | 'config' | 'default';
     };
+    lanUrls: string[];
     transport: McpTransportSettings;
+    sensors: McpSensorSettings;
     mqtt: McpMqttSettings;
     gpio: McpGpioSettings;
 }
@@ -108,6 +118,9 @@ const McpServer: React.FC = () => {
     const [status, setStatus] = useState<McpStatus | null>(null);
     const [enabled, setEnabled] = useState(false);
     const [port, setPort] = useState('');
+    const [allowLan, setAllowLan] = useState(false);
+    const [toolSetterEnabled, setToolSetterEnabled] = useState(true);
+    const [probeEnabled, setProbeEnabled] = useState(true);
     const [transport, setTransport] = useState('');
     const [mqtt, setMqtt] = useState<{ [field: string]: string }>({});
     const [inverted, setInverted] = useState<{ [channel: string]: boolean }>({});
@@ -123,6 +136,11 @@ const McpServer: React.FC = () => {
                 setStatus(body);
                 setEnabled(body.settings.enabled);
                 setPort(String(body.settings.port));
+                setAllowLan(!!body.settings.allowLan);
+                if (body.sensors) {
+                    setToolSetterEnabled(body.sensors.toolSetter !== false);
+                    setProbeEnabled(body.sensors.probe !== false);
+                }
                 setTransport(body.transport ? body.transport.stored : '');
 
                 const { inverted: mqttInvertedNames, ...mqttValues } = body.mqtt.values;
@@ -150,7 +168,15 @@ const McpServer: React.FC = () => {
         }
         const gpioUpdate: { [field: string]: string } = { ...gpio };
         gpioUpdate.inverted = CHANNELS.filter((channel) => gpioInverted[channel]).join(',');
-        await api.setMcpSettings({ enabled, port: value, transport, mqtt: mqttUpdate, gpio: gpioUpdate });
+        await api.setMcpSettings({
+            enabled,
+            port: value,
+            allowLan,
+            sensors: { toolSetter: toolSetterEnabled, probe: probeEnabled },
+            transport,
+            mqtt: mqttUpdate,
+            gpio: gpioUpdate,
+        });
     };
 
     useEffect(() => {
@@ -230,9 +256,30 @@ const McpServer: React.FC = () => {
                         className={styles['port-input']}
                     />
                     <div className={styles['port-tips']}>
-                        {i18n._('key-App/Settings/McpServer-Local agents connect at')} http://127.0.0.1:&lt;port&gt;/mcp. {i18n._('key-App/Settings/McpServer-Loopback only; never reachable from the network')}
+                        {i18n._('key-App/Settings/McpServer-Local agents connect at')} http://127.0.0.1:&lt;port&gt;/mcp. {allowLan
+                            ? i18n._('key-App/Settings/McpServer-LAN access is ON: hosts on this machine\'s own subnets are accepted too.')
+                            : i18n._('key-App/Settings/McpServer-Loopback only; never reachable from the network')}
                     </div>
                 </div>
+                <div className="sm-flex align-center margin-bottom-8 margin-top-8">
+                    <Switch
+                        checked={allowLan}
+                        onChange={(checked) => setAllowLan(checked)}
+                        disabled={!enabled || !!(status && status.settings && status.settings.allowLanSource === 'env')}
+                    />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Allow access from the local network (same subnet only; applies after restart)')}</span>
+                </div>
+                {allowLan && (
+                    <div className="margin-bottom-8" style={{ color: '#FF4D4F' }}>
+                        {i18n._('key-App/Settings/McpServer-WARNING: there is no authentication. Anyone on your local network can then command the machine. Only enable on a trusted network, and never leave the machine unattended.')}
+                        {status && status.lanUrls && status.lanUrls.length > 0 && (
+                            <div style={{ color: 'inherit' }}>{i18n._('key-App/Settings/McpServer-LAN URLs:')} {status.lanUrls.join(', ')}</div>
+                        )}
+                        {status && status.settings && status.settings.allowLanSource === 'env' && (
+                            <div>{i18n._('key-App/Settings/McpServer-Overridden by LUBAN_MCP_ALLOW_LAN')}</div>
+                        )}
+                    </div>
+                )}
             </div>
 
             <div className="border-bottom-normal padding-bottom-4 margin-top-16">
@@ -241,6 +288,15 @@ const McpServer: React.FC = () => {
             <div className="margin-top-8">
                 <div className="margin-bottom-8">
                     {i18n._('key-App/Settings/McpServer-External tool setter, overtravel and touch probe sensors report over this feed. Applies at the next feed connection.')}
+                </div>
+                <div className="sm-flex align-center margin-bottom-8">
+                    <Switch checked={toolSetterEnabled} onChange={(checked) => setToolSetterEnabled(checked)} disabled={!enabled} />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Tool setter (contact + overtravel sensors)')}</span>
+                    <Switch className="margin-left-16" checked={probeEnabled} onChange={(checked) => setProbeEnabled(checked)} disabled={!enabled} />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Touch probe')}</span>
+                </div>
+                <div className="margin-bottom-8">
+                    {i18n._('key-App/Settings/McpServer-A disabled sensor is never bound: no pill, no readings, and procedures that need it refuse. If the USB sensor bridge is unplugged the feed just reports "not detected" and keeps retrying quietly - disable the sensors here when you know it will be absent.')}
                 </div>
                 <div className="sm-flex align-center margin-bottom-8">
                     <span style={LABEL_STYLE}>{i18n._('key-App/Settings/McpServer-Transport')}</span>
