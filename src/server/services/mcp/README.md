@@ -17,7 +17,7 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 |---|---|
 | `mcpEnabled`, `mcpPort` | Start the server on 127.0.0.1:port (default 40889). Legacy: `mcpPort` alone enables when `mcpEnabled` was never written. |
 | `mcpCameraUrl` | HTTP(S) snapshot URL; takes precedence over ffmpeg. |
-| `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg DirectShow capture. Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. |
+| `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg capture — DirectShow on Windows (device = friendly name), v4l2 on Linux (device = a `list_cameras` entry, preferably the stable `/dev/v4l/by-id/… (Name)` form; a bare `/dev/videoN` works but renumbers on replug). Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. |
 | `mcpMaxJogDistance` | Per-call XY travel cap for direct moves, default 100 mm. `goto_work_origin` is exempt (fixed operator-set destination). |
 | `mcpToolRegion` | Fractional box where the endmill images (fixed camera-to-spindle geometry); returned with every frame; settable via the `set_tool_region` tool. |
 | `mcpInstalledModules` | e.g. `["snapmaker-2.0-bracing-kit-module"]` — feeds effective work ranges in `get_machine_profile`. |
@@ -36,6 +36,16 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
   Run workflow → pick branch + platforms, or `gh workflow run build-on-pull-request.yml
   --ref <branch> -f platforms=all`) and download the platform installer from the run's
   artifacts.
+- **Ubuntu 23.10+ / AppArmor**: these releases restrict unprivileged user namespaces
+  (`kernel.apparmor_restrict_unprivileged_userns=1`), which kills Chromium's sandbox — the
+  app dies on launch with `Trace/breakpoint trap (core dumped)` (seen on Ubuntu 24.04,
+  2026-09-04). The `.deb`/`.rpm` post-install (`build/linux-after-install.sh`) writes
+  `/etc/apparmor.d/snapmaker-luban` granting `userns` (same shape Ubuntu ships for
+  Discord/code) and reloads it; post-remove deletes it. For a package built before that,
+  install the profile by hand once:
+  `sudo tee /etc/apparmor.d/snapmaker-luban > /dev/null <<'EOF'` … (contents in the
+  script) … `EOF && sudo apparmor_parser -r /etc/apparmor.d/snapmaker-luban`. Last-resort
+  workaround: launch with `snapmaker-luban --no-sandbox` (also proves the diagnosis).
 - **Local dev**: Node 16 + python 3.11 for node-gyp (details under Development workflow),
   `npm install`, then `npm run dev` (watch mode) or `npm run build` + `npm run
   start-electron` (production build; see the build caveats below).
@@ -45,11 +55,16 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
   interpreter. Nothing else needs Python at runtime. On Linux, if the monitor dies with
   an HID open/permission error, grant the user access to the Pico's hidraw device (udev
   rule) and re-plug.
-- **ffmpeg — camera capture, Windows only**: the ffmpeg path is DirectShow (`-f dshow`),
-  so it only serves Windows; install any ffmpeg build and set `mcpFfmpegPath` if not on
-  PATH. On Linux/macOS use an HTTP snapshot endpoint via `mcpCameraUrl` (e.g. Android IP
-  Webcam) — it takes precedence over ffmpeg everywhere and is platform-independent.
-  (A v4l2 capture provider would be the Linux-native alternative; not built.)
+- **ffmpeg — camera capture (Windows + Linux)**: install any ffmpeg build (`apt install
+  ffmpeg` on Ubuntu) and set `mcpFfmpegPath` if not on PATH. Windows captures via
+  DirectShow (device = friendly name); Linux via v4l2 — devices are enumerated from
+  `/sys/class/video4linux` (capture nodes only, listed as
+  `/dev/v4l/by-id/usb-…-video-index0 (Name)` — stable across replugs, unlike
+  `/dev/videoN`, which renumbers when cameras come and go), and the user must be able to
+  read `/dev/video*` (usually the `video` group). Pin `mcpCameraDevice` to the by-id
+  entry from `list_cameras`, never to a bare `/dev/videoN`. macOS has no
+  ffmpeg input wired up. `mcpCameraUrl` (HTTP snapshot, e.g. Android IP Webcam) remains
+  platform-independent and takes precedence everywhere.
 
 ## Architecture
 

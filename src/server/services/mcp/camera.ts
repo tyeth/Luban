@@ -16,9 +16,12 @@ const log = logger('service:mcp:camera');
 // plain forked Node process (no Electron media stack), so capture goes
 // through one of two providers:
 //   - mcpCameraUrl: HTTP(S) snapshot URL returning a JPEG/PNG per GET
-//   - ffmpeg DirectShow: mcpFfmpegPath (or ffmpeg on PATH) reading the
-//     device named by mcpCameraDevice
+//   - ffmpeg: mcpFfmpegPath (or ffmpeg on PATH) reading the device named by
+//     mcpCameraDevice - DirectShow on Windows, v4l2 on Linux. macOS has no
+//     ffmpeg input wired up; use mcpCameraUrl there.
 const CAPTURE_TIMEOUT_MS = 15000;
+
+const FFMPEG_PROVIDER = process.platform === 'win32' ? 'ffmpeg-dshow' : 'ffmpeg-v4l2';
 
 export interface CapturedFrame {
     frameId: string;
@@ -69,10 +72,70 @@ async function runFfmpeg(args: string[]): Promise<{ code: number; stderr: string
     });
 }
 
+/**
+ * Enumerate v4l2 capture devices from sysfs (ffmpeg cannot list them). Each
+ * physical camera exposes several /dev/video* nodes; only `index` 0 is the
+ * actual capture node (the rest are metadata companions), so only those are
+ * listed. /dev/videoN numbering shuffles whenever cameras are (un)plugged
+ * (seen on the Ubuntu box: the toolhead camera moved video0 -> video2 when
+ * a second camera appeared), so entries prefer udev's stable per-device
+ * symlink: "/dev/v4l/by-id/usb-...-video-index0 (Friendly Name)", falling
+ * back to "/dev/videoN (Friendly Name)". The same string is stored as the
+ * sticky device and the leading path is parsed back out at capture time.
+ */
+function listV4l2Devices(): string[] {
+    const root = '/sys/class/video4linux';
+    if (!fs.existsSync(root)) {
+        return [];
+    }
+    const byIdDir = '/dev/v4l/by-id';
+    const stablePath: { [node: string]: string } = {};
+    if (fs.existsSync(byIdDir)) {
+        for (const link of fs.readdirSync(byIdDir)) {
+            try {
+                const target = path.basename(fs.readlinkSync(path.join(byIdDir, link)));
+                stablePath[target] = path.join(byIdDir, link);
+            } catch (err) {
+                // not a symlink; ignore
+            }
+        }
+    }
+    const nodes = fs.readdirSync(root)
+        .filter((entry) => /^video\d+$/.test(entry))
+        .sort((a, b) => Number(a.slice(5)) - Number(b.slice(5)));
+    const devices: string[] = [];
+    for (const node of nodes) {
+        const devPath = stablePath[node] || `/dev/${node}`;
+        try {
+            const index = fs.readFileSync(path.join(root, node, 'index'), 'utf8').trim();
+            if (index !== '0') {
+                continue;
+            }
+            const name = fs.readFileSync(path.join(root, node, 'name'), 'utf8').trim();
+            devices.push(name ? `${devPath} (${name})` : devPath);
+        } catch (err) {
+            devices.push(devPath);
+        }
+    }
+    return devices;
+}
+
 export async function listCameras(): Promise<{ provider: string; devices: string[]; note?: string }> {
     const cameraUrl = config.get('mcpCameraUrl');
     if (cameraUrl) {
         return { provider: 'http', devices: [String(cameraUrl)], note: 'mcpCameraUrl is set; it takes precedence.' };
+    }
+
+    if (process.platform === 'linux') {
+        return { provider: 'ffmpeg-v4l2', devices: listV4l2Devices() };
+    }
+    if (process.platform !== 'win32') {
+        return {
+            provider: 'ffmpeg',
+            devices: [],
+            note: `No ffmpeg camera input is wired up for ${process.platform}; set mcpCameraUrl to an `
+                + 'HTTP snapshot URL instead.',
+        };
     }
 
     const { stderr } = await runFfmpeg(['-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy']);
@@ -131,12 +194,20 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
     // (possibly dead virtual) camera is worse than an error. The last
     // device that produced a frame is remembered and preferred; a missing
     // device is an error, never a substitution.
+    if (process.platform !== 'win32' && process.platform !== 'linux') {
+        throw new McpToolError(`No ffmpeg camera input is wired up for ${process.platform}. `
+            + 'Set mcpCameraUrl to an HTTP snapshot URL instead.');
+    }
     let device = config.get('mcpCameraDevice');
     if (!device) {
         const { devices } = await listCameras();
         if (!devices.length) {
-            throw new McpToolError('No DirectShow video devices found. Set configstore key mcpCameraDevice, '
-                + 'or mcpCameraUrl for an HTTP snapshot source.');
+            const linuxHint = process.platform === 'linux'
+                ? ' (v4l2 devices are read from /sys/class/video4linux; check the camera is attached '
+                    + 'and the user can read /dev/video* - video group.)'
+                : '';
+            throw new McpToolError(`No ${process.platform === 'win32' ? 'DirectShow' : 'v4l2'} video devices `
+                + `found. Set configstore key mcpCameraDevice, or mcpCameraUrl for an HTTP snapshot source.${linuxHint}`);
         }
         const lastGood = config.get('mcpCameraLastGood');
         if (lastGood && devices.includes(String(lastGood))) {
@@ -150,11 +221,19 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
         }
     }
 
+    // dshow addresses cameras by friendly name; v4l2 by device path. Linux
+    // list entries read "<path> (Name)" where path is a /dev/v4l/by-id
+    // symlink or /dev/videoN - parse the path back out, and accept a bare
+    // path set directly in mcpCameraDevice.
+    const inputArgs = process.platform === 'win32'
+        ? ['-f', 'dshow', '-i', `video=${device}`]
+        : ['-f', 'v4l2', '-i', (String(device).match(/^(\/dev\/\S+)/) || [])[1] || String(device)];
+
     const outPath = path.join(DataStorage.tmpDir, `mcp-frame-${crypto.randomBytes(4).toString('hex')}.jpg`);
     try {
         const ffmpegArgs = [
             '-hide_banner', '-loglevel', 'error',
-            '-f', 'dshow', '-i', `video=${device}`,
+            ...inputArgs,
             '-frames:v', '1', '-f', 'image2', '-y', outPath,
         ];
         let { code, stderr } = await runFfmpeg(ffmpegArgs);
@@ -176,7 +255,7 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
             frameId: cacheFrame(body),
             imageBase64: body.toString('base64'),
             mimeType: 'image/jpeg',
-            provider: 'ffmpeg-dshow',
+            provider: FFMPEG_PROVIDER,
             device: String(device),
             capturedAt: Date.now(),
         };
@@ -191,6 +270,6 @@ export async function captureFrame(): Promise<CapturedFrame> {
         log.debug(`Capturing frame via HTTP snapshot: ${cameraUrl}`);
         return captureViaHttp(String(cameraUrl));
     }
-    log.debug('Capturing frame via ffmpeg dshow');
+    log.debug(`Capturing frame via ${FFMPEG_PROVIDER}`);
     return captureViaFfmpeg();
 }
