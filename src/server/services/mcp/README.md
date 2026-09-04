@@ -22,9 +22,34 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 | `mcpToolRegion` | Fractional box where the endmill images (fixed camera-to-spindle geometry); returned with every frame; settable via the `set_tool_region` tool. |
 | `mcpInstalledModules` | e.g. `["snapmaker-2.0-bracing-kit-module"]` — feeds effective work ranges in `get_machine_profile`. |
 | `mcpMqtt*` | Probe sensor feed (MQTT): `Host`, `Port` (default 8883 = TLS, 1883 = plain), `User`, `Pass`, `ClientId` (default = username + MAC bytes), `FeedToolsetter`, `FeedOvertravel`, `FeedProbe` (Adafruit IO feed key, or a full topic when it contains `/`), `Inverted` (comma-separated channels whose sensor idles HIGH and reads low on contact — the operator's CNC touch probe is normally open, so `"probe"`). Env `LUBAN_MCP_MQTT_HOST/PORT/USER/PASS/CLIENT_ID/FEED_TOOLSETTER/FEED_OVERTRAVEL/FEED_PROBE/INVERTED` override field-by-field. |
+| `mcpProbeTransport` | Which probe feed backend: `mqtt` or `gpio`. Unset = auto: `mqtt`, unless only the GPIO side is configured. Env `LUBAN_MCP_PROBE_TRANSPORT` overrides. |
+| `mcpGpio*` | Probe sensor feed (direct GPIO via Adafruit Blinka, default over U2IF — a Pi Pico as USB GPIO bridge): `PinToolsetter`, `PinOvertravel`, `PinProbe` (Blinka pin name with optional pull suffix, e.g. `GP6:up`, `GP7:down`, `GP8` = floating), `Inverted` (same semantics as the MQTT field — a pull-up NO switch idles `1`, so its channel goes here), `Python` (interpreter with `adafruit-blinka` installed, e.g. the venv's; default `python3`/`python`), `PollMs` (default 10, clamp 2–1000), `BlinkaEnv` (NAME=VALUE pairs handed to the monitor so Blinka picks the board — default `BLINKA_U2IF=1`; `BLINKA_MCP2221=1`, `BLINKA_FT232H=1`, `BLINKA_FORCEBOARD=…`, or `native` for on-board GPIO). Env `LUBAN_MCP_GPIO_PIN_TOOLSETTER/PIN_OVERTRAVEL/PIN_PROBE/INVERTED/PYTHON/POLL_MS/BLINKA_ENV` override field-by-field. All of it is editable on Settings → MCP Server, which also flags active env overrides. |
 
 A project-scope `.mcp.json` at the repo root points Claude Code sessions at
 `http://127.0.0.1:40889/mcp` automatically.
+
+## Installing
+
+- **Release/CI builds**: the fork publishes no releases — installers come from CI
+  artifacts. `Build on PR` (`build-on-pull-request.yml`) auto-runs only on pushes to
+  `main`/`release/*`; for a feature branch dispatch it manually (Actions → Build on PR →
+  Run workflow → pick branch + platforms, or `gh workflow run build-on-pull-request.yml
+  --ref <branch> -f platforms=all`) and download the platform installer from the run's
+  artifacts.
+- **Local dev**: Node 16 + python 3.11 for node-gyp (details under Development workflow),
+  `npm install`, then `npm run dev` (watch mode) or `npm run build` + `npm run
+  start-electron` (production build; see the build caveats below).
+- **Python venv — GPIO probe transport only**: `python3 -m venv .venv &&
+  .venv/bin/pip install -r src/server/services/mcp/requirements.txt` (Windows:
+  `.venv\Scripts\pip`), then point `LUBAN_MCP_GPIO_PYTHON` / `mcpGpioPython` at that
+  interpreter. Nothing else needs Python at runtime. On Linux, if the monitor dies with
+  an HID open/permission error, grant the user access to the Pico's hidraw device (udev
+  rule) and re-plug.
+- **ffmpeg — camera capture, Windows only**: the ffmpeg path is DirectShow (`-f dshow`),
+  so it only serves Windows; install any ffmpeg build and set `mcpFfmpegPath` if not on
+  PATH. On Linux/macOS use an HTTP snapshot endpoint via `mcpCameraUrl` (e.g. Android IP
+  Webcam) — it takes precedence over ffmpeg everywhere and is platform-independent.
+  (A v4l2 capture provider would be the Linux-native alternative; not built.)
 
 ## Architecture
 
@@ -45,26 +70,62 @@ mcp/
   tracking.ts    zero-mean NCC template matching between cached frames
   calibration.ts Y/Z-keyed pixel->mm calibration store (userDataDir, persists)
   mqtt.ts        minimal MQTT 3.1.1 client over net/tls (hand-rolled, no deps)
+  probeTransport.ts  probe channel names + the ProbeTransport contract
   probeFeed.ts   external probe sensor feed: config resolution (env->config),
-                 last-reading cache per channel, overtravel tripwire latch
+                 last-reading cache per channel, overtravel tripwire latch,
+                 transport selection + the MQTT backend
+  gpioFeed.ts    GPIO backend: Blinka/U2IF python monitor subprocess (embedded
+                 source, JSON lines: ready|reading|hb|fatal), stall watchdog
   toolSetter.ts  tool height measurement: config, envelope planner, staged runner
   tools/         status, machine, gcode, camera, calibration, probe, toolsetter
 ```
 
 External probe sensors (tool height setter, overtravel switch, CNC touch probe) report
-over a message feed, not the controller. The transport is abstracted behind
-`ProbeFeedService`; the first implementation is MQTT (built for Adafruit IO:
-`{user}/feeds/{key}` topics, TLS on 8883, and a `<topic>/get` publish primes the last
-value on connect). The feed auto-connects at service start when fully configured, and
-verified against public brokers over both plain TCP and TLS.
+over a sensor feed, not the controller. The transport is abstracted behind
+`ProbeFeedService` (contract in `probeTransport.ts`; readings, polarity, the alarm latch
+and reconnect backoff all live in the service — backends only deliver raw values). Two
+backends exist, selected by `mcpProbeTransport` / `LUBAN_MCP_PROBE_TRANSPORT`:
 
-**Overtravel tripwire**: any triggered reading on the overtravel channel immediately
+- **MQTT** (built for Adafruit IO: `{user}/feeds/{key}` topics, TLS on 8883, and a
+  `<topic>/get` publish primes the last value on connect); verified against public
+  brokers over both plain TCP and TLS. Change-reporting: silence means unchanged.
+- **GPIO** (2026-09-03): sensors wired to pins read through Adafruit Blinka, by default
+  via U2IF (a Pi Pico as a USB GPIO bridge, `BLINKA_U2IF=1`). Blinka is Python, so the
+  transport spawns a monitor subprocess (`python -c`, source embedded in `gpioFeed.ts`)
+  that polls the pins (default 10 ms) and streams JSON lines: `reading` on change plus a
+  1 s heartbeat with all values. The heartbeat doubles as a liveness watchdog (silent
+  ≥5 s ⇒ kill + reconnect) and refreshes reading ages without log/broadcast spam; trip
+  decisions stay on change events, matching MQTT semantics. Pin config carries the pull
+  (`GP6:up`); polarity stays in the shared `inverted` mechanism. Latency is poll + USB
+  round-trip (single-digit ms vs MQTT's measured ~120–150 ms). Verified against a real
+  PICO_U2IF (board detect, pulls, heartbeats) and a stubbed Blinka (change detection,
+  fatal paths incl. unknown-pin reporting the board's available pins).
+
+The feed auto-connects at service start when fully configured.
+
+**Overtravel tripwire**: while a sensor-gated procedure is running (the tool setter /
+probing runners declare expected contacts for their whole run) or MCP direct motion is in
+flight (`procedureArmed()`), a triggered reading on the overtravel channel immediately
 stops the running job, force-closes the machine connection, latches an alarm that blocks
 every motion tool (`assertNoOvertravel` in `assertSafeToMove`, `home`, `move_z`,
 `start_gcode_job`), and reports to the operator. The latch clears only via
 `clear_overtravel_alarm` on the operator's explicit word (refused while the feed still
-reads triggered) or an application restart. `disconnect_probe_feed` disarms the tripwire
-— never disconnect while a probing procedure could run.
+reads triggered) or an application restart. Outside that window — machine idle, operator
+pressing the switch by hand — it is logged and broadcast (`overtravel_unarmed`) but does
+NOT latch (operator decision 2026-09-04: "we only care about the overtravel alarm latching
+during a tool height test, not for general use"). `disconnect_probe_feed` disarms the
+tripwire — never disconnect while a probing procedure could run.
+
+**Sensor pills** (Workspace → Connection, beside the module badges): Probe / Tool Setter /
+Setter Overtravel, each yellow (unknown: feed not connected, no reading yet), green (idle)
+or red (in contact) — a visual bump-test aid. A red pill with an **ALARM** marker is the
+safety LATCH, not the sensor: it survives reconnects and clears only on the operator's
+word — the pill's **Clear alarm** button (confirm dialog → `POST /api/mcp/clear-alarm`,
+the operator's own click) or the `clear_overtravel_alarm` tool — or a restart; both paths
+refuse while the sensor still reads triggered. Hand bump tests with the machine idle no
+longer latch (see the tripwire arming rule above) — the pill just goes red while pressed.
+Seeded from `GET /api/mcp` (`probeFeed`), driven live by `mcp:activity` (`probe_feed`
+readings / connected / disconnected / alarms), reconciled by a 10 s poll.
 
 UI integration: verbose console toggle (Workspace) mirrors heartbeat position changes,
 every MCP-sent gcode line and controller reply (`[mcp:home] > G28` / `< X:-19.00 ...`),
@@ -96,8 +157,10 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    box below that height.
 5. **Contact sensors are crash sensors** — a probe/toolsetter trigger during motion that no
    procedure declared as expected trips a CRASH alarm (stop + force-close + latch), the
-   same machinery as overtravel; `clear_overtravel_alarm` clears either kind on the
-   operator's explicit word. Feed readings and all gcode traffic are logged server-side.
+   same machinery as overtravel; `clear_overtravel_alarm` (or the Workspace pill's Clear
+   alarm button) clears either kind on the operator's explicit word. Motion is "in
+   flight" inside `moveMachineSettled` (every procedure move, since 2026-09-04) and
+   `move_and_capture`. Feed readings and all gcode traffic are logged server-side.
 6. The approved-code page re-shows the exact gcode next to the one-time code.
    **Chat is not a motion gate — the staged job is** (operator, 2026-09-02): deliberate
    traverses/descents go through staged jobs so authorization is the one-time code against
@@ -145,6 +208,8 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
 - Controller has **G53 (machine workspace) and G54+ (numbered workspaces)**; the heartbeat
   `pos` is in the *currently selected* workspace. Convention everywhere:
   `machine = work − originOffset`.
+- **Bed = 320 × 340 × 330 mm (X/Y/Z), with extra travel on BOTH ends of every axis**
+  (operator, 2026-09-02) — matching the observed extremes below.
 - **Machine home = (−19, 342, 328)**; **firmware X limit = 339** (sweep-verified 2026-09-01:
   tracks requests exactly through 330, clamps a 340 request at 339 — the tool-change park X);
   homing = `G53;G28;G54` exactly like Luban's button
@@ -209,7 +274,8 @@ from the calibration prediction — the depth-plane parallax signature) ·
 surfaced on every capture) · `get_stored_state` (one-call orientation: calibrations,
 landmarks, tool region, limits, camera config, connection, probe feed — call this first in
 a fresh session) · `get_probe_feed_status` · `connect_probe_feed` / `disconnect_probe_feed`
-(MQTT sensor feed; connecting arms the overtravel tripwire) · `clear_overtravel_alarm`
+(sensor feed over MQTT or Blinka GPIO; connecting arms the overtravel tripwire) ·
+`clear_overtravel_alarm`
 (operator's explicit word only) · `set_/get_tool_setter_config` (setter centre, trigger Z
 with a reference bit, bit lengths — operator-stated) · `run_tool_setter` (tool height
 measurement: ONE operator approval covers a server-driven envelope-bounded routine — XY to
@@ -277,12 +343,11 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   Long term: a manual probe/inspection file driving a probing session, and a report
   exportable to CAD/CAM (Fusion + free tools). The tool setter's staged
   approach/release/confirm runner in `toolSetter.ts` is the motion template.
-- **Future probe transports (operator-stated 2026-08-31)**: MQTT may be replaced or joined
-  by hardwired USB-GPIO, or an HTTP service (e.g. a Pi running Python with a USB camera
-  plus GPIOs for the contact sensors). The transport contract is the `ProbeFeedService`
-  surface (`connect/disconnect/getReading/waitForReading/assertNoOvertravel/status`) —
-  consumers never see MQTT; a new backend implements that surface and feeds the same
-  reading cache and overtravel latch. Sensor latency is transport-dependent: local GPIO
-  would let `sensor_delay_ms` and the release timeouts collapse to near zero. The Pi's
-  camera half already fits `mcpCameraUrl` (any HTTP snapshot endpoint), so one box could
-  serve both.
+- **Probe transports**: the USB-GPIO transport landed 2026-09-03 (Blinka/U2IF backend in
+  `gpioFeed.ts`, behind the `ProbeTransport` contract — consumers still only see the
+  `ProbeFeedService` surface). Remaining ideas from the 2026-08-31 operator note: an HTTP
+  service (e.g. a Pi running Python with a USB camera plus GPIOs — its camera half
+  already fits `mcpCameraUrl`), and UART sensors through the same U2IF Pico. With local
+  GPIO the `sensor_delay_ms` contact windows and release timeouts can collapse to near
+  zero — the defaults are still MQTT-sized, so tighten them per-call when running on
+  gpio.

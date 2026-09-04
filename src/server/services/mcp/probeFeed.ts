@@ -1,31 +1,41 @@
+import { EventEmitter } from 'events';
 import os from 'os';
 
 import logger from '../../lib/logger';
 import config from '../configstore';
 import { connectionManager } from '../machine/ConnectionManager';
+import { GpioProbeTransport, describePin, resolveGpioFeedConfig } from './gpioFeed';
 import { mcpBroadcast } from './index';
 import { MqttClient } from './mqtt';
+import { PROBE_CHANNELS, ProbeChannel, ProbeTransport, ProbeTransportKind } from './probeTransport';
 import { McpToolError } from './registry';
 
 const log = logger('service:mcp:probe-feed');
 
 // External probe sensors (tool height setter, CNC touch probe) report over a
-// message feed rather than the machine controller - the controller has no
-// input for them. The transport is abstracted behind ProbeFeedService; the
-// first implementation is MQTT (Adafruit IO), configured from environment
-// variables with the server configstore as the fallback, editable on the
-// Settings -> MCP Server pane.
+// sensor feed rather than the machine controller - the controller has no
+// input for them. The transport is abstracted behind ProbeFeedService
+// (see probeTransport.ts for the contract); the backends are MQTT
+// (Adafruit IO, below in this file) and Blinka GPIO (gpioFeed.ts, direct
+// pins over U2IF/native). Each is configured from environment variables
+// with the server configstore as the fallback, editable on the Settings ->
+// MCP Server pane; LUBAN_MCP_PROBE_TRANSPORT / mcpProbeTransport picks the
+// backend (default mqtt, or gpio when only gpio is configured).
 //
 // The overtravel channel is a TRIPWIRE: the sensor only reports overtravel
-// when the physical mechanism has been pushed past its safe range, so any
-// triggered reading immediately stops the running job, force-closes the
-// machine connection, latches an alarm that blocks every motion tool, and
-// reports to the operator. The latch clears only on the operator's explicit
-// word (clear_overtravel_alarm) or an application restart.
+// when the physical mechanism has been pushed past its safe range. While a
+// sensor-gated procedure is running (or MCP direct motion is in flight - see
+// procedureArmed), a triggered reading immediately stops the running job,
+// force-closes the machine connection, latches an alarm that blocks every
+// motion tool, and reports to the operator. The latch clears only on the
+// operator's explicit word (clear_overtravel_alarm) or an application
+// restart. Outside that window (machine idle, operator bump-testing the
+// switch by hand) it is reported but does not latch (operator, 2026-09-04).
 
-export type ProbeChannel = 'toolsetter' | 'overtravel' | 'probe';
-
-export const PROBE_CHANNELS: ProbeChannel[] = ['toolsetter', 'overtravel', 'probe'];
+// Channel names moved to probeTransport.ts (shared with the transport
+// backends); re-exported here so existing consumers keep their import path.
+export { PROBE_CHANNELS };
+export type { ProbeChannel };
 
 interface FieldSpec {
     env: string;
@@ -146,6 +156,93 @@ export function resolveProbeFeedConfig(): ProbeFeedConfig {
 }
 
 /**
+ * Which transport backend the probe feed uses. Explicit setting wins
+ * (LUBAN_MCP_PROBE_TRANSPORT env, then mcpProbeTransport config); with
+ * nothing stated the default is mqtt, unless only the GPIO side is
+ * configured - so the Blinka box needs nothing beyond its pin variables.
+ */
+export function resolveProbeTransportKind(): ProbeTransportKind {
+    const raw = String(process.env.LUBAN_MCP_PROBE_TRANSPORT || config.get('mcpProbeTransport') || '')
+        .trim().toLowerCase();
+    if (raw === 'mqtt' || raw === 'gpio') {
+        return raw;
+    }
+    if (raw) {
+        log.warn(`Unknown probe transport "${raw}" (expected mqtt or gpio) - falling back to auto-detect`);
+    }
+    if (!resolveProbeFeedConfig().configured && resolveGpioFeedConfig().configured) {
+        return 'gpio';
+    }
+    return 'mqtt';
+}
+
+/** The transport-agnostic view of the active backend's configuration. */
+export interface ActiveProbeConfig {
+    kind: ProbeTransportKind;
+    configured: boolean;
+    missing: string[];
+    /** Per channel: the MQTT topic or GPIO pin label bound to it, if any. */
+    channels: { [channel in ProbeChannel]: string | null };
+    inverted: { [channel in ProbeChannel]: boolean };
+    /** Where the operator fixes a missing configuration, for error messages. */
+    settingsHint: string;
+}
+
+export function resolveActiveProbeConfig(): ActiveProbeConfig {
+    const kind = resolveProbeTransportKind();
+    if (kind === 'gpio') {
+        const cfg = resolveGpioFeedConfig();
+        const channels = {} as { [channel in ProbeChannel]: string | null };
+        for (const channel of PROBE_CHANNELS) {
+            channels[channel] = describePin(cfg.pins[channel]);
+        }
+        return {
+            kind,
+            configured: cfg.configured,
+            missing: cfg.missing,
+            channels,
+            inverted: cfg.inverted,
+            settingsHint: 'Set LUBAN_MCP_GPIO_PIN_TOOLSETTER/_OVERTRAVEL/_PROBE (Blinka pin name with an '
+                + 'optional :up/:down/:float pull suffix, e.g. "GP6:up"), plus LUBAN_MCP_GPIO_PYTHON, '
+                + '_INVERTED, _POLL_MS, _BLINKA_ENV as needed - or the matching mcpGpio* config keys '
+                + '(Settings -> MCP Server).',
+        };
+    }
+    const cfg = resolveProbeFeedConfig();
+    return {
+        kind,
+        configured: cfg.configured,
+        missing: cfg.missing,
+        channels: cfg.topics,
+        inverted: cfg.inverted,
+        settingsHint: 'Set the MQTT fields on Settings -> MCP Server or the LUBAN_MCP_MQTT_* '
+            + 'environment variables.',
+    };
+}
+
+/** Static (not-yet-connected) transport detail for status reports. */
+function describeTransportConfig(kind: ProbeTransportKind): object {
+    if (kind === 'gpio') {
+        const cfg = resolveGpioFeedConfig();
+        return {
+            python: cfg.python,
+            blinkaEnv: cfg.blinkaEnvText,
+            pollMs: cfg.pollMs,
+            configSources: cfg.sources,
+        };
+    }
+    const cfg = resolveProbeFeedConfig();
+    return {
+        host: cfg.host || null,
+        port: cfg.port,
+        tls: cfg.tls,
+        username: cfg.username || null,
+        clientId: cfg.clientId,
+        configSources: cfg.sources,
+    };
+}
+
+/**
  * Sensor payloads that count as "in contact" / "tripped". `inverted` flips
  * the polarity for normally-open circuits that idle HIGH and read low on
  * contact (the CNC touch probe); an empty payload is unknown, never contact,
@@ -167,7 +264,8 @@ export interface ProbeReading {
     value: string;
     triggered: boolean;
     receivedAt: number;
-    topic: string;
+    /** MQTT topic or GPIO pin label the value arrived on. */
+    source: string;
 }
 
 interface SafetyTrip {
@@ -181,10 +279,128 @@ interface SafetyTrip {
 const RECONNECT_BASE_MS = 5000;
 const RECONNECT_MAX_MS = 60000;
 
-export class ProbeFeedService {
+/**
+ * ProbeTransport backend over the hand-rolled MqttClient: subscribes the
+ * configured channel topics, primes Adafruit IO's last-value replay, and
+ * re-emits inbound publishes as channel readings. MQTT brokers only report
+ * changes, so this transport never emits 'refresh'.
+ */
+class MqttProbeTransport extends EventEmitter implements ProbeTransport {
+    private cfg: ProbeFeedConfig;
+
     private client: MqttClient | null = null;
 
-    private activeConfig: ProbeFeedConfig | null = null;
+    private connected = false;
+
+    public constructor(cfg: ProbeFeedConfig) {
+        super();
+        this.cfg = cfg;
+    }
+
+    public async connect(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const cfg = this.cfg;
+            const client = new MqttClient({
+                host: cfg.host,
+                port: cfg.port,
+                tls: cfg.tls,
+                clientId: cfg.clientId,
+                username: cfg.username,
+                password: cfg.password,
+            });
+            this.client = client;
+            let settled = false;
+
+            client.on('connect', () => {
+                this.connected = true;
+                const topics = PROBE_CHANNELS.map((channel) => cfg.topics[channel]).filter(Boolean) as string[];
+                client.subscribe(topics);
+                // Adafruit IO replays a feed's last value when an empty
+                // message is published to <topic>/get - prime the cache so a
+                // fresh session knows the resting state without waiting for
+                // the sensor to change.
+                if (cfg.host.toLowerCase().includes('adafruit')) {
+                    for (const topic of topics) {
+                        client.publish(`${topic}/get`, '');
+                    }
+                }
+                log.info(`Probe feed connected to ${cfg.host}:${cfg.port} as ${cfg.clientId}, `
+                    + `subscribed to ${topics.length} topic(s)`);
+                if (!settled) {
+                    settled = true;
+                    resolve();
+                }
+            });
+
+            client.on('message', (topic: string, payload: string) => {
+                for (const channel of PROBE_CHANNELS) {
+                    if (cfg.topics[channel] === topic) {
+                        this.emit('reading', channel, payload);
+                        return;
+                    }
+                }
+            });
+
+            client.on('error', (err: Error) => {
+                if (!settled) {
+                    settled = true;
+                    reject(err);
+                } else {
+                    this.emit('error', err);
+                }
+            });
+
+            client.on('close', () => {
+                this.connected = false;
+                if (this.client === client) {
+                    this.client = null;
+                }
+                if (!settled) {
+                    settled = true;
+                    reject(new Error(`MQTT connection to ${cfg.host}:${cfg.port} closed before CONNACK`));
+                }
+                this.emit('close');
+            });
+
+            client.connect();
+        });
+    }
+
+    public end(): void {
+        if (this.client) {
+            this.client.end();
+            this.client = null;
+        }
+        this.connected = false;
+    }
+
+    public isConnected(): boolean {
+        return this.connected && !!this.client && this.client.connected;
+    }
+
+    public describe(): object {
+        return {
+            host: this.cfg.host || null,
+            port: this.cfg.port,
+            tls: this.cfg.tls,
+            username: this.cfg.username || null,
+            clientId: this.cfg.clientId,
+            configSources: this.cfg.sources,
+        };
+    }
+}
+
+/** Build a fresh transport for the kind from freshly resolved configuration. */
+function buildTransport(kind: ProbeTransportKind): ProbeTransport {
+    return kind === 'gpio'
+        ? new GpioProbeTransport(resolveGpioFeedConfig())
+        : new MqttProbeTransport(resolveProbeFeedConfig());
+}
+
+export class ProbeFeedService {
+    private transport: ProbeTransport | null = null;
+
+    private activeConfig: ActiveProbeConfig | null = null;
 
     private readings = new Map<ProbeChannel, ProbeReading>();
 
@@ -214,13 +430,13 @@ export class ProbeFeedService {
      * broker accepts the session and subscriptions are sent.
      */
     public async connect(): Promise<void> {
-        if (this.client && this.client.connected) {
+        if (this.transport && this.transport.isConnected()) {
             return;
         }
-        const cfg = resolveProbeFeedConfig();
+        const cfg = resolveActiveProbeConfig();
         if (!cfg.configured) {
-            throw new Error(`Probe feed is not configured: missing ${cfg.missing.join(', ')}. `
-                + 'Set the MQTT fields on Settings -> MCP Server or the LUBAN_MCP_MQTT_* environment variables.');
+            throw new Error(`Probe feed (${cfg.kind} transport) is not configured: `
+                + `missing ${cfg.missing.join(', ')}. ${cfg.settingsHint}`);
         }
         this.wantConnected = true;
         await this.openOnce(cfg);
@@ -233,15 +449,15 @@ export class ProbeFeedService {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
-        if (this.client) {
-            this.client.end();
-            this.client = null;
+        if (this.transport) {
+            this.transport.end();
+            this.transport = null;
         }
         this.connecting = false;
     }
 
     public isConnected(): boolean {
-        return !!(this.client && this.client.connected);
+        return !!(this.transport && this.transport.isConnected());
     }
 
     public getReading(channel: ProbeChannel): ProbeReading | null {
@@ -316,17 +532,28 @@ export class ProbeFeedService {
         this.expectedContact = new Set(channels);
     }
 
+    /**
+     * True while the machine is under MCP control that a sensor could
+     * legitimately protect: a sensor-gated procedure has declared its
+     * expected contacts (tool setter / probing runners bracket their whole
+     * run), or a direct motion is in flight (motionBegin). The overtravel
+     * tripwire only latches inside this window.
+     */
+    public procedureArmed(): boolean {
+        return this.motionCount > 0 || this.expectedContact.size > 0;
+    }
+
     public clearExpectedContact(): void {
         this.expectedContact.clear();
     }
 
     public status(): object {
-        const cfg = this.activeConfig || resolveProbeFeedConfig();
+        const cfg = this.activeConfig || resolveActiveProbeConfig();
         const feeds: { [channel: string]: object | null } = {};
         for (const channel of PROBE_CHANNELS) {
             const reading = this.readings.get(channel);
             feeds[channel] = {
-                topic: cfg.topics[channel],
+                source: cfg.channels[channel],
                 inverted: cfg.inverted[channel],
                 last: reading ? {
                     value: reading.value,
@@ -337,17 +564,12 @@ export class ProbeFeedService {
             };
         }
         return {
-            transport: 'mqtt',
+            transport: cfg.kind,
             configured: cfg.configured,
             missing: cfg.missing,
             connected: this.isConnected(),
             connecting: this.connecting,
-            host: cfg.host || null,
-            port: cfg.port,
-            tls: cfg.tls,
-            username: cfg.username || null,
-            clientId: cfg.clientId,
-            configSources: cfg.sources,
+            ...(this.transport ? this.transport.describe() : describeTransportConfig(cfg.kind)),
             feeds,
             safetyTrip: this.trip,
             reconnectAttempts: this.reconnectAttempts,
@@ -355,72 +577,45 @@ export class ProbeFeedService {
         };
     }
 
-    private async openOnce(cfg: ProbeFeedConfig): Promise<void> {
+    private async openOnce(cfg: ActiveProbeConfig): Promise<void> {
         if (this.connecting) {
-            return Promise.resolve();
+            return;
         }
         this.connecting = true;
         this.activeConfig = cfg;
-        return new Promise((resolve, reject) => {
-            const client = new MqttClient({
-                host: cfg.host,
-                port: cfg.port,
-                tls: cfg.tls,
-                clientId: cfg.clientId,
-                username: cfg.username,
-                password: cfg.password,
-            });
-            this.client = client;
-            let settled = false;
+        const transport = buildTransport(cfg.kind);
+        this.transport = transport;
 
-            client.on('connect', () => {
-                this.connecting = false;
-                this.reconnectAttempts = 0;
-                this.lastError = null;
-                const topics = PROBE_CHANNELS.map((channel) => cfg.topics[channel]).filter(Boolean) as string[];
-                client.subscribe(topics);
-                // Adafruit IO replays a feed's last value when an empty
-                // message is published to <topic>/get - prime the cache so a
-                // fresh session knows the resting state without waiting for
-                // the sensor to change.
-                if (cfg.host.toLowerCase().includes('adafruit')) {
-                    for (const topic of topics) {
-                        client.publish(`${topic}/get`, '');
-                    }
-                }
-                log.info(`Probe feed connected to ${cfg.host}:${cfg.port} as ${cfg.clientId}, `
-                    + `subscribed to ${topics.length} topic(s)`);
-                mcpBroadcast('mcp:activity', { tool: 'probe_feed', phase: 'connected', host: cfg.host });
-                if (!settled) {
-                    settled = true;
-                    resolve();
-                }
-            });
-
-            client.on('message', (topic: string, payload: string) => this.onMessage(topic, payload));
-
-            client.on('error', (err: Error) => {
-                this.lastError = err.message;
-                log.error(`Probe feed error: ${err.message}`);
-                if (!settled) {
-                    settled = true;
-                    this.connecting = false;
-                    reject(err);
-                }
-            });
-
-            client.on('close', () => {
-                this.connecting = false;
-                if (this.client === client) {
-                    this.client = null;
-                }
-                if (this.wantConnected) {
-                    this.scheduleReconnect();
-                }
-            });
-
-            client.connect();
+        transport.on('reading', (channel: ProbeChannel, value: string) => this.onReading(channel, value, false));
+        transport.on('refresh', (channel: ProbeChannel, value: string) => this.onReading(channel, value, true));
+        transport.on('error', (err: Error) => {
+            this.lastError = err.message;
+            log.error(`Probe feed error: ${err.message}`);
         });
+        transport.on('close', () => {
+            this.connecting = false;
+            if (this.transport === transport) {
+                this.transport = null;
+            }
+            // Lets the UI's sensor pills fall back to "unknown" rather than
+            // showing the last reading as if it were still live.
+            mcpBroadcast('mcp:activity', { tool: 'probe_feed', phase: 'disconnected', transport: cfg.kind });
+            if (this.wantConnected) {
+                this.scheduleReconnect();
+            }
+        });
+
+        try {
+            await transport.connect();
+            this.connecting = false;
+            this.reconnectAttempts = 0;
+            this.lastError = null;
+            mcpBroadcast('mcp:activity', { tool: 'probe_feed', phase: 'connected', transport: cfg.kind });
+        } catch (err) {
+            this.connecting = false;
+            this.lastError = err.message;
+            throw err;
+        }
     }
 
     private scheduleReconnect(): void {
@@ -432,7 +627,7 @@ export class ProbeFeedService {
         log.info(`Probe feed reconnect ${this.reconnectAttempts} in ${delay}ms`);
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
-            const cfg = resolveProbeFeedConfig();
+            const cfg = resolveActiveProbeConfig();
             if (!cfg.configured) {
                 this.wantConnected = false;
                 return;
@@ -443,40 +638,60 @@ export class ProbeFeedService {
         }, delay);
     }
 
-    private onMessage(topic: string, payload: string): void {
+    private onReading(channel: ProbeChannel, value: string, refreshOnly: boolean): void {
         const cfg = this.activeConfig;
         if (!cfg) {
             return;
         }
-        for (const channel of PROBE_CHANNELS) {
-            if (cfg.topics[channel] !== topic) {
-                continue;
-            }
-            const reading: ProbeReading = {
-                value: payload,
-                triggered: isTriggeredValue(payload, cfg.inverted[channel]),
-                receivedAt: Date.now(),
-                topic,
-            };
-            this.readings.set(channel, reading);
-            mcpBroadcast('mcp:activity', {
-                tool: 'probe_feed',
-                phase: 'reading',
-                channel,
-                value: payload,
-                triggered: reading.triggered,
-            });
-            log.info(`reading ${channel}=${payload} triggered=${reading.triggered}`);
-            if (!this.trip && reading.triggered) {
-                if (channel === 'overtravel') {
-                    this.tripSafety('overtravel', channel, reading);
-                } else if (this.motionCount > 0 && !this.expectedContact.has(channel)) {
-                    // A contact sensor fired during motion that expected no
-                    // contact: collision. Stop everything.
-                    this.tripSafety('crash', channel, reading);
-                }
-            }
+        const existing = this.readings.get(channel);
+        if (refreshOnly && existing && existing.value === value) {
+            // Polled-but-unchanged (the GPIO heartbeat): freshness only, no
+            // broadcast/log spam. Trip decisions stay on CHANGE events so the
+            // latch semantics match the change-reporting MQTT transport; a
+            // refresh carrying a DIFFERENT value (a missed change) falls
+            // through to full handling as a safety net.
+            existing.receivedAt = Date.now();
             return;
+        }
+        const reading: ProbeReading = {
+            value,
+            triggered: isTriggeredValue(value, cfg.inverted[channel]),
+            receivedAt: Date.now(),
+            source: cfg.channels[channel] || channel,
+        };
+        this.readings.set(channel, reading);
+        mcpBroadcast('mcp:activity', {
+            tool: 'probe_feed',
+            phase: 'reading',
+            channel,
+            value,
+            triggered: reading.triggered,
+        });
+        log.info(`reading ${channel}=${value} triggered=${reading.triggered}`);
+        if (!this.trip && reading.triggered) {
+            if (channel === 'overtravel') {
+                // Operator decision (2026-09-04): the overtravel tripwire is
+                // armed only while a sensor-gated procedure (tool height
+                // test, probing) is running or MCP direct motion is in
+                // flight. Pressing the switch by hand with the machine idle
+                // is a bump test, not an emergency - report, don't latch.
+                if (this.procedureArmed()) {
+                    this.tripSafety('overtravel', channel, reading);
+                } else {
+                    log.warn(`overtravel reported while no procedure is running (value "${value}") - not latching`);
+                    mcpBroadcast('mcp:activity', {
+                        tool: 'probe_feed',
+                        phase: 'overtravel_unarmed',
+                        channel,
+                        value,
+                        message: 'Overtravel switch triggered with no procedure running - no alarm latched.',
+                    });
+                }
+            } else if (this.motionCount > 0 && !this.expectedContact.has(channel)) {
+                // A contact sensor fired during motion that expected no
+                // contact: collision. Stop everything.
+                this.tripSafety('crash', channel, reading);
+            }
         }
     }
 
@@ -524,6 +739,7 @@ export class ProbeFeedService {
         mcpBroadcast('mcp:activity', {
             tool: 'probe_feed',
             phase: kind === 'crash' ? 'CRASH_ALARM' : 'OVERTRAVEL_ALARM',
+            channel,
             value: reading.value,
             message: `${kind === 'crash' ? `Collision: ${channel} sensor fired during motion that expected no contact` : 'Overtravel sensor tripped'}: `
                 + 'running job stopped, machine connection force-closed, all MCP motion blocked '

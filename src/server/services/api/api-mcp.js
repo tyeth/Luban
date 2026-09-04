@@ -1,6 +1,7 @@
 import config from '../configstore';
 import { getMcpStatus } from '../mcp';
-import { resolveProbeFeedConfig } from '../mcp/probeFeed';
+import { DEFAULT_BLINKA_ENV, resolveGpioFeedConfig } from '../mcp/gpioFeed';
+import { probeFeedService, resolveProbeFeedConfig, resolveProbeTransportKind } from '../mcp/probeFeed';
 
 const ERR_BAD_REQUEST = 400;
 
@@ -32,6 +33,30 @@ const MQTT_SOURCE_FIELDS = {
     inverted: 'inverted',
 };
 
+// Probe feed (Blinka GPIO) fields, same env-first resolution
+// (LUBAN_MCP_GPIO_*). Pin values are a Blinka pin name with an optional
+// pull suffix, e.g. "GP6:up".
+const GPIO_FIELD_KEYS = {
+    python: 'mcpGpioPython',
+    pinToolsetter: 'mcpGpioPinToolsetter',
+    pinOvertravel: 'mcpGpioPinOvertravel',
+    pinProbe: 'mcpGpioPinProbe',
+    inverted: 'mcpGpioInverted',
+    pollMs: 'mcpGpioPollMs',
+    blinkaEnv: 'mcpGpioBlinkaEnv',
+};
+
+// api field name -> gpioFeed resolver field name (for env-override display)
+const GPIO_SOURCE_FIELDS = {
+    python: 'python',
+    pinToolsetter: 'toolsetter',
+    pinOvertravel: 'overtravel',
+    pinProbe: 'probe',
+    inverted: 'inverted',
+    pollMs: 'pollMs',
+    blinkaEnv: 'blinkaEnv',
+};
+
 function mqttSettings() {
     const resolved = resolveProbeFeedConfig();
     const values = {};
@@ -55,8 +80,59 @@ function mqttSettings() {
     };
 }
 
+function gpioSettings() {
+    const resolved = resolveGpioFeedConfig();
+    const values = {};
+    for (const [field, key] of Object.entries(GPIO_FIELD_KEYS)) {
+        const raw = config.get(key);
+        values[field] = (raw === undefined || raw === null) ? '' : String(raw);
+    }
+    const envOverrides = Object.entries(GPIO_SOURCE_FIELDS)
+        .filter(([, sourceField]) => resolved.sources[sourceField] === 'env')
+        .map(([field]) => field);
+    return {
+        values,
+        envOverrides,
+        configured: resolved.configured,
+        missing: resolved.missing,
+        defaultPython: resolved.python,
+        defaultBlinkaEnv: DEFAULT_BLINKA_ENV,
+    };
+}
+
+function transportSettings() {
+    return {
+        // What the operator stored (may be empty = auto), and what is live.
+        stored: String(config.get('mcpProbeTransport') || ''),
+        envOverride: !!(process.env.LUBAN_MCP_PROBE_TRANSPORT || '').trim(),
+        active: resolveProbeTransportKind(),
+    };
+}
+
 export const getStatus = (req, res) => {
-    res.send({ ...getMcpStatus(), mqtt: mqttSettings() });
+    res.send({ ...getMcpStatus(), transport: transportSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
+};
+
+/**
+ * Operator clears the latched safety alarm (overtravel or crash) from the
+ * Workspace pill. A human click in the app IS the operator's explicit word;
+ * the same guard as clear_overtravel_alarm applies - refused (409) while the
+ * tripped channel still reads triggered.
+ */
+export const clearAlarm = (req, res) => {
+    const trip = probeFeedService.getTrip();
+    if (!trip) {
+        res.send({ cleared: false, note: 'No safety alarm is latched.', probeFeed: probeFeedService.status() });
+        return;
+    }
+    try {
+        probeFeedService.clearTrip();
+    } catch (err) {
+        res.status(409).send({ msg: err.message, probeFeed: probeFeedService.status() });
+        return;
+    }
+    const reason = String((req.body || {}).reason || 'cleared from the Workspace connection panel');
+    res.send({ cleared: true, previousTrip: trip, reason, probeFeed: probeFeedService.status() });
 };
 
 /**
@@ -66,7 +142,7 @@ export const getStatus = (req, res) => {
  * omitted field is left unchanged (the pane omits an untouched password).
  */
 export const updateSettings = (req, res) => {
-    const { enabled, port, mqtt } = req.body || {};
+    const { enabled, port, mqtt, gpio, transport } = req.body || {};
 
     if (port !== undefined) {
         const value = Number(port);
@@ -103,5 +179,40 @@ export const updateSettings = (req, res) => {
         }
     }
 
-    res.send({ ...getMcpStatus(), mqtt: mqttSettings() });
+    if (transport !== undefined) {
+        const value = String(transport).trim().toLowerCase();
+        if (value === '') {
+            config.unset('mcpProbeTransport'); // back to auto-detect
+        } else if (value === 'mqtt' || value === 'gpio') {
+            config.set('mcpProbeTransport', value);
+        } else {
+            res.status(ERR_BAD_REQUEST).send({ msg: `Invalid probe transport: ${transport} (mqtt, gpio or empty)` });
+            return;
+        }
+    }
+
+    if (gpio && typeof gpio === 'object') {
+        for (const [field, key] of Object.entries(GPIO_FIELD_KEYS)) {
+            if (gpio[field] === undefined) {
+                continue;
+            }
+            const value = String(gpio[field]).trim();
+            if (value === '') {
+                config.unset(key);
+                continue;
+            }
+            if (field === 'pollMs') {
+                const numeric = Number(value);
+                if (!Number.isFinite(numeric) || numeric < 2 || numeric > 1000) {
+                    res.status(ERR_BAD_REQUEST).send({ msg: `Invalid GPIO poll interval: ${value} (2-1000 ms)` });
+                    return;
+                }
+                config.set(key, numeric);
+                continue;
+            }
+            config.set(key, value);
+        }
+    }
+
+    res.send({ ...getMcpStatus(), transport: transportSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
 };

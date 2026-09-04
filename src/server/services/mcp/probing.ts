@@ -52,7 +52,7 @@ export async function sleep(ms: number): Promise<void> {
  * a stable double-beat since a stale beat could pass). The overtravel latch
  * is re-checked before the move and on every poll.
  */
-export async function moveMachineSettled(
+async function moveMachineSettledUnguarded(
     tool: string,
     target: { x?: number; y?: number; z?: number },
     feed: number
@@ -130,6 +130,26 @@ export async function moveMachineSettled(
         }
     }
     throw new ProcedureAbort(`Timed out waiting for the heartbeat to verify the move to ${words}.`);
+}
+
+/**
+ * moveMachineSettledUnguarded inside the motion-in-flight bracket: while the
+ * move runs, a contact sensor the procedure did NOT declare as expected
+ * (setExpectedContact) firing is a collision and latches CRASH, and the
+ * overtravel tripwire is armed (operator, 2026-09-04: alarm on unexpected
+ * probe contact during an X/Y/Z move outside the region of interest).
+ */
+export async function moveMachineSettled(
+    tool: string,
+    target: { x?: number; y?: number; z?: number },
+    feed: number
+): Promise<void> {
+    probeFeedService.motionBegin();
+    try {
+        await moveMachineSettledUnguarded(tool, target, feed);
+    } finally {
+        probeFeedService.motionEnd();
+    }
 }
 
 /**
