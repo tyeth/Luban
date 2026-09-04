@@ -97,8 +97,8 @@ export function planProbePoint(args: {
         limitCoord: Number(limitCoord.toFixed(3)),
         coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 2),
         fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 0.5, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 200, 100), 10000),
+        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
+        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
         confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
     };
 }
@@ -176,7 +176,7 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         phases.push({ phase, coord: Number(coord.toFixed(3)), note });
         mcpBroadcast('mcp:activity', { tool: 'probe_point', phase, axis: plan.axis, coord: Number(coord.toFixed(3)), note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 2500);
+    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
     const startCoord = plan.start[plan.axis];
     const towards = (value: number) => (plan.direction === 1
         ? Math.min(value, plan.limitCoord) : Math.max(value, plan.limitCoord));
@@ -244,7 +244,7 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
 
         // Quick lift-and-retest confirm cycles; median wins, spread reported.
         const passContacts: number[] = [];
-        const cycleLimit = towards(fineContact + plan.direction * 0.5);
+        const cycleLimit = towards(fineContact + plan.direction * Math.max(0.5, plan.backoffMm));
         let reference = fineContact;
         for (let pass = 1; pass <= plan.confirmPasses; pass++) {
             const liftIssuedAt = Date.now();

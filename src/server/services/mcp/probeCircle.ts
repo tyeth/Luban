@@ -15,6 +15,7 @@ import {
     senseAfter,
     senseReleaseAfter,
 } from './probing';
+import { DESCENT_GUARD_MM } from './probeSequence';
 import { McpToolError } from './registry';
 import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
 import { connectionManager } from '../machine/ConnectionManager';
@@ -174,8 +175,8 @@ export function planProbeCircle(args: {
         points,
         coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 0.5, 0.2), 2),
         fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 0.5, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 200, 100), 10000),
+        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
+        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
         confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 2), 1), 5),
         staged,
     };
@@ -215,7 +216,9 @@ export function describeProbeCirclePlanAsGcode(plan: ProbeCirclePlan): string {
         if (!plan.inside) {
             lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; lift to safe traverse height`);
             lines.push(`G1 X${point.startXY.x.toFixed(3)} Y${point.startXY.y.toFixed(3)} F${TRAVEL_FEED}; approach start`);
-            lines.push(`G1 Z${plan.probeZ.toFixed(3)} F${TRAVEL_FEED}; descend to probing depth`);
+            lines.push(`G1 Z${(plan.probeZ + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend fast to ${DESCENT_GUARD_MM} mm above probing depth`);
+            lines.push(`; ...guarded final approach: ${DESCENT_GUARD_MM} x 1 mm sensor-checked steps to Z${plan.probeZ.toFixed(3)} -`);
+            lines.push(`G1 Z${plan.probeZ.toFixed(3)} F${COARSE_FEED}; ANY contact during descent aborts + latches CRASH`);
         }
         let r = plan.inside ? 0 : plan.startRadiusMm;
         let step = 0;
@@ -323,7 +326,7 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
         phases.push({ phase, note });
         mcpBroadcast('mcp:activity', { tool: 'probe_circle', phase, note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 2500);
+    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
     const contacts: { azimuthDeg: number; x: number; y: number; radius: number; passRadii: number[]; spreadMm: number }[] = [];
 
     const radialXY = (azimuthRad: number, r: number) => ({
@@ -346,7 +349,18 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
                 probeFeedService.clearExpectedContact();
                 await moveMachineSettled(`circle:hop:${label}`, { z: plan.hopZ }, TRAVEL_FEED);
                 await moveMachineSettled(`circle:hop:${label}`, { ...point.startXY }, TRAVEL_FEED);
-                await moveMachineSettled(`circle:descend:${label}`, { z: plan.probeZ }, TRAVEL_FEED);
+                await moveMachineSettled(`circle:descend:${label}`, { z: plan.probeZ + DESCENT_GUARD_MM }, TRAVEL_FEED);
+                let gz = plan.probeZ + DESCENT_GUARD_MM;
+                while (gz - plan.probeZ > 1e-9) {
+                    const t0 = Date.now();
+                    gz = Math.max(gz - 1, plan.probeZ);
+                    await moveMachineSettled(`circle:descend-guard:${label}`, { z: gz }, COARSE_FEED);
+                    const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
+                    if (sensed.contact) {
+                        throw new ProcedureAbort(`UNEXPECTED CONTACT during guarded descent at Z${gz.toFixed(3)} `
+                            + '- something is where the plan says nothing should be. Machine held.');
+                    }
+                }
                 announce(`start-${label}`, `approach start (${point.startXY.x}, ${point.startXY.y}) Z${plan.probeZ}`);
             } else {
                 announce(`start-${label}`, `outward march from (${point.startXY.x}, ${point.startXY.y}) Z${plan.probeZ}`);
@@ -409,7 +423,7 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
 
             // Confirm cycles on the march distance; median wins.
             const passS: number[] = [];
-            const cycleLimit = Math.min(fineContactS + 0.5, travelBudget);
+            const cycleLimit = Math.min(fineContactS + Math.max(0.5, plan.backoffMm), travelBudget);
             let reference = fineContactS;
             for (let pass = 1; pass <= plan.confirmPasses; pass++) {
                 const liftIssuedAt = Date.now();
