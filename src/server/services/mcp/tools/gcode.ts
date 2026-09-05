@@ -119,6 +119,9 @@ const sleep = async (ms: number) => new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
 });
 
+// How long start_gcode_job waits for a procedure before handing off to
+// get_gcode_job_status long-polling (well inside typical MCP client timeouts).
+const PROCEDURE_START_WAIT_MS = 25000;
 const FILE_JOB_POLL_MS = 1000;
 const FILE_JOB_IDLE_DEBOUNCE_POLLS = 3;
 const FILE_JOB_NEVER_SEEN_ACTIVE_IDLE_POLLS = 20;
@@ -266,6 +269,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             type: 'object',
             properties: {
                 job_id: { type: 'string' },
+                wait_ms: {
+                    type: 'number',
+                    description: 'Procedure jobs only: how long to wait for the result before returning a running status (0-120000, default 25000). The runner continues either way; long-poll get_gcode_job_status.',
+                },
                 confirm_token: { type: 'string', description: 'One-time code from the operator.' },
                 wait_until_moved: {
                     type: 'boolean',
@@ -277,7 +284,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             required: ['job_id', 'confirm_token'],
             additionalProperties: false,
         },
-        handler: async (args: { job_id?: string; confirm_token?: string; wait_until_moved?: boolean }) => {
+        handler: async (args: { job_id?: string; confirm_token?: string; wait_until_moved?: boolean; wait_ms?: number }) => {
             probeFeedService.assertNoOvertravel();
             const job = jobManager.get(String(args.job_id || ''));
             if (!job) {
@@ -313,27 +320,55 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 job.startedAt = Date.now();
                 jobManager.appendEvent(job, 'started', { note: 'procedure runner started' });
                 jobManager.setActive(job);
-                try {
-                    const outcome = await job.runner();
-                    // On the record first: a client that timed out waiting here
-                    // still finds the result in get_gcode_job_status.
-                    job.result = outcome;
-                    job.state = 'completed';
-                    job.endedAt = Date.now();
-                    jobManager.appendEvent(job, 'completed', { note: 'procedure finished; result stored on the job' });
+                // The runner is DETACHED from this request: a tool setter or
+                // probe circuit runs for minutes, longer than MCP clients wait
+                // (timeouts seen live 2026-09-04/05), and a client giving up
+                // must never abandon the machine mid-procedure or lose the
+                // result. The outcome lands on the job record; this call waits
+                // a bounded time and returns the result if it arrived, else a
+                // "running" status to long-poll with get_gcode_job_status.
+                const finished = job.runner()
+                    .then((outcome) => {
+                        job.result = outcome;
+                        job.state = 'completed';
+                        job.endedAt = Date.now();
+                        jobManager.appendEvent(job, 'completed', { note: 'procedure finished; result stored on the job' });
+                        return { ok: true as const, outcome };
+                    })
+                    .catch((err: Error) => {
+                        job.state = 'start_failed';
+                        job.error = err.message;
+                        job.endedAt = Date.now();
+                        jobManager.appendEvent(job, 'failed', { note: err.message });
+                        log.error(`Procedure job ${job.id} failed: ${err.message}`);
+                        return { ok: false as const, error: err.message };
+                    })
+                    .finally(() => {
+                        if (jobManager.getActive() === job) {
+                            jobManager.setActive(null);
+                        }
+                    });
+                const waitMs = Math.min(Math.max(Number(args.wait_ms) || PROCEDURE_START_WAIT_MS, 0), 120000);
+                const settledInTime = await Promise.race([
+                    finished,
+                    sleep(waitMs).then(() => null),
+                ]);
+                if (settledInTime === null) {
                     return {
                         job: jobManager.describe(job),
-                        result: outcome,
+                        running: true,
+                        note: `The procedure is still running after ${waitMs} ms and continues on the server. `
+                            + 'Long-poll get_gcode_job_status (wait_ms up to 120000, since_event) for phases and '
+                            + 'the result; do not resubmit.',
                     };
-                } catch (err) {
-                    job.state = 'start_failed';
-                    job.error = err.message;
-                    job.endedAt = Date.now();
-                    jobManager.appendEvent(job, 'failed', { note: err.message });
-                    throw err;
-                } finally {
-                    jobManager.setActive(null);
                 }
+                if (!settledInTime.ok) {
+                    throw new McpToolError(settledInTime.error);
+                }
+                return {
+                    job: jobManager.describe(job),
+                    result: settledInTime.outcome,
+                };
             }
 
             if (job.kind === 'direct') {

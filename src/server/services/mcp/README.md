@@ -251,6 +251,15 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
   emergency stop; MCP direct single-command ops do NOT.
 - Heartbeat period ~1 s; a settled-looking heartbeat can predate the motion (hence the
   verified-settle contract). `query_firmware_position` (M114) is the authoritative check.
+- **Origin-offset transient (2026-09-05, job 44abebd9bab3)**: the SSTP status poll rebuilds
+  `originOffset` from `offsetX/Y/Z` on every beat, and a beat inside a move's `G53…G54`
+  window can carry none — `getPositionSnapshot` used to fall through to zero and reframe
+  machine coordinates as work coordinates ((170, 199, 240) read as (119, 77, −88)), which
+  aborted a probe_sequence march re-check after every step had verifiably settled. Now a
+  missing offset reuses the last complete one (`originOffsetSource: cached`, with a
+  warning), and position re-checks re-read once after a heartbeat period before aborting.
+  This session's work origin sat at machine (51, 122, 328) — negative offsets in the
+  heartbeat; `machine = work − originOffset` holds.
 - Camera is **toolhead-mounted** (rides X/Z; the platform moves under it in Y): pixel→mm
   calibration is keyed by machine Y AND Z. The board-viewing anchor pose is the pre-home
   park (machine X0/Y0), not machine home. The **gold cylinder at machine Y≈176–340 is the
@@ -309,8 +318,9 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
 `query_firmware_position` (raw M114) · `validate_gcode` · `submit_gcode_job` →
-`start_gcode_job` → `get_gcode_job_status` (event log + stored result; long-poll with
-`wait_ms`/`since_event`) / `stop_gcode_job` · `move_z` (single or
+`start_gcode_job` (procedures run detached: returns the result if it arrives within
+`wait_ms`, default 25 s, else a `running` status) → `get_gcode_job_status` (event log +
+stored result; long-poll with `wait_ms`/`since_event`) / `stop_gcode_job` · `move_z` (single or
 `z_targets` batch) · `home` · `goto_work_origin` · `move_and_capture` · `list_cameras` ·
 `capture_frame` (position-stamped, `frameId`, `expectedToolRegion`) · `set_tool_region` ·
 `track_feature` (NCC between cached frames — use instead of eyeballing pixels) ·
