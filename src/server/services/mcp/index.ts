@@ -43,6 +43,9 @@ let broadcaster: McpBroadcaster | null = null;
  * No-op until the service starts.
  */
 export function mcpBroadcast(eventName: string, options?: object): void {
+    // The active job keeps its own copy of what happened (get_gcode_job_status
+    // events), so agents read the record instead of the server log.
+    jobManager.recordActivity(eventName, options);
     broadcaster && broadcaster.broadcast(eventName, options);
 }
 
