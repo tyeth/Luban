@@ -55,8 +55,12 @@ height drove the probe into the rotary stock and destroyed it.
    disconnect the probe feed while anything might move.
 6. **Chat is not a motion gate — the staged job is.** Deliberate traverses
    and descents go through `submit_gcode_job` / staged procedures, so the
-   operator authorises the literal gcode with a one-time code from the
-   confirm page. A "go" in chat is only permission to STAGE; interpretation
+   operator authorises the literal gcode by clicking approve on the confirm
+   page. After staging, call `start_gcode_job` with `wait_for_approval_ms`
+   (e.g. 110000): it starts the moment they click, with nothing to copy, and
+   returns `approved: false, timed_out: true` if they have not clicked yet -
+   call again, never restage. If the operator has hand-off disabled, they
+   relay the one-time code as `confirm_token` instead. A "go" in chat is only permission to STAGE; interpretation
    of chat wording is exactly what fails (see law 1's violations). Direct
    move tools are for small vision nudges only. Home (re-prove position)
    before a traverse whenever position state has any doubt — including
@@ -132,6 +136,24 @@ as the state turns terminal or new events arrive past `since_event` (pass back
 waits up to `wait_ms` (default 25 s) and returns the result if it arrived, otherwise a
 `running: true` status - the runner keeps going on the server; long-poll for the result,
 never resubmit. If your MCP client times out anyway, the result is still on the record.
+`next_event_index` is a sequence number, not an array index: the log keeps 2000 events and
+paging stays valid when it trims.
+
+When a procedure is slow or aborts, the evidence is already in its events - do not grep
+server logs. `gcode` events carry `execMs` (send to controller reply) and `idleMs` (previous
+reply to this send; engine + sensor window only, so > 750 ms inside a job also raises a
+`slow_step` event). `event_loop_stall`, `heartbeat_gap`, `heartbeat_frame_flip`,
+`sense_overrun` and `position-estimated` events name the server-side cause when there is
+one; `get_mcp_diagnostics` has the totals. The machine heartbeat is a 2 s poll: a
+`position-recheck` note saying the record or a machine-frame (G53 window) report was used
+is normal, not a fault - the runner verified every move against the controller's echo.
+Likewise a `get_position` warning that a zero work-origin offset was set aside (a
+G53-window beat reports offsets as 0,0,0 with machine coordinates in `pos`) is the server
+protecting you: machine coordinates stay right, `originOffsetSource` reads `cached`. Only a
+zero offset that persists for 3 beats is believed. If a scan aborts saying the toolhead is
+BELOW the descent target, do not re-stage from a lower `start_z_machine` - verify the
+position with `query_firmware_position` first; the check exists because one bad beat once
+read Z320 as Z-8.
 
 `survey_bed`'s `pitch_mm` is a MAXIMUM: each axis is divided evenly into steps no larger
 than it (min 20), so rows and columns are uniform and both edges are covered — no more 80 mm
@@ -176,8 +198,12 @@ surface is that minus the probe length).
 first march starts with the tip just above the surface — measured (an earlier
 `probe_point -Z`, a previous scan) or operator-stated, never inferred from a
 photo (law 3). The runner reaches it law-2 style: raise to the traverse height,
-hop at gantry height to station 1, then a guarded 1 mm descent where any
-contact latches CRASH.
+hop at gantry height to station 1, then descend in ≤ 5 mm segments to 20 mm
+above `start_z_machine` under the asynchronous crash guard (a probe touch latches
+CRASH and the next segment is refused), then a guarded 1 mm descent with a serial
+sensor check after each step. Every procedure descent is segmented like this
+(operator law: a single long move toward the work cannot be stopped once sent),
+and the segments do not wait on the heartbeat - expect `position-estimated` notes.
 
 **The envelope (operator law, 2026-09-05)** — the ONLY exception to motion law
 2, valid inside these two procedures only, between consecutive stations only.
@@ -197,9 +223,40 @@ sensor-checked segments expecting NO contact — a touch during a hop means the
 surface rose more than `z_safe_delta_mm` and latches the CRASH alarm (law 5).
 Completion and abort both raise to the traverse height. Never ask for the caps
 to be widened and never approximate a scan with `probe_sequence` hops at a
-"measured safe" height — that is exactly what law 2 forbids. On the GPIO
-transport, `sensor_delay_ms: 50` and `coarse_step_mm: 2` on a known-flat surface
-roughly halve the time per station.
+"measured safe" height — that is exactly what law 2 forbids.
+
+**Coarse press.** `coarse_step_mm` is also the worst-case press into the probe:
+the controller finishes a step before the runner sees the sensor. From station 2
+the runner uses the previous contact as the expected height and switches to fine
+steps `slow_zone_mm` (default 1) above it — press one fine step. Station 1 has no
+neighbour, so its coarse step is capped at 1 mm unless you pass
+`expected_z_machine` (a MEASURED neighbouring contact — a `probe_point -Z`, a
+`probe_sequence` centre, an earlier scan; never a guess, law 3). Each station
+result says `approach: slow-zone | coarse-contact` and `worstPressMm`. `coarse_step_mm`
+is capped at 1 mm in surface scans (operator law: never 2; 0.5–1). On the GPIO
+transport `sensor_delay_ms: 50` is ample.
+
+**Event-log budget — check it BEFORE staging a large scan.** The job keeps at most
+`mcpJobEventLimit` events (default 2000; `get_mcp_diagnostics` → `buffers` and the
+Settings pane show the live value). Beyond that the log keeps its first 20 events
+and the newest tail — `eventsTotal` > `eventCount` on the job tells you it trimmed.
+The procedure `result` (stations, fit, height map) is stored separately and is
+never trimmed; only the step-by-step evidence is. Measured cost (8-station path,
+`z_safe_delta_mm` 20, coarse 1, fine 0.1, 3 confirm passes: 763 events):
+
+| Item | Events |
+|---|---|
+| Fixed: approval, raise, traverse, 20-step guarded descent, final raise | ≈ 100 |
+| Per station (coarse ladder over the 20 mm retract ≈ 19 steps, ≈ 10 fine, 3 confirm cycles, hop segments, readings, diagnostics) | ≈ 90–120 |
+| Same with `z_safe_delta_mm` 5 on a known-flat surface (4 coarse steps) | ≈ 60 |
+
+So `events ≈ 100 + stations × 110` (use 120 to be safe): the default 2000 covers
+about 15 stations; a 5 × 5 grid needs ~3000, a 10 × 10 grid ~12 000, the 400-station
+maximum ~48 000. There is deliberately no MCP tool to change the limit: when the
+estimate exceeds the live value, ASK the operator to raise it (Settings → MCP Server →
+Diagnostic buffers, or `LUBAN_MCP_JOB_EVENT_LIMIT`, range 400–100 000, applied
+immediately) BEFORE you stage, and say the number you need. If they decline, stage
+anyway and read the result from `result`, not the events.
 
 ## Bed survey
 

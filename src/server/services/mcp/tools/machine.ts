@@ -14,6 +14,7 @@ import {
 import DataStorage from '../../../DataStorage';
 import config from '../../configstore';
 import { connectionManager } from '../../machine/ConnectionManager';
+import { ZERO_OFFSET_ACCEPT_BEATS, directGcodeQuiet, judgeOffsetReport } from '../positionOfRecord';
 import { McpToolError, ToolRegistry } from '../registry';
 
 const MACHINES = [
@@ -122,6 +123,8 @@ export interface PositionSnapshot {
     isHomed: boolean | null;
     machineStatus: string | null;
     reportAgeMs: number;
+    /** The beat's own timestamp (ms epoch) - compare beats with this, never with Date.now() - reportAgeMs (1 ms jitter made one beat look like two). */
+    reportedAt: number;
     convention: string;
     warnings: string[];
 }
@@ -155,6 +158,22 @@ export function assertFreshHeartbeat(what: string): void {
  * capture tools. Throws McpToolError when unavailable.
  */
 let lastKnownOriginOffset: { x: number; y: number; z: number; at: number } | null = null;
+// Zero-offset transient tracking (see getPositionSnapshot / judgeOffsetReport).
+let zeroOffsetStreak = 0;
+let zeroOffsetSeenAt: number | null = null;
+let zeroOffsetBeats = 0;
+const ZERO_OFFSET_QUIET_MS = 3000;
+
+/** Diagnostics: how the origin offset is currently being resolved. */
+export function originOffsetDiagnostics() {
+    return {
+        lastKnownOriginOffset,
+        zeroOffsetStreak,
+        zeroOffsetAcceptBeats: ZERO_OFFSET_ACCEPT_BEATS,
+        /** Snapshots that set a zero-offset report aside as a G53-window transient. */
+        zeroOffsetTransientsSeen: zeroOffsetBeats,
+    };
+}
 
 export function getPositionSnapshot(): PositionSnapshot {
     const status = connectionManager.getConnectionStatus();
@@ -192,20 +211,49 @@ export function getPositionSnapshot(): PositionSnapshot {
         y: axisValue(originOffset.y),
         z: axisValue(originOffset.z),
     };
-    let offsetSource: 'heartbeat' | 'cached' | 'assumed-zero' = 'heartbeat';
-    let offset: { x: number; y: number; z: number };
-    if (reported.x !== null && reported.y !== null && reported.z !== null) {
-        offset = { x: reported.x, y: reported.y, z: reported.z };
-        lastKnownOriginOffset = { ...offset, at: state.timestamp };
-    } else if (lastKnownOriginOffset) {
-        offset = { x: lastKnownOriginOffset.x, y: lastKnownOriginOffset.y, z: lastKnownOriginOffset.z };
-        offsetSource = 'cached';
+    // Zero-offset transient (G53-window beat: offsets read 0,0,0 and pos is
+    // in machine coordinates) - see positionOfRecord.judgeOffsetReport. A
+    // zero that contradicts the cached non-zero offset counts one streak per
+    // DISTINCT beat and is believed only once the streak reaches
+    // ZERO_OFFSET_ACCEPT_BEATS.
+    // Only QUIET beats count towards believing a zero offset: while direct
+    // gcode is in flight (or replied within the last ZERO_OFFSET_QUIET_MS) a
+    // zero is the G53-window artefact by construction - a scan stepping
+    // every second produced runs of them and the 3-beat streak accepted the
+    // zero 28 times in one run (2026-09-05). A real re-zero from the
+    // touchscreen happens with the machine idle and is believed after 3
+    // quiet beats (~6 s).
+    const reportedAllZero = reported.x === 0 && reported.y === 0 && reported.z === 0;
+    if (reportedAllZero) {
+        if (zeroOffsetSeenAt !== state.timestamp) {
+            zeroOffsetSeenAt = state.timestamp;
+            if (directGcodeQuiet(ZERO_OFFSET_QUIET_MS)) {
+                zeroOffsetStreak += 1;
+            } else {
+                zeroOffsetStreak = 0;
+            }
+        }
+    } else {
+        zeroOffsetStreak = 0;
+        zeroOffsetSeenAt = null;
+    }
+    const cached = lastKnownOriginOffset ? { x: lastKnownOriginOffset.x, y: lastKnownOriginOffset.y, z: lastKnownOriginOffset.z } : null;
+    const judged = judgeOffsetReport(reported, cached, zeroOffsetStreak);
+    const offset = judged.offset;
+    const offsetSource = judged.source;
+    if (judged.cache && (judged.source === 'heartbeat')) {
+        lastKnownOriginOffset = { ...judged.cache, at: state.timestamp };
+    }
+    if (judged.transientZero) {
+        zeroOffsetBeats += 1;
+        warnings.push('The latest heartbeat reports a zero work-origin offset while this connection has seen '
+            + `(${offset.x}, ${offset.y}, ${offset.z}) - a G53-window beat (pos is then in machine coordinates); `
+            + `using the last complete offset (zero would be believed after ${ZERO_OFFSET_ACCEPT_BEATS} consecutive beats).`);
+    } else if (judged.source === 'cached' && lastKnownOriginOffset) {
         warnings.push('The latest heartbeat carried no work-origin offset; machine coordinates use the '
             + `last complete offset (${offset.x}, ${offset.y}, ${offset.z}) seen ${((state.timestamp - lastKnownOriginOffset.at) / 1000).toFixed(1)}s earlier. `
             + 'Re-read before trusting a position check.');
-    } else {
-        offset = { x: reported.x || 0, y: reported.y || 0, z: reported.z || 0 };
-        offsetSource = 'assumed-zero';
+    } else if (judged.source === 'assumed-zero') {
         warnings.push('No work-origin offset has been reported on this connection yet; machine coordinates '
             + 'ASSUME a zero offset and may be wrong - query_firmware_position and re-verify.');
     }
@@ -252,6 +300,7 @@ export function getPositionSnapshot(): PositionSnapshot {
         isHomed: (state as { isHomed?: boolean }).isHomed ?? null,
         machineStatus: (state as { status?: string }).status || null,
         reportAgeMs,
+        reportedAt: state.timestamp,
         convention: 'machine = work - originOffset; heartbeat reports work coordinates',
         warnings,
     };

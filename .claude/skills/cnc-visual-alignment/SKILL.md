@@ -33,7 +33,7 @@ better frames.
 | Single guarded move | `move_and_capture` | ONE bounded XY move at current Z, settle, capture. No Z parameter by design. |
 | Servo step | `visual_servo` | One clamped correction per call; the loop lives in you, not the tool. |
 | Calibration store | `set_/get_/delete_camera_calibration` | 2×2 pixel-delta→mm matrix, keyed by the machine Y and Z it was derived at. |
-| Anything compound, and all Z | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. The one-time confirm code exists so you cannot self-authorise motion — only the operator can. |
+| Anything compound, and all Z | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. Only the operator's click on the confirm page authorises motion — call `start_gcode_job` with `wait_for_approval_ms` to start on that click, or pass the one-time code they relay as `confirm_token`. |
 
 ### Machine semantics you must not re-derive wrongly (verified on the A350)
 

@@ -11,11 +11,15 @@ import {
     ProcedureAbort,
     TRAVEL_FEED,
     assertChannelReady,
+    RECHECK_TOLERANCE_MM,
+    DESCENT_SEGMENT_MM,
     assertMachineReadyForProcedure,
+    descendInSegments,
+    expectMachinePosition,
+    knownMachinePosition,
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
-    sleep,
 } from './probing';
 import { McpToolError } from './registry';
 import {
@@ -25,6 +29,7 @@ import {
     SurfaceStation,
     assertHopsWithin,
     buildZMatrix,
+    coarseStepFor,
     fitLine,
     fitPlane,
     hopSegments,
@@ -33,6 +38,7 @@ import {
     renderHeightMap,
     renderPathProfile,
     resolveEnvelope,
+    slowZoneFor,
     stationEnvelope,
     summarizeZ,
 } from './surfaceScan';
@@ -92,6 +98,10 @@ export interface ProbeSurfacePlan {
     backoffMm: number;
     sensorDelayMs: number;
     confirmPasses: number;
+    /** Coarse steps stop this far above the expected contact and fine steps take over (caps the press at one fine step). */
+    slowZoneMm: number;
+    /** Expected contact Z for station 1 (a measured neighbour); null = coarse capped at 1 mm there. */
+    expectedZMachine: number | null;
     path?: {
         start: { x: number; y: number };
         end: { x: number; y: number };
@@ -119,6 +129,8 @@ interface CommonArgs {
     backoff_mm?: number;
     sensor_delay_ms?: number;
     confirm_passes?: number;
+    slow_zone_mm?: number;
+    expected_z_machine?: unknown;
 }
 
 function toToolError<T>(fn: () => T): T {
@@ -176,6 +188,18 @@ function finishPlan(
         throw new McpToolError('Current machine position unknown; cannot anchor the scan.');
     }
 
+    let expectedZ: number | null = null;
+    if (args.expected_z_machine !== undefined && args.expected_z_machine !== null && args.expected_z_machine !== '') {
+        expectedZ = Number(args.expected_z_machine);
+        if (!Number.isFinite(expectedZ)) {
+            throw new McpToolError('expected_z_machine must be a number (toolhead machine Z of a measured neighbouring contact).');
+        }
+        if (expectedZ > startZ + 1e-9 || expectedZ < floorZ - 1e-9) {
+            throw new McpToolError(`expected_z_machine ${expectedZ} must lie between floor_z_machine ${floorZ.toFixed(3)} and start_z_machine ${startZ.toFixed(3)}.`);
+        }
+        expectedZ = Number(expectedZ.toFixed(3));
+    }
+
     return {
         kind,
         tool: kind === 'path' ? 'probe_surface_path' : 'probe_surface_grid',
@@ -188,11 +212,18 @@ function finishPlan(
         worstHopMm,
         hopZ,
         staged: { x, y, z },
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 2),
+        // Operator (2026-09-05, job cdbc29371b97): never 2 mm - the coarse
+        // step is also the press into the probe wherever it finds the
+        // surface. 1 mm max; 0.5 when the step cadence can carry it.
+        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.5), 1),
         fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
         backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
+        // Floor 30 ms: on the GPIO transport the trigger led the controller
+        // reply on every contact of jobs 1db4/d8f6 (tightest lead 5 ms).
+        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 30), 10000),
         confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
+        slowZoneMm: Math.min(Math.max(Number(args.slow_zone_mm) || 1, 0.3), env.zSafeDeltaMm),
+        expectedZMachine: expectedZ,
     };
 }
 
@@ -264,8 +295,13 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
     const guardTop = Math.min(plan.startZMachine + DESCENT_GUARD_MM, plan.hopZ);
     const lines = [
         `; SURFACE ${plan.kind.toUpperCase()} SCAN: ${shape}`,
-        '; every station = a -Z sensor-gated march on the probe channel (coarse to contact, release,',
-        `; ${plan.fineStepMm} mm fine approach, ${plan.confirmPasses} confirm pass(es), median); all coordinates MACHINE frame.`,
+        '; every station = a -Z sensor-gated march on the probe channel (coarse towards the expected contact,',
+        `; ${plan.fineStepMm} mm fine steps inside the SLOW ZONE, ${plan.confirmPasses} confirm pass(es), median); all coordinates MACHINE frame.`,
+        `; SLOW ZONE (slow_zone_mm ${plan.slowZoneMm}): coarse steps stop ${plan.slowZoneMm} mm ABOVE the expected contact (the previous`,
+        `;   station's contact; expected_z_machine ${plan.expectedZMachine === null ? 'not given' : `Z${plan.expectedZMachine}`} for station 1) and`,
+        `;   ${plan.fineStepMm} mm steps take over down to ${(plan.slowZoneMm + 2 * plan.coarseStepMm).toFixed(1)} mm BELOW it (coarse resumes below that).`,
+        `;   Worst press into the probe: ${plan.fineStepMm} mm where the surface lies in the zone; one coarse step (${plan.coarseStepMm} mm)`,
+        `;   where it is higher; station 1 without expected_z_machine uses ${coarseStepFor(plan, plan.expectedZMachine !== null)} mm coarse steps (cap 1).`,
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)})`
             + ' - re-verified before any motion, and before EVERY march',
         ';',
@@ -273,7 +309,7 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
         '; change of 60mm)") - the operator-authorised EXCEPTION to motion law 2, valid ONLY inside this',
         '; procedure, ONLY between consecutive stations, ONLY for hops <= max_hop_mm:',
         `;   * between stations the probe retracts to LAST CONTACT + ${plan.zSafeDeltaMm} mm (z_safe_delta_mm, cap 20) and hops`,
-        `;     horizontally AT THAT HEIGHT in <= ${HOP_SEGMENT_MM} mm sensor-checked segments - ANY probe contact during a hop`,
+        `;     horizontally AT THAT HEIGHT in <= ${HOP_SEGMENT_MM} mm segments (crash guard armed) - ANY probe contact during a hop`,
         ';     is a collision: CRASH alarm latches (job stop + connection close), operator clears it.',
         `;   * largest hop in this plan: ${plan.worstHopMm} mm (max_hop_mm ${plan.maxHopMm}, cap 60) - refused at staging otherwise.`,
         `;   * each march searches from the hop height down to max(last contact - ${plan.maxDropMm} mm, FLOOR Z${plan.absoluteFloorZ});`,
@@ -286,21 +322,33 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
         'G53;',
         `G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to the safe traverse height (law 2)`,
         `G1 X${first.x.toFixed(3)} Y${first.y.toFixed(3)} F${TRAVEL_FEED}; hop at gantry height to station 1 "${first.label}"`,
-        `G1 Z${guardTop.toFixed(3)} F${TRAVEL_FEED}; descend fast to ${(guardTop - plan.startZMachine).toFixed(1)} mm above start_z_machine`,
+        `G1 Z${guardTop.toFixed(3)} F${TRAVEL_FEED}; descend to ${(guardTop - plan.startZMachine).toFixed(1)} mm above start_z_machine in <= ${DESCENT_SEGMENT_MM} mm segments (crash guard armed)`,
         '; ...guarded final approach: 1 mm steps, sensor-checked after each - ANY contact here aborts (CRASH).',
     ];
     for (let gz = guardTop - 1; gz > plan.startZMachine - 1e-9; gz -= 1) {
         lines.push(`G1 Z${Math.max(gz, plan.startZMachine).toFixed(3)} F${COARSE_FEED}; guarded descent step`);
     }
     lines.push(`; --- station 1 "${first.label}" (${first.x}, ${first.y}): march -Z from Z${firstEnv.marchStartZ} to floor Z${firstEnv.floorZ} ---`);
+    const firstCoarse = coarseStepFor(plan, plan.expectedZMachine !== null);
+    const firstZone = slowZoneFor(firstEnv.marchStartZ, plan.expectedZMachine, plan.slowZoneMm, plan.coarseStepMm, firstEnv.travelMm);
     let s = 0;
     let k = 0;
     while (firstEnv.travelMm - s > 1e-9) {
-        s = Math.min(s + plan.coarseStepMm, firstEnv.travelMm);
+        if (firstZone && s >= firstZone.topS - 1e-9 && s < firstZone.bottomS - 1e-9) {
+            lines.push(`; ...slow zone Z${(firstEnv.marchStartZ - firstZone.topS).toFixed(3)} -> Z${(firstEnv.marchStartZ - firstZone.bottomS).toFixed(3)}: `
+                + `${plan.fineStepMm} mm steps at F${FINE_FEED}, check probe after each`);
+            s = firstZone.bottomS;
+            continue;
+        }
+        let next = Math.min(s + firstCoarse, firstEnv.travelMm);
+        if (firstZone && s < firstZone.topS - 1e-9 && next > firstZone.topS + 1e-9) {
+            next = firstZone.topS;
+        }
+        s = next;
         k += 1;
         lines.push(`G1 Z${(firstEnv.marchStartZ - s).toFixed(3)} F${COARSE_FEED}; coarse ${k} - settle, check probe, stop at contact`);
     }
-    lines.push(`; ...on contact: release, ${plan.fineStepMm} mm fine approach, ${plan.confirmPasses} confirm cycle(s) (lift ${plan.backoffMm} mm)`);
+    lines.push(`; ...on coarse contact: release, ${plan.fineStepMm} mm fine approach; then ${plan.confirmPasses} confirm cycle(s) (lift ${plan.backoffMm} mm)`);
     lines.push(`; retract to contact + ${plan.zSafeDeltaMm} mm (runtime number, never above Z${plan.hopZ})`);
     for (let i = 1; i < n; i++) {
         const prev = plan.stations[i - 1];
@@ -310,7 +358,8 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
         segs.forEach((seg, j) => {
             lines.push(`G1 X${seg.x.toFixed(3)} Y${seg.y.toFixed(3)} F${TRAVEL_FEED}; hop segment ${j + 1}/${segs.length} - settle, probe must NOT be in contact`);
         });
-        lines.push(`; march -Z in ${plan.coarseStepMm} mm steps from the hop height to max(last contact - ${plan.maxDropMm}, Z${plan.absoluteFloorZ})`);
+        lines.push(`; march -Z in ${plan.coarseStepMm} mm steps from the hop height to last contact + ${plan.slowZoneMm}, then ${plan.fineStepMm} mm steps `
+            + `through the slow zone; coarse again below it to max(last contact - ${plan.maxDropMm}, Z${plan.absoluteFloorZ})`);
         lines.push(`G1 Z${plan.absoluteFloorZ.toFixed(3)} F${COARSE_FEED}; deepest allowed at this station (absolute floor) - no contact by here = no_contact`);
         lines.push(`; ...on contact: release, fine, confirm; retract to contact + ${plan.zSafeDeltaMm} mm`);
     }
@@ -334,6 +383,10 @@ export interface SurfaceStationResult {
     floorZ: number;
     confirmPassContacts?: number[];
     spreadMm?: number;
+    /** How the contact was found: fine steps inside the slow zone, or a coarse step (then release + fine). */
+    approach?: 'slow-zone' | 'coarse-contact';
+    /** Upper bound on how far the probe was pressed past contact by the step that found it. */
+    worstPressMm?: number;
 }
 
 /**
@@ -347,8 +400,9 @@ async function marchDownZ(
     station: SurfaceStation,
     startZ: number,
     floorZ: number,
+    expectedContactZ: number | null,
     announce: (phase: string, note?: string) => void
-): Promise<{ contactZ: number; passContacts: number[]; spreadMm: number } | null> {
+): Promise<{ contactZ: number; passContacts: number[]; spreadMm: number; approach: 'slow-zone' | 'coarse-contact'; worstPressMm: number } | null> {
     const travel = Number((startZ - floorZ).toFixed(3));
     const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
     const zAt = (s: number) => Number((startZ - s).toFixed(3));
@@ -356,50 +410,81 @@ async function marchDownZ(
         await moveMachineSettled(tool, { z: zAt(s) }, feed);
     };
     const tag = `${plan.tool}:${station.label}`;
+    const coarseStep = coarseStepFor(plan, expectedContactZ !== null);
+    const zone = slowZoneFor(startZ, expectedContactZ, plan.slowZoneMm, plan.coarseStepMm, travel);
+    if (zone) {
+        announce(`slow-zone-${station.label}`, `fine ${plan.fineStepMm} mm steps between Z${zAt(zone.topS)} and Z${zAt(zone.bottomS)} `
+            + `(expected contact Z${expectedContactZ} +${plan.slowZoneMm} / -${(plan.slowZoneMm + 2 * plan.coarseStepMm).toFixed(1)}); coarse ${coarseStep} mm elsewhere`);
+    } else {
+        announce(`coarse-ladder-${station.label}`, `${coarseStep} mm steps to contact (no expected contact to bound the press)`);
+    }
+    const inZone = (sv: number) => zone !== null && sv >= zone.topS - 1e-9 && sv < zone.bottomS - 1e-9;
 
     let s = 0;
     let coarseContactS: number | null = null;
-    while (travel - s > 1e-9) {
-        const t0 = Date.now();
-        s = Math.min(s + plan.coarseStepMm, travel);
-        await move(`${tag}:coarse`, s, COARSE_FEED);
-        const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
-        if (sensed.contact) {
-            coarseContactS = s;
-            announce(`coarse-contact-${station.label}`, `Z${zAt(s)}`);
-            break;
-        }
-    }
-    if (coarseContactS === null) {
-        return null;
-    }
-    let released = false;
-    while (s > 1e-9 && coarseContactS - s < MAX_RETREAT_MM + 1e-9) {
-        const t0 = Date.now();
-        s = Math.max(s - plan.coarseStepMm, 0);
-        await move(`${tag}:release`, s, COARSE_FEED);
-        const sensed = await senseReleaseAfter('probe', t0, releaseTimeoutMs);
-        if (!sensed.contact) {
-            released = true;
-            break;
-        }
-    }
-    if (!released) {
-        throw new ProcedureAbort(`Station "${station.label}": probe still triggered ${MAX_RETREAT_MM} mm back from first contact - stuck probe or feed fault.`);
-    }
     let fineContactS: number | null = null;
     while (travel - s > 1e-9) {
         const t0 = Date.now();
-        s = Math.min(s + plan.fineStepMm, travel);
-        await move(`${tag}:fine`, s, FINE_FEED);
+        const fine = inZone(s);
+        let next: number;
+        if (fine) {
+            next = Math.min(s + plan.fineStepMm, travel, (zone as { bottomS: number }).bottomS);
+        } else {
+            next = Math.min(s + coarseStep, travel);
+            if (zone && s < zone.topS - 1e-9 && next > zone.topS + 1e-9) {
+                next = zone.topS; // a coarse step never crosses into the slow zone
+            }
+        }
+        s = next;
+        await move(fine ? `${tag}:fine` : `${tag}:coarse`, s, fine ? FINE_FEED : COARSE_FEED);
         const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
         if (sensed.contact) {
-            fineContactS = s;
+            if (fine) {
+                fineContactS = s;
+                announce(`fine-contact-${station.label}`, `Z${zAt(s)} inside the slow zone (press <= ${plan.fineStepMm} mm)`);
+            } else {
+                coarseContactS = s;
+                announce(`coarse-contact-${station.label}`, `Z${zAt(s)} (press <= ${coarseStep} mm)`);
+            }
             break;
         }
     }
+    if (coarseContactS === null && fineContactS === null) {
+        return null;
+    }
+    const approach: 'slow-zone' | 'coarse-contact' = fineContactS !== null ? 'slow-zone' : 'coarse-contact';
+    const worstPressMm = fineContactS !== null ? plan.fineStepMm : coarseStep;
     if (fineContactS === null) {
-        throw new ProcedureAbort(`Station "${station.label}": fine approach lost the contact.`);
+        // Coarse contact (surface above the slow zone, or no zone): release
+        // by coarse steps until the probe reads clear, then fine-step back.
+        const contactS = coarseContactS as number;
+        let released = false;
+        while (s > 1e-9 && contactS - s < MAX_RETREAT_MM + 1e-9) {
+            const t0 = Date.now();
+            s = Math.max(s - coarseStep, 0);
+            await move(`${tag}:release`, s, COARSE_FEED);
+            const sensed = await senseReleaseAfter('probe', t0, releaseTimeoutMs);
+            if (!sensed.contact) {
+                released = true;
+                break;
+            }
+        }
+        if (!released) {
+            throw new ProcedureAbort(`Station "${station.label}": probe still triggered ${MAX_RETREAT_MM} mm back from first contact - stuck probe or feed fault.`);
+        }
+        while (travel - s > 1e-9) {
+            const t0 = Date.now();
+            s = Math.min(s + plan.fineStepMm, travel);
+            await move(`${tag}:fine`, s, FINE_FEED);
+            const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
+            if (sensed.contact) {
+                fineContactS = s;
+                break;
+            }
+        }
+        if (fineContactS === null) {
+            throw new ProcedureAbort(`Station "${station.label}": fine approach lost the contact.`);
+        }
     }
     const passContacts: number[] = [];
     const cycleLimit = Math.min(fineContactS + Math.max(0.5, plan.backoffMm), travel);
@@ -432,7 +517,7 @@ async function marchDownZ(
     const sorted = [...passContacts].sort((a, b) => a - b);
     const contactZ = sorted[Math.floor((sorted.length - 1) / 2)];
     const spreadMm = Number((sorted[sorted.length - 1] - sorted[0]).toFixed(3));
-    return { contactZ, passContacts, spreadMm };
+    return { contactZ, passContacts, spreadMm, approach, worstPressMm };
 }
 
 /** Structured procedure result (lands on job.result): stations, statistics, renderings. */
@@ -511,36 +596,20 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
         mcpBroadcast('mcp:activity', { tool: plan.tool, phase, note });
     };
 
-    // Position checks: every preceding move verified its own arrival, so a
-    // mismatch is drift or a transient heartbeat (a beat inside a G53...G54
-    // window carrying no origin offset - job 44abebd9bab3, 2026-09-05).
-    // Re-read once after a heartbeat period before believing it.
-    const fmt = (sn: ReturnType<typeof getPositionSnapshot>) => `(${sn.machine.x}, ${sn.machine.y}, ${sn.machine.z}) `
-        + `[work (${sn.work.x}, ${sn.work.y}, ${sn.work.z}), offset (${sn.originOffset.x}, ${sn.originOffset.y}, ${sn.originOffset.z}) `
-        + `from ${sn.originOffsetSource}]`;
+    // Position checks: every preceding move verified its own arrival, so the
+    // engine's position of record and an either-frame reading of the
+    // heartbeat decide (positionOfRecord.ts). Job 1db4902a4cd6 (2026-09-05)
+    // aborted here on one lagging beat and one G53-window beat while the
+    // controller had echoed both hop segments at their targets.
     const expectPosition = async (
         expected: { x: number; y: number; z: number },
         what: string,
         onMismatch: (message: string) => Error
     ) => {
-        const matches = (p: { x: number | null; y: number | null; z: number | null }) => (
-            p.x !== null && p.y !== null && p.z !== null
-            && Math.abs(p.x - expected.x) <= 0.5
-            && Math.abs(p.y - expected.y) <= 0.5
-            && Math.abs(p.z - expected.z) <= 0.5
-        );
-        let snapshot = getPositionSnapshot();
-        if (matches(snapshot.machine)) {
-            return;
+        const check = await expectMachinePosition(expected, what, onMismatch);
+        if (check.note) {
+            announce('position-recheck', `${what}: ${check.note}`);
         }
-        const firstRead = snapshot;
-        await sleep(1200);
-        snapshot = getPositionSnapshot();
-        if (!matches(snapshot.machine)) {
-            throw onMismatch(`${what}: machine at ${fmt(snapshot)} (first read ${fmt(firstRead)}) but the plan expects `
-                + `(${expected.x}, ${expected.y}, ${expected.z}).`);
-        }
-        announce('position-recheck', `${what}: passed on the second heartbeat (first read was transient)`);
     };
 
     await expectPosition(plan.staged, 'staged position', (message) => new McpToolError(
@@ -562,9 +631,21 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
         await moveMachineSettled(`${plan.tool}:traverse`, { x: first.x, y: first.y }, TRAVEL_FEED);
         announce('traverse', `(${first.x}, ${first.y}) at Z${plan.hopZ} (law 2)`);
         const guardTop = plan.startZMachine + DESCENT_GUARD_MM;
-        const zNow = getPositionSnapshot().machine.z;
-        if (zNow !== null && zNow > guardTop + 1e-9) {
-            await moveMachineSettled(`${plan.tool}:descend`, { z: guardTop }, TRAVEL_FEED);
+        // The verified position (traverse echo) decides the descent, never a
+        // single heartbeat - job 42df7b9351b7 (2026-09-05) read a zero-offset
+        // beat as Z-8 here, skipped this move and aborted at the station check.
+        const known = knownMachinePosition();
+        const zNow = known.position.z;
+        if (zNow === null) {
+            throw new ProcedureAbort('Machine Z unknown before the descent to station 1 - refusing to guess.');
+        }
+        if (zNow < plan.startZMachine - RECHECK_TOLERANCE_MM) {
+            throw new ProcedureAbort(`The toolhead is at machine Z${zNow} (${known.source}), BELOW start_z_machine Z${plan.startZMachine} `
+                + '- the approach to station 1 must descend, never rise into the surface. Re-stage from a verified position.');
+        }
+        announce('descend-from', `Z${zNow} (${known.source}) to guard top Z${guardTop} in <= ${DESCENT_SEGMENT_MM} mm segments (crash guard armed)`);
+        if (zNow > guardTop + 1e-9) {
+            await descendInSegments(`${plan.tool}:descend`, zNow, guardTop, 'probe', plan.sensorDelayMs);
         }
         let gz = Math.min(zNow === null ? guardTop : Math.max(zNow, plan.startZMachine), guardTop);
         while (gz - plan.startZMachine > 1e-9) {
@@ -614,7 +695,10 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                 (message) => new ProcedureAbort(message));
 
             probeFeedService.setExpectedContact(['probe']);
-            const outcome = await marchDownZ(plan, station, marchStartZ, env.floorZ, announce);
+            // Expected contact for the slow zone: the previous real contact,
+            // or the caller's expected_z_machine for station 1.
+            const expectedContact = isFirst ? plan.expectedZMachine : reference;
+            const outcome = await marchDownZ(plan, station, marchStartZ, env.floorZ, expectedContact, announce);
             let retractTo: number;
             if (outcome === null) {
                 if (reference === null) {
@@ -652,9 +736,12 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                     floorZ: env.floorZ,
                     confirmPassContacts: outcome.passContacts,
                     spreadMm: outcome.spreadMm,
+                    approach: outcome.approach,
+                    worstPressMm: outcome.worstPressMm,
                 });
                 retractTo = hopHeightFor(outcome.contactZ);
-                announce(`measured-${station.label}`, `(${station.x}, ${station.y}, ${outcome.contactZ}) spread ${outcome.spreadMm}`);
+                announce(`measured-${station.label}`, `(${station.x}, ${station.y}, ${outcome.contactZ}) spread ${outcome.spreadMm}, `
+                    + `${outcome.approach}, press <= ${outcome.worstPressMm} mm`);
             }
 
             // Retract to the hop height (contact still expected while leaving

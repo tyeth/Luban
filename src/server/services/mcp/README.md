@@ -189,10 +189,14 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    alarm button) clears either kind on the operator's explicit word. Motion is "in
    flight" inside `moveMachineSettled` (every procedure move, since 2026-09-04) and
    `move_and_capture`. Feed readings and all gcode traffic are logged server-side.
-6. The approved-code page re-shows the exact gcode next to the one-time code.
+6. The approved-code page re-shows the exact gcode next to the approval.
    **Chat is not a motion gate — the staged job is** (operator, 2026-09-02): deliberate
-   traverses/descents go through staged jobs so authorization is the one-time code against
-   the literal gcode, not a model's reading of chat wording. A "go" in chat only permits
+   traverses/descents go through staged jobs so authorization is the operator's click on the
+   confirm page against the literal gcode, not a model's reading of chat wording. Since
+   2026-09-05 (operator request) that click can be **handed straight to a waiting agent**:
+   `start_gcode_job` called with `wait_for_approval_ms` stays open until the click and starts
+   the job with no code to relay (times out `approved: false` after ≤ 120 s; call again). The
+   one-time code path remains, and Settings → MCP Server → Job approval can require it. A "go" in chat only permits
    staging. Re-prove position (home) before a traverse when state is in any doubt,
    including after any motion that wasn't part of the agreed sequence.
 7. **Use tools for their purpose** — `move_and_capture` is a vision reposition, not a
@@ -234,6 +238,39 @@ horizontally at that height instead of at the gantry. Nothing else inherits this
   latches CRASH (law 5); only marches run with `setExpectedContact(['probe'])`. The staged
   position and every march start are re-checked (one re-read after ~1.2 s).
 
+**Descents are segmented (operator law, 2026-09-05).** A single long `G1` toward the work
+cannot be stopped once sent — a collision would be driven to the end of the move. Every
+procedure descent (surface scans and probe_sequence to the guard top, probe_circle to its
+probe height, the tool setter's travel to its start height) is therefore issued in
+`descendInSegments`: segments of **≤ 5 mm**, and **none of them waits on the heartbeat**
+(lenient settle: the controller's ok is the gate; a misframed or missing echo records the
+commanded Z as `estimated`). Contact detection during a descent is **asynchronous**: the
+probe feed's crash guard latches CRASH the instant an unexpected channel fires while motion
+is in flight (job stop + connection close), and every segment re-checks the latch before it
+is sent, so a hit ends the descent within one segment with no serial sensor wait between
+segments. A manoeuvre that needs a synchronous verdict passes `serialCheck` (a `senseAfter`
+window after each segment). The tool setter's travel clears its expected-contact set for
+the descent, so a setter hit above the start height is a collision, not a measurement. The
+1 mm guarded final approach and the coarse/fine ladders (which do sense serially, because
+contact there is the measurement) are unchanged. Upward moves stay single.
+
+**Coarse press and the slow zone (operator, 2026-09-05, job d8f6ec1b5c11).** A coarse step is
+executed whole by the controller before the runner sees the probe, so wherever the surface
+is found by a coarse step the probe is pressed past contact by up to a FULL coarse step
+(0.4 mm at station 1 with 2 mm steps; worst case the whole step). `coarse_step_mm` is
+therefore also the worst-case press. From station 2 the runner knows the expected contact
+(the previous station's Z), so — like `run_tool_setter`'s `slow_zone_mm` — coarse steps now
+stop `slow_zone_mm` (default 1, min 0.3) above it and fine steps take over, down to
+`slow_zone + 2 × coarse` below it (coarse resumes lower, so a pocket edge costs seconds).
+Press in the zone = one fine step. Station 1 has no neighbour: coarse is capped at 1 mm
+unless `expected_z_machine` (a MEASURED neighbouring contact, law 3) is given. The confirm
+page prints the zone; each station result carries `approach` (`slow-zone` |
+`coarse-contact`) and `worstPressMm`. Bonus: no coarse contact means no release-and-return
+ladder, ~5–8 s saved per station. **`coarse_step_mm` is capped at 1 mm everywhere in
+surface scans** (operator, job cdbc29371b97: "we never wanted 2mm"; range 0.5–1, default 1).
+Verified on the rerun (cdbc29371b97, 8/8, same numbers as d8f6): every station
+`slow-zone`, `worstPressMm 0.1`, 408 s vs 492 s.
+
 ## Safety model (operator-defined, non-negotiable)
 
 - **Compound motion and all cutting goes out as gcode FILES** through the same
@@ -242,9 +279,13 @@ horizontally at that height instead of at the gantry. Nothing else inherits this
   (`execute_code`) path is reserved for single guarded actions.
 - **Human confirm page** (`/confirm/<id>`, loopback + Origin-checked): shows validation,
   extents, warnings, and for direct moves a banner stating the interlock does NOT apply.
-  Approval mints a one-time code (15 min TTL) that is never returned over MCP — a model
-  cannot self-authorise motion. Batch direct jobs: one approval covers an exact target
-  list; each `start_gcode_job` call executes one step.
+  Approval mints a one-time code (15 min TTL). Only the operator's click authorises motion:
+  a model cannot approve its own job. By default (`mcpApprovalHandoff` = `agent`) an agent
+  already waiting in `start_gcode_job wait_for_approval_ms` is started by that click and the
+  page says "handed to the waiting agent" (the code is still printed small as a fallback);
+  with `code` (or `LUBAN_MCP_APPROVAL_HANDOFF=code`) the code must be relayed by hand as
+  before. Batch direct jobs: one approval covers an exact target list; each
+  `start_gcode_job` call executes one step.
 - **Z policy**: no Z through XY tools, ever. `move_z` = per-move operator confirmation
   showing current Z, target, delta, feed. Every request needs a `reason`.
 - **Guards on every direct move**: machine idle, toolhead off (headStatus/headPower),
@@ -282,17 +323,41 @@ horizontally at that height instead of at the gantry. Nothing else inherits this
   difference). XY holds; Z does not — that is why `move_z` exists on the direct path.
   The job-concept split that matters: machine-interpreter (file) jobs get the door-detector
   emergency stop; MCP direct single-command ops do NOT.
-- Heartbeat period ~1 s; a settled-looking heartbeat can predate the motion (hence the
-  verified-settle contract). `query_firmware_position` (M114) is the authoritative check.
+- **Heartbeat period is 2 s on WiFi** (`workers/heartBeat.ts` polls `/api/v1/status` every
+  2000 ms with a 3 s timeout — not the ~1 s assumed until 2026-09-05), and a beat's position
+  can be sampled before a synchronous move finished, so a settled-looking heartbeat can
+  predate the motion (hence the verified-settle contract). `query_firmware_position` (M114)
+  is the authoritative check. The HTTP channel sends each gcode line as its own request, so
+  the engine's `G90` / `G53;` / `G1 …` / `G54;` is four requests and a status poll can land
+  INSIDE the G53 window: that beat reports **machine coordinates in `pos`**, with the offset
+  either still populated (a "frame flip"; `diagnostics` counts `heartbeat_frame_flip`) or read
+  as **(0, 0, 0)** (`zeroOffsetBeats`; set aside by `judgeOffsetReport` until a zero offset
+  persists for 3 beats) or missing (`missingOffsetBeats`; the cached offset is used).
 - **Origin-offset transient (2026-09-05, job 44abebd9bab3)**: the SSTP status poll rebuilds
   `originOffset` from `offsetX/Y/Z` on every beat, and a beat inside a move's `G53…G54`
   window can carry none — `getPositionSnapshot` used to fall through to zero and reframe
   machine coordinates as work coordinates ((170, 199, 240) read as (119, 77, −88)), which
   aborted a probe_sequence march re-check after every step had verifiably settled. Now a
   missing offset reuses the last complete one (`originOffsetSource: cached`, with a
-  warning), and position re-checks re-read once after a heartbeat period before aborting.
-  This session's work origin sat at machine (51, 122, 328) — negative offsets in the
-  heartbeat; `machine = work − originOffset` holds.
+  warning). This session's work origin sat at machine (51, 122, 328) — negative offsets in
+  the heartbeat; `machine = work − originOffset` holds.
+- **Position of record (2026-09-05, job 1db4902a4cd6)**: the same afternoon a surface scan
+  aborted at its station-4 re-check after three clean stations, on two bad beats in a row:
+  one lagging (still the previous hop segment's position) and one frame-flipped
+  (170, 207.571, 227.7 in `pos`, offset present → "machine (221, 329.6, 555.7)"), while the
+  controller had echoed both hop segments at their targets. Rules now (`positionOfRecord.ts`,
+  `probing.ts`):
+  - every verified arrival (controller echo, or settled heartbeat) is the engine's **position
+    of record**; any other gcode sent to the machine voids it;
+  - a status report is judged in **either frame** — `pos − offset` (normal) or raw `pos`
+    (G53-window beat) — for echoes, settle waits, `move_z` waits and re-checks;
+  - a re-check passes on a matching report in either frame, or on the record while the
+    latest report still predates it; it aborts only when **two distinct reports agree** the
+    machine is elsewhere (real drift), or nothing matched within 4.5 s;
+  - **operator rule**: a move of ≤ 1 mm that the controller accepted with no contradicting
+    echo is taken as arrived after a 400 ms grace if the heartbeat has not caught up
+    (`position-estimated` event) — inching is never paced by the 2 s poll. Larger moves
+    still wait for verification.
 - Camera is **toolhead-mounted** (rides X/Z; the platform moves under it in Y): pixel→mm
   calibration is keyed by machine Y AND Z. The board-viewing anchor pose is the pre-home
   park (machine X0/Y0), not machine home. The **gold cylinder at machine Y≈176–340 is the
@@ -416,9 +481,11 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   operator to close their copy. The build dirties `src/package.json` and
   `MaterialTestGcodeParams.jsx` — revert before staging.
 - **Stack**: stacked single-commit PRs `mcp/N-*`, each targeting the previous branch
-  (#15 → #73 as of 2026-09-04: tip `mcp/39-linux-mac-packaging`, next `mcp/40`; #70 stale-
-  heartbeat, #71 probe_sequence, #72 GPIO probe feed, #73 Linux/mac packaging; origin =
-  Snapmaker/Luban is NEVER pushed). Mid-stack changes:
+  (#15 → #79 as of 2026-09-05, then `mcp/46-position-of-record`; next `mcp/47`. #70 stale-
+  heartbeat, #71 probe_sequence, #72 GPIO probe feed, #73 Linux/mac packaging, #74 machine
+  settings + docs, #75 sensor toggles + LAN, #76 job events + even survey, #77 offset
+  transient + detached procedures, #78 surface scans, #79 console input leak, mcp/46 position
+  of record + diagnostics; origin = Snapmaker/Luban is NEVER pushed). Mid-stack changes:
   amend + rebase the chain. commitlint enforces `Type: Sentence-case subject` (20–100
   chars).
 - **Credentials**: active gh account is `tyeth-ai-assisted` (no push). Per-command
@@ -428,6 +495,79 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
 - eslint judged against baseline (pre-existing errors in ConnectionManager/SstpHttpChannel
   stay); `npx tsc -p tsconfig-server.json --noEmit` filtered to `services/mcp` must be
   clean.
+- **Timing diagnostics (`diagnostics.ts`, 2026-09-05)**: in job 1db4902a4cd6 the 0.1 mm fine
+  steps took ~370 ms at the controller plus a 100 ms sensor window, yet one step in four
+  idled 1.3–2.1 s between the controller's reply and the next send, and the resumptions fell
+  on a strict ~4 s grid — every echo matched, so the settle wait was NOT involved; something
+  periodic held the server's timers (event-loop block or CPU starvation on the Celeron box;
+  the renderer console and GNOME Remote Desktop are suspects). Evidence is now recorded as
+  **job events in sequence with the gcode traffic**: `event_loop_stall` (100 ms ticker > 250 ms
+  late), `heartbeat_gap` (> 4.5 s between beats), `heartbeat_frame_flip`, `slow_step` (> 750 ms
+  from the previous reply to the next send inside a job), `sense_overrun` (sensor window
+  finished > 200 ms late), `position-estimated`; every `gcode` event carries `execMs`
+  (send → reply) and `idleMs` (previous reply → this send); probe-feed readings carry
+  `pipeMs` (GPIO monitor detection → server). Totals via `get_mcp_diagnostics` (also in
+  GET `/api/mcp`). The job event log keeps 2000 events (was 400 — a scan overflowed it) and
+  pages by `seq`, so `since_event` / `next_event_index` stay valid after the cap trims the
+  middle. On GPIO the sensor lead over the controller reply was 5–144 ms on all 14 contacts
+  of that job: `sensor_delay_ms` 50 is ample there; the surface-scan floor is 30.
+  **Second run (job d8f6ec1b5c11, mcp/46 build)**: event loop clean (0 stalls, max lag 119 ms),
+  heartbeat mean 1.99 s with 0 gaps, sensor pipe < 3 ms — yet 56 `slow_step` events totalling
+  159 s of 492 s, every echo matching, each long one (3.5–4.6 s = two beats) landing ~2 s
+  after a `heartbeat_frame_flip`, the short ones (1.1–1.6 s = one beat) every third
+  descend/coarse step. The step path has no await but two timers, so the send events now
+  carry the breakdown `replyToSenseEndMs` / `senseMs` / `senseWindowMs` / `senseEndToEngineMs`
+  / `engineMs` to say which segment holds the time. **Third run (cdbc29371b97)**: the whole
+  idle is `replyToSenseEndMs` (sense 50–52 ms, engine 0–1 ms) — i.e. between the controller's
+  reply and the sensor window opening, inside the move's return path, with every echo
+  matching in the work frame. The code there is synchronous plus promise resumptions, so the
+  send events now also carry a `trace` of wall-clock marks (`reply-returned`, `echo-match` /
+  `echo-miss` / `echo-absent`, `engine-exit`, `settled-exit`, `sense-start`, `sense-end`,
+  `engine-enter`) and a `settle-wait` / `settle-done` event fires whenever the heartbeat
+  fallback runs at all. **Fourth run (70b2b8c675a6, 11 stations, 587 s) named it**: all 84
+  `settle-wait` events carried `offset: 0,0,0` from the heartbeat. A G53-window beat reports
+  `offsetX/Y/Z` as **(0, 0, 0)** (not missing) with `pos` in machine coordinates, so the
+  work-frame echo matched neither frame and the engine waited one beat (two after a flip) —
+  ~180 s of that scan. The same beat, read by the runner before the descent to station 1,
+  turned a verified Z320 into "Z−8", skipped the fast descent and aborted the scan at the
+  station check (job 42df7b9351b7; GPT-5.6 agent's write-up
+  `ROTARY_SCAN_POSITION_RECHECK_ISSUE.md` on the box). Fix: `judgeOffsetReport`
+  (positionOfRecord.ts) — a zero offset that contradicts a non-zero offset seen on this
+  connection is a transient until reported on 3 distinct beats in a row (a real zero origin
+  persists); `getPositionSnapshot` uses the cached offset meanwhile (`originOffsetSource:
+  cached`, warning); runners take their current Z from `knownMachinePosition()` (the
+  position of record first) and abort if the toolhead is already BELOW the descent target;
+  diagnostics count `zeroOffsetBeats`; `get_mcp_diagnostics.originOffset` shows the cache and
+  streak. **Fifth run**: the descent fix held (`descend-from Z320 (record)`), but 28
+  `settle-wait`s remained, all zero-offset, stations 47–54 s — a scan stepping every second
+  keeps the poll inside G53 windows for beats in a row, so the 3-beat streak *accepted* the
+  zero (125 zero-offset beats). Two more changes: (1) only QUIET beats count towards
+  believing a zero — none while direct gcode is in flight or replied within 3 s
+  (`directGcodeQuiet`); a real touchscreen re-zero happens idle and is believed after ~6 s;
+  (2) the engine keeps its own **trusted offset** (the one that last proved an arrival via echo
+  or settled heartbeat) and judges echoes with it FIRST, the heartbeat's offset second
+  (`matchFrameWithOffsets`), so the echo path no longer depends on the per-beat value at all;
+  `settle-wait` events print `trustedOffset`, `get_mcp_diagnostics.originOffset.trustedByEngine`
+  shows it.
+- **Stale post-hop beat read as drift (job de932e286afd, 133-station grid, aborted at r2c10
+  after 29 contacts; GPT-5.6 agent's retest note)**: a 4 mm hop's echo verified X174 and set
+  the record; the next status report, stamped ~750 ms later, still showed the previous
+  station X178 (the poll samples the machine before its response is processed). The
+  re-check read that ONE beat twice 250 ms apart, and `reportTime` derived as
+  `Date.now() − reportAgeMs` differed by 1 ms between the reads, so "two distinct agreeing
+  beats" fired and the scan aborted. Fixes: snapshots carry the beat's own `reportedAt`;
+  two reports are distinct only ≥ 1 s apart; the record remembers `previousMachine`, and a
+  report still showing that position is stale by definition (never drift evidence — the
+  4.5 s deadline still aborts if nothing ever catches up). Unit checks replay the abort.
+- **Buffer sizes** (Settings → MCP Server → Diagnostic buffers, or env): `mcpJobEventLimit` /
+  `LUBAN_MCP_JOB_EVENT_LIMIT` (default 2000, 400–100000 events per job) and
+  `mcpDiagnosticsRecentLimit` / `LUBAN_MCP_DIAGNOSTICS_RECENT_LIMIT` (default 40, 10–10000 per
+  list). Applied immediately. Measured (cdbc29371b97, 8-station path, z_safe_delta 20, coarse 1,
+  fine 0.1, 3 confirm passes): 763 events ≈ 100 fixed + ~85 per station; budget
+  `100 + stations × 120` — the default covers ~15 stations, a 10 × 10 grid needs ~12 000.
+  `job.result` is stored outside the log and is never trimmed; `eventsTotal > eventCount`
+  flags a trimmed log. The cnc-probing skill tells agents to ask the operator to raise the
+  limit before staging a scan that would overflow it (no MCP tool changes it, by design).
 - **Claude Code caches MCP tool schemas at session start**: after a server rebuild that adds
   or changes tool arguments, the client strips the new args (`additionalProperties: false`)
   until Claude Code restarts — or use a raw JSON-RPC helper

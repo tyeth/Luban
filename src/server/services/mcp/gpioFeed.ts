@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { recordSensorLatency } from './diagnostics';
 import { PROBE_CHANNELS, ProbeChannel, ProbeTransport } from './probeTransport';
 
 const log = logger('service:mcp:gpio-feed');
@@ -232,11 +233,13 @@ def main():
                 values[channel] = value
                 if last.get(channel) != value:
                     last[channel] = value
-                    emit({'t': 'reading', 'channel': channel, 'value': value})
+                    # ts: wall clock at detection, so the server can measure
+                    # the pipe latency (same host, same clock).
+                    emit({'t': 'reading', 'channel': channel, 'value': value, 'ts': time.time()})
             now = time.monotonic()
             if now >= next_hb:
                 next_hb = now + hb_s
-                emit({'t': 'hb', 'values': values})
+                emit({'t': 'hb', 'values': values, 'ts': time.time()})
             time.sleep(poll_s)
         except Exception as err:
             emit({'t': 'fatal', 'error': 'read loop failed: %s' % err})
@@ -437,7 +440,14 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
         if (message.t === 'reading') {
             const channel = String(message.channel) as ProbeChannel;
             if (PROBE_CHANNELS.includes(channel)) {
-                this.emit('reading', channel, String(message.value));
+                // Monitor -> server pipe latency (diagnostics.ts): the monitor
+                // stamps wall-clock seconds at detection.
+                const sentAt = Number(message.ts) * 1000;
+                const meta = Number.isFinite(sentAt) && sentAt > 0 ? { sentAt } : undefined;
+                if (meta) {
+                    recordSensorLatency(Math.max(0, Date.now() - sentAt));
+                }
+                this.emit('reading', channel, String(message.value), meta);
             }
             return;
         }
