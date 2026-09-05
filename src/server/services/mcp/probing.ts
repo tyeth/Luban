@@ -158,7 +158,10 @@ async function moveMachineSettledUnguarded(
         target.y !== undefined ? `Y${target.y.toFixed(3)}` : '',
         target.z !== undefined ? `Z${target.z.toFixed(3)}` : '',
     ].filter(Boolean).join(' ');
-    const gcode = `G90\nG53;\nG1 ${words} F${feed};\nG54;`;
+    const gcode = `G90
+G53;
+G1 ${words} F${feed};
+G54;`;
 
     const before = getPositionSnapshot();
     // Where the move starts: the engine's own record while it is current (no
@@ -568,6 +571,55 @@ export function assertMachineReadyForProcedure(): void {
     if ((Number.isFinite(headPower) && headPower > 0) || (state && (state.headStatus === true || state.headStatus === 'on'))) {
         throw new McpToolError('Toolhead appears to be on; refusing to run the procedure.');
     }
+}
+
+/** Rotary B feed for program rotations (deg/min): 600 = 10 deg/s, a 180 deg turn in 18 s. */
+export const ROTATE_FEED = 600;
+const ROTATE_TOLERANCE_DEG = 0.05;
+const ROTATE_TIMEOUT_MS = 120000;
+
+/**
+ * Rotate the rotary axis to an ABSOLUTE B angle on the direct path, inside a
+ * probe_program the operator approved with the B schedule enumerated. The
+ * toolhead must be at or above `requireZAtLeast` (the safe traverse height:
+ * the stock turns under a raised head). The HTTP channel executes the move
+ * synchronously and the M114 in the same batch reports B; if that echo is
+ * missing the heartbeat's `b` is polled until it agrees. Any probe contact
+ * while the stock turns is a collision (crash guard: the motion bracket is
+ * armed, no contact is expected).
+ */
+export async function rotateB(tool: string, targetDeg: number, requireZAtLeast: number): Promise<{ from: number | null; to: number; verifiedBy: 'echo' | 'heartbeat' }> {
+    probeFeedService.assertNoOvertravel();
+    const known = knownMachinePosition();
+    if (known.position.z === null || known.position.z < requireZAtLeast - 1e-9) {
+        throw new ProcedureAbort(`Rotation refused: toolhead machine Z is ${known.position.z} (${known.source}), below the required Z${requireZAtLeast}.`);
+    }
+    const snapshot = getPositionSnapshot();
+    if (!snapshot.isFourAxis) {
+        throw new ProcedureAbort('Rotation refused: the heartbeat reports no B axis.');
+    }
+    const from = snapshot.b;
+    const channel = getDirectChannel();
+    const target = Number(targetDeg.toFixed(3));
+    probeFeedService.clearExpectedContact();
+    const executed = await sendGcodeVisible(channel, tool, `G90\nG0 B${target.toFixed(3)} F${ROTATE_FEED}\nM114`);
+    if (executed.result !== 0) {
+        throw new ProcedureAbort(`Controller rejected the rotation: ${executed.text || executed.result}`);
+    }
+    const echo = String(executed.text || '').match(/\bB:(-?\d+(?:\.\d+)?)/);
+    if (echo && Math.abs(Number(echo[1]) - target) <= ROTATE_TOLERANCE_DEG) {
+        return { from, to: target, verifiedBy: 'echo' };
+    }
+    const deadline = Date.now() + ROTATE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        await sleep(500);
+        probeFeedService.assertNoOvertravel();
+        const now = getPositionSnapshot();
+        if (now.b !== null && Math.abs(now.b - target) <= ROTATE_TOLERANCE_DEG && now.machineStatus === 'idle') {
+            return { from, to: target, verifiedBy: 'heartbeat' };
+        }
+    }
+    throw new ProcedureAbort(`Rotation to B${target} not confirmed within ${ROTATE_TIMEOUT_MS / 1000} s (echo ${echo ? echo[1] : 'none'}).`);
 }
 
 /** Longest single Z move toward the work a procedure may issue (operator law 2026-09-05). */

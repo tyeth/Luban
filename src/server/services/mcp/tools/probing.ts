@@ -18,6 +18,7 @@ import {
     planProbeSurfacePath,
     runProbeSurfaceProcedure,
 } from '../probeSurface';
+import { describeProbeProgramAsGcode, planProbeProgram, runProbeProgramProcedure } from '../probeProgram';
 import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
@@ -645,6 +646,75 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 next_step: 'Ask the operator to open confirm_url, check the Z clears everything on the '
                     + 'bed (rotary included), and approve. start_gcode_job then drives the whole grid '
                     + 'and returns the frame index.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'probe_program',
+        description: 'Stage a COMPOSITE probing program for ONE human approval: an ordered list of operations - '
+            + 'rotate_b (turn the rotary axis to an absolute B, toolhead at/above the traverse height), '
+            + 'surface_path, surface_grid and sequence (the same arguments as the standalone tools) - run by one '
+            + 'runner that hands the machine from op to op, each ending raised at the traverse height. Numbers an op '
+            + 'cannot know at staging are REFERENCES to earlier results: {"from": "<opId>.<path>", "plus"?: n, '
+            + '"minus"?: n, "between": [low, high]} - e.g. expected_z_machine: {"from": "c90.top.z", "between": '
+            + '[195, 240]} where c90 is a sequence op with a probe named "top", or start_z_machine: {"from": '
+            + '"ns90.summary.zMean", "plus": 7, "between": [200, 250]}. The bounds are REQUIRED (law 3): the confirm '
+            + 'page shows them with a preview at the mid-point and the runner refuses the op (stopping the program '
+            + 'raised, keeping earlier results) if the value resolves outside them. A failed op stops the program '
+            + 'unless on_fail: "skip". Result: per-op status and the standalone tool\'s result object (stations, fits, '
+            + 'timing), plus the B schedule. Use it to string the four faces, sides and end of a rotary stock into one '
+            + 'approved operation instead of 18 approvals.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                name: { type: 'string', description: 'Program name shown to the operator.' },
+                ops: {
+                    type: 'array',
+                    description: 'Ordered operations. Each: {id, kind, on_fail?, ...args}. kinds: rotate_b {b, require_z_at_least?}; '
+                        + 'surface_path / surface_grid / sequence: the standalone tool arguments, where start_z_machine, '
+                        + 'expected_z_machine, floor_z_machine and sequence descend z may be references.',
+                    items: { type: 'object' },
+                    minItems: 1,
+                    maxItems: 40,
+                },
+                reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
+            },
+            required: ['name', 'ops', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeProgram({ name: args.name, ops: args.ops });
+            const envelope = `; reason: ${reason}
+${describeProbeProgramAsGcode(plan)}`;
+            const validation = validateGcode(envelope);
+            const job = jobManager.submit(
+                envelope,
+                `program ${plan.name} (${plan.ops.length} ops${plan.rotations.length ? `, B ${plan.rotations.join('/')}` : ''}) - ${reason.slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeProgramProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan: {
+                    name: plan.name,
+                    ops: plan.ops.map((op) => ({ id: op.id, kind: op.kind, on_fail: op.on_fail, refs: op.refs })),
+                    rotations: plan.rotations,
+                    hopZ: plan.hopZ,
+                    staged: plan.staged,
+                },
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url and review the WHOLE program: every operation\'s envelope, every '
+                    + 'reference with its bounds, and the B rotation schedule. One approval covers the program; call '
+                    + 'start_gcode_job with wait_for_approval_ms, then long-poll get_gcode_job_status (a full four-face survey '
+                    + 'runs 35-75 minutes; budget the job event limit first).',
             };
         },
     });

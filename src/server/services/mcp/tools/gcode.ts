@@ -5,6 +5,7 @@ import * as fs from 'fs-extra';
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpJob, approvalHandoff, jobManager } from '../jobs';
+import { summarizeJobTiming } from '../jobTiming';
 import { matchFrame } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -391,7 +392,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 // "running" status to long-poll with get_gcode_job_status.
                 const finished = job.runner()
                     .then((outcome) => {
-                        job.result = outcome;
+                        // Where the time went, from the job's own events, so
+                        // agents optimise from the record (get_job_timing has
+                        // the same for running/failed jobs).
+                        job.result = { ...(outcome as object), timing: summarizeJobTiming(job.events) };
                         job.state = 'completed';
                         job.endedAt = Date.now();
                         jobManager.appendEvent(job, 'completed', { note: 'procedure finished; result stored on the job' });
@@ -711,6 +715,36 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     : 'Ask the operator to open confirm_url, review the DIRECT-move banner '
                         + '(current Z, target, delta, feed), and approve. Their one-time code passed to '
                         + 'start_gcode_job executes the move; the position then persists.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'get_job_timing',
+        description: 'Where a job\'s time went, computed from its event log (works for running, completed and failed jobs; '
+            + 'completed procedures also carry it as result.timing): per command kind (coarse, fine, confirm, backoff, '
+            + 'retract, hop, descend, raise, ...) the count, feeds, distance, controller time (execMs), motion time '
+            + '(distance / feed), per-batch overhead, idle time and sensor windows; per station the wall time and its '
+            + 'kind breakdown; approval wait, run time, median station; settle-waits, slow steps, estimated positions, '
+            + 'event-loop stalls and frame flips. Use it to pick parameters (z_safe_delta_mm, coarse feed, '
+            + 'confirm_passes, sensor_delay_ms) instead of mining events by hand.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                job_id: { type: 'string' },
+            },
+            required: ['job_id'],
+            additionalProperties: false,
+        },
+        handler: async (args: { job_id?: string }) => {
+            const job = jobManager.get(String(args.job_id || ''));
+            if (!job) {
+                throw new McpToolError('Unknown job_id.');
+            }
+            return {
+                job: jobManager.describe(job),
+                timing: summarizeJobTiming(job.events),
+                trimmed: job.eventSeq > job.events.length,
             };
         },
     });

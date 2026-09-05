@@ -236,6 +236,33 @@ result says `approach: slow-zone | coarse-contact` and `worstPressMm`. `coarse_s
 is capped at 1 mm in surface scans (operator law: never 2; 0.5–1). On the GPIO
 transport `sensor_delay_ms: 50` is ample.
 
+## Whole-stock programs (one approval)
+
+`probe_program` strings operations into ONE approved job: `rotate_b` (absolute B;
+the runner refuses it unless the toolhead is at/above the traverse height),
+`surface_path`, `surface_grid` and `sequence` with their usual arguments. Where a
+later op needs a number only an earlier op can measure, pass a REFERENCE with
+operator-approved bounds - `expected_z_machine: {"from": "c90.top.z", "between":
+[200, 240]}` (sequence op `c90`, probe named `top`), `start_z_machine: {"from":
+"c90.top.z", "plus": 7, "between": [205, 250]}`, a sequence `descend` `z: {"from":
+"ns90.summary.zMean", "minus": 7, "between": [...]}`. Bounds are required (law 3):
+the confirm page shows them, and the runner refuses the op outside them, stops the
+program raised and keeps earlier results under `result.ops`. Order ops so every
+reference points backwards; `on_fail: "skip"` lets an overtravel-type op fail
+without ending the program. A four-face survey is `rotate_b 90 → centre sequence →
+N-S path → W-E path → sides sequence → rotate_b 180 → …`; budget the event log
+(≈ 100 + stations × 120 per scan op) before staging and use
+`wait_for_approval_ms` to start.
+
+**Speed.** Read `result.timing` (or `get_job_timing`) after a scan instead of mining
+events: per command kind it gives count, feeds, distance, controller time vs motion
+time vs overhead, idle and sensor windows, plus per-station wall time. The coarse walk
+down from the hop height is the biggest cost (~19 of 30 commands per station at
+`z_safe_delta_mm` 20), so on stock known to vary < 5 mm between stations use
+`z_safe_delta_mm: 5`, `confirm_passes: 2` and `sensor_delay_ms: 30` on GPIO (an
+11-station path ~400 s → ~170 s). Never raise the coarse feed yourself: impact speed is
+the operator's call.
+
 **Event-log budget — check it BEFORE staging a large scan.** The job keeps at most
 `mcpJobEventLimit` events (default 2000; `get_mcp_diagnostics` → `buffers` and the
 Settings pane show the live value). Beyond that the log keeps its first 20 events

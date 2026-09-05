@@ -102,6 +102,8 @@ export interface ProbeSurfacePlan {
     slowZoneMm: number;
     /** Expected contact Z for station 1 (a measured neighbour); null = coarse capped at 1 mm there. */
     expectedZMachine: number | null;
+    /** floor_z_machine was given explicitly: station 1 may search down to it (not just start_z - max_drop). */
+    floorExplicit: boolean;
     path?: {
         start: { x: number; y: number };
         end: { x: number; y: number };
@@ -224,6 +226,7 @@ function finishPlan(
         confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
         slowZoneMm: Math.min(Math.max(Number(args.slow_zone_mm) || 1, 0.3), env.zSafeDeltaMm),
         expectedZMachine: expectedZ,
+        floorExplicit: args.floor_z_machine !== undefined && args.floor_z_machine !== null && args.floor_z_machine !== '',
     };
 }
 
@@ -290,6 +293,11 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
     const firstEnv = stationEnvelope(plan.startZMachine, true, plan.startZMachine, {
         zSafeDeltaMm: plan.zSafeDeltaMm, maxDropMm: plan.maxDropMm, absoluteFloorZ: plan.absoluteFloorZ,
     });
+    if (plan.floorExplicit) {
+        // Station 1 searches to the explicit floor (runner: stationFloorZ).
+        firstEnv.floorZ = plan.absoluteFloorZ;
+        firstEnv.travelMm = Number((firstEnv.marchStartZ - plan.absoluteFloorZ).toFixed(3));
+    }
     // The guarded descent starts at min(start_z + guard, traverse height): the
     // runner never commands a Z above the height it is already at.
     const guardTop = Math.min(plan.startZMachine + DESCENT_GUARD_MM, plan.hopZ);
@@ -688,6 +696,11 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
             const env = stationEnvelope(reference === null ? plan.startZMachine : reference, isFirst, plan.startZMachine, {
                 zSafeDeltaMm: plan.zSafeDeltaMm, maxDropMm: plan.maxDropMm, absoluteFloorZ: plan.absoluteFloorZ,
             });
+            // Station 1 may search all the way to an EXPLICIT floor_z_machine
+            // (job d7ac9247838e aborted because start_z - max_drop was the
+            // only window honoured); later stations keep max_drop below the
+            // last contact.
+            const stationFloorZ = isFirst && plan.floorExplicit ? plan.absoluteFloorZ : env.floorZ;
             // The march starts where the walk left us (start_z for station 1,
             // the hop height otherwise). Re-verify before trusting the sensor.
             const marchStartZ = isFirst ? plan.startZMachine : currentZ;
@@ -698,12 +711,12 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
             // Expected contact for the slow zone: the previous real contact,
             // or the caller's expected_z_machine for station 1.
             const expectedContact = isFirst ? plan.expectedZMachine : reference;
-            const outcome = await marchDownZ(plan, station, marchStartZ, env.floorZ, expectedContact, announce);
+            const outcome = await marchDownZ(plan, station, marchStartZ, stationFloorZ, expectedContact, announce);
             let retractTo: number;
             if (outcome === null) {
                 if (reference === null) {
                     throw new ProcedureAbort(`Station "${station.label}" (the first) found no surface between Z${marchStartZ} and the floor `
-                        + `Z${env.floorZ} - no measured reference to base the envelope on. Check start_z_machine / floor_z_machine.`);
+                        + `Z${stationFloorZ} - no measured reference to base the envelope on. Check start_z_machine / floor_z_machine.`);
                 }
                 results.push({
                     index: station.index,
@@ -716,10 +729,10 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                     status: 'no_contact',
                     z: null,
                     marchStartZ,
-                    floorZ: env.floorZ,
+                    floorZ: stationFloorZ,
                 });
                 retractTo = hopHeightFor(reference);
-                announce(`no-contact-${station.label}`, `nothing between Z${marchStartZ} and the floor Z${env.floorZ}; reference stays Z${reference}`);
+                announce(`no-contact-${station.label}`, `nothing between Z${marchStartZ} and the floor Z${stationFloorZ}; reference stays Z${reference}`);
             } else {
                 reference = outcome.contactZ;
                 results.push({
@@ -733,7 +746,7 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                     status: 'contact',
                     z: outcome.contactZ,
                     marchStartZ,
-                    floorZ: env.floorZ,
+                    floorZ: stationFloorZ,
                     confirmPassContacts: outcome.passContacts,
                     spreadMm: outcome.spreadMm,
                     approach: outcome.approach,

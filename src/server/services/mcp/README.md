@@ -271,6 +271,52 @@ surface scans** (operator, job cdbc29371b97: "we never wanted 2mm"; range 0.5–
 Verified on the rerun (cdbc29371b97, 8/8, same numbers as d8f6): every station
 `slow-zone`, `worstPressMm 0.1`, 408 s vs 492 s.
 
+**Where the time goes (measured 2026-09-05, on-box analysis of the four-face survey).** Every
+command batch costs ~270 ms over its motion time on the WiFi channel (four HTTP lines per
+batch); motion time is distance / feed, so short steps are dominated by that overhead.
+
+| Step | Feed | Motion | Measured per command |
+|---|---|---|---|
+| Coarse 1 mm | F100 | 600 ms | ~874 ms |
+| Fine 0.1 mm | F60 | 100 ms | ~365 ms |
+| Backoff 0.3 mm | F60 | 300 ms | ~574 ms |
+| Retract 20 mm | F600 | 2000 ms | ~2280 ms |
+| Descent segment 5 mm | F600 | 500 ms | ~834 ms |
+| Raise 120 mm | F600 | 12 s | ~12.4 s |
+
+An 11-station path at 402 s split as: 179 s coarse steps, 51 s fine, 35 s confirm, 26 s
+retracts, 20 s hops, 18 s station-1 guard band, 17 s backoffs, 14 s initial descent, 16 s
+traverse + final raise, 25 s of sensor windows; ~31.5 s per station of which 19 of the 30
+commands are the coarse walk back down from the 20 mm hop height. Levers, no code needed:
+`z_safe_delta_mm` 20 → 5 (~145 s per scan; the hop guard still catches a surface rising > 5 mm),
+`confirm_passes` 2 (~19 s), `sensor_delay_ms` 30 (~8 s); coarse feed F100 → F300 (~80 s) is an
+operator call on impact speed. Code levers: `get_job_timing` / `result.timing` now compute this
+breakdown from any job's events (per kind: count, feeds, distance, controller vs motion vs
+overhead, idle, sensor windows; per station; waits). One-line `G53 G1 …` (three lines per
+batch, no workspace switch, ~100 s per scan) is NOT used: it is unverified on this firmware and
+an unsupported inline G53 would execute in WORK coordinates. Station 1 of a surface scan now searches down to an explicit `floor_z_machine` (job
+d7ac9247838e aborted because only start − max_drop was honoured).
+
+**`probe_program` — one approval for a whole survey (2026-09-06).** An ordered list of
+operations, staged once and approved on ONE confirm page that enumerates every op's envelope
+and the B rotation schedule, run by one runner that hands the machine from op to op (each ends
+raised at the traverse height): `rotate_b` (absolute B on the direct path, refused unless the
+toolhead is at/above the safe traverse height, verified by the M114 in the same batch or the
+heartbeat's `b`), `surface_path`, `surface_grid` and `sequence` with their standalone
+arguments. Numbers an op cannot know at staging are **references** to earlier results —
+`{from: "c90.top.z", plus: 7, between: [200, 240]}` (a sequence probe by name, `.z` shorthand
+for `contactMachine.z`) or `{from: "ns90.summary.zMean", minus: 7, between: [...]}` — with
+operator-approved **bounds required** (law 3): the page shows the bounds and a preview plan at
+the mid-point, and the runner refuses the op if the resolved value falls outside them,
+stopping the program raised and keeping every earlier result under `result.ops`. `on_fail:
+"skip"` records a failure and continues (rotations always stop). Each op result is the
+standalone tool's result object. The four-face survey that took 18 approvals is one program:
+`rotate_b 90 → sequence (centre) → surface_path N–S (expected from the centre) → surface_path
+W–E → sequence (sides) → rotate_b 180 → …`. Still to do from the brief
+([docs/COMPOSITE_PROBE_PROGRAM.md](docs/COMPOSITE_PROBE_PROGRAM.md)): multi-segment paths in
+one op (stage two path ops for now), tip diameter as configuration, the stock-geometry
+reduction (section size, centring, yaw), live progress on the confirm page.
+
 ## Safety model (operator-defined, non-negotiable)
 
 - **Compound motion and all cutting goes out as gcode FILES** through the same
@@ -481,7 +527,7 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   operator to close their copy. The build dirties `src/package.json` and
   `MaterialTestGcodeParams.jsx` — revert before staging.
 - **Stack**: stacked single-commit PRs `mcp/N-*`, each targeting the previous branch
-  (#15 → #79 as of 2026-09-05, then `mcp/46-position-of-record`; next `mcp/47`. #70 stale-
+  (#15 → #79 as of 2026-09-05, then `mcp/46-position-of-record` (#80) and `mcp/47-timing-inline-g53`; next `mcp/48`. #70 stale-
   heartbeat, #71 probe_sequence, #72 GPIO probe feed, #73 Linux/mac packaging, #74 machine
   settings + docs, #75 sensor toggles + LAN, #76 job events + even survey, #77 offset
   transient + detached procedures, #78 surface scans, #79 console input leak, mcp/46 position
