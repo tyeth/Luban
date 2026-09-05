@@ -95,6 +95,10 @@ mcp/
   gpioFeed.ts    GPIO backend: Blinka/U2IF python monitor subprocess (embedded
                  source, JSON lines: ready|reading|hb|fatal), stall watchdog
   toolSetter.ts  tool height measurement: config, envelope planner, staged runner
+  probing.ts     shared sensor-gated motion engine (moveMachineSettled, senseAfter, guards)
+  probeTool.ts / probeVector.ts / probeSequence.ts / probeCircle.ts   staged probe procedures
+  surfaceScan.ts pure station planning + flatness statistics (no imports; unit-tested alone)
+  probeSurface.ts probe_surface_path / probe_surface_grid plan builders + runner
   tools/         status, machine, gcode, camera, calibration, probe, toolsetter
 ```
 
@@ -200,6 +204,35 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
 8. **The MCP surface is the only interface** — no agent may touch the machine, its
    configstore, or the backend APIs directly while the app runs; every guard lives in the
    tools, so bypassing them bypasses all of it.
+
+### Surface scans — the one bounded exception to law 2 (operator-authorised 2026-09-05)
+
+`probe_surface_path` and `probe_surface_grid` measure a TOP surface with many −Z marches
+in one approved circuit. The operator's words: *"with the grid we need the point to point
+variation to not risk the probe toolhead so no more than 20mm z safe delta from the top
+(within a horizontal change of 60mm)"*. Hence, **inside these two procedures only, between
+consecutive stations only**, the probe retracts to `last contact + z_safe_delta_mm` and hops
+horizontally at that height instead of at the gantry. Nothing else inherits this. Bounds
+(`surfaceScan.ts`, refused at staging — never clamped or split silently):
+
+- `z_safe_delta_mm` default 20, **hard cap 20** (min 3) — the hop height above the last real
+  contact (`resolveEnvelope`).
+- `max_hop_mm` default 60, **hard cap 60** — every consecutive station pair must be within
+  it (`assertHopsWithin`); a spacing/pitch that violates it is refused naming the pair.
+- `max_drop_mm` default 40, cap 80 — a station's march may search at most this far below the
+  previous real contact, and never below `floor_z_machine` (default `start_z_machine −
+  max_drop_mm`, the deepest Z the scan can ever command — on the confirm page). Reaching the
+  floor without contact records the station `no_contact` and continues; the reference height
+  stays the last real contact. The FIRST station finding nothing aborts (no measured
+  reference to base the envelope on).
+- `start_z_machine` is REQUIRED — measured or operator-stated, never guessed. The approach to
+  station 1 is a full law-2 move: raise to the traverse height, hop, guarded 1 mm descent
+  (`probe_sequence` pattern; contact = CRASH). Completion and abort both raise to the
+  traverse height.
+- Runtime (`probeSurface.ts`): hops go through `moveMachineSettled` with
+  `clearExpectedContact()` in ≤ 10 mm sensor-checked segments, so a probe touch during a hop
+  latches CRASH (law 5); only marches run with `setExpectedContact(['probe'])`. The staged
+  position and every march start are re-checked (one re-read after ~1.2 s).
 
 ## Safety model (operator-defined, non-negotiable)
 
@@ -313,7 +346,7 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
   the agent click Approve for one bounded series of moves, that authority ends with that
   series ("no approvals carry forwards in CNC work").
 
-## Tool surface (33)
+## Tool surface (40)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
@@ -344,7 +377,15 @@ and untriggered; `store_as_reference` locks the measured Z in as the new referen
 `stay_at_trigger` / `start_from_current` support the touchscreen swap wizard) ·
 `goto_tool_change_position` (two approved steps: Z up, then X/Y to the operator-set park) ·
 `apply_tool_length_offset` (confirmed G92 shifting work-origin Z by the measured
-new−old tool length difference — flow A only).
+new−old tool length difference — flow A only) · **touch-probe procedures** (all staged,
+one approval per circuit, results in MACHINE coordinates): `probe_point` (one axis from the
+current position) · `probe_vector` (any downward/lateral unit vector) · `probe_sequence`
+(enumerated hop/descend/probe circuit, law-2 hops) · `probe_circle` (N radial marches +
+least-squares fit, outside or inside a hole) · `probe_surface_path` (N −Z stations along a
+line: per-station contact, best-fit line slope, flatness) · `probe_surface_grid` (serpentine
+−Z grid: Z matrix, best-fit plane + residuals, ASCII height map) — the two surface scans hop
+at `last contact + z_safe_delta_mm` (cap 20) within `max_hop_mm` (cap 60), see "Surface
+scans" above · `survey_bed` (camera grid at gantry height).
 
 ## Tool change workflows
 

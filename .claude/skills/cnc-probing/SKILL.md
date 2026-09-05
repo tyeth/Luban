@@ -1,6 +1,6 @@
 ---
 name: cnc-probing
-description: "Measure work with the spindle touch probe and the whole-bed camera survey via the Luban MCP tools (probe_point, survey_bed, run_tool_setter with accept_probe_contact) — including the motion laws written in the aftermath of a probe-destroying crash. Use whenever the user wants to probe stock, find surfaces/edges, survey the bed, or calibrate the touch probe."
+description: "Measure work with the spindle touch probe and the whole-bed camera survey via the Luban MCP tools (probe_point, probe_vector, probe_sequence, probe_circle, probe_surface_path/grid flatness scans, survey_bed, run_tool_setter with accept_probe_contact) — including the motion laws written in the aftermath of a probe-destroying crash. Use whenever the user wants to probe stock, find surfaces/edges, check flatness or map a surface height, survey the bed, or calibrate the touch probe."
 ---
 
 # CNC probing: the probe, the survey, and the motion laws
@@ -149,6 +149,57 @@ inseparable unless one is known. Direction-dependent residuals expose an
 out-of-round tip (the post-unbending health check). Repositioning between
 points obeys law 2 in full: lift to the safe traverse height, hop, descend;
 a probe touch during a hop or descent latches the CRASH alarm.
+
+## Surface flatness and height maps
+
+Two staged procedures measure a TOP surface with many −Z marches under ONE
+operator approval; every commanded move is enumerated on the confirm page,
+all numbers are machine coordinates, and every contact Z is TOOLHEAD Z (the
+surface is that minus the probe length).
+
+- `probe_surface_path` — N stations along a straight line (`start_x/start_y`
+  plus `end_x/end_y` or `dx/dy` + `length_mm`; sampled by `stations` count or a
+  MAXIMUM `spacing_mm`). Use it for "is this stock level along Y", "how much
+  does the board rise toward the free end", a rotary-mounted flat. Result:
+  per-station XYZ (or `no_contact`), Z min/max/range, best-fit line slope (mm
+  per 100 mm and degrees, rise over the length), flatness = residual
+  peak-to-valley, a text profile.
+- `probe_surface_grid` — a serpentine grid over a region (`x_min..y_max` or
+  `center_x/center_y` + `size_x_mm[/size_y_mm]`; sampled by a MAXIMUM `pitch_mm`
+  or `x_count/y_count`, max 400 stations). Use it for a wasteboard, a pocketed
+  box, a log — anything whose height varies in two directions. Result:
+  `zMatrix` (rows = ys ascending, cols = xs ascending, null = no contact),
+  best-fit plane (tilt X/Y) with per-point residuals and flatness, and a text
+  `heightMap` printed with +Y at the top like the bed seen from above.
+
+`start_z_machine` is REQUIRED for both: the toolhead machine Z at which the
+first march starts with the tip just above the surface — measured (an earlier
+`probe_point -Z`, a previous scan) or operator-stated, never inferred from a
+photo (law 3). The runner reaches it law-2 style: raise to the traverse height,
+hop at gantry height to station 1, then a guarded 1 mm descent where any
+contact latches CRASH.
+
+**The envelope (operator law, 2026-09-05)** — the ONLY exception to motion law
+2, valid inside these two procedures only, between consecutive stations only.
+The operator's words: "no more than 20mm z safe delta from the top (within a
+horizontal change of 60mm)".
+
+| Parameter | Default | Hard limit | Meaning |
+|---|---|---|---|
+| `z_safe_delta_mm` | 20 | **cap 20**, min 3 | After each station the probe retracts to LAST CONTACT + this and hops at that height. |
+| `max_hop_mm` | 60 | **cap 60** | Largest allowed distance between consecutive stations. A spacing/pitch that breaks it is REFUSED at staging, naming the pair — pick a finer pitch; nothing is split for you. |
+| `max_drop_mm` | 40 | cap 80 | How far below the previous real contact a station may search. Also bounded by `floor_z_machine` (default `start_z_machine − max_drop_mm`), the deepest Z the scan can ever command — shown on the confirm page. |
+
+Reaching the floor without contact records the station `no_contact` and the
+scan CONTINUES with the reference height unchanged (a pocket, a hole, an edge
+overshoot); the first station finding nothing aborts. Hops run in ≤ 10 mm
+sensor-checked segments expecting NO contact — a touch during a hop means the
+surface rose more than `z_safe_delta_mm` and latches the CRASH alarm (law 5).
+Completion and abort both raise to the traverse height. Never ask for the caps
+to be widened and never approximate a scan with `probe_sequence` hops at a
+"measured safe" height — that is exactly what law 2 forbids. On the GPIO
+transport, `sensor_delay_ms: 50` and `coarse_step_mm: 2` on a known-flat surface
+roughly halve the time per station.
 
 ## Bed survey
 
