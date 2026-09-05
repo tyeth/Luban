@@ -11,6 +11,13 @@ import { jobManager } from '../jobs';
 import { describeProbeCirclePlanAsGcode, planProbeCircle, runProbeCircleProcedure } from '../probeCircle';
 import { describeProbePlanAsGcode, planProbePoint, runProbePointProcedure } from '../probeTool';
 import { describeProbeSequencePlanAsGcode, planProbeSequence, runProbeSequenceProcedure } from '../probeSequence';
+import {
+    ProbeSurfacePlan,
+    describeProbeSurfacePlanAsGcode,
+    planProbeSurfaceGrid,
+    planProbeSurfacePath,
+    runProbeSurfaceProcedure,
+} from '../probeSurface';
 import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
@@ -301,6 +308,166 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
                     + 'hops and depths), and approve. Their one-time code passed to start_gcode_job runs '
                     + 'the whole star and returns the circle fit.',
             };
+        },
+    });
+
+    // Shared staging for the two top-surface scans. The envelope description
+    // is repeated in both tool descriptions on purpose: the MCP client caches
+    // schemas, and the operator-authorised law-2 exception must be visible
+    // wherever the tool is read.
+    const SURFACE_ENVELOPE_TEXT = 'ENVELOPE (operator-authorised 2026-09-05, the ONLY exception to motion law 2 - '
+        + 'valid only inside this procedure, only between consecutive stations): after each station the probe '
+        + 'retracts to LAST CONTACT + z_safe_delta_mm (default 20, HARD CAP 20) and hops horizontally AT THAT '
+        + 'HEIGHT to the next station, which must be within max_hop_mm (default 60, HARD CAP 60) - a wider '
+        + 'spacing/pitch is REFUSED at staging, never split silently. Hops run in <= 10 mm sensor-checked segments '
+        + 'expecting NO contact: a touch during a hop is a collision and latches the CRASH alarm. Each -Z march '
+        + 'searches from the hop height down to max(last contact - max_drop_mm (default 40, cap 80), '
+        + 'floor_z_machine (default start_z_machine - max_drop_mm)); reaching the floor without contact records '
+        + 'the station as no_contact and continues with the reference height unchanged (the first station finding '
+        + 'nothing aborts). The approach to the FIRST station is a full law-2 move: raise to the safe traverse '
+        + 'height, traverse, guarded 1 mm descent to start_z_machine (REQUIRED - a measured or operator-stated '
+        + 'toolhead machine Z with the tip just above the surface, never a guess). Ends raised at the traverse '
+        + 'height. All numbers MACHINE coordinates; Z values are toolhead Z at contact (surface = Z - probe length).';
+    const surfaceCommonProperties = {
+        start_z_machine: {
+            type: 'number',
+            description: 'REQUIRED. Toolhead machine Z where the first -Z march starts (probe tip just above the '
+                + 'surface) - measured (probe_point -Z, an earlier scan) or operator-stated. Reached by a guarded descent.',
+        },
+        floor_z_machine: {
+            type: 'number',
+            description: 'Absolute deepest toolhead machine Z any march may command. Default start_z_machine - '
+                + 'max_drop_mm. State it explicitly (lower) to scan into a deep pocket; must stay within 150 mm of start_z_machine.',
+        },
+        z_safe_delta_mm: {
+            type: 'number',
+            description: 'Retract above the last contact for the hop to the next station. Default 20, HARD CAP 20 '
+                + '(operator law), min 3. Above the cap = refused.',
+        },
+        max_hop_mm: {
+            type: 'number',
+            description: 'Largest allowed horizontal distance between consecutive stations. Default 60, HARD CAP 60 '
+                + '(operator law). A plan whose spacing/pitch exceeds it is refused at staging.',
+        },
+        max_drop_mm: {
+            type: 'number',
+            description: 'How far below the previous contact one station may search before recording no_contact. '
+                + 'Default 40, cap 80 (also bounded by floor_z_machine).',
+        },
+        coarse_step_mm: { type: 'number', description: 'Coarse -Z step for every march, default 1 (0.2-2). 2 is faster on a known-flat surface.' },
+        fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
+        backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
+        sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300 (GPIO transport: ~50 is enough).' },
+        confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per station, default 3 (1-10).' },
+        reason: { type: 'string', description: 'Shown to the operator: what surface is being scanned and why.' },
+    };
+    const stageSurfaceScan = (plan: ProbeSurfacePlan, reason: string, label: string) => {
+        const envelope = `; reason: ${reason}
+${describeProbeSurfacePlanAsGcode(plan)}`;
+        const validation = validateGcode(envelope);
+        const job = jobManager.submit(
+            envelope,
+            `surface-${plan.kind} ${plan.stations.length}st ${label} - ${reason.slice(0, 40)}`,
+            'cnc',
+            validation,
+            'procedure'
+        );
+        job.runner = async () => runProbeSurfaceProcedure(plan);
+        return {
+            job: jobManager.describe(job),
+            plan,
+            confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+            next_step: 'Ask the operator to open confirm_url and review the WHOLE scan: the law-2 exception '
+                + `(hops at last contact + ${plan.zSafeDeltaMm} mm, largest hop ${plan.worstHopMm} mm), every station, `
+                + `the guarded descent to Z${plan.startZMachine} and the absolute floor Z${plan.absoluteFloorZ}. One approval `
+                + 'covers the circuit; their one-time code passed to start_gcode_job runs it (detached - long-poll '
+                + 'get_gcode_job_status for the result: per-station machine XYZ plus flatness statistics).',
+        };
+    };
+
+    registry.register({
+        name: 'probe_surface_path',
+        description: 'Stage a TOP-SURFACE FLATNESS scan along a straight line for human confirmation: N stations '
+            + 'from a start point to an end point (or direction + length), spaced by count or maximum spacing, '
+            + 'each measured with a -Z sensor-gated march of the spindle touch probe (coarse to contact, release, '
+            + 'fine, lift-and-retest confirm, median). Result per station: machine XYZ of contact or no_contact; '
+            + 'plus Z min/max/range, the best-fit line (slope in mm per 100 mm and degrees, rise over the length) '
+            + 'and flatness as residual peak-to-valley, and a text profile. Purpose: level/flatness of stock along a '
+            + `line, e.g. along a rotary-mounted board. ${SURFACE_ENVELOPE_TEXT}`,
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_x: { type: 'number', description: 'First station machine X.' },
+                start_y: { type: 'number', description: 'First station machine Y.' },
+                end_x: { type: 'number', description: 'Last station machine X (with end_y). Alternative: dx/dy + length_mm.' },
+                end_y: { type: 'number', description: 'Last station machine Y.' },
+                dx: { type: 'number', description: 'Path direction X component (with dy and length_mm) when end_x/end_y are not given. Magnitude ignored.' },
+                dy: { type: 'number', description: 'Path direction Y component.' },
+                length_mm: { type: 'number', description: 'Path length along dx/dy (1-400).' },
+                stations: { type: 'number', description: 'Station count including both ends (2-60). Alternative: spacing_mm.' },
+                spacing_mm: {
+                    type: 'number',
+                    description: 'MAXIMUM spacing: the length is divided evenly into steps no larger than this, both ends '
+                        + 'covered. Must give consecutive stations within max_hop_mm or staging refuses.',
+                },
+                ...surfaceCommonProperties,
+            },
+            required: ['start_x', 'start_y', 'start_z_machine', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeSurfacePath(args as Parameters<typeof planProbeSurfacePath>[0]);
+            return stageSurfaceScan(plan, reason, `${plan.path ? plan.path.lengthMm : 0}mm`);
+        },
+    });
+
+    registry.register({
+        name: 'probe_surface_grid',
+        description: 'Stage a TOP-SURFACE HEIGHT MAP for human confirmation: a serpentine grid of -Z touches of the '
+            + 'spindle touch probe over a region (x/y extents, or centre + size; sampled by maximum pitch or by '
+            + 'x_count/y_count), every station a sensor-gated march (coarse to contact, release, fine, '
+            + 'lift-and-retest confirm, median). Result: per-station machine XYZ or no_contact, a zMatrix '
+            + '(rows = ys ascending, cols = xs ascending, null = no contact) with its coordinates, Z min/max/range, '
+            + 'the best-fit plane (tilt X/Y in mm per 100 mm and degrees) with per-point residuals and flatness '
+            + '(residual peak-to-valley), and a compact text height map (+Y at the top). Purpose: scan a pocketed '
+            + `box, a log, a wasteboard - anything with a top. ${SURFACE_ENVELOPE_TEXT}`,
+        inputSchema: {
+            type: 'object',
+            properties: {
+                x_min: { type: 'number', description: 'Region machine X minimum (with x_max/y_min/y_max). Alternative: center_x/center_y + size.' },
+                x_max: { type: 'number', description: 'Region machine X maximum.' },
+                y_min: { type: 'number', description: 'Region machine Y minimum.' },
+                y_max: { type: 'number', description: 'Region machine Y maximum.' },
+                center_x: { type: 'number', description: 'Region centre machine X (with center_y, size_x_mm[, size_y_mm]).' },
+                center_y: { type: 'number', description: 'Region centre machine Y.' },
+                size_x_mm: { type: 'number', description: 'Region width along X.' },
+                size_y_mm: { type: 'number', description: 'Region depth along Y (default = size_x_mm).' },
+                pitch_mm: {
+                    type: 'number',
+                    description: 'MAXIMUM grid pitch on both axes: each extent is divided evenly into steps no larger than '
+                        + 'this, both edges covered. Must be within max_hop_mm (cap 60) or staging refuses - the operator '
+                        + 'picks a finer pitch, the plan is never split.',
+                },
+                x_count: { type: 'number', description: 'Number of X lines (2-40) instead of pitch_mm for X.' },
+                y_count: { type: 'number', description: 'Number of Y lines (2-40) instead of pitch_mm for Y. Max 400 stations total.' },
+                ...surfaceCommonProperties,
+            },
+            required: ['start_z_machine', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeSurfaceGrid(args as Parameters<typeof planProbeSurfaceGrid>[0]);
+            return stageSurfaceScan(plan, reason, plan.grid ? `${plan.grid.xs.length}x${plan.grid.ys.length}` : '');
         },
     });
 
