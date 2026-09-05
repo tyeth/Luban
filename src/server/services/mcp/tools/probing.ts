@@ -315,7 +315,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
         inputSchema: {
             type: 'object',
             properties: {
-                pitch_mm: { type: 'number', description: 'Grid spacing, default 80 (40-160).' },
+                pitch_mm: { type: 'number', description: 'MAXIMUM grid spacing, default 80 (20-160). Each axis span is divided into equal steps no larger than this, so rows and columns are uniform and both edges are covered - no fixed-pitch stub at the far end.' },
                 margin_mm: { type: 'number', description: 'Inset from the default bounds, default 10.' },
                 x_min: { type: 'number', description: 'Machine-coord grid bounds. Defaults: margin..(size-margin).' },
                 x_max: { type: 'number', description: 'Set beyond the nominal size to cover reachable overtravel (e.g. the far-X column the camera angle otherwise misses - setup-specific, so state it explicitly).' },
@@ -357,14 +357,15 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
             if (!size) {
                 throw new McpToolError('Unknown machine size; cannot plan the grid.');
             }
-            const pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 40), 160);
+            const pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
             const margin = Math.min(Math.max(Number(args.margin_mm) || 10, 0), 50);
 
             // Serpentine at the current Z. Bounds are explicit (clamped to the
-            // direct-move envelope) and BOTH endpoints are always covered - a
-            // pitch that undershoots gets a final row/column at the far edge,
-            // because what the camera sees at the extremes is setup-specific
-            // and the far reach is often the only view of its region.
+            // direct-move envelope) and BOTH endpoints are always covered.
+            // Each axis is divided EVENLY into steps no larger than the pitch
+            // (operator, 2026-09-05: the old fixed pitch gave 80 mm jumps and
+            // then a 9-10 mm stub at the far edge - uneven coverage on both
+            // axes); the far reach is often the only view of its region.
             const clampAxis = (value: number, max: number) => Math.min(Math.max(value, -25), max + 40);
             const bounds = {
                 xMin: clampAxis(args.x_min !== undefined ? Number(args.x_min) : margin, size.x),
@@ -375,18 +376,20 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
             if (!(bounds.xMax > bounds.xMin) || !(bounds.yMax > bounds.yMin)) {
                 throw new McpToolError('Survey bounds are empty after clamping; check x/y min/max.');
             }
-            const axisPoints = (min: number, max: number): number[] => {
+            const axisPoints = (min: number, max: number): { points: number[]; step: number } => {
+                const span = max - min;
+                const intervals = Math.max(1, Math.ceil(span / pitch - 1e-9));
+                const step = span / intervals;
                 const points: number[] = [];
-                for (let value = min; value <= max + 1e-9; value += pitch) {
-                    points.push(Number(value.toFixed(1)));
+                for (let i = 0; i <= intervals; i++) {
+                    points.push(Number((min + (step * i)).toFixed(1)));
                 }
-                if (points[points.length - 1] < max - 1) {
-                    points.push(Number(max.toFixed(1)));
-                }
-                return points;
+                return { points, step: Number(step.toFixed(2)) };
             };
-            const xs = axisPoints(bounds.xMin, bounds.xMax);
-            const ys = axisPoints(bounds.yMin, bounds.yMax);
+            const xAxis = axisPoints(bounds.xMin, bounds.xMax);
+            const yAxis = axisPoints(bounds.yMin, bounds.yMax);
+            const xs = xAxis.points;
+            const ys = yAxis.points;
             const waypoints: { x: number; y: number }[] = [];
             ys.forEach((wy, row) => {
                 const ordered = row % 2 === 0 ? xs : [...xs].reverse();
@@ -394,7 +397,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
             });
 
             const envelope = [
-                `; BED SURVEY: ${waypoints.length} waypoints on a ${pitch} mm serpentine grid at CURRENT machine Z ${z.toFixed(1)}`,
+                `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch}) at CURRENT machine Z ${z.toFixed(1)}`,
                 '; one frame captured per waypoint after the move settles; frames saved to disk with a',
                 '; machine-position index. Each line is sent individually. Aborts on the first capture failure.',
                 'G90',
@@ -447,7 +450,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
             return {
                 job: jobManager.describe(job),
                 waypoints: waypoints.length,
-                grid: { pitch_mm: pitch, machine_z: z, columns: xs.length, rows: ys.length },
+                grid: { max_pitch_mm: pitch, step_x_mm: xAxis.step, step_y_mm: yAxis.step, xs, ys, machine_z: z, columns: xs.length, rows: ys.length },
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: 'Ask the operator to open confirm_url, check the Z clears everything on the '
                     + 'bed (rotary included), and approve. start_gcode_job then drives the whole grid '

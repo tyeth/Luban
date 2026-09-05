@@ -309,7 +309,8 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
 `query_firmware_position` (raw M114) · `validate_gcode` · `submit_gcode_job` →
-`start_gcode_job` → `get_gcode_job_status` / `stop_gcode_job` · `move_z` (single or
+`start_gcode_job` → `get_gcode_job_status` (event log + stored result; long-poll with
+`wait_ms`/`since_event`) / `stop_gcode_job` · `move_z` (single or
 `z_targets` batch) · `home` · `goto_work_origin` · `move_and_capture` · `list_cameras` ·
 `capture_frame` (position-stamped, `frameId`, `expectedToolRegion`) · `set_tool_region` ·
 `track_feature` (NCC between cached frames — use instead of eyeballing pixels) ·
@@ -461,9 +462,12 @@ toolhead camera. Everything a fresh install needs:
   zero — the defaults are still MQTT-sized, so tighten them per-call when running on
   gpio.
 
-- **Procedure results only travel on the `start_gcode_job` response** — a client timeout
-  loses them (recovered once from the motion log; `probe_sequence` aborts also drop
-  completed results into the error text). Store the runner outcome on the job record.
+- ~~Procedure results only travel on the `start_gcode_job` response~~ — done 2026-09-05: the
+  runner outcome is stored as `job.result`, every job carries an event log (state changes,
+  runner phases, gcode traffic while active, file-job progress), and `get_gcode_job_status`
+  long-polls (`wait_ms`, `since_event`) — agents no longer read server logs to learn how a
+  job went. Still open: `probe_sequence` aborts drop completed marches into the error text
+  (they are now in the events, but not structured).
 - **`traverse_xy` staged batch tool** (law-2-compliant XY transport twin of `move_z`): hops
   currently need `submit_gcode_job` file jobs or `probe_sequence` hop steps.
 - **Console bug**: MCP gcode broadcasts leak into the Workspace console INPUT element with

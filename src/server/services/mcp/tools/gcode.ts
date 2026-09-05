@@ -115,6 +115,10 @@ const log = logger('service:mcp:gcode-jobs');
 // the heartbeat: once the job has been seen active, a debounced return to
 // idle is completion. A job too short to ever show as active is completed
 // after the heartbeat holds idle for a longer fallback window.
+const sleep = async (ms: number) => new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+});
+
 const FILE_JOB_POLL_MS = 1000;
 const FILE_JOB_IDLE_DEBOUNCE_POLLS = 3;
 const FILE_JOB_NEVER_SEEN_ACTIVE_IDLE_POLLS = 20;
@@ -125,10 +129,17 @@ function watchFileJobCompletion(job: McpJob): void {
     let sawActive = false;
     let idleStreak = 0;
     let unreadableStreak = 0;
+    let lastProgress = -1;
+    const release = () => {
+        if (jobManager.getActive() === job) {
+            jobManager.setActive(null);
+        }
+    };
     const timer = setInterval(() => {
         if (job.state !== 'started') {
             // Stopped (or otherwise finalised) through another path.
             clearInterval(timer);
+            release();
             return;
         }
         const status = machineStatus();
@@ -139,7 +150,9 @@ function watchFileJobCompletion(job: McpJob): void {
                 clearInterval(timer);
                 job.error = 'Completion unverified: machine state became unreadable after the job '
                     + 'started (connection lost?). The job may still be running on the machine.';
+                jobManager.appendEvent(job, 'completion_unverified', { note: job.error });
                 log.warn(`MCP file job ${job.id}: ${job.error}`);
+                release();
             }
             return;
         }
@@ -147,6 +160,17 @@ function watchFileJobCompletion(job: McpJob): void {
         if (FILE_JOB_ACTIVE_STATUSES.includes(status)) {
             sawActive = true;
             idleStreak = 0;
+            // Progress from the heartbeat, recorded every 5 % so the event
+            // log shows the job advancing without a reader having to poll.
+            const state = connectionManager.getLatestMachineState() as { gcodePrintingInfo?: { progress?: number } } | null;
+            const raw = state && state.gcodePrintingInfo ? Number(state.gcodePrintingInfo.progress) : NaN;
+            if (Number.isFinite(raw)) {
+                const percent = Math.round((raw <= 1 ? raw * 100 : raw));
+                if (percent >= lastProgress + 5) {
+                    lastProgress = percent;
+                    jobManager.appendEvent(job, 'progress', { percent, machineStatus: status });
+                }
+            }
             return;
         }
         if (status === 'idle') {
@@ -156,8 +180,12 @@ function watchFileJobCompletion(job: McpJob): void {
                 clearInterval(timer);
                 job.state = 'completed';
                 job.endedAt = Date.now();
+                jobManager.appendEvent(job, 'completed', {
+                    note: `heartbeat idle for ${idleStreak}s${sawActive ? '' : ' (job too short for an active heartbeat to be observed)'}`,
+                });
                 log.info(`MCP file job ${job.id} completed: heartbeat idle for ${idleStreak}s`
                     + `${sawActive ? '' : ' (job too short for an active heartbeat to be observed)'}`);
+                release();
             }
             return;
         }
@@ -283,10 +311,16 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 }
                 job.state = 'started';
                 job.startedAt = Date.now();
+                jobManager.appendEvent(job, 'started', { note: 'procedure runner started' });
+                jobManager.setActive(job);
                 try {
                     const outcome = await job.runner();
+                    // On the record first: a client that timed out waiting here
+                    // still finds the result in get_gcode_job_status.
+                    job.result = outcome;
                     job.state = 'completed';
                     job.endedAt = Date.now();
+                    jobManager.appendEvent(job, 'completed', { note: 'procedure finished; result stored on the job' });
                     return {
                         job: jobManager.describe(job),
                         result: outcome,
@@ -294,7 +328,11 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 } catch (err) {
                     job.state = 'start_failed';
                     job.error = err.message;
+                    job.endedAt = Date.now();
+                    jobManager.appendEvent(job, 'failed', { note: err.message });
                     throw err;
+                } finally {
+                    jobManager.setActive(null);
                 }
             }
 
@@ -324,23 +362,33 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         return trimmed.length > 0 && !trimmed.startsWith(';');
                     })
                     .join('\n');
-                const executed = await sendGcodeVisible(channel as GcodeChannel, `direct:${job.name}`, executable);
-                if (executed.result !== 0) {
-                    job.state = 'start_failed';
-                    job.error = `Controller rejected the move: ${executed.text || executed.result}`;
-                    throw new McpToolError(job.error);
-                }
-                const shouldWait = args.wait_until_moved !== undefined
-                    ? args.wait_until_moved !== false
-                    : job.waitUntilMoved !== false;
-                const settle = !shouldWait
-                    ? {
-                        position: null,
-                        verified: false,
-                        warning: 'wait_until_moved was false: the move was accepted but not awaited - '
-                            + 'poll get_position (or query_firmware_position) before relying on position.',
+                jobManager.appendEvent(job, 'started', { note: isBatch ? `direct step ${job.nextStep + 1}/${job.steps.length}` : 'direct move' });
+                jobManager.setActive(job);
+                let settle;
+                try {
+                    const executed = await sendGcodeVisible(channel as GcodeChannel, `direct:${job.name}`, executable);
+                    if (executed.result !== 0) {
+                        job.state = 'start_failed';
+                        job.error = `Controller rejected the move: ${executed.text || executed.result}`;
+                        job.endedAt = Date.now();
+                        jobManager.appendEvent(job, 'failed', { note: job.error });
+                        throw new McpToolError(job.error);
                     }
-                    : await waitForStableHeartbeat(issuedAt, parseZTarget(executable));
+                    const shouldWait = args.wait_until_moved !== undefined
+                        ? args.wait_until_moved !== false
+                        : job.waitUntilMoved !== false;
+                    settle = !shouldWait
+                        ? {
+                            position: null,
+                            verified: false,
+                            warning: 'wait_until_moved was false: the move was accepted but not awaited - '
+                                + 'poll get_position (or query_firmware_position) before relying on position.',
+                        }
+                        : await waitForStableHeartbeat(issuedAt, parseZTarget(executable));
+                    jobManager.appendEvent(job, 'settled', { position: settle.position, verified: settle.verified });
+                } finally {
+                    jobManager.setActive(null);
+                }
                 if (isBatch) {
                     job.nextStep += 1;
                     if (job.nextStep < job.steps.length) {
@@ -361,6 +409,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 }
                 job.state = 'completed';
                 job.endedAt = Date.now();
+                jobManager.appendEvent(job, 'completed', { note: 'direct move(s) done' });
                 return {
                     job: jobManager.describe(job),
                     position: settle.position,
@@ -379,24 +428,32 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (uploadError) {
                 job.state = 'start_failed';
                 job.error = `Upload failed: ${uploadError}`;
+                job.endedAt = Date.now();
+                jobManager.appendEvent(job, 'failed', { note: job.error });
                 throw new McpToolError(job.error);
             }
+            jobManager.appendEvent(job, 'uploaded', { note: `${job.name}.nc uploaded to the machine` });
 
             const started = await channel.startGcodeJob();
             if (!started.ok) {
                 job.state = 'start_failed';
                 job.error = `Start failed: ${started.text || started.code || 'unknown error'}`;
+                job.endedAt = Date.now();
+                jobManager.appendEvent(job, 'failed', { note: job.error });
                 throw new McpToolError(job.error);
             }
 
             job.state = 'started';
             job.startedAt = Date.now();
+            jobManager.appendEvent(job, 'started', { note: 'machine interpreter running the file (door interlock applies)' });
+            jobManager.setActive(job);
             watchFileJobCompletion(job);
             return {
                 job: jobManager.describe(job),
-                note: 'Job started. Poll get_gcode_job_status; the controller, its door interlock '
-                    + 'and the machine UI remain in control. The job is marked completed when the '
-                    + 'heartbeat settles back to idle.',
+                note: 'Job started. Poll get_gcode_job_status with wait_ms to long-poll for progress '
+                    + 'events and completion (no need to read server logs); the controller, its door '
+                    + 'interlock and the machine UI remain in control. The job is marked completed when '
+                    + 'the heartbeat settles back to idle.',
             };
         },
     });
@@ -563,23 +620,52 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
     registry.register({
         name: 'get_gcode_job_status',
-        description: 'Job record plus live progress from the machine heartbeat. Read-only.',
+        description: 'Job record, its event log (state changes, runner phases, gcode traffic while '
+            + 'active, file-job progress), the stored procedure result, and live machine progress. '
+            + 'LONG-POLL: pass wait_ms (up to 120000) and it returns as soon as the job reaches a '
+            + 'terminal state or new events arrive past since_event - use this instead of tight '
+            + 'polling or reading server logs. Read-only.',
         inputSchema: {
             type: 'object',
             properties: {
                 job_id: { type: 'string' },
+                wait_ms: {
+                    type: 'number',
+                    description: 'Block up to this long (0-120000) for a terminal state or new events. Default 0 = return now.',
+                },
+                since_event: {
+                    type: 'number',
+                    description: 'Return only events at index >= this (the previous response\'s next_event_index); '
+                        + 'new events past it also end a wait early. Default 0 = all events.',
+                },
             },
             required: ['job_id'],
             additionalProperties: false,
         },
-        handler: async (args: { job_id?: string }) => {
+        handler: async (args: { job_id?: string; wait_ms?: number; since_event?: number }) => {
             const job = jobManager.get(String(args.job_id || ''));
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
             }
+            const waitMs = Math.min(Math.max(Number(args.wait_ms) || 0, 0), 120000);
+            const since = Math.max(0, Math.floor(Number(args.since_event) || 0));
+            const startedWaiting = Date.now();
+            let timedOut = false;
+            while (!jobManager.isTerminal(job) && job.events.length <= since) {
+                if (Date.now() - startedWaiting >= waitMs) {
+                    timedOut = waitMs > 0;
+                    break;
+                }
+                await sleep(Math.min(250, waitMs - (Date.now() - startedWaiting)));
+            }
             const state = connectionManager.getLatestMachineState();
             return {
                 job: jobManager.describe(job),
+                result: job.result,
+                events: job.events.slice(since),
+                next_event_index: job.events.length,
+                waited_ms: Date.now() - startedWaiting,
+                timed_out: timedOut,
                 machineStatus: machineStatus(),
                 printingInfo: state ? ((state as { gcodePrintingInfo?: object }).gcodePrintingInfo || null) : null,
                 reportAgeMs: state ? Date.now() - state.timestamp : null,
@@ -611,6 +697,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (stopped.ok) {
                 job.state = 'stopped';
                 job.endedAt = Date.now();
+                jobManager.appendEvent(job, 'stopped', { note: `stop sent by the agent${stopped.text ? `: ${stopped.text}` : ''}` });
+                if (jobManager.getActive() === job) {
+                    jobManager.setActive(null);
+                }
             }
             return {
                 ok: stopped.ok,

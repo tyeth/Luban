@@ -40,6 +40,20 @@ export type McpJobState =
  */
 export type McpJobKind = 'file' | 'direct' | 'procedure';
 
+export interface JobEvent {
+    at: number;
+    /** State change ('submitted', 'approved', 'started', 'completed', ...), a runner phase, 'gcode', 'progress'. */
+    phase: string;
+    /** Which tool/source produced it. */
+    tool?: string;
+    note?: string;
+    [detail: string]: unknown;
+}
+
+const MAX_JOB_EVENTS = 400;
+
+export const TERMINAL_JOB_STATES: McpJobState[] = ['rejected', 'start_failed', 'stopped', 'completed'];
+
 export interface McpJob {
     id: string;
     name: string;
@@ -56,6 +70,14 @@ export interface McpJob {
     // Set when the job reaches a terminal state (completed / stopped).
     endedAt: number | null;
     error: string | null;
+    // Everything that happened to the job, in order: state changes, the
+    // runner's phase announcements, gcode sent/replies while it was the active
+    // job, file-job progress. Returned by get_gcode_job_status so an agent
+    // never has to read server logs to learn how a job went. Capped.
+    events: JobEvent[];
+    // Procedure outcome (tool setter / probe results), kept on the record so
+    // a client that timed out waiting on start_gcode_job can still read it.
+    result: object | null;
     // Batch direct jobs: the operator approved this exact list; each
     // start_gcode_job call executes ONE step, so captures can happen between
     // steps and the series can be abandoned at any point.
@@ -82,6 +104,8 @@ function range(r: { min: number; max: number } | null): string {
 }
 
 export class JobManager {
+    private activeJob: McpJob | null = null;
+
     private jobs = new Map<string, McpJob>();
 
     private jobsDir: string | null = null;
@@ -115,13 +139,63 @@ export class JobManager {
             startedAt: null,
             endedAt: null,
             error: null,
+            events: [],
+            result: null,
             steps,
             nextStep: steps ? 0 : undefined,
         };
         this.jobs.set(id, job);
         this.prune();
+        this.appendEvent(job, 'submitted', { note: `${kind} job staged, awaiting human confirmation` });
         log.info(`MCP job submitted: ${id} (${safeName}), awaiting human confirmation`);
         return job;
+    }
+
+    /** Record something that happened to a job (state change, phase, gcode, progress). */
+    public appendEvent(job: McpJob, phase: string, detail: { [key: string]: unknown } = {}): void {
+        job.events.push({ at: Date.now(), phase, ...detail });
+        if (job.events.length > MAX_JOB_EVENTS) {
+            // Keep the head (submission/approval/start) and the most recent tail.
+            job.events.splice(20, job.events.length - MAX_JOB_EVENTS);
+        }
+    }
+
+    /**
+     * The job currently driving the machine (a procedure runner, a direct
+     * step, a running file job). Activity broadcast while it is active is
+     * attached to its event log - see recordActivity.
+     */
+    public setActive(job: McpJob | null): void {
+        this.activeJob = job;
+    }
+
+    public getActive(): McpJob | null {
+        return this.activeJob;
+    }
+
+    /**
+     * Hook for mcpBroadcast: phase-style tool activity (runner announcements,
+     * probe feed readings/alarms) and gcode traffic land on the active job's
+     * event log. Tool-call summaries (ok/duration) are not job events.
+     */
+    public recordActivity(eventName: string, options?: object): void {
+        const job = this.activeJob;
+        if (!job || !options) {
+            return;
+        }
+        const payload = options as { [key: string]: unknown };
+        if (eventName === 'mcp:activity' && payload.phase !== undefined) {
+            const { phase, ...rest } = payload;
+            this.appendEvent(job, String(phase), rest);
+        } else if (eventName === 'mcp:gcode') {
+            const gcode = payload.gcode !== undefined ? String(payload.gcode).slice(0, 300) : undefined;
+            const response = payload.response !== undefined ? String(payload.response).slice(0, 300) : undefined;
+            this.appendEvent(job, 'gcode', { tool: payload.tool, gcode, response });
+        }
+    }
+
+    public isTerminal(job: McpJob): boolean {
+        return TERMINAL_JOB_STATES.includes(job.state);
     }
 
     public get(id: string): McpJob | null {
@@ -173,6 +247,10 @@ export class JobManager {
             startedAt: job.startedAt,
             endedAt: job.endedAt,
             error: job.error,
+            terminal: this.isTerminal(job),
+            result: job.result,
+            eventCount: job.events.length,
+            lastEvent: job.events.length ? job.events[job.events.length - 1] : null,
             totalSteps: job.steps ? job.steps.length : undefined,
             nextStep: job.steps ? job.nextStep : undefined,
             validation: job.validation,
@@ -232,6 +310,7 @@ export class JobManager {
             job.confirmToken = crypto.randomBytes(4).toString('hex');
             job.approvedAt = Date.now();
             job.state = 'approved';
+            this.appendEvent(job, 'approved', { note: 'operator approved on the confirm page' });
             log.info(`MCP job ${job.id} approved by operator`);
             this.page(res, 200, this.approvedPage(job));
             return;
@@ -239,6 +318,7 @@ export class JobManager {
         if (req.method === 'POST' && action === 'reject') {
             job.state = 'rejected';
             job.confirmToken = null;
+            this.appendEvent(job, 'rejected', { note: 'operator rejected on the confirm page' });
             log.info(`MCP job ${job.id} rejected by operator`);
             this.page(res, 200, '<h2>Rejected</h2><p>The job will not run.</p>');
             return;

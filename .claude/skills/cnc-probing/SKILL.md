@@ -121,6 +121,20 @@ a tool refusing with "the touch probe / tool setter is disabled (Settings -> MCP
 Server)" means the operator switched that sensor off in the app - ask, never
 bypass. Sensors the operator has disabled have no pill at all.
 
+## Waiting on a job or procedure
+
+Never read server logs to find out whether a job finished. `get_gcode_job_status` carries
+the whole story: `job.state` (+ `terminal`), the procedure `result` once stored, and
+`events` — state changes, the runner's phase announcements, gcode sent/replies while the
+job was active, file-job progress every 5 %. Long-poll it: `wait_ms: 60000` returns as soon
+as the state turns terminal or new events arrive past `since_event` (pass back
+`next_event_index`), so one call replaces a polling loop. `start_gcode_job` on a procedure
+still returns the result directly; if that call times out, the result is on the record.
+
+`survey_bed`'s `pitch_mm` is a MAXIMUM: each axis is divided evenly into steps no larger
+than it (min 20), so rows and columns are uniform and both edges are covered — no more 80 mm
+jumps followed by a 10 mm stub. Pick the pitch from what one frame covers.
+
 ## Circle probing
 
 `probe_circle` measures a roughly-round vertical feature (post, boss, pin):
