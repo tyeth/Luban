@@ -50,7 +50,7 @@ export function registerProbingTools(registry: ToolRegistry, getConfirmBaseUrl: 
                     type: 'number',
                     description: 'REQUIRED hard travel limit (1-150): the march aborts here without contact.',
                 },
-                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-2).' },
+                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger - the coarse step is also the press into the probe).' },
                 fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
                 backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
                 sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300.' },
@@ -111,7 +111,7 @@ ${describeProbePlanAsGcode(plan)}`;
                     description: 'REQUIRED hard travel limit (1-150) along the vector: the march aborts '
                         + 'there without contact. Clamped so the whole segment stays in the machine envelope.',
                 },
-                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-2).' },
+                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger - the coarse step is also the press into the probe).' },
                 fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
                 backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
                 sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300.' },
@@ -354,11 +354,34 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
             description: 'How far below the previous contact one station may search before recording no_contact. '
                 + 'Default 40, cap 80 (also bounded by floor_z_machine).',
         },
-        coarse_step_mm: { type: 'number', description: 'Coarse -Z step for every march, default 1 (0.2-2). 2 is faster on a known-flat surface.' },
+        coarse_step_mm: {
+            type: 'number',
+            description: 'Coarse -Z step for every march, default 1, range 0.5-1 (operator law: never larger - the '
+                + 'coarse step is ALSO the worst-case press into the probe wherever the surface is found by a coarse '
+                + 'step, because the controller finishes the step before the runner sees the sensor; inside the slow '
+                + 'zone the press is one fine step instead). Values above 1 are clamped to 1.',
+        },
         fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
         backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1 (also the confirm re-contact window).' },
-        sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300 (GPIO transport: ~50 is enough).' },
+        sensor_delay_ms: {
+            type: 'number',
+            description: 'Contact-check window per step, default 300, floor 30 (GPIO transport: 50 is ample - the trigger led '
+                + 'the controller reply on every contact measured).',
+        },
         confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per station, default 3 (1-10).' },
+        slow_zone_mm: {
+            type: 'number',
+            description: 'Coarse steps stop this far ABOVE the expected contact (the previous station\'s Z; '
+                + 'expected_z_machine for station 1) and fine steps take over, down to slow_zone + 2 x coarse below it '
+                + '(coarse resumes lower). Caps the press into the probe at one fine step where the surface is where '
+                + 'expected. Default 1, min 0.3, max z_safe_delta_mm.',
+        },
+        expected_z_machine: {
+            type: 'number',
+            description: 'Optional: toolhead machine Z of a MEASURED neighbouring contact (probe_point -Z, a probe_sequence '
+                + 'centre, an earlier scan) so station 1 gets the slow zone too. Never inferred (law 3). Without it '
+                + 'station 1 uses coarse steps capped at 1 mm.',
+        },
         reason: { type: 'string', description: 'Shown to the operator: what surface is being scanned and why.' },
     };
     const stageSurfaceScan = (plan: ProbeSurfacePlan, reason: string, label: string) => {
@@ -389,8 +412,8 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
         name: 'probe_surface_path',
         description: 'Stage a TOP-SURFACE FLATNESS scan along a straight line for human confirmation: N stations '
             + 'from a start point to an end point (or direction + length), spaced by count or maximum spacing, '
-            + 'each measured with a -Z sensor-gated march of the spindle touch probe (coarse to contact, release, '
-            + 'fine, lift-and-retest confirm, median). Result per station: machine XYZ of contact or no_contact; '
+            + 'each measured with a -Z sensor-gated march of the spindle touch probe (coarse towards the expected contact, fine steps in a slow zone, '
+            + 'lift-and-retest confirm, median). Result per station: machine XYZ of contact or no_contact; '
             + 'plus Z min/max/range, the best-fit line (slope in mm per 100 mm and degrees, rise over the length) '
             + 'and flatness as residual peak-to-valley, and a text profile. Purpose: level/flatness of stock along a '
             + `line, e.g. along a rotary-mounted board. ${SURFACE_ENVELOPE_TEXT}`,
@@ -430,7 +453,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
         name: 'probe_surface_grid',
         description: 'Stage a TOP-SURFACE HEIGHT MAP for human confirmation: a serpentine grid of -Z touches of the '
             + 'spindle touch probe over a region (x/y extents, or centre + size; sampled by maximum pitch or by '
-            + 'x_count/y_count), every station a sensor-gated march (coarse to contact, release, fine, '
+            + 'x_count/y_count), every station a sensor-gated march (coarse towards the expected contact, fine steps in a slow zone, '
             + 'lift-and-retest confirm, median). Result: per-station machine XYZ or no_contact, a zMatrix '
             + '(rows = ys ascending, cols = xs ascending, null = no contact) with its coordinates, Z min/max/range, '
             + 'the best-fit plane (tilt X/Y in mm per 100 mm and degrees) with per-point residuals and flatness '

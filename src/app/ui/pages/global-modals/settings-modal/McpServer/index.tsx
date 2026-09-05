@@ -71,6 +71,18 @@ interface McpStatus {
     sensors: McpSensorSettings;
     mqtt: McpMqttSettings;
     gpio: McpGpioSettings;
+    buffers?: {
+        jobEventLimit: number;
+        jobEventLimitRange: [number, number];
+        jobEventLimitSource: 'env' | 'config' | 'default';
+        diagnosticsRecentLimit: number;
+        diagnosticsRecentLimitRange: [number, number];
+        diagnosticsRecentLimitSource: 'env' | 'config' | 'default';
+    };
+    approval?: {
+        handoff: 'agent' | 'code';
+        source: 'env' | 'config' | 'default';
+    };
 }
 
 const MQTT_FIELDS: Array<{ name: keyof McpMqttSettings['values']; labelKey: string; placeholder?: string; channel?: string }> = [
@@ -128,6 +140,12 @@ const McpServer: React.FC = () => {
     const [mqttPassTouched, setMqttPassTouched] = useState(false);
     const [gpio, setGpio] = useState<{ [field: string]: string }>({});
     const [gpioInverted, setGpioInverted] = useState<{ [channel: string]: boolean }>({});
+    // Diagnostic buffer sizes; '' = server default. Stored values only (an
+    // env override disables the field).
+    const [jobEventLimit, setJobEventLimit] = useState('');
+    const [diagnosticsRecentLimit, setDiagnosticsRecentLimit] = useState('');
+    // Job approval hand-off: true = a waiting agent starts on the operator's click.
+    const [approvalHandoffAgent, setApprovalHandoffAgent] = useState(true);
 
     useEffect(() => {
         api.getMcpStatus()
@@ -142,6 +160,13 @@ const McpServer: React.FC = () => {
                     setProbeEnabled(body.sensors.probe !== false);
                 }
                 setTransport(body.transport ? body.transport.stored : '');
+                if (body.buffers) {
+                    setJobEventLimit(body.buffers.jobEventLimitSource === 'config' ? String(body.buffers.jobEventLimit) : '');
+                    setDiagnosticsRecentLimit(body.buffers.diagnosticsRecentLimitSource === 'config' ? String(body.buffers.diagnosticsRecentLimit) : '');
+                }
+                if (body.approval) {
+                    setApprovalHandoffAgent(body.approval.handoff !== 'code');
+                }
 
                 const { inverted: mqttInvertedNames, ...mqttValues } = body.mqtt.values;
                 setMqtt({ ...mqttValues });
@@ -176,6 +201,8 @@ const McpServer: React.FC = () => {
             transport,
             mqtt: mqttUpdate,
             gpio: gpioUpdate,
+            buffers: { jobEventLimit, diagnosticsRecentLimit },
+            approvalHandoff: approvalHandoffAgent ? 'agent' : 'code',
         });
     };
 
@@ -280,6 +307,69 @@ const McpServer: React.FC = () => {
                         )}
                     </div>
                 )}
+            </div>
+
+            <div className="border-bottom-normal padding-bottom-4 margin-top-16">
+                <span>{i18n._('key-App/Settings/McpServer-Job approval')}</span>
+            </div>
+            <div className="margin-top-8">
+                <div className="sm-flex align-center">
+                    <Switch
+                        checked={approvalHandoffAgent}
+                        onChange={(checked) => setApprovalHandoffAgent(checked)}
+                        disabled={!enabled || !!(status && status.approval && status.approval.source === 'env')}
+                    />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Hand approval to the waiting agent (your click on the confirm page starts the job; no code to copy)')}</span>
+                </div>
+                <div className={styles['port-tips']}>
+                    {i18n._('key-App/Settings/McpServer-Off: the confirm page shows a one-time code you must relay to the agent yourself. Either way only your click in the browser authorises motion.')}
+                    {status && status.approval && status.approval.source === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_APPROVAL_HANDOFF` : ''}
+                </div>
+            </div>
+
+            <div className="border-bottom-normal padding-bottom-4 margin-top-16">
+                <span>{i18n._('key-App/Settings/McpServer-Diagnostic buffers')}</span>
+            </div>
+            <div className="margin-top-8">
+                <div className={styles['port-tips']}>
+                    {i18n._('key-App/Settings/McpServer-Long procedures (surface scans, bed surveys) write several events per step; raise the job event limit so the whole record survives. Applies immediately; empty = default.')}
+                </div>
+                <div className="sm-flex align-center margin-top-8">
+                    <span style={LABEL_STYLE}>{i18n._('key-App/Settings/McpServer-Job event log (events kept per job)')}</span>
+                    <Input
+                        value={jobEventLimit}
+                        onChange={(e) => {
+                            if (/^\d*$/.test(e.target.value)) {
+                                setJobEventLimit(e.target.value);
+                            }
+                        }}
+                        disabled={!enabled || !!(status && status.buffers && status.buffers.jobEventLimitSource === 'env')}
+                        className={styles['port-input']}
+                        placeholder={status && status.buffers ? String(status.buffers.jobEventLimit) : '2000'}
+                    />
+                    <span className="margin-left-8">
+                        {status && status.buffers ? `${status.buffers.jobEventLimitRange[0]}-${status.buffers.jobEventLimitRange[1]}` : ''}
+                        {status && status.buffers && status.buffers.jobEventLimitSource === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_JOB_EVENT_LIMIT` : ''}
+                    </span>
+                </div>
+                <div className="sm-flex align-center margin-top-8">
+                    <span style={LABEL_STYLE}>{i18n._('key-App/Settings/McpServer-Recent timing records (per diagnostics list)')}</span>
+                    <Input
+                        value={diagnosticsRecentLimit}
+                        onChange={(e) => {
+                            if (/^\d*$/.test(e.target.value)) {
+                                setDiagnosticsRecentLimit(e.target.value);
+                            }
+                        }}
+                        disabled={!enabled || !!(status && status.buffers && status.buffers.diagnosticsRecentLimitSource === 'env')}
+                        className={styles['port-input']}
+                        placeholder={status && status.buffers ? String(status.buffers.diagnosticsRecentLimit) : '40'}
+                    />
+                    <span className="margin-left-8">
+                        {status && status.buffers ? `${status.buffers.diagnosticsRecentLimitRange[0]}-${status.buffers.diagnosticsRecentLimitRange[1]}` : ''}
+                        {status && status.buffers && status.buffers.diagnosticsRecentLimitSource === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_DIAGNOSTICS_RECENT_LIMIT` : ''}
+                    </span>
+                </div>
             </div>
 
             <div className="border-bottom-normal padding-bottom-4 margin-top-16">

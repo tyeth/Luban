@@ -338,6 +338,44 @@ export function stationEnvelope(
     return { marchStartZ, floorZ, travelMm: round3(marchStartZ - floorZ) };
 }
 
+/**
+ * Where the fine steps take over on a march, given the expected contact
+ * (previous station's Z, or expected_z_machine for station 1): the SLOW ZONE
+ * runs from expected + slow_zone_mm down to expected - (slow_zone_mm + 2 x
+ * coarse), expressed in s (mm below the march start). Coarse steps never
+ * cross into it; below it coarse resumes (a pocket edge costs seconds, not
+ * minutes). null = no expected contact, or the zone lies wholly outside the
+ * march: coarse all the way (capped at 1 mm by coarseStepFor).
+ *
+ * Why (operator, 2026-09-05, job d8f6ec1b5c11): a coarse step is executed
+ * whole by the controller before the runner sees the probe, so the coarse
+ * ladder presses the probe past contact by up to a FULL coarse step (0.4 mm
+ * at station 1 with 2 mm steps, worst case 2 mm) - the same problem
+ * run_tool_setter's slow_zone_mm already solves.
+ */
+export function slowZoneFor(
+    startZ: number,
+    expectedContactZ: number | null,
+    slowZoneMm: number,
+    coarseStepMm: number,
+    travelMm: number
+): { topS: number; bottomS: number } | null {
+    if (expectedContactZ === null) {
+        return null;
+    }
+    const topS = Math.max(0, round3(startZ - (expectedContactZ + slowZoneMm)));
+    const bottomS = Math.min(travelMm, round3(startZ - (expectedContactZ - (slowZoneMm + 2 * coarseStepMm))));
+    if (topS >= travelMm - 1e-9 || bottomS <= topS + 1e-9) {
+        return null;
+    }
+    return { topS, bottomS };
+}
+
+/** Coarse step actually used on a march: capped at 1 mm when nothing bounds the press. */
+export function coarseStepFor(plan: { coarseStepMm: number }, hasExpectedContact: boolean): number {
+    return hasExpectedContact ? plan.coarseStepMm : Math.min(plan.coarseStepMm, 1);
+}
+
 /** Split a hop into equal segments no longer than HOP_SEGMENT_MM (sensor-checked between). */
 export function hopSegments(
     from: { x: number; y: number },

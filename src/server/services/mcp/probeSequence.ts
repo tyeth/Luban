@@ -10,7 +10,11 @@ import {
     ProcedureAbort,
     TRAVEL_FEED,
     assertChannelReady,
+    RECHECK_TOLERANCE_MM,
     assertMachineReadyForProcedure,
+    descendInSegments,
+    expectMachinePosition,
+    knownMachinePosition,
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
@@ -173,7 +177,7 @@ export function planProbeSequence(args: {
 
     return {
         steps,
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 2),
+        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
         fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
         backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
         sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
@@ -226,7 +230,7 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
             lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to traverse height (law 2)`);
             lines.push(`G1 X${step.x.toFixed(3)} Y${step.y.toFixed(3)} F${TRAVEL_FEED}; hop`);
         } else if (step.kind === 'descend') {
-            lines.push(`G1 Z${(step.z + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend fast to ${DESCENT_GUARD_MM} mm above target`);
+            lines.push(`G1 Z${(step.z + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend (<= 5 mm segments (crash guard armed)) to ${DESCENT_GUARD_MM} mm above target`);
             lines.push('; ...guarded final approach (operator, 2026-09-02): 1 mm steps, sensor-checked after each -');
             lines.push('; ANY contact during a descent aborts and latches the CRASH alarm.');
             for (let gz = step.z + DESCENT_GUARD_MM - 1; gz > step.z - 1e-9; gz -= 1) {
@@ -259,10 +263,6 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
     lines.push('G54;');
     return lines.join('\n');
 }
-
-const sleep = async (ms: number) => new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-});
 
 export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promise<object> {
     assertChannelReady('probe', 'probe sequence');
@@ -305,9 +305,18 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
             } else if (step.kind === 'descend') {
                 probeFeedService.clearExpectedContact();
                 const guardTop = step.z + DESCENT_GUARD_MM;
-                const zNow = getPositionSnapshot().machine.z;
+                // Verified position (record) over a single heartbeat - see
+                // probing.knownMachinePosition (job 42df7b9351b7).
+                const known = knownMachinePosition();
+                const zNow = known.position.z;
+                if (zNow !== null && zNow < step.z - RECHECK_TOLERANCE_MM) {
+                    throw new ProcedureAbort(`Descend step ${stepIndex}: the toolhead is at machine Z${zNow} (${known.source}), BELOW the `
+                        + `planned descent target Z${step.z} - a descent never rises. Re-stage from a verified position.`);
+                }
                 if (zNow !== null && zNow > guardTop + 1e-9) {
-                    await moveMachineSettled(`seq:descend:${stepIndex}`, { z: guardTop }, TRAVEL_FEED);
+                    // Operator law 2026-09-05: descents in <= 5 mm sensor-checked
+                    // segments, never one long move toward the work.
+                    await descendInSegments(`seq:descend:${stepIndex}`, zNow, guardTop, 'probe', plan.sensorDelayMs);
                 }
                 let gz = Math.min(zNow === null ? guardTop : Math.max(zNow, step.z), guardTop);
                 while (gz - step.z > 1e-9) {
@@ -323,30 +332,14 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 announce(`descend-${stepIndex}`, `Z${step.z} (guarded final ${DESCENT_GUARD_MM} mm)`);
             } else {
                 // Re-verify the walk matches the simulation before marching.
-                // Every preceding move already verified its own arrival, so a
-                // mismatch here is either real drift or a transient heartbeat
-                // (a beat inside a G53...G54 window reporting no/zero origin
-                // offset - job 44abebd9bab3, 2026-09-05). Re-read once after a
-                // heartbeat period before believing it.
-                const expected = step.start;
-                const matches = (p: { x: number | null; y: number | null; z: number | null }) => (
-                    p.x !== null && p.y !== null && p.z !== null
-                    && Math.abs(p.x - expected.x) <= 0.5
-                    && Math.abs(p.y - expected.y) <= 0.5
-                    && Math.abs(p.z - expected.z) <= 0.5
-                );
-                let snapshot = getPositionSnapshot();
-                if (!matches(snapshot.machine)) {
-                    const first = snapshot;
-                    await sleep(1200);
-                    snapshot = getPositionSnapshot();
-                    if (!matches(snapshot.machine)) {
-                        const fmt = (s: typeof snapshot) => `(${s.machine.x}, ${s.machine.y}, ${s.machine.z}) [work (${s.work.x}, ${s.work.y}, ${s.work.z}), offset (${s.originOffset.x}, ${s.originOffset.y}, ${s.originOffset.z}) from ${s.originOffsetSource}]`;
-                        throw new ProcedureAbort(`March "${step.name}": machine at ${fmt(snapshot)} `
-                            + `(first read ${fmt(first)}) but the plan expects `
-                            + `(${expected.x}, ${expected.y}, ${expected.z}).`);
-                    }
-                    announce(`recheck-${stepIndex}`, 'position re-check passed on the second heartbeat (first read was transient)');
+                // Every preceding move already verified its own arrival, so
+                // the engine's position of record and an either-frame reading
+                // of the heartbeat decide (positionOfRecord.ts; jobs
+                // 44abebd9bab3 and 1db4902a4cd6, 2026-09-05).
+                const check = await expectMachinePosition(step.start, `March "${step.name}"`,
+                    (message) => new ProcedureAbort(message));
+                if (check.note) {
+                    announce(`recheck-${stepIndex}`, check.note);
                 }
                 probeFeedService.setExpectedContact(['probe']);
                 const move = async (tool: string, s: number, feed: number) => {

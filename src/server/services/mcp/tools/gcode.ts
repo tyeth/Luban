@@ -4,7 +4,8 @@ import * as fs from 'fs-extra';
 
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
-import { McpJob, jobManager } from '../jobs';
+import { McpJob, approvalHandoff, jobManager } from '../jobs';
+import { matchFrame } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 import { validateGcode } from '../validator';
@@ -71,8 +72,13 @@ async function waitForStableHeartbeat(
             continue;
         }
         if (expect) {
-            const reportedZ = expect.frame === 'work' ? now.work.z : now.machine.z;
-            if (reportedZ === null || Math.abs(reportedZ - expect.z) > 0.15) {
+            // Machine-frame targets accept a report in either frame: a beat
+            // inside the move's G53 window carries machine coordinates with
+            // the offset still populated (positionOfRecord.ts).
+            const atTarget = expect.frame === 'work'
+                ? (now.work.z !== null && Math.abs(now.work.z - expect.z) <= 0.15)
+                : matchFrame(now.work, now.originOffset, { z: expect.z }, 0.15) !== null;
+            if (!atTarget) {
                 continue; // settled, but not AT the target yet - keep waiting
             }
         }
@@ -254,8 +260,9 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             return {
                 job: jobManager.describe(job),
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
-                next_step: 'Ask the operator to open confirm_url in a browser, review, and approve. '
-                    + 'They will receive a one-time code to give you for start_gcode_job.',
+                next_step: 'Ask the operator to open confirm_url in a browser, review, and approve. Then either call '
+                    + 'start_gcode_job with wait_for_approval_ms (their click starts it - nothing to copy) or pass the '
+                    + 'one-time code they relay as confirm_token.',
             };
         },
     });
@@ -264,7 +271,11 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
         name: 'start_gcode_job',
         description: 'Start an approved job: uploads the file to the machine through the same '
             + 'prepare/start path as "Start on Luban" (door interlock applies) and starts it. '
-            + 'Requires the one-time code the operator received when approving.',
+            + 'Authorisation is the operator\'s click on the confirm page. EITHER pass the one-time code they '
+            + 'relay (confirm_token) OR call with wait_for_approval_ms right after staging: the call stays open '
+            + 'until they approve (then the job starts at once - nothing to copy), reject, or the wait expires '
+            + '(returns approved: false, timed_out: true - call again to keep waiting; approval is never lost). '
+            + 'The hand-off can be disabled in Settings -> MCP Server, in which case only confirm_token works.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -273,7 +284,12 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     type: 'number',
                     description: 'Procedure jobs only: how long to wait for the result before returning a running status (0-120000, default 25000). The runner continues either way; long-poll get_gcode_job_status.',
                 },
-                confirm_token: { type: 'string', description: 'One-time code from the operator.' },
+                confirm_token: { type: 'string', description: 'One-time code from the operator (not needed with wait_for_approval_ms).' },
+                wait_for_approval_ms: {
+                    type: 'number',
+                    description: 'Wait this long (1-120000, e.g. 110000) for the operator to approve on the confirm page, then start '
+                        + 'without a code. Times out with approved: false if they have not clicked yet - call again.',
+                },
                 wait_until_moved: {
                     type: 'boolean',
                     description: 'Direct jobs only. Default true: block until the heartbeat verifiably '
@@ -281,14 +297,60 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         + 'the command, with position_verified: false - poll get_position afterwards.',
                 },
             },
-            required: ['job_id', 'confirm_token'],
+            required: ['job_id'],
             additionalProperties: false,
         },
-        handler: async (args: { job_id?: string; confirm_token?: string; wait_until_moved?: boolean; wait_ms?: number }) => {
+        handler: async (args: { job_id?: string; confirm_token?: string; wait_for_approval_ms?: number; wait_until_moved?: boolean; wait_ms?: number }) => {
             probeFeedService.assertNoOvertravel();
             const job = jobManager.get(String(args.job_id || ''));
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
+            }
+
+            // Approval hand-off (operator request 2026-09-05): with no code
+            // given, wait for the operator's click on the confirm page and
+            // use the job's own token. The click remains the only authority;
+            // this only removes the copying.
+            let token = String(args.confirm_token || '');
+            if (!token) {
+                const waitMs = Math.min(Math.max(Number(args.wait_for_approval_ms) || 0, 0), 120000);
+                if (waitMs <= 0) {
+                    throw new McpToolError('Provide confirm_token (the operator\'s one-time code) or wait_for_approval_ms '
+                        + '(1-120000) to wait for the operator to approve on the confirm page.');
+                }
+                if (approvalHandoff() !== 'agent') {
+                    throw new McpToolError('Approval hand-off to agents is disabled in Settings -> MCP Server: the operator '
+                        + 'must give you the one-time code from the confirm page (confirm_token).');
+                }
+                if (job.state === 'awaiting_confirmation') {
+                    job.agentWaiting = true;
+                    jobManager.appendEvent(job, 'agent_waiting', { note: `agent waiting up to ${waitMs} ms for the operator's approval` });
+                    const startedWaiting = Date.now();
+                    try {
+                        while (job.state === 'awaiting_confirmation' && Date.now() - startedWaiting < waitMs) {
+                            await sleep(250);
+                        }
+                    } finally {
+                        job.agentWaiting = false;
+                    }
+                }
+                if (job.state === 'awaiting_confirmation') {
+                    return {
+                        job: jobManager.describe(job),
+                        approved: false,
+                        timed_out: true,
+                        note: `Not approved within ${waitMs} ms. The confirm page stays valid - call start_gcode_job again with `
+                            + 'wait_for_approval_ms to keep waiting, or ask the operator whether they intend to approve.',
+                    };
+                }
+                if (job.state === 'rejected') {
+                    throw new McpToolError('The operator rejected this job on the confirm page. Do not restage the same motion without asking why.');
+                }
+                if (!job.confirmToken) {
+                    throw new McpToolError(`Job is ${job.state}; nothing to start.`);
+                }
+                token = job.confirmToken;
+                jobManager.appendEvent(job, 'approval_handed_off', { note: 'operator approved on the confirm page; the waiting agent starts the job (no code relayed)' });
             }
 
             // Connectivity, heartbeat freshness and idleness are checked
@@ -303,7 +365,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
             // Consumed from here on, success or not - a failed start needs a
             // fresh human approval, not a retry loop.
-            const verdict = jobManager.consumeToken(job, String(args.confirm_token || ''));
+            const verdict = jobManager.consumeToken(job, token);
             if (!verdict.ok) {
                 throw new McpToolError(verdict.reason || 'Confirmation failed.');
             }
@@ -686,7 +748,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             const since = Math.max(0, Math.floor(Number(args.since_event) || 0));
             const startedWaiting = Date.now();
             let timedOut = false;
-            while (!jobManager.isTerminal(job) && job.events.length <= since) {
+            while (!jobManager.isTerminal(job) && job.eventSeq <= since) {
                 if (Date.now() - startedWaiting >= waitMs) {
                     timedOut = waitMs > 0;
                     break;
@@ -697,8 +759,8 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             return {
                 job: jobManager.describe(job),
                 result: job.result,
-                events: job.events.slice(since),
-                next_event_index: job.events.length,
+                events: jobManager.eventsSince(job, since),
+                next_event_index: job.eventSeq,
                 waited_ms: Date.now() - startedWaiting,
                 timed_out: timedOut,
                 machineStatus: machineStatus(),

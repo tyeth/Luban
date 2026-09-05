@@ -1,6 +1,8 @@
 import config from '../configstore';
 import { getMcpStatus } from '../mcp';
+import { MAX_RECENT_LIMIT, MIN_RECENT_LIMIT, diagnosticsRecentLimit } from '../mcp/diagnostics';
 import { DEFAULT_BLINKA_ENV, resolveGpioFeedConfig } from '../mcp/gpioFeed';
+import { MAX_JOB_EVENT_LIMIT, MIN_JOB_EVENT_LIMIT, approvalHandoff, jobEventLimit } from '../mcp/jobs';
 import { probeFeedService, resolveProbeFeedConfig, resolveProbeTransportKind, resolveSensorEnabled } from '../mcp/probeFeed';
 
 const ERR_BAD_REQUEST = 400;
@@ -113,6 +115,25 @@ function sensorSettings() {
     };
 }
 
+// Diagnostic buffer sizes (jobs.ts / diagnostics.ts). Env overrides win.
+function limitSource(envName, configKey) {
+    if (process.env[envName]) {
+        return 'env';
+    }
+    return config.get(configKey) ? 'config' : 'default';
+}
+
+function bufferSettings() {
+    return {
+        jobEventLimit: jobEventLimit(),
+        jobEventLimitRange: [MIN_JOB_EVENT_LIMIT, MAX_JOB_EVENT_LIMIT],
+        jobEventLimitSource: limitSource('LUBAN_MCP_JOB_EVENT_LIMIT', 'mcpJobEventLimit'),
+        diagnosticsRecentLimit: diagnosticsRecentLimit(),
+        diagnosticsRecentLimitRange: [MIN_RECENT_LIMIT, MAX_RECENT_LIMIT],
+        diagnosticsRecentLimitSource: limitSource('LUBAN_MCP_DIAGNOSTICS_RECENT_LIMIT', 'mcpDiagnosticsRecentLimit'),
+    };
+}
+
 function transportSettings() {
     return {
         // What the operator stored (may be empty = auto), and what is live.
@@ -122,8 +143,29 @@ function transportSettings() {
     };
 }
 
+// Job approval hand-off (jobs.ts approvalHandoff): 'agent' lets a waiting
+// start_gcode_job start on the operator's click; 'code' requires the relayed code.
+function approvalSettings() {
+    return {
+        handoff: approvalHandoff(),
+        source: limitSource('LUBAN_MCP_APPROVAL_HANDOFF', 'mcpApprovalHandoff'),
+    };
+}
+
+function settingsPayload() {
+    return {
+        ...getMcpStatus(),
+        transport: transportSettings(),
+        sensors: sensorSettings(),
+        mqtt: mqttSettings(),
+        gpio: gpioSettings(),
+        buffers: bufferSettings(),
+        approval: approvalSettings(),
+    };
+}
+
 export const getStatus = (req, res) => {
-    res.send({ ...getMcpStatus(), transport: transportSettings(), sensors: sensorSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
+    res.send(settingsPayload());
 };
 
 /**
@@ -155,7 +197,7 @@ export const clearAlarm = (req, res) => {
  * omitted field is left unchanged (the pane omits an untouched password).
  */
 export const updateSettings = (req, res) => {
-    const { enabled, port, allowLan, sensors, mqtt, gpio, transport } = req.body || {};
+    const { enabled, port, allowLan, sensors, mqtt, gpio, transport, buffers, approvalHandoff: handoff } = req.body || {};
 
     if (port !== undefined) {
         const value = Number(port);
@@ -172,6 +214,40 @@ export const updateSettings = (req, res) => {
         // Applies at the next start (bind address). No authentication exists:
         // the pane carries the warning; here we only persist the choice.
         config.set('mcpAllowLan', !!allowLan);
+    }
+    if (handoff !== undefined) {
+        const value = String(handoff).trim().toLowerCase();
+        if (value === '') {
+            config.unset('mcpApprovalHandoff'); // default: agent
+        } else if (value === 'agent' || value === 'code') {
+            config.set('mcpApprovalHandoff', value);
+        } else {
+            res.status(ERR_BAD_REQUEST).send({ msg: `Invalid approvalHandoff: ${handoff} (agent, code or empty)` });
+            return;
+        }
+    }
+    if (buffers && typeof buffers === 'object') {
+        // Diagnostic buffer sizes: applied immediately (read on every append).
+        const limits = [
+            ['jobEventLimit', 'mcpJobEventLimit', MIN_JOB_EVENT_LIMIT, MAX_JOB_EVENT_LIMIT],
+            ['diagnosticsRecentLimit', 'mcpDiagnosticsRecentLimit', MIN_RECENT_LIMIT, MAX_RECENT_LIMIT],
+        ];
+        for (const [field, key, min, max] of limits) {
+            if (buffers[field] === undefined) {
+                continue;
+            }
+            const value = String(buffers[field]).trim();
+            if (value === '') {
+                config.unset(key); // back to the default
+                continue;
+            }
+            const numeric = Number(value);
+            if (!Number.isInteger(numeric) || numeric < min || numeric > max) {
+                res.status(ERR_BAD_REQUEST).send({ msg: `Invalid ${field}: ${value} (${min}-${max})` });
+                return;
+            }
+            config.set(key, numeric);
+        }
     }
     if (sensors && typeof sensors === 'object') {
         if (sensors.toolSetter !== undefined) {
@@ -240,5 +316,5 @@ export const updateSettings = (req, res) => {
         }
     }
 
-    res.send({ ...getMcpStatus(), transport: transportSettings(), sensors: sensorSettings(), mqtt: mqttSettings(), gpio: gpioSettings() });
+    res.send(settingsPayload());
 };

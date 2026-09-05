@@ -7,7 +7,7 @@ import { connectionManager } from '../machine/ConnectionManager';
 import { GpioProbeTransport, describePin, resolveGpioFeedConfig } from './gpioFeed';
 import { mcpBroadcast } from './index';
 import { MqttClient } from './mqtt';
-import { PROBE_CHANNELS, ProbeChannel, ProbeTransport, ProbeTransportKind } from './probeTransport';
+import { PROBE_CHANNELS, ProbeChannel, ProbeTransport, ProbeTransportKind, ReadingMeta } from './probeTransport';
 import { McpToolError } from './registry';
 
 const log = logger('service:mcp:probe-feed');
@@ -681,7 +681,7 @@ export class ProbeFeedService {
         const transport = buildTransport(cfg.kind);
         this.transport = transport;
 
-        transport.on('reading', (channel: ProbeChannel, value: string) => this.onReading(channel, value, false));
+        transport.on('reading', (channel: ProbeChannel, value: string, meta?: ReadingMeta) => this.onReading(channel, value, false, meta));
         transport.on('refresh', (channel: ProbeChannel, value: string) => this.onReading(channel, value, true));
         transport.on('error', (err: Error) => {
             // An unplugged sensor bridge produces the same error on every
@@ -743,7 +743,7 @@ export class ProbeFeedService {
         }, delay);
     }
 
-    private onReading(channel: ProbeChannel, value: string, refreshOnly: boolean): void {
+    private onReading(channel: ProbeChannel, value: string, refreshOnly: boolean, meta?: ReadingMeta): void {
         const cfg = this.activeConfig;
         if (!cfg) {
             return;
@@ -765,14 +765,18 @@ export class ProbeFeedService {
             source: cfg.channels[channel] || channel,
         };
         this.readings.set(channel, reading);
+        // Transport -> server latency when the transport stamped the reading
+        // (GPIO monitor wall clock); part of the sensor-timing evidence.
+        const pipeMs = meta && meta.sentAt ? Math.max(0, reading.receivedAt - meta.sentAt) : undefined;
         mcpBroadcast('mcp:activity', {
             tool: 'probe_feed',
             phase: 'reading',
             channel,
             value,
             triggered: reading.triggered,
+            pipeMs,
         });
-        log.info(`reading ${channel}=${value} triggered=${reading.triggered}`);
+        log.info(`reading ${channel}=${value} triggered=${reading.triggered}${pipeMs === undefined ? '' : ` pipe=${pipeMs}ms`}`);
         if (!this.trip && reading.triggered) {
             if (channel === 'overtravel') {
                 // Operator decision (2026-09-04): the overtravel tripwire is

@@ -28,8 +28,11 @@ shifted exactly, without ever re-touching the stock.
   (`get_tool_setter_config`; the operator sets them once with
   `set_tool_setter_config` — on this machine the park is Z at the homing
   height, X at the far end, Y free).
-- Every motion step below stages a job the OPERATOR approves on a confirm page;
-  the one-time code they give you goes to `start_gcode_job`.
+- Every motion step below stages a job the OPERATOR approves on a confirm page.
+  Call `start_gcode_job` with `wait_for_approval_ms` (e.g. 110000) right after
+  staging: their click starts it with nothing to copy (`approved: false` on
+  timeout means call again). If hand-off is disabled in their settings, the
+  one-time code they give you goes in as `confirm_token`.
 
 ## Two flows — ask which one the operator is using
 

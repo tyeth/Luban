@@ -3,6 +3,7 @@ import http from 'http';
 import pkg from '../../../package.json';
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { diagnosticsSnapshot, startDiagnostics } from './diagnostics';
 import { McpServer, isAllowedOrigin, isLocalSubnetAddress, isLocalSubnetOrigin, isLoopback, localSubnets } from './McpServer';
 import { jobManager } from './jobs';
 import { probeFeedService, resolveActiveProbeConfig } from './probeFeed';
@@ -142,6 +143,9 @@ export function getMcpStatus() {
         // Sensor feed snapshot for the Workspace connection pills; live
         // updates arrive over mcp:activity (tool 'probe_feed').
         probeFeed: probeFeedService.status(),
+        // Timing evidence (event-loop stalls, heartbeat cadence, gcode
+        // pacing, sensor pipe latency) - diagnostics.ts.
+        diagnostics: diagnosticsSnapshot(),
     };
 }
 
@@ -219,6 +223,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
             : ' (loopback only)';
         log.info(`MCP server listening at http://127.0.0.1:${port}/mcp${reach}`);
     });
+    startDiagnostics();
 
     // Arm the external probe feed (and its overtravel tripwire) without any
     // agent involvement when it is fully configured. Failure is logged and
