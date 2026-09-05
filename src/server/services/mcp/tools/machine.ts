@@ -116,6 +116,7 @@ export interface PositionSnapshot {
     work: { x: number | null; y: number | null; z: number | null };
     machine: { x: number | null; y: number | null; z: number | null };
     originOffset: { x: number; y: number; z: number };
+    originOffsetSource: 'heartbeat' | 'cached' | 'assumed-zero';
     b: number | null;
     isFourAxis: boolean;
     isHomed: boolean | null;
@@ -153,6 +154,8 @@ export function assertFreshHeartbeat(what: string): void {
  * Position from the latest heartbeat, shared by get_position and the
  * capture tools. Throws McpToolError when unavailable.
  */
+let lastKnownOriginOffset: { x: number; y: number; z: number; at: number } | null = null;
+
 export function getPositionSnapshot(): PositionSnapshot {
     const status = connectionManager.getConnectionStatus();
     if (!status.connected) {
@@ -174,11 +177,38 @@ export function getPositionSnapshot(): PositionSnapshot {
         y: axisValue(pos.y),
         z: axisValue(pos.z),
     };
-    const offset = {
-        x: axisValue(originOffset.x) || 0,
-        y: axisValue(originOffset.y) || 0,
-        z: axisValue(originOffset.z) || 0,
+    const warnings: string[] = [];
+    // The SSTP status poll rebuilds originOffset from data.offsetX/Y/Z on
+    // every beat. A beat that lands inside a move's G53...G54 window (or any
+    // beat the firmware sends without offsets) used to fall through `|| 0`
+    // and silently reframe machine coordinates as work coordinates - which
+    // aborted a probe_sequence march re-check on 2026-09-05 (job
+    // 44abebd9bab3: settled at machine (170,199,240), re-check read
+    // (119,77,-88)). Missing offsets now reuse the last complete offset seen
+    // on this connection and say so; callers that verify position should
+    // re-read once when a check fails (see probeSequence).
+    const reported = {
+        x: axisValue(originOffset.x),
+        y: axisValue(originOffset.y),
+        z: axisValue(originOffset.z),
     };
+    let offsetSource: 'heartbeat' | 'cached' | 'assumed-zero' = 'heartbeat';
+    let offset: { x: number; y: number; z: number };
+    if (reported.x !== null && reported.y !== null && reported.z !== null) {
+        offset = { x: reported.x, y: reported.y, z: reported.z };
+        lastKnownOriginOffset = { ...offset, at: state.timestamp };
+    } else if (lastKnownOriginOffset) {
+        offset = { x: lastKnownOriginOffset.x, y: lastKnownOriginOffset.y, z: lastKnownOriginOffset.z };
+        offsetSource = 'cached';
+        warnings.push('The latest heartbeat carried no work-origin offset; machine coordinates use the '
+            + `last complete offset (${offset.x}, ${offset.y}, ${offset.z}) seen ${((state.timestamp - lastKnownOriginOffset.at) / 1000).toFixed(1)}s earlier. `
+            + 'Re-read before trusting a position check.');
+    } else {
+        offset = { x: reported.x || 0, y: reported.y || 0, z: reported.z || 0 };
+        offsetSource = 'assumed-zero';
+        warnings.push('No work-origin offset has been reported on this connection yet; machine coordinates '
+            + 'ASSUME a zero offset and may be wrong - query_firmware_position and re-verify.');
+    }
     const machine = {
         x: work.x === null ? null : work.x - offset.x,
         y: work.y === null ? null : work.y - offset.y,
@@ -189,7 +219,6 @@ export function getPositionSnapshot(): PositionSnapshot {
     // reporting positions in an unselected workspace, so derived machine
     // coordinates land outside the build volume (e.g. Z 656 on a 325 mm
     // machine). Flag it rather than let an agent trust it.
-    const warnings: string[] = [];
     const reportAgeMs = Date.now() - state.timestamp;
     if (reportAgeMs > HEARTBEAT_STALE_MS) {
         warnings.push(`STALE: the last heartbeat is ${(reportAgeMs / 1000).toFixed(0)}s old `
@@ -217,6 +246,7 @@ export function getPositionSnapshot(): PositionSnapshot {
         work,
         machine,
         originOffset: offset,
+        originOffsetSource: offsetSource,
         b: axisValue(pos.b),
         isFourAxis: !!pos.isFourAxis,
         isHomed: (state as { isHomed?: boolean }).isHomed ?? null,

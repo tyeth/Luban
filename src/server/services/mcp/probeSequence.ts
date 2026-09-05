@@ -227,7 +227,7 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
             lines.push(`G1 X${step.x.toFixed(3)} Y${step.y.toFixed(3)} F${TRAVEL_FEED}; hop`);
         } else if (step.kind === 'descend') {
             lines.push(`G1 Z${(step.z + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend fast to ${DESCENT_GUARD_MM} mm above target`);
-            lines.push(`; ...guarded final approach (operator, 2026-09-02): 1 mm steps, sensor-checked after each -`);
+            lines.push('; ...guarded final approach (operator, 2026-09-02): 1 mm steps, sensor-checked after each -');
             lines.push('; ANY contact during a descent aborts and latches the CRASH alarm.');
             for (let gz = step.z + DESCENT_GUARD_MM - 1; gz > step.z - 1e-9; gz -= 1) {
                 const zz = Math.max(gz, step.z);
@@ -259,6 +259,10 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
     lines.push('G54;');
     return lines.join('\n');
 }
+
+const sleep = async (ms: number) => new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+});
 
 export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promise<object> {
     assertChannelReady('probe', 'probe sequence');
@@ -319,14 +323,30 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 announce(`descend-${stepIndex}`, `Z${step.z} (guarded final ${DESCENT_GUARD_MM} mm)`);
             } else {
                 // Re-verify the walk matches the simulation before marching.
-                const now = getPositionSnapshot().machine;
-                if (now.x === null || now.y === null || now.z === null
-                    || Math.abs(now.x - step.start.x) > 0.5
-                    || Math.abs(now.y - step.start.y) > 0.5
-                    || Math.abs(now.z - step.start.z) > 0.5) {
-                    throw new ProcedureAbort(`March "${step.name}": machine at `
-                        + `(${now.x}, ${now.y}, ${now.z}) but the plan expects `
-                        + `(${step.start.x}, ${step.start.y}, ${step.start.z}).`);
+                // Every preceding move already verified its own arrival, so a
+                // mismatch here is either real drift or a transient heartbeat
+                // (a beat inside a G53...G54 window reporting no/zero origin
+                // offset - job 44abebd9bab3, 2026-09-05). Re-read once after a
+                // heartbeat period before believing it.
+                const expected = step.start;
+                const matches = (p: { x: number | null; y: number | null; z: number | null }) => (
+                    p.x !== null && p.y !== null && p.z !== null
+                    && Math.abs(p.x - expected.x) <= 0.5
+                    && Math.abs(p.y - expected.y) <= 0.5
+                    && Math.abs(p.z - expected.z) <= 0.5
+                );
+                let snapshot = getPositionSnapshot();
+                if (!matches(snapshot.machine)) {
+                    const first = snapshot;
+                    await sleep(1200);
+                    snapshot = getPositionSnapshot();
+                    if (!matches(snapshot.machine)) {
+                        const fmt = (s: typeof snapshot) => `(${s.machine.x}, ${s.machine.y}, ${s.machine.z}) [work (${s.work.x}, ${s.work.y}, ${s.work.z}), offset (${s.originOffset.x}, ${s.originOffset.y}, ${s.originOffset.z}) from ${s.originOffsetSource}]`;
+                        throw new ProcedureAbort(`March "${step.name}": machine at ${fmt(snapshot)} `
+                            + `(first read ${fmt(first)}) but the plan expects `
+                            + `(${expected.x}, ${expected.y}, ${expected.z}).`);
+                    }
+                    announce(`recheck-${stepIndex}`, 'position re-check passed on the second heartbeat (first read was transient)');
                 }
                 probeFeedService.setExpectedContact(['probe']);
                 const move = async (tool: string, s: number, feed: number) => {
