@@ -1,7 +1,10 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention (the plan builders take the
 // probe_surface_path / probe_surface_grid arguments verbatim).
+import { ObstacleBox, checkMotion, describeViolations, surfaceMotion } from './envelopeChecks';
 import { mcpBroadcast } from './index';
+import { landmarkStore } from './landmarks';
+import { steppedTraverseZ } from './march';
 import { probeFeedService } from './probeFeed';
 import { DESCENT_GUARD_MM } from './probeSequence';
 import {
@@ -9,6 +12,7 @@ import {
     FINE_FEED,
     MAX_RETREAT_MM,
     ProcedureAbort,
+    ProcedureStopped,
     TRAVEL_FEED,
     assertChannelReady,
     RECHECK_TOLERANCE_MM,
@@ -22,13 +26,17 @@ import {
     senseReleaseAfter,
 } from './probing';
 import { McpToolError } from './registry';
+import { probeGeometry } from './rotaryGeometry';
 import {
+    CIRCLE_MAX_OFFSET_FRACTION,
+    CircleProfile,
     ContactSample,
     HOP_SEGMENT_MM,
     SurfacePlanError,
     SurfaceStation,
     assertHopsWithin,
     buildZMatrix,
+    circleExpectedZ,
     coarseStepFor,
     fitLine,
     fitPlane,
@@ -104,6 +112,22 @@ export interface ProbeSurfacePlan {
     expectedZMachine: number | null;
     /** floor_z_machine was given explicitly: station 1 may search down to it (not just start_z - max_drop). */
     floorExplicit: boolean;
+    /**
+     * Expected contact PROFILE (mcp/48): per-station expected Z from a model
+     * of the surface (a cylinder along the rotary axis) instead of the
+     * previous station - the slow zone and the max_drop band follow the model.
+     */
+    profile: CircleProfile | null;
+    /**
+     * How the probe travels between stations (mcp/48, operator 2026-09-06):
+     * 'guarded' (default) hops at last contact + z_safe_delta expecting NO
+     * contact (a contact aborts); 'stepped' travels at last contact +
+     * hop_lift_mm as a touch-probing traverse - a contact backs off, lifts
+     * hop_lift_mm and continues, so the height follows the surface in steps
+     * (gentle slope or the wall of a hole) instead of a fixed clearance.
+     */
+    hopMode: 'guarded' | 'stepped';
+    hopLiftMm: number;
     path?: {
         start: { x: number; y: number };
         end: { x: number; y: number };
@@ -133,6 +157,9 @@ interface CommonArgs {
     confirm_passes?: number;
     slow_zone_mm?: number;
     expected_z_machine?: unknown;
+    expected_profile?: unknown;
+    hop_mode?: unknown;
+    hop_lift_mm?: unknown;
 }
 
 function toToolError<T>(fn: () => T): T {
@@ -146,11 +173,56 @@ function toToolError<T>(fn: () => T): T {
     }
 }
 
+/**
+ * expected_profile: { circle: { center_x, center_z_contact, radius, tip_radius? } }
+ * - a cylinder along machine Y. Every station must lie within 0.7 R of the
+ * axis (contact angle <= ~45 deg) and its expected Z inside the march window.
+ */
+function parseProfile(raw: unknown, stations: SurfaceStation[], startZ: number, floorZ: number): CircleProfile | null {
+    if (raw === undefined || raw === null) {
+        return null;
+    }
+    const circle = (raw as { circle?: unknown }).circle as { [k: string]: unknown } | undefined;
+    if (!circle || typeof circle !== 'object') {
+        throw new McpToolError('expected_profile must be {circle: {center_x, center_z_contact, radius, tip_radius?}}.');
+    }
+    const centerX = Number(circle.center_x);
+    const centerZ = Number(circle.center_z_contact);
+    const radius = Number(circle.radius);
+    if (!Number.isFinite(centerX) || !Number.isFinite(centerZ) || !Number.isFinite(radius) || radius <= 0 || radius > 200) {
+        throw new McpToolError('expected_profile.circle needs finite center_x, center_z_contact (toolhead Z with the tip on the axis) and radius (0-200).');
+    }
+    let tipRadius: number;
+    if (circle.tip_radius !== undefined) {
+        tipRadius = Number(circle.tip_radius);
+        if (!Number.isFinite(tipRadius) || tipRadius < 0 || tipRadius > 15) {
+            throw new McpToolError('expected_profile.circle.tip_radius must be 0-15 mm.');
+        }
+    } else {
+        const geometry = probeGeometry();
+        tipRadius = geometry && geometry.tipDiameter !== null ? geometry.tipDiameter / 2 : 0;
+    }
+    const profile: CircleProfile = { kind: 'circle', centerX, centerZContact: centerZ, radius, tipRadius };
+    for (const st of stations) {
+        const z = circleExpectedZ(profile, st.x);
+        if (z === null) {
+            throw new McpToolError(`Station ${st.label} (X${st.x}) lies more than ${CIRCLE_MAX_OFFSET_FRACTION} x radius from the cylinder axis `
+                + `X${centerX} - the tip would glance off the curve (contact angle > 45 deg). Shorten the path.`);
+        }
+        if (z > startZ + 1e-9 || z < floorZ - 1e-9) {
+            throw new McpToolError(`Station ${st.label}: the circle profile expects contact at Z${z}, outside the march window `
+                + `floor Z${floorZ.toFixed(3)} .. start Z${startZ.toFixed(3)}.`);
+        }
+    }
+    return profile;
+}
+
 /** Everything both scans share once the stations exist. */
 function finishPlan(
     kind: SurfaceScanKind,
     stations: SurfaceStation[],
-    args: CommonArgs
+    args: CommonArgs,
+    extraObstacles: ObstacleBox[] = []
 ): Omit<ProbeSurfacePlan, 'path' | 'grid'> {
     const env = toToolError(() => resolveEnvelope(args));
     const worstHopMm = toToolError(() => assertHopsWithin(stations, env.maxHopMm));
@@ -202,6 +274,29 @@ function finishPlan(
         expectedZ = Number(expectedZ.toFixed(3));
     }
 
+    const profile = parseProfile(args.expected_profile, stations, startZ, floorZ);
+    const hopMode = args.hop_mode === undefined || args.hop_mode === null || args.hop_mode === '' ? 'guarded' : String(args.hop_mode);
+    if (hopMode !== 'guarded' && hopMode !== 'stepped') {
+        throw new McpToolError('hop_mode must be "guarded" (hop at last contact + z_safe_delta, contact aborts) or "stepped" (touch-probing traverse that lifts on contact).');
+    }
+    const hopLiftMm = args.hop_lift_mm === undefined ? 2 : Number(args.hop_lift_mm);
+    if (!Number.isFinite(hopLiftMm) || hopLiftMm < 0.5 || hopLiftMm > 10) {
+        throw new McpToolError('hop_lift_mm must be 0.5-10.');
+    }
+
+    // Law 4 (mcp/48): station-1 descent, every hop at its lowest possible
+    // height (floor + z_safe_delta) and every march column down to the floor
+    // are checked against obstacle landmarks and the program's keep-out boxes.
+    const violations = checkMotion(
+        surfaceMotion({ hopZ, absoluteFloorZ: floorZ, zSafeDeltaMm: hopMode === 'stepped' ? hopLiftMm : env.zSafeDeltaMm, hopMode, stations }),
+        [...landmarkStore.obstacleBoxes(), ...extraObstacles],
+        { traverseZ: hopZ }
+    );
+    if (violations.length) {
+        throw new McpToolError(`Scan refused (law 4, landmarks are obstacles): ${describeViolations(violations)}. `
+            + 'Raise floor_z_machine, shorten the path / grid, or have the operator adjust the landmark.');
+    }
+
     return {
         kind,
         tool: kind === 'path' ? 'probe_surface_path' : 'probe_surface_grid',
@@ -225,10 +320,14 @@ function finishPlan(
         sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 30), 10000),
         confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
         slowZoneMm: Math.min(Math.max(Number(args.slow_zone_mm) || 1, 0.3), env.zSafeDeltaMm),
-        expectedZMachine: expectedZ,
+        expectedZMachine: profile && expectedZ === null ? circleExpectedZ(profile, stations[0].x) : expectedZ,
         floorExplicit: args.floor_z_machine !== undefined && args.floor_z_machine !== null && args.floor_z_machine !== '',
+        profile,
+        hopMode,
+        hopLiftMm,
     };
 }
+
 
 export function planProbeSurfacePath(args: CommonArgs & {
     start_x?: unknown;
@@ -240,7 +339,7 @@ export function planProbeSurfacePath(args: CommonArgs & {
     length_mm?: unknown;
     stations?: unknown;
     spacing_mm?: unknown;
-}): ProbeSurfacePlan {
+}, extraObstacles: ObstacleBox[] = []): ProbeSurfacePlan {
     const path = toToolError(() => planPathStations({
         start_x: args.start_x,
         start_y: args.start_y,
@@ -253,7 +352,7 @@ export function planProbeSurfacePath(args: CommonArgs & {
         spacing_mm: args.spacing_mm,
     }));
     return {
-        ...finishPlan('path', path.stations, args),
+        ...finishPlan('path', path.stations, args, extraObstacles),
         path: { start: path.start, end: path.end, unit: path.unit, lengthMm: path.lengthMm, spacingMm: path.spacingMm },
     };
 }
@@ -270,10 +369,10 @@ export function planProbeSurfaceGrid(args: CommonArgs & {
     pitch_mm?: unknown;
     x_count?: unknown;
     y_count?: unknown;
-}): ProbeSurfacePlan {
+}, extraObstacles: ObstacleBox[] = []): ProbeSurfacePlan {
     const grid = toToolError(() => planGridStations(args));
     return {
-        ...finishPlan('grid', grid.stations, args),
+        ...finishPlan('grid', grid.stations, args, extraObstacles),
         grid: { xs: grid.xs, ys: grid.ys, pitchXMm: grid.pitchXMm, pitchYMm: grid.pitchYMm, bounds: grid.bounds },
     };
 }
@@ -310,6 +409,15 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
         `;   ${plan.fineStepMm} mm steps take over down to ${(plan.slowZoneMm + 2 * plan.coarseStepMm).toFixed(1)} mm BELOW it (coarse resumes below that).`,
         `;   Worst press into the probe: ${plan.fineStepMm} mm where the surface lies in the zone; one coarse step (${plan.coarseStepMm} mm)`,
         `;   where it is higher; station 1 without expected_z_machine uses ${coarseStepFor(plan, plan.expectedZMachine !== null)} mm coarse steps (cap 1).`,
+        ...(plan.hopMode === 'stepped' ? [
+            `; HOP MODE stepped: between stations the probe travels at last contact + ${plan.hopLiftMm} mm as a TOUCH-PROBING traverse (1 mm steps, F300,`,
+            `;   probe expected): a contact backs off 1 mm, lifts ${plan.hopLiftMm} mm and continues - the height follows the surface in steps (never above Z${plan.hopZ}).`,
+        ] : []),
+        ...(plan.profile ? [
+            `; EXPECTED PROFILE: cylinder along machine Y, axis X${plan.profile.centerX}, tip-on-axis Z${plan.profile.centerZContact}, radius ${plan.profile.radius}`
+                + ` (tip radius ${plan.profile.tipRadius}); every station's slow zone and max_drop band follow the model, not the previous station:`,
+            `;   ${plan.stations.map((st) => `${st.label} Z${circleExpectedZ(plan.profile as CircleProfile, st.x)}`).join(', ')}`,
+        ] : []),
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)})`
             + ' - re-verified before any motion, and before EVERY march',
         ';',
@@ -544,6 +652,7 @@ function buildResult(plan: ProbeSurfacePlan, results: SurfaceStationResult[], ph
         noContactStations: noContact,
         summary,
         worstConfirmSpreadMm: Number(worstSpread.toFixed(3)),
+        profile: plan.profile,
         envelope: {
             zSafeDeltaMm: plan.zSafeDeltaMm,
             maxHopMm: plan.maxHopMm,
@@ -627,7 +736,7 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
     const results: SurfaceStationResult[] = [];
     // Reference height for the envelope: the last REAL contact (toolhead Z).
     let reference: number | null = null;
-    const hopHeightFor = (ref: number) => Number(Math.min(ref + plan.zSafeDeltaMm, plan.hopZ).toFixed(3));
+    const hopHeightFor = (ref: number) => Number(Math.min(ref + (plan.hopMode === 'stepped' ? plan.hopLiftMm : plan.zSafeDeltaMm), plan.hopZ).toFixed(3));
 
     let stationIndex = 0;
     try {
@@ -678,22 +787,40 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                 // header for the operator's authorisation and its bounds.
                 const previous = plan.stations[station.index - 2];
                 probeFeedService.clearExpectedContact();
-                const segs = hopSegments({ x: previous.x, y: previous.y }, { x: station.x, y: station.y });
-                for (let j = 0; j < segs.length; j++) {
-                    const t0 = Date.now();
-                    await moveMachineSettled(`${plan.tool}:hop:${station.label}`, { x: segs[j].x, y: segs[j].y }, TRAVEL_FEED);
-                    const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
-                    if (sensed.contact) {
-                        throw new ProcedureAbort(`UNEXPECTED CONTACT during the hop to "${station.label}" at `
-                            + `(${segs[j].x}, ${segs[j].y}, ${currentZ}) - the surface rises more than ${plan.zSafeDeltaMm} mm `
-                            + 'above the last contact. Machine held.');
+                if (plan.hopMode === 'stepped') {
+                    const traverse = await steppedTraverseZ(plan.tool, station.label, previous, station, currentZ, {
+                        liftMm: plan.hopLiftMm, maxZ: plan.hopZ, sensorDelayMs: plan.sensorDelayMs,
+                    }, announce);
+                    currentZ = traverse.z;
+                    announce(`hop-${station.label}`, `${station.hopFromPreviousMm} mm to (${station.x}, ${station.y}), stepped traverse: `
+                        + `${traverse.lifts.length} lift(s), arrived at Z${currentZ}`);
+                } else {
+                    const segs = hopSegments({ x: previous.x, y: previous.y }, { x: station.x, y: station.y });
+                    for (let j = 0; j < segs.length; j++) {
+                        const t0 = Date.now();
+                        await moveMachineSettled(`${plan.tool}:hop:${station.label}`, { x: segs[j].x, y: segs[j].y }, TRAVEL_FEED);
+                        const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
+                        if (sensed.contact) {
+                            throw new ProcedureAbort(`UNEXPECTED CONTACT during the hop to "${station.label}" at `
+                                + `(${segs[j].x}, ${segs[j].y}, ${currentZ}) - the surface rises more than ${plan.zSafeDeltaMm} mm `
+                                + 'above the last contact. Machine held.');
+                        }
                     }
+                    announce(`hop-${station.label}`, `${station.hopFromPreviousMm} mm to (${station.x}, ${station.y}) at Z${currentZ} `
+                        + `(last contact + ${plan.zSafeDeltaMm})`);
                 }
-                announce(`hop-${station.label}`, `${station.hopFromPreviousMm} mm to (${station.x}, ${station.y}) at Z${currentZ} `
-                    + `(last contact + ${plan.zSafeDeltaMm})`);
             }
 
-            const env = stationEnvelope(reference === null ? plan.startZMachine : reference, isFirst, plan.startZMachine, {
+            // With a profile the max_drop band hangs below the MODEL's expectation
+            // for this station (a cylinder falls away from the crown faster than
+            // max_drop below the previous contact would allow); hops still use
+            // the last real contact (the law-2 exception is unchanged).
+            const modelZ = plan.profile ? circleExpectedZ(plan.profile, station.x) : null;
+            let envReference = reference === null ? plan.startZMachine : reference;
+            if (modelZ !== null) {
+                envReference = modelZ;
+            }
+            const env = stationEnvelope(envReference, isFirst, plan.startZMachine, {
                 zSafeDeltaMm: plan.zSafeDeltaMm, maxDropMm: plan.maxDropMm, absoluteFloorZ: plan.absoluteFloorZ,
             });
             // Station 1 may search all the way to an EXPLICIT floor_z_machine
@@ -710,7 +837,10 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
             probeFeedService.setExpectedContact(['probe']);
             // Expected contact for the slow zone: the previous real contact,
             // or the caller's expected_z_machine for station 1.
-            const expectedContact = isFirst ? plan.expectedZMachine : reference;
+            let expectedContact = isFirst ? plan.expectedZMachine : reference;
+            if (modelZ !== null) {
+                expectedContact = modelZ;
+            }
             const outcome = await marchDownZ(plan, station, marchStartZ, stationFloorZ, expectedContact, announce);
             let retractTo: number;
             if (outcome === null) {
@@ -789,8 +919,12 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
             }
         }
         if (err instanceof ProcedureAbort) {
-            throw new McpToolError(`Surface ${plan.kind} scan aborted at station ${stationIndex}: ${err.message} `
-                + `Completed stations: ${JSON.stringify(results)} Phases: ${JSON.stringify(phases)}`);
+            // Keep the class (a program runner tells a requested stop from a
+            // fault) and carry the completed stations as the partial result.
+            const partial = { ...buildResult(plan, results, phases), aborted: true, abortedAtStation: stationIndex };
+            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+            throw new Ctor(`Surface ${plan.kind} scan aborted at station ${stationIndex}: ${err.message} `
+                + `${results.filter((r) => r.status === 'contact').length} station(s) measured before the abort are on the job record.`, partial);
         }
         throw err;
     } finally {

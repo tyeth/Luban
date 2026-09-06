@@ -6,6 +6,7 @@ import { calibrationStore } from '../calibration';
 import { Landmark, landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
+import { GEOMETRY_FIELDS, geometrySettings, setGeometryValues } from '../rotaryGeometry';
 import { getToolSetterConfig } from '../toolSetter';
 import { readAppMachineSettings } from './machine';
 
@@ -80,6 +81,51 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
     });
 
     registry.register({
+        name: 'set_probe_geometry',
+        description: 'Store the jig/tool constants a rotary probe_program may reference as the "axis" namespace: '
+            + 'rotary_axis_x (machine X of the axis line), rotary_axis_z_physical (PHYSICAL machine Z of the axis, '
+            + 'e.g. from an opposite-face pair: (topA + topB)/2 - probe length), probe_effective_length (toolhead Z at '
+            + 'contact minus this = surface; run_tool_setter accept_probe_contact measures it), probe_tip_diameter. '
+            + 'Operator-stated or MEASURED values only, with the reason - like set_landmark. Omit a field to leave it; '
+            + 'null clears it. None of these is a prerequisite for probing: only a program that references axis.* '
+            + 'needs them; B0-only, stationary or off-rotary work needs nothing here. Stock size is never stored '
+            + '(a rotation\'s swept radius is a per-program argument).',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                rotary_axis_x: { type: ['number', 'null'], description: 'Machine X of the rotary axis line.' },
+                rotary_axis_z_physical: { type: ['number', 'null'], description: 'Physical machine Z of the axis (not a contact Z).' },
+                probe_effective_length: { type: ['number', 'null'], description: 'Probe effective length in mm (this fitting).' },
+                probe_tip_diameter: { type: ['number', 'null'], description: 'Probe tip diameter in mm.' },
+                reason: { type: 'string', description: 'How the values were obtained (which job / measurement / operator statement).' },
+            },
+            required: ['reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required: say how the values were measured or who stated them.');
+            }
+            const values: { [field: string]: unknown } = {};
+            for (const spec of GEOMETRY_FIELDS) {
+                if (args[spec.field] !== undefined) {
+                    values[spec.field] = args[spec.field];
+                }
+            }
+            if (!Object.keys(values).length) {
+                throw new McpToolError(`Nothing to set: pass one or more of ${GEOMETRY_FIELDS.map((f) => f.field).join(', ')}.`);
+            }
+            try {
+                const outcome = setGeometryValues(values, reason);
+                return { ...outcome, geometry: geometrySettings() };
+            } catch (err) {
+                throw new McpToolError((err as Error).message);
+            }
+        },
+    });
+
+    registry.register({
         name: 'delete_landmark',
         description: 'Delete one stored landmark by id or name.',
         inputSchema: {
@@ -131,6 +177,9 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 installedModules: (readAppMachineSettings() || { modules: [] }).modules,
                 probeFeed: probeFeedService.status(),
                 toolSetter: getToolSetterConfig(),
+                // Operator-measured jig/tool constants (Settings -> MCP Server ->
+                // Rotary and probe geometry); programs read them as `axis.*`.
+                geometry: geometrySettings(),
             };
         },
     });

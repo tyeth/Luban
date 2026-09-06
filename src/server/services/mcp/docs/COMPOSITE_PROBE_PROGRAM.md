@@ -30,24 +30,24 @@ plus horizontal side + end marches at two rotations. Today this is 18 approvals 
    of start_z even when floor_z_machine is explicitly lower (d7ac9247838e). Add
    `first_station_search_mm` (bounded by the floor) or honour the explicit floor for station 1
    only when no expected_z is given. With (3) this is mostly moot but still a footgun.
-5. **Multi-segment paths in one op**: `segments: [{start, end}, ...]` sharing a reference, so
+5. *(open)* **Multi-segment paths in one op**: `segments: [{start, end}, ...]` sharing a reference, so
    W-E from the measured centre outward to both edges is one op (today two jobs, or an
    off-stock first station aborts - 1dc39a8210a4).
-6. **Tip radius as configuration** (`probeTipDiameterMm` in the tool-setter config): side and
+6. *(done mcp/48: `mcpProbeTipDiameter` + `axis.tip_radius`, widths reported with the tip)* **Tip radius as configuration** (`probeTipDiameterMm` in the tool-setter config): side and
    end marches report contact centre AND corrected face; width/thickness/end position come out
    corrected. Unpinned today (~2.5 mm per README, inconsistent).
-7. **Stock-geometry reduction in the result**: faces keyed by B; per face: mean/slope/flatness;
+7. *(done mcp/48: `stockGeometry.ts` → `result.derived`)* **Stock-geometry reduction in the result**: faces keyed by B; per face: mean/slope/flatness;
    across faces: section dimensions (opposite-face pair means), axis height, centring offsets,
    yaw and pitch of the stock centreline (from side pairs and pair-mean slopes), end squareness.
    All the arithmetic done by hand in REPORT-four-face-scan-2026-09-05.md.
-8. **Event budget**: a full program is ~6,000-8,000 events at today's verbosity (537 batches x
+8. *(done mcp/48: plan estimate + staging refusal; limit is a setting)* **Event budget**: a full program is ~6,000-8,000 events at today's verbosity (537 batches x
    2 events per 11-station scan + readings). Either per-op event logs, or `mcpJobEventLimit`
    default 10,000, or drop the per-batch `response` payload behind a verbosity flag. Summaries
    and per-op results must never be trimmed.
 9. **Abort semantics**: any op failure (no contact at station 1, hop-guard contact, crash
    alarm, B settle failure) -> raise to traverse Z, mark the op failed, stop the program, keep
    all earlier op results. Optional `on_fail: skip|stop` per op for overtravel-type ops.
-10. **Confirm page for long programs**: live progress (op k of n, station, ETA from the timing
+10. *(partly: budget and B schedule on the page; live progress open)* **Confirm page for long programs**: live progress (op k of n, station, ETA from the timing
     table), the B schedule, total extents, and the token TTL is irrelevant once
     wait_for_approval_ms hands off - but the page should keep working as a monitor for the
     ~40-70 min run.

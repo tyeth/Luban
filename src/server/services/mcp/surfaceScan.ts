@@ -415,6 +415,9 @@ export interface ZSummary {
     zMean: number;
     highest: string;
     lowest: string;
+    /** Machine XY of the highest / lowest contact (mcp/48: locates a cylinder's crown or a face's high edge by reference). */
+    highestAt: { x: number; y: number };
+    lowestAt: { x: number; y: number };
 }
 
 export function summarizeZ(samples: ContactSample[]): ZSummary | null {
@@ -441,7 +444,41 @@ export function summarizeZ(samples: ContactSample[]): ZSummary | null {
         zMean: round3(sum / samples.length),
         highest: hi.label,
         lowest: lo.label,
+        highestAt: { x: hi.x, y: hi.y },
+        lowestAt: { x: lo.x, y: lo.y },
     };
+}
+
+// ---------------------------------------------------------------- expected profiles
+
+/**
+ * Expected contact profile of a CYLINDER lying along machine Y (the rotary
+ * axis): a circle in the XZ plane. `centerZContact` is the toolhead Z with
+ * the probe tip on the axis line (axis.z_contact); `radius` the stock
+ * radius; `tipRadius` the probe tip's. Toolhead Z at contact over lateral
+ * offset d from the axis: the tip sphere's centre rides a circle of radius
+ * R + rt about the axis, and the contact Z convention (toolhead Z with the
+ * tip's lowest point on the surface) subtracts rt again -
+ * z(d) = centerZContact + sqrt((R + rt)^2 - d^2) - rt, so z(0) = centre + R.
+ */
+export interface CircleProfile {
+    kind: 'circle';
+    centerX: number;
+    centerZContact: number;
+    radius: number;
+    tipRadius: number;
+}
+
+/** Contact angle limit: beyond ~45 deg from the crown the tip glances and the side channel would read a crash. */
+export const CIRCLE_MAX_OFFSET_FRACTION = 0.7;
+
+export function circleExpectedZ(profile: CircleProfile, x: number): number | null {
+    const d = x - profile.centerX;
+    const r = profile.radius + profile.tipRadius;
+    if (Math.abs(d) > profile.radius * CIRCLE_MAX_OFFSET_FRACTION + 1e-9 || Math.abs(d) >= r) {
+        return null;
+    }
+    return round3(profile.centerZContact + Math.sqrt(r * r - d * d) - profile.tipRadius);
 }
 
 export interface LineFit {

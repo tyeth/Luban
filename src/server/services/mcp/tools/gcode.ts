@@ -4,10 +4,11 @@ import * as fs from 'fs-extra';
 
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
-import { McpJob, approvalHandoff, jobManager } from '../jobs';
+import { McpJob, TERMINAL_JOB_STATES, approvalHandoff, jobManager } from '../jobs';
 import { summarizeJobTiming } from '../jobTiming';
 import { matchFrame } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
+import { clearProcedureStop, procedureStopRequested, requestProcedureStop } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
 import { validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
@@ -390,6 +391,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 // result. The outcome lands on the job record; this call waits
                 // a bounded time and returns the result if it arrived, else a
                 // "running" status to long-poll with get_gcode_job_status.
+                clearProcedureStop();
                 const finished = job.runner()
                     .then((outcome) => {
                         // Where the time went, from the job's own events, so
@@ -402,14 +404,28 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         return { ok: true as const, outcome };
                     })
                     .catch((err: Error) => {
-                        job.state = 'start_failed';
+                        // What the procedure measured before it ended stays on
+                        // the record (stations, contacts, completed ops).
+                        const partial = (err as { partial?: object }).partial;
+                        if (partial) {
+                            job.result = { ...partial, timing: summarizeJobTiming(job.events) };
+                        }
                         job.error = err.message;
                         job.endedAt = Date.now();
-                        jobManager.appendEvent(job, 'failed', { note: err.message });
-                        log.error(`Procedure job ${job.id} failed: ${err.message}`);
+                        const stop = procedureStopRequested();
+                        if (stop) {
+                            job.state = 'stopped';
+                            jobManager.appendEvent(job, 'stopped', { note: `stopped on request (${stop.reason}): ${err.message}` });
+                            log.info(`Procedure job ${job.id} stopped on request: ${err.message}`);
+                        } else {
+                            job.state = 'start_failed';
+                            jobManager.appendEvent(job, 'failed', { note: err.message });
+                            log.error(`Procedure job ${job.id} failed: ${err.message}`);
+                        }
                         return { ok: false as const, error: err.message };
                     })
                     .finally(() => {
+                        clearProcedureStop();
                         if (jobManager.getActive() === job) {
                             jobManager.setActive(null);
                         }
@@ -806,19 +822,54 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
     registry.register({
         name: 'stop_gcode_job',
-        description: 'Stop the running job on the machine. Stopping needs no confirmation.',
+        description: 'Stop a running job. Stopping needs no confirmation. A PROCEDURE (probe_*, probe_program, '
+            + 'run_tool_setter, survey) is a server-driven loop, so it stops at the next step boundary (within one '
+            + '<= 1 mm step or sensor window), raises the head to the traverse height and keeps every completed '
+            + 'station / contact / op on the job record (result, state "stopped"); this call waits up to wait_ms for '
+            + 'that. A FILE job is stopped on the machine (firmware stop_print). Result: {ok, stopped, stopping, job}.',
         inputSchema: {
             type: 'object',
             properties: {
-                job_id: { type: 'string', description: 'Job to mark stopped; the machine stop is global.' },
+                job_id: { type: 'string', description: 'Job to stop (procedures: the running procedure; file jobs: the machine stop is global).' },
+                wait_ms: { type: 'number', description: 'Procedures: how long to wait for the stop to complete (default 20000, max 120000).' },
             },
             required: ['job_id'],
             additionalProperties: false,
         },
-        handler: async (args: { job_id?: string }) => {
+        handler: async (args: { job_id?: string; wait_ms?: number }) => {
             const job = jobManager.get(String(args.job_id || ''));
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
+            }
+            if (job.kind === 'procedure') {
+                if (TERMINAL_JOB_STATES.includes(job.state)) {
+                    return { ok: true, stopped: true, stopping: false, note: `Procedure already ${job.state}.`, job: jobManager.describe(job) };
+                }
+                if (job.state !== 'started') {
+                    // Not running yet: withdraw it so the approval cannot start it later.
+                    job.state = 'stopped';
+                    job.endedAt = Date.now();
+                    jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
+                    return { ok: true, stopped: true, stopping: false, note: 'Procedure withdrawn before it started.', job: jobManager.describe(job) };
+                }
+                const request = requestProcedureStop('stop_gcode_job by the agent');
+                jobManager.appendEvent(job, 'stop-requested', { note: 'stop requested by the agent; the runner stops at the next step boundary and raises' });
+                const waitMs = Math.min(Math.max(Number(args.wait_ms) || 20000, 0), 120000);
+                const deadline = Date.now() + waitMs;
+                while (!TERMINAL_JOB_STATES.includes(job.state) && Date.now() < deadline) {
+                    await sleep(250);
+                }
+                const stopped = TERMINAL_JOB_STATES.includes(job.state);
+                return {
+                    ok: true,
+                    stopped,
+                    stopping: !stopped,
+                    requestedAt: request.requestedAt,
+                    note: stopped
+                        ? `Procedure ${job.state}; completed measurements are in result (${job.error || 'no error'}).`
+                        : `Stop requested ${Date.now() - request.requestedAt} ms ago; the runner is finishing its current step and raising. Long-poll get_gcode_job_status.`,
+                    job: jobManager.describe(job),
+                };
             }
             const channel = getJobChannel();
             if (typeof channel.stopGcodeJob !== 'function') {

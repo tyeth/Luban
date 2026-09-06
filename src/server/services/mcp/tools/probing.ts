@@ -7,7 +7,7 @@ import path from 'path';
 import DataStorage from '../../../DataStorage';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { captureFrame } from '../camera';
-import { jobManager } from '../jobs';
+import { jobEventLimit, jobManager } from '../jobs';
 import { describeProbeCirclePlanAsGcode, planProbeCircle, runProbeCircleProcedure } from '../probeCircle';
 import { describeProbePlanAsGcode, planProbePoint, runProbePointProcedure } from '../probeTool';
 import { describeProbeSequencePlanAsGcode, planProbeSequence, runProbeSequenceProcedure } from '../probeSequence';
@@ -18,6 +18,7 @@ import {
     planProbeSurfacePath,
     runProbeSurfaceProcedure,
 } from '../probeSurface';
+import { describeProbeOutlinePlanAsGcode, planProbeOutline, runProbeOutlineProcedure } from '../probeOutline';
 import { describeProbeProgramAsGcode, planProbeProgram, runProbeProgramProcedure } from '../probeProgram';
 import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
@@ -182,6 +183,12 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
                             dy: { type: 'number', description: 'probe: direction Y component.' },
                             dz: { type: 'number', description: 'probe: direction Z component (<= 0).' },
                             max_travel_mm: { type: 'number', description: 'probe: hard travel limit (1-150).' },
+                            on_miss: {
+                                type: 'string',
+                                enum: ['continue', 'abort'],
+                                description: 'probe: reaching max_travel_mm without contact records a no_contact result and continues '
+                                    + '(default) or aborts the sequence. A later reference to a missed probe is refused at that op.',
+                            },
                         },
                         required: ['kind'],
                         additionalProperties: false,
@@ -376,6 +383,24 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
                 + 'expected_z_machine for station 1) and fine steps take over, down to slow_zone + 2 x coarse below it '
                 + '(coarse resumes lower). Caps the press into the probe at one fine step where the surface is where '
                 + 'expected. Default 1, min 0.3, max z_safe_delta_mm.',
+        },
+        hop_mode: {
+            type: 'string',
+            enum: ['guarded', 'stepped'],
+            description: 'Travel between stations: "guarded" (default) hops at last contact + z_safe_delta_mm expecting no contact '
+                + '(a contact aborts); "stepped" travels at last contact + hop_lift_mm as a touch-probing traverse (1 mm steps, '
+                + 'probe expected) that backs off, lifts hop_lift_mm and continues on contact - the height follows the surface '
+                + 'in steps, gentle over a slope or one lift at the wall of a hole, instead of a fixed clearance.',
+        },
+        hop_lift_mm: { type: 'number', description: 'stepped hop_mode: lift per contact and travel height above the last contact, default 2 (0.5-10).' },
+        expected_profile: {
+            type: 'object',
+            description: 'Optional surface MODEL for curved stock: {"circle": {"center_x", "center_z_contact", "radius", '
+                + '"tip_radius"?}} = a cylinder along machine Y (the rotary axis) with the given axis X, toolhead Z with the '
+                + 'tip on the axis (axis.z_contact when the geometry is configured) and stock radius (operator-bounded). '
+                + 'Every station then gets its own expected contact Z from the model (slow zone + max_drop band follow it, '
+                + 'not the previous station); stations more than 0.7 x radius off the axis are refused (the tip would '
+                + 'glance). In a probe_program the numbers may be references.',
         },
         expected_z_machine: {
             type: 'number',
@@ -651,15 +676,94 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
     });
 
     registry.register({
+        name: 'probe_stock_outline',
+        description: 'Stage ONE approved procedure that finds a block\'s top, true outline and CENTRE from an ESTIMATE of '
+            + 'where it is and how big it is - no re-probing the centre for every side. 1) TOP: -Z marches at top_points '
+            + '(default 3 along the longer axis around center_x/center_y) from the operator-stated start_z_machine to '
+            + 'floor_z_machine; the HIGHEST contact is the top and a sample lower by more than hole_tolerance_mm (default 2) '
+            + 'is a hole and ignored (a first probe landing in a drilled hole does not define the surface); between points '
+            + 'the probe travels close above the surface as a stepped traverse that lifts hop_lift_mm on contact. 2) SIDES '
+            + '(default all four): horizontal marches toward the stock from overextend_mm (default 5) OUTSIDE the estimate '
+            + 'at top - side_depth_mm (default 2), points_per_side (default 3, midpoint first) per side, each up to '
+            + 'side_max_travel_mm (default 25 - generous on purpose: the combined error of the centre and width estimate '
+            + 'must fit inside it, a short march silently misses the face); a march that finds nothing records no_contact '
+            + 'and the procedure continues. 3) FIT: per-side mean and slope -> centre (machine AND work frame), size '
+            + 'centre-to-centre and PHYSICAL (minus the tip diameter when set_probe_geometry stored it - external faces lie '
+            + 'one tip radius inside their contacts), yaw. Result: top, topSamples, sides, fit, centerMachine, centerWork, '
+            + 'sizeMm, sizePhysicalMm, yawDeg, lifts. Also available as probe_program op kind "stock_outline".',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                center_x: { type: 'number', description: 'Estimated stock centre, machine X (default: current X).' },
+                center_y: { type: 'number', description: 'Estimated stock centre, machine Y (default: current Y).' },
+                size_x_mm: { type: 'number', description: 'REQUIRED estimated size along machine X (2-400).' },
+                size_y_mm: { type: 'number', description: 'REQUIRED estimated size along machine Y (2-400).' },
+                overextend_mm: { type: 'number', description: 'Side marches start this far outside the estimated face, default 5 (3-60).' },
+                side_max_travel_mm: { type: 'number', description: 'Travel of each side march from its start, default max(25, 2 x overextend + 10) (5-150). Must cover overextend + width uncertainty + centre uncertainty + margin; 25 suits a few mm of each.' },
+                start_z_machine: { type: 'number', description: 'REQUIRED toolhead machine Z above the top where the -Z search starts (operator-stated or from an earlier contact; never a guess).' },
+                floor_z_machine: { type: 'number', description: 'REQUIRED deepest toolhead Z the top search may reach (<= 150 mm below start).' },
+                top_points: { type: 'number', description: 'Top samples: 1-5, default 3 (centre, +/- a quarter of the longer axis; 4-5 add the shorter axis).' },
+                hole_tolerance_mm: { type: 'number', description: 'A top sample lower than the highest by more than this is a hole, default 2.' },
+                side_depth_mm: { type: 'number', description: 'Side marches run at (measured top) - this, default 2 (1-40).' },
+                points_per_side: { type: 'number', description: '1-4 marches per side over the middle half of the side, midpoint first then away from the corners, default 3.' },
+                sides: { type: 'array', items: { type: 'string', enum: ['west', 'east', 'south', 'north'] }, description: 'Which sides to probe (west marches +X, east -X, south +Y, north -Y). Default all four.' },
+                hop_lift_mm: { type: 'number', description: 'Stepped traverse lift per contact and height above the last contact, default 2 (0.5-10).' },
+                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger).' },
+                fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1.' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300, floor 30 (GPIO: 50).' },
+                confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per contact, default 3 (1-10).' },
+                reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
+            },
+            required: ['size_x_mm', 'size_y_mm', 'start_z_machine', 'floor_z_machine', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeOutline(args as Parameters<typeof planProbeOutline>[0]);
+            const envelope = `; reason: ${reason}
+${describeProbeOutlinePlanAsGcode(plan)}`;
+            const validation = validateGcode(envelope);
+            const job = jobManager.submit(
+                envelope,
+                `stock-outline ${plan.topPoints.length}top/${plan.sidePoints.length}sides - ${reason.slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeOutlineProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan,
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url and review the whole procedure (top points, every side start and '
+                    + 'travel limit, the stepped traverses), then start with start_gcode_job wait_for_approval_ms. The result '
+                    + 'carries centerMachine / centerWork and the fitted size; the true faces are one tip radius beyond the contacts.',
+            };
+        },
+    });
+
+    registry.register({
         name: 'probe_program',
         description: 'Stage a COMPOSITE probing program for ONE human approval: an ordered list of operations - '
             + 'rotate_b (turn the rotary axis to an absolute B, toolhead at/above the traverse height), '
             + 'surface_path, surface_grid and sequence (the same arguments as the standalone tools) - run by one '
             + 'runner that hands the machine from op to op, each ending raised at the traverse height. Numbers an op '
-            + 'cannot know at staging are REFERENCES to earlier results: {"from": "<opId>.<path>", "plus"?: n, '
-            + '"minus"?: n, "between": [low, high]} - e.g. expected_z_machine: {"from": "c90.top.z", "between": '
-            + '[195, 240]} where c90 is a sequence op with a probe named "top", or start_z_machine: {"from": '
-            + '"ns90.summary.zMean", "plus": 7, "between": [200, 250]}. The bounds are REQUIRED (law 3): the confirm '
+            + 'cannot know at staging are REFERENCES to earlier results: {"from": "<opId>.<path>", "plus"?, "minus"?, '
+            + '"between": [low, high]} - e.g. expected_z_machine: {"from": "c90.top.z", "between": [195, 240]} where c90 '
+            + 'is a sequence op with a probe named "top" (.x/.y/.z read contactMachine), or start_z_machine: {"from": '
+            + '"ns90.summary.zMean", "plus": 7, "between": [200, 250]}. Two-operand forms: {"mid": [a, b]} = (a+b)/2 '
+            + '(stock centre from two side contacts), {"diff": [a, b], "scale"?: 0.5} = (a-b)*scale (width, half-width), '
+            + '{"min"|"max": [a, b, ...]}; "plus"/"minus" may be a number or a path. Once set_probe_geometry has stored '
+            + 'the rotary axis and probe length, the seeded namespace "axis" offers axis.x, axis.z_physical, axis.z_contact '
+            + '(toolhead Z with the tip on the axis), axis.tip_radius, axis.probe_length - so the B90 face height is '
+            + '{"diff": ["s0.east.x", "s0.west.x"], "scale": 0.5, "plus": "axis.z_contact", "between": [...]}. A program that '
+            + 'references only its own earlier ops (any B0-only, stationary or off-rotary survey) needs NO geometry. '
+            + 'The bounds are REQUIRED (law 3): the confirm '
             + 'page shows them with a preview at the mid-point and the runner refuses the op (stopping the program '
             + 'raised, keeping earlier results) if the value resolves outside them. A failed op stops the program '
             + 'unless on_fail: "skip". Result: per-op status and the standalone tool\'s result object (stations, fits, '
@@ -671,14 +775,27 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 name: { type: 'string', description: 'Program name shown to the operator.' },
                 ops: {
                     type: 'array',
-                    description: 'Ordered operations. Each: {id, kind, on_fail?, ...args}. kinds: rotate_b {b, require_z_at_least?}; '
-                        + 'surface_path / surface_grid / sequence: the standalone tool arguments, where start_z_machine, '
-                        + 'expected_z_machine, floor_z_machine and sequence descend z may be references.',
+                    description: 'Ordered operations. Each: {id, kind, on_fail?, ...args}. kinds: rotate_b {b, require_z_at_least?, '
+                        + 'swept_radius_mm? (largest reach of THIS stock and clamping about the axis - adds a tip-outside-the-cylinder check)}; '
+                        + 'surface_path / surface_grid / sequence / stock_outline: the standalone tool arguments, where ANY number (start_z_machine, '
+                        + 'expected_z_machine, floor_z_machine, start_x/end_x, sequence hop x/y and descend z, expected_profile.circle.*) '
+                        + 'may be a reference; group {id, for_b: [0, 90, 180, 270], ops: [...]} = the inner ops run once per angle '
+                        + `after a rotate_b to it, with the token "${'$'}{b}" in any string replaced by the angle and inner ids without it `
+                        + 'suffixed "_b<angle>" (references between them are rewritten to match). Up to 80 ops after expansion.',
                     items: { type: 'object' },
                     minItems: 1,
-                    maxItems: 40,
+                    maxItems: 80,
                 },
                 reason: { type: 'string', description: 'Shown to the operator: what is being measured and why.' },
+                keep_out: {
+                    type: 'array',
+                    description: 'Transient obstacle boxes for THIS clamping (chuck jaws, tailstock): [{name, machine: {x0, y0, x1, y1}, '
+                        + 'clearance_z}] with clearance_z the minimum safe TOOLHEAD machine Z over the box. Checked together with '
+                        + 'the stored landmarks against every hop, descent column and march of every op at staging (law 4); shown on '
+                        + 'the confirm page; never persisted.',
+                    items: { type: 'object' },
+                    maxItems: 20,
+                },
             },
             required: ['name', 'ops', 'reason'],
             additionalProperties: false,
@@ -689,7 +806,15 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 throw new McpToolError('reason is required; it is shown to the operator.');
             }
             probeFeedService.assertNoOvertravel();
-            const plan = planProbeProgram({ name: args.name, ops: args.ops });
+            const plan = planProbeProgram({ name: args.name, ops: args.ops, keep_out: args.keep_out });
+            // W6: a program of 30+ minutes must fit its own job event log, or the
+            // record the operator approved is lost while it runs.
+            const limit = jobEventLimit();
+            if (plan.eventBudget > limit) {
+                throw new McpToolError(`This program will write about ${plan.eventBudget} job events but the job event log keeps ${limit}. `
+                    + `Raise it to at least ${Math.ceil(plan.eventBudget * 1.2 / 1000) * 1000} first (Settings -> MCP Server -> Diagnostic buffers, `
+                    + 'or LUBAN_MCP_JOB_EVENT_LIMIT), then stage again.');
+            }
             const envelope = `; reason: ${reason}
 ${describeProbeProgramAsGcode(plan)}`;
             const validation = validateGcode(envelope);
@@ -709,6 +834,11 @@ ${describeProbeProgramAsGcode(plan)}`;
                     rotations: plan.rotations,
                     hopZ: plan.hopZ,
                     staged: plan.staged,
+                    keepOut: plan.keepOut,
+                    axis: plan.seeds.axis || null,
+                    groups: plan.groups,
+                    eventBudget: plan.eventBudget,
+                    jobEventLimit: limit,
                 },
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: 'Ask the operator to open confirm_url and review the WHOLE program: every operation\'s envelope, every '

@@ -81,7 +81,63 @@ export function takeStepTrace(since: number | null): string | undefined {
     return text;
 }
 
-export class ProcedureAbort extends Error {}
+export class ProcedureAbort extends Error {
+    /** Partial result (completed stations / ops) so an abort never loses what was measured. */
+    public partial?: object;
+
+    public constructor(message: string, partial?: object) {
+        super(message);
+        this.partial = partial;
+    }
+}
+
+/** Thrown at the first step boundary after requestProcedureStop(): a graceful, operator/agent-initiated stop. */
+export class ProcedureStopped extends ProcedureAbort {}
+
+// ---------------------------------------------------------------- cooperative stop
+//
+// A procedure is a server-driven loop of <= 1-5 mm settled steps, not a
+// firmware print job: the machine's stop_print cannot end it (job
+// 5ad5fcce6b3a, 2026-09-06 - three stop_gcode_job calls answered ok:false
+// while the scan kept stepping). stop_gcode_job now records a stop REQUEST;
+// every motion primitive checks it before sending, so the procedure stops at
+// the next step boundary (within one <= 1 mm step or one sensor window),
+// throws ProcedureStopped, and the runner's normal abort path raises the head
+// to the traverse height and keeps every completed result. The first check
+// throws and marks the request acknowledged so the abort path's own moves
+// (raise, retreat) are not refused; a program runner sees the request and
+// stops regardless of on_fail.
+interface StopRequest {
+    reason: string;
+    requestedAt: number;
+    acknowledged: boolean;
+}
+
+let stopRequest: StopRequest | null = null;
+
+export function requestProcedureStop(reason: string): StopRequest {
+    if (!stopRequest) {
+        stopRequest = { reason, requestedAt: Date.now(), acknowledged: false };
+    }
+    return stopRequest;
+}
+
+export function clearProcedureStop(): void {
+    stopRequest = null;
+}
+
+export function procedureStopRequested(): StopRequest | null {
+    return stopRequest;
+}
+
+/** Called at every step boundary: throws ProcedureStopped once per request. */
+export function checkProcedureStop(): void {
+    if (stopRequest && !stopRequest.acknowledged) {
+        stopRequest.acknowledged = true;
+        throw new ProcedureStopped(`Stopped on request (${stopRequest.reason}) at a step boundary, `
+            + `${Date.now() - stopRequest.requestedAt} ms after the request. Raising to the traverse height; completed results kept.`);
+    }
+}
 
 export interface StepResult {
     contact: boolean;
@@ -421,6 +477,7 @@ export async function moveMachineSettled(
     feed: number,
     options: MoveOptions = {}
 ): Promise<void> {
+    checkProcedureStop();
     probeFeedService.motionBegin();
     try {
         await moveMachineSettledUnguarded(tool, target, feed, options);
@@ -448,6 +505,7 @@ export async function senseAfter(
     stepIssuedAt: number,
     delayMs: number
 ): Promise<StepResult> {
+    checkProcedureStop();
     const list = Array.isArray(channels) ? channels : [channels];
     const startedAt = Date.now();
     traceMark('sense-start');
@@ -589,6 +647,7 @@ const ROTATE_TIMEOUT_MS = 120000;
  * armed, no contact is expected).
  */
 export async function rotateB(tool: string, targetDeg: number, requireZAtLeast: number): Promise<{ from: number | null; to: number; verifiedBy: 'echo' | 'heartbeat' }> {
+    checkProcedureStop();
     probeFeedService.assertNoOvertravel();
     const known = knownMachinePosition();
     if (known.position.z === null || known.position.z < requireZAtLeast - 1e-9) {

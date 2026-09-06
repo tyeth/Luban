@@ -84,7 +84,6 @@ interface McpStatus {
         source: 'env' | 'config' | 'default';
     };
 }
-
 const MQTT_FIELDS: Array<{ name: keyof McpMqttSettings['values']; labelKey: string; placeholder?: string; channel?: string }> = [
     { name: 'host', labelKey: 'key-App/Settings/McpServer-MQTT host', placeholder: 'io.adafruit.com' },
     { name: 'port', labelKey: 'key-App/Settings/McpServer-MQTT port', placeholder: '8883 (TLS)' },
@@ -167,7 +166,6 @@ const McpServer: React.FC = () => {
                 if (body.approval) {
                     setApprovalHandoffAgent(body.approval.handoff !== 'code');
                 }
-
                 const { inverted: mqttInvertedNames, ...mqttValues } = body.mqtt.values;
                 setMqtt({ ...mqttValues });
                 setInverted(parseInvertedFlags(mqttInvertedNames));

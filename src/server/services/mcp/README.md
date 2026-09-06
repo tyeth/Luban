@@ -312,10 +312,131 @@ stopping the program raised and keeping every earlier result under `result.ops`.
 "skip"` records a failure and continues (rotations always stop). Each op result is the
 standalone tool's result object. The four-face survey that took 18 approvals is one program:
 `rotate_b 90 → sequence (centre) → surface_path N–S (expected from the centre) → surface_path
-W–E → sequence (sides) → rotate_b 180 → …`. Still to do from the brief
-([docs/COMPOSITE_PROBE_PROGRAM.md](docs/COMPOSITE_PROBE_PROGRAM.md)): multi-segment paths in
-one op (stage two path ops for now), tip diameter as configuration, the stock-geometry
-reduction (section size, centring, yaw), live progress on the confirm page.
+W–E → sequence (sides) → rotate_b 180 → …`.
+
+**New stock from the jig alone (mcp/48, 2026-09-06).** What the manual four-face survey did by
+hand is now in the program tooling (work plan and hardware test order in
+[docs/NEW_STOCK_SURVEY_TODO.md](docs/NEW_STOCK_SURVEY_TODO.md)):
+
+- **Two-operand references** (`programRefs.ts`): `{mid: [a, b]}` = (a+b)/2 (stock centre from
+  two side contacts), `{diff: [a, b], scale: 0.5}` = (a−b)·scale (width, half-width),
+  `{min|max: [...]}`; `plus`/`minus` may be a number or a path, so "axis + half-width" is one
+  reference: `{diff: ["s0.east.x", "s0.west.x"], scale: 0.5, plus: "axis.z_contact", between:
+  [210, 235]}`. `.x/.y/.z` on a sequence probe read `contactMachine`. References may sit at
+  any depth of an op's arguments (`steps[1].z`, `expected_profile.circle.center_x`). Bounds
+  stay required; the page prints the formula (`describeRef`) and the runner the values.
+- **Rotary axis and probe geometry through the MCP surface** (`rotaryGeometry.ts`, tool
+  `set_probe_geometry` — operator-stated or MEASURED values with a reason, like `set_landmark`;
+  env overrides `LUBAN_MCP_ROTARY_AXIS_X/_Z`, `LUBAN_MCP_PROBE_LENGTH`,
+  `LUBAN_MCP_PROBE_TIP_DIAMETER`; read back in `get_stored_state → geometry`): axis X and
+  PHYSICAL axis Z, probe effective length and tip diameter. Programs read them as the seeded
+  namespace **`axis`** (`axis.x`, `axis.z_physical`, `axis.z_contact` = axis Z + probe length,
+  `axis.tip_radius`, `axis.probe_length`). **Never a prerequisite**: only a reference to
+  `axis.*` needs them (then a missing value is a staging error naming the tool); B0-only,
+  stationary and off-rotary work needs nothing. **Stock size is not stored anywhere** — it is a
+  property of the stock, not the jig — so a rotation takes an optional per-program
+  `swept_radius_mm` for the tip-outside-the-cylinder check. (A first cut put these in the app's
+  settings pane with a "max stock radius"; the operator rejected it on 2026-09-06 and it is
+  gone.) Measured values this jig: axis X ≈ 169.7, physical Z ≈ 112.4, probe 71.3, tip ≈ 2.5 —
+  re-measure after any probe re-fit or rotary move.
+- **Keep-out at plan time** (`envelopeChecks.ts`, law 4 in the planners): every `probe_sequence`
+  hop / descend column / march and every surface-scan station-1 descent, hop (at its lowest
+  possible height, floor + z_safe_delta) and station column is checked against the obstacle
+  landmarks (`clearanceZ` set) and the program's transient **`keep_out`** boxes (`[{name,
+  machine: {x0, y0, x1, y1}, clearance_z}]`, this clamping's chuck jaws / tailstock, shown on
+  the page, never persisted). Two obstacle semantics: stored landmarks are **crossing**
+  obstacles — their clearance forbids entering or leaving the box on a low path, exactly what the
+  direct XY guard enforces, while a hop, column or march wholly inside the box is the approved
+  procedure (the `rotary-axis` landmark covers the whole stock; probing it is the job — the first
+  cut treated it as a volume and refused every descent, caught by the on-box agent 2026-09-06);
+  program `keep_out` boxes are **volumes** nothing enters, not even a column. A hit refuses
+  staging naming the step, the obstacle and the Z; the check re-runs when references resolve at
+  run time. `rotate_b` with `swept_radius_mm` additionally refuses if the tip is inside that
+  cylinder (`insideSweptCylinder`).
+- **Discovery**: `summary.highestAt` / `lowestAt` (machine XY) locate a cylinder's crown or a
+  face's high edge by reference; `surface_path expected_profile: {circle: {center_x,
+  center_z_contact, radius, tip_radius?}}` models a cylinder along machine Y — each station's
+  slow zone and max_drop band follow `z(d) = c + √((R+rt)² − d²) − rt`, stations beyond 0.7 R
+  off the axis are refused (the tip would glance). Unknown height needs no new op: a sequence
+  whose `descend` is `axis.z_contact + (largest possible radius + 5)` and whose probe travels
+  that radius + 10 (segmented descent, 1 mm coarse in the last band).
+- **`group`**: `{id, kind: "group", for_b: [0, 90, 180, 270], ops: [...]}` expands at staging
+  into a `rotate_b` per angle followed by the inner ops with the token `${b}` replaced in every
+  string; inner ids without the token get `_b<angle>` and references between them are rewritten
+  (`programGroups.ts`). Cap 80 ops after expansion.
+- **Derived section** on the program result (`stockGeometry.ts`, `result.derived`, labelled
+  inference not clearance): face heights above the axis per B, opposite-face thickness and
+  centring offset, centre-to-centre width and PHYSICAL width (minus the tip diameter: external
+  faces lie one tip radius inside their contacts) and stock centre X per Y, yaw per 100 mm, end
+  face slope, top-face slopes — the 2026-09-05 report's arithmetic, unit-tested against it.
+  Relies on probe names `top`, `west*`, `east*`, `end*`; every op result carries its `b`.
+- **Event budget**: the plan estimates its events (100 + 120/station + 60/probe + 20/rotation);
+  staging is refused when the estimate exceeds the job event limit, naming the number to set.
+
+Still open from the brief: multi-segment paths in one op, live progress on the confirm page.
+
+**`probe_stock_outline` — top, outline and centre from an estimate (2026-09-06).** The
+operator's ask after watching the agent re-probe the centre for every side: one approved
+procedure that (1) finds the TOP at a few points around the estimated centre (`top_points`,
+default 3 along the longer axis) — the highest contact wins and a sample lower by more than
+`hole_tolerance_mm` (default 2) is a hole and ignored, so a first probe landing in a drilled hole
+does not define the surface; (2) probes the SIDES with horizontal marches from `overextend_mm`
+(default 5) outside the estimate at `top − side_depth_mm` (default 2), `points_per_side` (default
+3, midpoint first) over the middle half of each side (corners are where estimates fail), each up
+to `side_max_travel_mm` (default 25), a miss recorded as `no_contact`; (3) FITS per-side mean and
+slope into centre (machine and work frame), size centre-to-centre and PHYSICAL (MINUS the tip
+diameter: on opposite external faces each stylus centre stops one tip radius outside its face —
+the on-box agent caught the earlier "+ tip" sign error; the centre is unaffected) and yaw
+(`outlineFit.ts`, pure, unit-tested against the agent's block: centre 168.85 / 241.383, physical
+44.27 × 69.0). **Why 25 mm:** the agent's first outline marched 11 mm from X132 and found nothing
+on the west; the face was at X145.5 — the estimate's centre was 3.85 mm off and its width a few
+mm out. A short march silently turns ordinary estimate error into a missed face; a generous one
+is still sensor-gated and only costs time. Derive travel as overextend + width uncertainty +
+centre uncertainty + margin, never less than 20–25 mm. Also a
+`probe_program` op kind `stock_outline`. The motion machinery is shared in `march.ts`:
+`marchToContact` (the coarse → release → fine → confirm march every runner used to copy) and
+**`steppedTraverse`** — travel close to a surface as a TOUCH-PROBING move: 1 mm steps at F300
+with the probe expected; a contact backs off one step, retreats `hop_lift_mm` (default 2) along
+the retreat direction and continues, so the path follows the surface in steps (a gentle slope,
+one lift at the wall of a hole, one bump for a projection on a side). Over a top the retreat is
++Z, capped at the traverse height where a plain move finishes (law 2); along a side it is AWAY
+from the face, capped at the approved start line where a further contact is a fault. Between
+side points the probe backs off the last contact by `side_standoff_mm` (default 3) and skips
+along the face at that standoff; the next march starts from the arrival point (a dynamic start
+off the previous contact, never a fresh approach from the outside line). Surface scans take the
+same idea as `hop_mode: "stepped"` (`hop_lift_mm`) in place of the fixed `z_safe_delta_mm` hop
+whose only answer to a contact was to abort; `guarded` stays the default.
+
+**Traverse height beats a landmark clearance above it (job 34d787bdb2d7, 2026-09-06).** The
+`rotary-axis` landmark declares clearance 328 (the homing height) while the operator's safe
+traverse height is 320, so a sequence hop at 320 out of the rotary footprint was refused by the
+new planner check and a six-op program lost its last op. Law 2 defines the traverse height as
+safe for XY by decree: segments at or above `mcpSafeTraverseZ` are exempt from CROSSING landmarks
+(`checkMotion({traverseZ})`); a program `keep_out` VOLUME can still refuse them (it is the
+agent's explicit box). Marches (sensor-gated approaches that stop on contact) are exempt from
+crossing landmarks too — probing INTO the rotary footprint from outside is the job — never from
+volumes.
+
+**A missed march is a measurement, not a fault (2026-09-06, job 5ad5fcce6b3a).** The agent's
+six-op centre-finding program aborted on its LAST op because the first south-side march started
+beyond a corner of the stock (width and step over-estimated) and found nothing within its
+25 mm - five completed ops were thrown away with it. `probe_sequence` steps now take `on_miss`:
+`continue` (default) records `{status: "no_contact", limitMachine, maxTravelMm}` for that probe,
+retreats, raises and carries on; `abort` keeps the old behaviour. Results carry `status` on every
+entry plus `contactCount` / `noContactProbes`; a later reference to a missed probe fails to resolve
+and refuses that op (program stops raised, everything else kept). Surface scans already treated a
+no-contact station this way.
+
+**Stopping a procedure (fixed 2026-09-06, job 5ad5fcce6b3a).** `stop_gcode_job` only knew the
+firmware's `stop_print`; a procedure is a server-driven loop, so three stop calls answered
+`ok: false` while the scan kept stepping. Now `requestProcedureStop()` (probing.ts) records a
+request that every motion primitive (`moveMachineSettled`, `senseAfter`, `rotateB`) checks
+before sending: the runner throws `ProcedureStopped` at the next step boundary, its normal
+abort path raises to the traverse height, and the job ends in state `stopped`. `ProcedureAbort`
+now carries `partial` (completed stations / contacts / ops) and the runner wrapper stores it as
+`job.result`, so the earlier promise "results are on the job record" is true for every abort,
+not only for stops. A program treats a stop as program-wide regardless of `on_fail`. The tool
+waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping, job}`.
 
 ## Safety model (operator-defined, non-negotiable)
 
@@ -442,6 +563,12 @@ reduction (section size, centring, yaw), live progress on the confirm page.
   centre X≈169.5); end face contact Y128.9 (exposed span ~Y130–300). The W side at Y140 was
   flaky (twice lost the confirm re-contact — local chamfer/fibre?). Stock-top figures are
   B-dependent (square stock rotates with B).
+- **Four-face survey (2026-09-05, 71.3 mm probe, machine coords, toolhead Z at contact)**: B0
+  top 207.8, B180 206.9, B90 219.6, B270 219.9 at (170, 199); section ≈ 71.9 × 47.2; sides at
+  B180 X134.2/133.5 (W) and 205.3/206.0 (E) at Y150/Y250; end Y129.2 at X190, Y128.7 at X150;
+  stock centre X ≈ 169.7; **rotary axis physical Z ≈ 112.4, X ≈ 169.7** (now the geometry
+  settings). Stock yawed ~0.4° (free end toward +X), centreline rising ~0.3 mm/100 mm toward the
+  tailstock. Full report on the box: `~/luban-evidence/REPORT-four-face-scan-2026-09-05.md`.
 - **Chuck fixed hole (probe_circle INSIDE mode, 8 points, rms 0.021, max residual 0.041)**:
   centre (168.974, 290.969), hole − tip 3.734. Cross-feature constraint: air-blast post
   diameter + hole diameter = **10.41 mm exactly** (tip-independent); the operator estimates
@@ -464,7 +591,9 @@ reduction (section size, centring, yaw), live progress on the confirm page.
 `query_firmware_position` (raw M114) · `validate_gcode` · `submit_gcode_job` →
 `start_gcode_job` (procedures run detached: returns the result if it arrives within
 `wait_ms`, default 25 s, else a `running` status) → `get_gcode_job_status` (event log +
-stored result; long-poll with `wait_ms`/`since_event`) / `stop_gcode_job` · `move_z` (single or
+stored result; long-poll with `wait_ms`/`since_event`) / `stop_gcode_job` (procedures: cooperative
+stop at the next step boundary, raise, state `stopped`, partial `result` kept; file jobs: firmware
+stop) · `move_z` (single or
 `z_targets` batch) · `home` · `goto_work_origin` · `move_and_capture` · `list_cameras` ·
 `capture_frame` (position-stamped, `frameId`, `expectedToolRegion`) · `set_tool_region` ·
 `track_feature` (NCC between cached frames — use instead of eyeballing pixels) ·
@@ -527,7 +656,8 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   operator to close their copy. The build dirties `src/package.json` and
   `MaterialTestGcodeParams.jsx` — revert before staging.
 - **Stack**: stacked single-commit PRs `mcp/N-*`, each targeting the previous branch
-  (#15 → #79 as of 2026-09-05, then `mcp/46-position-of-record` (#80) and `mcp/47-timing-inline-g53`; next `mcp/48`. #70 stale-
+  (#15 → #79 as of 2026-09-05, then `mcp/46-position-of-record` (#80), `mcp/47-timing-inline-g53` (#81),
+  `mcp/48-new-stock-survey`; next `mcp/49`. #70 stale-
   heartbeat, #71 probe_sequence, #72 GPIO probe feed, #73 Linux/mac packaging, #74 machine
   settings + docs, #75 sensor toggles + LAN, #76 job events + even survey, #77 offset
   transient + detached procedures, #78 surface scans, #79 console input leak, mcp/46 position

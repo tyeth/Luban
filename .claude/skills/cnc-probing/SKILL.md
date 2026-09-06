@@ -139,6 +139,16 @@ never resubmit. If your MCP client times out anyway, the result is still on the 
 `next_event_index` is a sequence number, not an array index: the log keeps 2000 events and
 paging stays valid when it trims.
 
+**Stopping a procedure.** `stop_gcode_job {job_id}` on a running procedure (probe_*,
+probe_program, tool setter, survey) is a cooperative stop: the runner finishes the step in
+flight (<= 1 mm or one sensor window), raises to the traverse height and ends the job in
+state `stopped` with everything measured so far in `result` (stations, contacts,
+completed ops, `derived`). The call waits up to `wait_ms` (default 20 s) and answers
+`{ok: true, stopped | stopping}`; if `stopping`, long-poll the status. It is NOT an
+emergency stop - the crash guard and the operator's machine stop are that. Stopping a
+program stops the whole program regardless of `on_fail`. A procedure that has not
+started yet is withdrawn by the same call.
+
 When a procedure is slow or aborts, the evidence is already in its events - do not grep
 server logs. `gcode` events carry `execMs` (send to controller reply) and `idleMs` (previous
 reply to this send; engine + sensor window only, so > 750 ms inside a job also raises a
@@ -252,7 +262,87 @@ reference points backwards; `on_fail: "skip"` lets an overtravel-type op fail
 without ending the program. A four-face survey is `rotate_b 90 → centre sequence →
 N-S path → W-E path → sides sequence → rotate_b 180 → …`; budget the event log
 (≈ 100 + stations × 120 per scan op) before staging and use
-`wait_for_approval_ms` to start.
+`wait_for_approval_ms` to start. Staging REFUSES a program whose estimate exceeds the
+job event limit and tells you the number to ask the operator for.
+
+**New stock, nothing known but the jig.** Geometry is NEVER a prerequisite: a program
+that references only its own earlier ops (any B0-only, stationary or off-rotary survey)
+needs nothing stored, so stage it. Only a reference to `axis.*` needs the rotary axis
+and probe length; check `get_stored_state → geometry`, and if they are unset, MEASURE
+them and store them yourself with `set_probe_geometry` (axis Z = mean of an
+opposite-face pair minus the probe length, axis X = mid of a side pair, probe length
+from `run_tool_setter accept_probe_contact`) - or write the program without `axis.*`.
+Never ask the operator to type numbers into a settings pane, and never type them into
+your program as constants. Stock size is a property of the stock, not the jig: pass the
+largest reach of THIS stock as `swept_radius_mm` on `rotate_b` if you want the
+tip-outside-the-cylinder check. Then:
+
+- **Find the top** without knowing the height: a `sequence` whose `descend` is
+  `{"from": "axis.z_contact", "plus": <largest possible radius + 5>, "between": [...]}`
+  and whose probe is `dz: -1, max_travel_mm: <that radius + 10>` (segmented descent, 1 mm
+  coarse in the last band). Without `axis`, descend to an operator-stated Z instead.
+- **Derive, don't guess**: `{"mid": ["s0.west.x", "s0.east.x"], "between": [...]}` is the
+  stock centre; `{"diff": ["s0.east.x", "s0.west.x"], "scale": 0.5, "plus":
+  "axis.z_contact", "between": [...]}` is the B90 face height (axis + half-width);
+  `{"min"|"max": [...]}` over several paths. References may sit anywhere in an op's
+  arguments (`steps[].z`, `start_x`, `expected_profile.circle.center_x`). Name your
+  probes `top`, `west*`, `east*`, `end*` and the result's `derived` section (thickness
+  per face pair, centring, width with tip, centre X, yaw, end slope) is computed for
+  you - it is planning inference, never a clearance.
+- **Keep-out for this clamping**: pass `keep_out: [{"name": "chuck jaws", "machine":
+  {"x0", "y0", "x1", "y1"}, "clearance_z"}]` (toolhead Z) - a VOLUME nothing enters, not
+  even a descent column. Stored landmarks are CROSSING obstacles: they forbid traversing
+  into or out of their box low, and a hop, column or march wholly inside one (probing
+  the stock inside the rotary-axis landmark) is allowed - the operator approves it on
+  the page. So never ask to delete or shrink the rotary landmark to make a scan pass; if
+  a check names it, the plan really does enter or leave the rotary region low. Both are
+  checked at staging AND when references resolve; a hit names the step. Jaws reach
+  ~Y269 on this jig (measured 2026-09-02); the tailstock bracket stands above the stock
+  below ~Y110 - use those as `keep_out` volumes, with the operator's confirmation.
+- **Cylinders**: `surface_path` with `expected_profile: {"circle": {"center_x": {"from":
+  "axis.x", ...}, "center_z_contact": {"from": "axis.z_contact", ...}, "radius": <operator
+  bound>}}` - each station's slow zone and drop band follow the circle; stations more than
+  0.7 R off the axis are refused. Locate the crown with `summary.highestAt.x`.
+- **Repeat per rotation**: `{"id": "faces", "kind": "group", "for_b": [0, 90, 180, 270],
+  "ops": [...]}` runs the inner ops once per angle after a `rotate_b`; write `${b}` in
+  ids/names/paths (or leave ids plain and they get `_b<angle>`).
+
+- **Side marches on stock of estimated size**: start each march OUTSIDE the largest
+  size the stock could be, set `max_travel_mm` to cover the whole uncertainty (the
+  travel is approved, so a long limit costs time, not safety), and put the first side
+  probe at mid-length, never near a corner. A march that reaches its limit records
+  `status: "no_contact"` and the sequence CONTINUES (`on_miss` default) - a miss is the
+  measurement "nothing within N mm". Only pass `on_miss: "abort"` when a later step is
+  unsafe without that contact. A reference to a missed probe refuses its op instead.
+
+**Block on the bed or in the chuck: `probe_stock_outline` (centre from an estimate).**
+Give it the estimated centre and size, the operator's `start_z_machine` /
+`floor_z_machine`, and it finds the top at `top_points` (default 3; the highest wins, a
+sample > `hole_tolerance_mm` lower is a hole and ignored - so a first probe in a drilled
+hole cannot define the surface), then marches the sides from `overextend_mm` outside the
+estimate at `top - side_depth_mm`, `points_per_side` per side, skipping along each face at
+`side_standoff_mm` off the last contact (a projection bumps the probe outward, never
+aborts), and returns `centerMachine`, `centerWork`, `sizeMm` (centre-to-centre),
+`sizePhysicalMm` (MINUS the tip diameter - external faces lie one tip radius inside their
+contacts; the centre needs no correction), `yawDeg`. Use it instead of hand-built
+sequences whenever the job is "where is this block and how big is it". Defaults are
+deliberately generous: `points_per_side` 3 (midpoint first), `side_max_travel_mm` 25,
+`overextend_mm` 5, `side_depth_mm` 2. Do NOT shorten the travel to save time: the first
+outline on the box marched 11 mm and missed a face 13.6 mm away because the centre estimate
+was 3.85 mm off - travel must cover overextend + width uncertainty + centre uncertainty +
+margin, and a march that finds nothing is only lost time. For top scans over stock that may
+be narrow or offset from the estimate, keep `spacing_mm` at 5 or less. Also an op kind
+`stock_outline` in `probe_program`. For surface scans over uneven or holed stock use
+`hop_mode: "stepped"` with `hop_lift_mm` (contact lifts and continues) instead of a big
+`z_safe_delta_mm`.
+
+**Landmarks vs the traverse height.** The rotary landmark says clearance 328; the traverse
+height is 320. Hops at the traverse height are lawful and exempt from crossing landmarks;
+so are marches (they stop on contact). A refusal naming a landmark therefore means a LOW
+hop or a descent column enters or leaves its box - fix the plan, do not touch the landmark.
+
+Hardware test order for a new program: B0 half without rotations first, then one
+rotation, then the whole program - and compare `derived` with the operator's calipers.
 
 **Speed.** Read `result.timing` (or `get_job_timing`) after a scan instead of mining
 events: per command kind it gives count, feeds, distance, controller time vs motion
