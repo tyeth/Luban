@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const fs = require('fs');
 const path = require('path');
 const webpack = require('webpack');
 const TerserPlugin = require('terser-webpack-plugin');
@@ -8,15 +7,36 @@ const pkg = require('./package.json');
 
 const NODE_MODULES = path.resolve(__dirname, 'node_modules');
 
-// http://jlongster.com/Backend-Apps-with-Webpack--Part-I
-const externals = {};
-fs.readdirSync(NODE_MODULES)
-    .filter((x) => {
-        return ['.bin'].indexOf(x) === -1;
-    })
-    .forEach((mod) => {
-        externals[mod] = `commonjs ${mod}`;
-    });
+// Bundle dependencies into the server bundle instead of externalizing all of
+// node_modules: a cold start used to crawl thousands of small files (each
+// scanned by antivirus on first open, ~10s+ after a rebuild or reboot before
+// the backend answered), whereas one bundle is a single read. Only packages
+// that cannot live inside a bundle stay external: native addons, packages
+// that spawn or load sibling binaries/assets out of their own package
+// directory, and template engines resolved by name at runtime.
+const KEEP_EXTERNAL = [
+    'serialport', // native (@serialport/bindings-cpp)
+    'font-scanner', // native
+    'lzma-native', // native
+    '@snapmaker/snapmaker-lunar', // spawns LunarTPP binaries from its package dir
+    'snapmaker-luban-engine', // spawns CuraEngine binaries from its package dir
+    'opencv-wasm', // loads .wasm from its package dir
+    'consolidate', // requires template engines by name at runtime
+    'hogan.js', // loaded dynamically by consolidate
+    'formidable', // constructor requires its plugin files from its package dir
+    'errorhandler', // reads its stylesheet from its package dir
+    'socket.io', // serveClient reads the client bundle from its package dir
+];
+const externals = [
+    (context, request, callback) => {
+        const external = request.startsWith('@serialport/')
+            || KEEP_EXTERNAL.some((mod) => request === mod || request.startsWith(`${mod}/`));
+        if (external) {
+            return callback(null, `commonjs ${request}`);
+        }
+        return callback();
+    },
+];
 
 // Use publicPath for production
 // const payload = pkg.version;

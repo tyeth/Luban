@@ -42,6 +42,7 @@ import Select from '../../components/Select';
 import SvgIcon from '../../components/SvgIcon';
 import useThrottle from '../../utils/useThrottle';
 import MachineModuleStatusBadge from './components/MachineModuleStatusBadge';
+import ProbeFeedStatusBadges from './components/ProbeFeedStatusBadges';
 import LaserLockModal from './modals/LaserLockModal';
 import MismatchModal from './modals/MismatchModal';
 import MismatchNozzleModal from './modals/MismatchNozzleModal';
@@ -709,6 +710,8 @@ const NetworkConnection: React.FC = () => {
                                 </div>
                             )
                         }
+                        {/* MCP probe sensor feed pills (touch probe / tool setter / overtravel) */}
+                        <ProbeFeedStatusBadges />
                     </div>
                 )
             }

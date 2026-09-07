@@ -115,6 +115,9 @@ class ConnectionManager {
     // connected machine instance to handle life cycle
     private machineInstance: MachineInstance = null;
 
+    // identifier of the connected machine, kept for status reporting
+    private machineIdentifier: string | null = null;
+
     private scheduledTasksHandle;
 
     /**
@@ -122,6 +125,57 @@ class ConnectionManager {
      */
     public getProtocol(): NetworkProtocol | SerialPortProtocol {
         return this.protocol;
+    }
+
+    /**
+     * Stable channel name for reporting. constructor.name is useless in
+     * production builds (webpack minifies class names to single letters).
+     */
+    private describeChannel(): string | null {
+        switch (this.channel) {
+            case null: return null;
+            case sstpHttpChannel: return 'sstp-http';
+            case sacpTcpChannel: return 'sacp-tcp';
+            case sacpUdpChannel: return 'sacp-udp';
+            case sacpSerialChannel: return 'sacp-serial';
+            case textSerialChannel: return 'text-serial';
+            default: return 'unknown';
+        }
+    }
+
+    /**
+     * The active channel, or null when disconnected. Read-only use (MCP).
+     */
+    public getCurrentChannel(): Channel | null {
+        return this.channel;
+    }
+
+    /**
+     * Last heartbeat state from the active channel, or null when the channel
+     * does not report one (no heartbeat yet, or unsupported channel type).
+     */
+    public getLatestMachineState(): { [key: string]: unknown; timestamp: number } | null {
+        const channel = this.channel as unknown as {
+            getLatestMachineState?: () => { [key: string]: unknown; timestamp: number } | null;
+        };
+        if (channel && typeof channel.getLatestMachineState === 'function') {
+            return channel.getLatestMachineState();
+        }
+        return null;
+    }
+
+    /**
+     * Read-only snapshot of the connection, for status reporting (MCP).
+     */
+    public getConnectionStatus() {
+        return {
+            connected: !!this.channel,
+            channelName: this.describeChannel(),
+            connectionType: this.channel ? this.connectionType : null,
+            protocol: this.channel ? this.protocol : null,
+            machineIdentifier: this.machineIdentifier,
+            machineReady: !!this.machineInstance,
+        };
     }
 
     // TODO: Refactor this
@@ -203,6 +257,7 @@ class ConnectionManager {
         const machineIdentifier = data?.machineIdentifier;
 
         log.debug(`machineIdentifier = ${machineIdentifier}`);
+        this.machineIdentifier = machineIdentifier || null;
 
         // configure machine instance
         this.machineInstance = null;
@@ -398,6 +453,7 @@ class ConnectionManager {
         // destroy channel
         this.unbindChannelEvents();
         this.channel = null;
+        this.machineIdentifier = null;
 
         // destroy machine instance
         if (this.machineInstance) {
