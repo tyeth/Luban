@@ -143,7 +143,14 @@ var zOutput = createVariable({prefix: "Z"}, xyzFormat);
 var bOutput = createVariable({prefix: "B", force: true}, abcFormat);
 var feedOutput = createVariable({prefix: "F"}, feedFormat);
 
-var gMotionModal = createModal({}, gFormat); // G0-G1
+// NOT a modal group: Marlin (Snapmaker firmware) has no implicit modal motion - a line of bare
+// axis words is not a move - and Luban's own gcode carries G0/G1 on every line. The MCP
+// translator tracks modal state itself, but the program must read the same to a human and to
+// any plain sender. Same interface as createModal so call sites stay familiar.
+var gMotionModal = {
+  format: function (code) { return gFormat.format(code); },
+  reset : function () {}
+};
 var gAbsIncModal = createModal({}, gFormat); // G90-91
 var gUnitModal = createModal({}, gFormat);   // G20-21
 
@@ -187,6 +194,9 @@ function triple(v) {
 
 /** Raise to the traverse height in MACHINE coordinates (G53 on its own line, as the translator wants). */
 function writeTraverseHeight() {
+  // G0 written explicitly every time: a "G53 Z320." without its motion word is legal for the
+  // translator (G0 stays modal) but reads as an unqualified move on the confirm page.
+  gMotionModal.reset();
   writeBlock(gFormat.format(53), gMotionModal.format(0), "Z" + n3(getProperty("traverseZ")));
   zOutput.reset();
 }
@@ -331,6 +341,8 @@ function setWorkPlane(abc) {
   }
   writeComment("B rotation: raise to the traverse height first (law 2), then rotate on its own line");
   writeTraverseHeight();
+  // The raise just made G0 modal; force it back out so the rotation reads "G0 B..", never a bare "B..".
+  gMotionModal.reset();
   writeBlock(gMotionModal.format(0), bOutput.format(getProperty("bAxisSign") * abc.y));
   currentB = abc.y;
 }
@@ -389,9 +401,10 @@ function onDwell(seconds) {
 }
 
 function onRapid(_x, _y, _z) {
-  // Positioning outside a cycle (rare in probing operations): keep it lawful.
-  var p = new Vector(_x, _y, _z);
-  writeApproach(p);
+  // Fusion's linking moves between cycles (retract, XY at the retract height, feed height...)
+  // are not written: every probe writes its own law-2 approach from the traverse height and
+  // the MCP retreats to that approach point itself. Echoing them produced three raises to the
+  // traverse height per point on the first Fusion run (2026-09-07).
 }
 
 function onLinear(_x, _y, _z, feed) {
@@ -411,6 +424,7 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
 }
 
 function onCycle() {
+  inspectPoints = [];
 }
 
 /**
@@ -433,7 +447,8 @@ function onCyclePoint(x, y, z) {
   var ot = overtravel();
   var zs = z - cycle.depth;
   var op = operationComment();
-  var group = op + "_" + groupIndex + "_" + (getCurrentCyclePointIndex ? getCurrentCyclePointIndex() : probeId);
+  // (a bare reference to an undefined kernel helper is a ReferenceError - always test with typeof)
+  var group = op + "_" + groupIndex + "_" + (typeof getCurrentCyclePointIndex == "function" ? getCurrentCyclePointIndex() : probeId);
   var tolSize = cycle.toleranceSize;
   var tolPos = cycle.tolerancePosition;
 
@@ -551,45 +566,88 @@ function onCyclePoint(x, y, z) {
   }
 }
 
-/** Inspect Surface: Fusion gives approach, measure and retract points; the nominal and normal come with the cycle. */
+/**
+ * Inspect Surface. Fusion delivers approach, measure and retract points for every surface point,
+ * with the nominal point and normal on the cycle record. The points are buffered per cycle and
+ * emitted from onCycleEnd, so nothing here depends on the kernel's point-index helpers
+ * (getNumberOfCyclePoints / isFirstCyclePoint / isLastCyclePoint) or on how many points one cycle
+ * carries: groups of three are approach/measure/retract, two are approach/measure, a lone point is
+ * a measure whose approach is synthesised along the normal.
+ */
+var inspectPoints = [];
+
 function inspectionCyclePoint(x, y, z) {
-  if (getNumberOfCyclePoints() != 3) {
-    error(localize("Missing endpoint in the inspection cycle - check the approach and retract heights."));
+  inspectPoints.push({
+    p        : new Vector(x, y, z),
+    nominal  : new Vector(cycle.nominalX || 0, cycle.nominalY || 0, cycle.nominalZ || 0),
+    normal   : new Vector(cycle.nominalI || 0, cycle.nominalJ || 0, cycle.nominalK || 1),
+    clearance: cycle.probeClearance
+  });
+}
+
+function scaled(v, s) {
+  return new Vector(v.x * s, v.y * s, v.z * s);
+}
+
+function flushInspection() {
+  var pts = inspectPoints;
+  inspectPoints = [];
+  if (pts.length == 0) {
     return;
   }
-  if (isFirstCyclePoint()) {
-    pendingApproach = new Vector(x, y, z);
-    return;
-  }
-  if (isLastCyclePoint()) {
-    return; // retract: the MCP retreats to the approach point itself
-  }
+  var stride = (pts.length % 3 == 0) ? 3 : ((pts.length % 2 == 0) ? 2 : 1);
   var m = getRotation();
-  var nominal = m.multiply(new Vector(cycle.nominalX, cycle.nominalY, cycle.nominalZ));
-  var normal = m.multiply(new Vector(cycle.nominalI, cycle.nominalJ, cycle.nominalK)).getNormalized();
-  var measure = new Vector(x, y, z);
-  // The target is the measure point pushed past the nominal along -normal by the overtravel.
-  var target = Vector.sum(measure, Vector.product(normal, -getProperty("minOvertravel")));
   var op = operationComment();
-  writeProbe({
-    name   : op + "_" + (probeId + 1),
-    group  : op + "_" + groupIndex,
-    role   : "surface",
-    feature: "point",
-    nominal: nominal,
-    normal : normal,
-    tolU   : hasParameter("operation:inspectUpperTolerance") ? getParameter("operation:inspectUpperTolerance") : undefined,
-    tolL   : hasParameter("operation:inspectLowerTolerance") ? getParameter("operation:inspectLowerTolerance") : undefined,
-    offset : hasParameter("operation:inspectSurfaceOffset") ? getParameter("operation:inspectSurfaceOffset") : undefined
-  }, pendingApproach || new Vector(x, y, getProperty("traverseZ")), target);
+  var ot = getProperty("minOvertravel");
+  for (var i = 0; i < pts.length; i += stride) {
+    var rec = pts[stride == 1 ? i : i + 1]; // the measure point carries the nominal
+    var normal = m.multiply(rec.normal).getNormalized();
+    var nominal = m.multiply(rec.nominal);
+    var measure = rec.p;
+    var approach;
+    if (stride == 1) {
+      // No approach point supplied: start a clearance away from the surface along its normal.
+      approach = Vector.sum(measure, scaled(normal, Math.max(rec.clearance || 0, 5)));
+    } else {
+      approach = pts[i].p;
+    }
+    // Fusion's middle point is already the END of its probing move (the nominal plus Fusion's own
+    // overtravel), and the move runs along the probe direction Fusion chose - for a chamfer that is
+    // an axis direction, NOT the surface normal (first Fusion run, 2026-09-07). Keep that direction;
+    // only extend along it until at least minOvertravel lies past the nominal surface.
+    var stroke = Vector.diff(measure, approach);
+    var dir = stroke.length > 1e-6 ? stroke.getNormalized() : scaled(normal, -1);
+    var past = Vector.dot(Vector.diff(measure, nominal), dir);
+    var target = past >= ot ? measure : Vector.sum(measure, scaled(dir, ot - past));
+    writeProbe({
+      name   : op + "_" + (probeId + 1),
+      group  : op + "_" + groupIndex,
+      role   : "surface",
+      feature: "point",
+      nominal: nominal,
+      normal : normal,
+      tolU   : hasParameter("operation:inspectUpperTolerance") ? getParameter("operation:inspectUpperTolerance") : undefined,
+      tolL   : hasParameter("operation:inspectLowerTolerance") ? getParameter("operation:inspectLowerTolerance") : undefined,
+      offset : hasParameter("operation:inspectSurfaceOffset") ? getParameter("operation:inspectSurfaceOffset") : undefined
+    }, approach, target);
+  }
 }
 
 function onCycleEnd() {
+  if (isInspectionOperation()) {
+    flushInspection();
+  }
   pendingApproach = undefined;
 }
 
 function onCommand(command) {
   switch (command) {
+  case COMMAND_PROBE_ON:
+  case COMMAND_PROBE_OFF:
+    // Fusion brackets every Probe / Inspect Surface operation with these (first Fusion run,
+    // 2026-09-07: "Unsupported probe-on command" killed the post at record 400). The MCP's
+    // probe feed is armed by the operator's approval, not by the program, so nothing is written.
+    return;
   case COMMAND_START_SPINDLE:
   case COMMAND_SPINDLE_CLOCKWISE:
   case COMMAND_SPINDLE_COUNTERCLOCKWISE:
@@ -624,6 +682,7 @@ function onClose() {
   writeln("");
   writeTraverseHeight();
   if (currentB !== undefined && abcFormat.areDifferent(currentB, 0)) {
+    gMotionModal.reset();
     writeBlock(gMotionModal.format(0), bOutput.format(0)); // unwind at the traverse height
   }
   writeBlock(mFormat.format(30));
