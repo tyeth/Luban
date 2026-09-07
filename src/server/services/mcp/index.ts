@@ -4,7 +4,8 @@ import pkg from '../../../package.json';
 import logger from '../../lib/logger';
 import config from '../configstore';
 import { diagnosticsSnapshot, startDiagnostics } from './diagnostics';
-import { McpServer, isAllowedOrigin, isLocalSubnetAddress, isLocalSubnetOrigin, isLoopback, localSubnets } from './McpServer';
+import { McpServer, isTrustedAddress, isTrustedOrigin, localSubnets } from './McpServer';
+import { OAuthShim } from './oauth';
 import { jobManager } from './jobs';
 import { probeFeedService, resolveActiveProbeConfig } from './probeFeed';
 import { ToolRegistry } from './registry';
@@ -187,17 +188,22 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         mcpBroadcast('mcp:activity', activity);
     };
 
-    const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version, onActivity);
+    // OAuth-shaped handshake for clients that insist on one (oauth.ts). It
+    // authenticates nobody - it exists so those clients connect at all, and
+    // so their registered name can label the log.
+    const oauth = new OAuthShim(port);
+    const mcpServer = new McpServer(registry, 'snapmaker-luban', pkg.version, onActivity, {
+        allowLan: settings.allowLan,
+        identifyClient: (req) => oauth.identifyClient(req),
+    });
 
     httpServer = http.createServer((req, res) => {
         // Same trust boundary for every route: local processes only (plus, in
         // LAN mode, hosts on this machine's own subnets), and no browser
         // contexts other than localhost / the app's own scheme (or, in LAN
         // mode, a same-subnet host).
-        const remote = req.socket.remoteAddress;
-        const addressOk = isLoopback(remote) || (settings.allowLan && isLocalSubnetAddress(remote));
-        const originOk = isAllowedOrigin(req.headers.origin) || (settings.allowLan && isLocalSubnetOrigin(req.headers.origin));
-        if (!addressOk || !originOk) {
+        if (!isTrustedAddress(req.socket.remoteAddress, settings.allowLan)
+            || !isTrustedOrigin(req.headers.origin, settings.allowLan)) {
             res.writeHead(403, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'forbidden' }));
             return;
@@ -207,6 +213,9 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         if (url.pathname.startsWith('/confirm')) {
             // Human job-confirmation pages (jobs.ts)
             jobManager.handleConfirmRequest(req, res, url.pathname);
+            return;
+        }
+        if (oauth.handleRequest(req, res, url)) {
             return;
         }
 

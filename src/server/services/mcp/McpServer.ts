@@ -120,6 +120,26 @@ export function isLocalSubnetOrigin(origin: string | undefined): boolean {
     return !!match && isLocalSubnetAddress(match[1]);
 }
 
+/**
+ * The one trust boundary, shared by every route (/mcp, the OAuth shim, the
+ * confirm pages): a local process, or in LAN mode a host on one of this
+ * machine's own subnets.
+ */
+export function isTrustedAddress(address: string | undefined, allowLan: boolean): boolean {
+    return isLoopback(address) || (allowLan && isLocalSubnetAddress(address));
+}
+
+export function isTrustedOrigin(origin: string | undefined, allowLan: boolean): boolean {
+    return isAllowedOrigin(origin) || (allowLan && isLocalSubnetOrigin(origin));
+}
+
+export interface McpServerOptions {
+    /** mcpAllowLan: accept same-subnet clients, not only loopback. */
+    allowLan?: boolean;
+    /** Label for the caller (from its OAuth token) - for log lines only. */
+    identifyClient?: (req: http.IncomingMessage) => string | null;
+}
+
 export class McpServer {
     private registry: ToolRegistry;
 
@@ -129,25 +149,32 @@ export class McpServer {
 
     private onActivity: ((activity: object) => void) | null;
 
+    private options: McpServerOptions;
+
     public constructor(
         registry: ToolRegistry,
         serverName: string,
         serverVersion: string,
-        onActivity?: (activity: object) => void
+        onActivity?: (activity: object) => void,
+        options?: McpServerOptions
     ) {
         this.registry = registry;
         this.serverName = serverName;
         this.serverVersion = serverVersion;
         this.onActivity = onActivity || null;
+        this.options = options || {};
     }
 
     public handleRequest = (req: http.IncomingMessage, res: http.ServerResponse): void => {
-        // Bound to loopback; re-check per request as defense in depth.
-        if (!isLoopback(req.socket.remoteAddress)) {
-            this.respond(res, 403, { error: 'loopback only' });
+        // index.ts gates every route already; re-check per request as
+        // defense in depth, with the SAME policy (a hard loopback check here
+        // used to refuse every LAN client that the outer gate had admitted).
+        const allowLan = !!this.options.allowLan;
+        if (!isTrustedAddress(req.socket.remoteAddress, allowLan)) {
+            this.respond(res, 403, { error: allowLan ? 'local subnet only' : 'loopback only' });
             return;
         }
-        if (!isAllowedOrigin(req.headers.origin)) {
+        if (!isTrustedOrigin(req.headers.origin, allowLan)) {
             log.warn(`MCP request with disallowed origin rejected: ${req.headers.origin}`);
             this.respond(res, 403, { error: 'origin not allowed' });
             return;
@@ -165,8 +192,9 @@ export class McpServer {
             return;
         }
 
+        const client = this.options.identifyClient ? this.options.identifyClient(req) : null;
         this.readBody(req, res, (body) => {
-            this.handlePost(body, res);
+            this.handlePost(body, res, client);
         });
     };
 
@@ -192,7 +220,7 @@ export class McpServer {
         });
     }
 
-    private async handlePost(body: string, res: http.ServerResponse): Promise<void> {
+    private async handlePost(body: string, res: http.ServerResponse, client: string | null): Promise<void> {
         let parsed: unknown;
         try {
             parsed = JSON.parse(body);
@@ -210,7 +238,7 @@ export class McpServer {
         const responses = [];
         for (const message of messages) {
             // eslint-disable-next-line no-await-in-loop
-            const response = await this.handleMessage(message);
+            const response = await this.handleMessage(message, client);
             if (response) {
                 responses.push(response);
             }
@@ -227,7 +255,7 @@ export class McpServer {
         }
     }
 
-    private async handleMessage(message: JsonRpcMessage): Promise<object | null> {
+    private async handleMessage(message: JsonRpcMessage, client: string | null): Promise<object | null> {
         if (!message || message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
             return rpcError((message && message.id) || null, JSONRPC_INVALID_REQUEST, 'Invalid request');
         }
@@ -240,7 +268,13 @@ export class McpServer {
         const { id, method, params } = message;
         try {
             switch (method) {
-                case 'initialize':
+                case 'initialize': {
+                    const info = (params && params.clientInfo) as { name?: unknown; version?: unknown } | undefined;
+                    const described = info && typeof info.name === 'string'
+                        ? `${info.name}${typeof info.version === 'string' ? ` ${info.version}` : ''}`
+                        : 'unnamed client';
+                    log.info(`MCP initialize from ${described}${client ? ` [token: ${client}]` : ''} `
+                        + `(protocol ${(params && params.protocolVersion) || '?'})`);
                     return rpcResult(id, {
                         protocolVersion: PROTOCOL_VERSION,
                         capabilities: {
@@ -251,12 +285,13 @@ export class McpServer {
                             version: this.serverVersion,
                         },
                     });
+                }
                 case 'ping':
                     return rpcResult(id, {});
                 case 'tools/list':
                     return rpcResult(id, { tools: this.registry.list() });
                 case 'tools/call':
-                    return await this.handleToolCall(id, params);
+                    return await this.handleToolCall(id, params, client);
                 default:
                     return rpcError(id, JSONRPC_METHOD_NOT_FOUND, `Method not found: ${method}`);
             }
@@ -266,7 +301,7 @@ export class McpServer {
         }
     }
 
-    private async handleToolCall(id: number | string, params: JsonRpcMessage['params']): Promise<object> {
+    private async handleToolCall(id: number | string, params: JsonRpcMessage['params'], client: string | null): Promise<object> {
         const name = params && params.name;
         if (typeof name !== 'string') {
             return rpcError(id, JSONRPC_INVALID_PARAMS, 'tools/call requires a tool name');
@@ -294,7 +329,7 @@ export class McpServer {
         };
         const args = ((params && params.arguments) as object) || {};
         const startedAt = Date.now();
-        log.info(`tool ${name} <- ${summarize(args, 600)}`);
+        log.info(`tool ${name}${client ? ` [${client}]` : ''} <- ${summarize(args, 600)}`);
         try {
             const result = await this.registry.call(name, args);
             log.info(`tool ${name} ok in ${Date.now() - startedAt}ms -> ${summarize(result, 900)}`);
