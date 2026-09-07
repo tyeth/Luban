@@ -21,6 +21,10 @@ import Terminal from './Terminal';
 
 let pubsubTokens = [];
 let unlisten = null;
+// Print the help/greeting only on the first ever mount - not again after the
+// operator clears the console and switches pages (history is legitimately
+// empty then).
+let hasGreeted = false;
 function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderStamp }) {
     const {
         connectionType,
@@ -384,13 +388,15 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
         });
 
         if (terminalHistory.getLength() === 0) {
-            terminalHistory.push('');
-            actions.getHelp();
-            actions.greetings();
+            if (!hasGreeted) {
+                hasGreeted = true;
+                actions.getHelp();
+                actions.greetings();
+            }
         } else {
             const terminal = terminalRef.current;
             const data = [];
-            for (let i = 1; i < terminalHistory.getLength(); i++) {
+            for (let i = 0; i < terminalHistory.getLength(); i++) {
                 data.push(`\r${terminalHistory.get(i)}\r\n`);
             }
             terminal.write(data.join(''));
@@ -467,15 +473,13 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
             if (terminal) {
                 terminal.clear(false);
                 const data = [];
-                for (let i = 1; i < terminalHistory.getLength(); i++) {
+                for (let i = 0; i < terminalHistory.getLength(); i++) {
                     data.push(`\r${terminalHistory.get(i)}\r\n`);
                 }
                 terminal.write(data.join(''));
             }
         }
     }, [isDefault]);
-
-    const inputValue = terminalHistory.getLength() > 0 ? terminalHistory.get(0) : '';
 
     return (
         <div>
@@ -486,7 +490,6 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
                 shouldRenderFitaddon={shouldRenderFitaddon}
                 terminalHistory={terminalHistory}
                 consoleHistory={consoleHistory}
-                inputValue={inputValue}
             />
         </div>
 

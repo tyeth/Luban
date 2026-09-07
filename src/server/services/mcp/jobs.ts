@@ -5,6 +5,7 @@ import path from 'path';
 
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
+import config from '../configstore';
 import { GcodeValidationReport } from './validator';
 
 const log = logger('service:mcp:jobs');
@@ -40,6 +41,60 @@ export type McpJobState =
  */
 export type McpJobKind = 'file' | 'direct' | 'procedure';
 
+export interface JobEvent {
+    at: number;
+    /**
+     * Position in the job's full event stream (0-based, never reused). The
+     * in-memory log is capped, so `events[i]` is not `seq === i` on a long
+     * job; get_gcode_job_status pages by seq (since_event / next_event_index).
+     */
+    seq: number;
+    /** State change ('submitted', 'approved', 'started', 'completed', ...), a runner phase, 'gcode', 'progress'. */
+    phase: string;
+    /** Which tool/source produced it. */
+    tool?: string;
+    note?: string;
+    [detail: string]: unknown;
+}
+
+// A surface scan produces ~4 gcode events per 0.1 mm step; the old 400 cap
+// lost the first three stations of job 1db4902a4cd6 (2026-09-05) before
+// anyone could read them. Long jobs need more, so the cap is a setting:
+// configstore mcpJobEventLimit (Settings -> MCP Server) or the environment
+// LUBAN_MCP_JOB_EVENT_LIMIT. ~700 bytes per event.
+export const DEFAULT_JOB_EVENT_LIMIT = 2000;
+export const MIN_JOB_EVENT_LIMIT = 400;
+export const MAX_JOB_EVENT_LIMIT = 100000;
+
+/**
+ * How an approval reaches the agent. 'agent' (default; operator request
+ * 2026-09-05): start_gcode_job may long-poll with wait_for_approval_ms and the
+ * operator's click on the confirm page starts the job - no code to copy. 'code':
+ * the one-time code must be relayed by the operator (the original scheme).
+ * Either way a human click in a browser is the only thing that authorises
+ * motion; the code was never a secret from a process with loopback access.
+ * configstore mcpApprovalHandoff or LUBAN_MCP_APPROVAL_HANDOFF.
+ */
+export type ApprovalHandoff = 'agent' | 'code';
+
+export function approvalHandoff(): ApprovalHandoff {
+    const env = process.env.LUBAN_MCP_APPROVAL_HANDOFF;
+    const raw = env !== undefined && String(env).trim() !== '' ? env : config.get('mcpApprovalHandoff');
+    return String(raw || '').trim().toLowerCase() === 'code' ? 'code' : 'agent';
+}
+
+export function jobEventLimit(): number {
+    const raw = process.env.LUBAN_MCP_JOB_EVENT_LIMIT !== undefined && String(process.env.LUBAN_MCP_JOB_EVENT_LIMIT).trim() !== ''
+        ? Number(process.env.LUBAN_MCP_JOB_EVENT_LIMIT)
+        : Number(config.get('mcpJobEventLimit'));
+    if (!Number.isFinite(raw) || raw <= 0) {
+        return DEFAULT_JOB_EVENT_LIMIT;
+    }
+    return Math.min(Math.max(Math.round(raw), MIN_JOB_EVENT_LIMIT), MAX_JOB_EVENT_LIMIT);
+}
+
+export const TERMINAL_JOB_STATES: McpJobState[] = ['rejected', 'start_failed', 'stopped', 'completed'];
+
 export interface McpJob {
     id: string;
     name: string;
@@ -52,10 +107,22 @@ export interface McpJob {
     confirmToken: string | null;
     approvedAt: number | null;
     tokenUsed: boolean;
+    /** An agent is long-polling start_gcode_job for the approval (approval hand-off); the confirm page says so instead of showing a code to copy. */
+    agentWaiting: boolean;
     startedAt: number | null;
     // Set when the job reaches a terminal state (completed / stopped).
     endedAt: number | null;
     error: string | null;
+    // Everything that happened to the job, in order: state changes, the
+    // runner's phase announcements, gcode sent/replies while it was the active
+    // job, file-job progress. Returned by get_gcode_job_status so an agent
+    // never has to read server logs to learn how a job went. Capped.
+    events: JobEvent[];
+    /** Total events ever appended (next seq); events[] may hold fewer. */
+    eventSeq: number;
+    // Procedure outcome (tool setter / probe results), kept on the record so
+    // a client that timed out waiting on start_gcode_job can still read it.
+    result: object | null;
     // Batch direct jobs: the operator approved this exact list; each
     // start_gcode_job call executes ONE step, so captures can happen between
     // steps and the series can be abandoned at any point.
@@ -82,6 +149,8 @@ function range(r: { min: number; max: number } | null): string {
 }
 
 export class JobManager {
+    private activeJob: McpJob | null = null;
+
     private jobs = new Map<string, McpJob>();
 
     private jobsDir: string | null = null;
@@ -111,17 +180,85 @@ export class JobManager {
             state: 'awaiting_confirmation',
             confirmToken: null,
             approvedAt: null,
+            agentWaiting: false,
             tokenUsed: false,
             startedAt: null,
             endedAt: null,
             error: null,
+            events: [],
+            eventSeq: 0,
+            result: null,
             steps,
             nextStep: steps ? 0 : undefined,
         };
         this.jobs.set(id, job);
         this.prune();
+        this.appendEvent(job, 'submitted', { note: `${kind} job staged, awaiting human confirmation` });
         log.info(`MCP job submitted: ${id} (${safeName}), awaiting human confirmation`);
         return job;
+    }
+
+    /** Record something that happened to a job (state change, phase, gcode, progress). */
+    public appendEvent(job: McpJob, phase: string, detail: { [key: string]: unknown } = {}): void {
+        const seq = job.eventSeq;
+        job.eventSeq += 1;
+        job.events.push({ at: Date.now(), seq, phase, ...detail });
+        const limit = jobEventLimit();
+        if (job.events.length > limit) {
+            // Keep the head (submission/approval/start) and the most recent tail.
+            job.events.splice(20, job.events.length - limit);
+        }
+    }
+
+    /** Events with seq >= since, in order (the cap may have dropped some). */
+    public eventsSince(job: McpJob, since: number): JobEvent[] {
+        return job.events.filter((event) => event.seq >= since);
+    }
+
+    /**
+     * The job currently driving the machine (a procedure runner, a direct
+     * step, a running file job). Activity broadcast while it is active is
+     * attached to its event log - see recordActivity.
+     */
+    public setActive(job: McpJob | null): void {
+        this.activeJob = job;
+    }
+
+    public getActive(): McpJob | null {
+        return this.activeJob;
+    }
+
+    /**
+     * Hook for mcpBroadcast: phase-style tool activity (runner announcements,
+     * probe feed readings/alarms) and gcode traffic land on the active job's
+     * event log. Tool-call summaries (ok/duration) are not job events.
+     */
+    public recordActivity(eventName: string, options?: object): void {
+        const job = this.activeJob;
+        if (!job || !options) {
+            return;
+        }
+        const payload = options as { [key: string]: unknown };
+        if (eventName === 'mcp:activity' && payload.phase !== undefined) {
+            const { phase, ...rest } = payload;
+            this.appendEvent(job, String(phase), rest);
+        } else if (eventName === 'mcp:gcode') {
+            const gcode = payload.gcode !== undefined ? String(payload.gcode).slice(0, 300) : undefined;
+            const response = payload.response !== undefined ? String(payload.response).slice(0, 300) : undefined;
+            // Timing stamps from sendGcodeVisible: idleMs = previous reply ->
+            // this send (engine + sensor window), execMs = send -> reply.
+            const timing: { [key: string]: unknown } = {};
+            for (const key of ['idleMs', 'execMs', 'engineMs', 'replyToSenseEndMs', 'senseMs', 'senseWindowMs', 'senseKind', 'senseEndToEngineMs', 'trace']) {
+                if (payload[key] !== undefined && payload[key] !== null) {
+                    timing[key] = payload[key];
+                }
+            }
+            this.appendEvent(job, 'gcode', { tool: payload.tool, gcode, response, ...timing });
+        }
+    }
+
+    public isTerminal(job: McpJob): boolean {
+        return TERMINAL_JOB_STATES.includes(job.state);
     }
 
     public get(id: string): McpJob | null {
@@ -173,6 +310,11 @@ export class JobManager {
             startedAt: job.startedAt,
             endedAt: job.endedAt,
             error: job.error,
+            terminal: this.isTerminal(job),
+            result: job.result,
+            eventCount: job.events.length,
+            eventsTotal: job.eventSeq,
+            lastEvent: job.events.length ? job.events[job.events.length - 1] : null,
             totalSteps: job.steps ? job.steps.length : undefined,
             nextStep: job.steps ? job.nextStep : undefined,
             validation: job.validation,
@@ -232,6 +374,7 @@ export class JobManager {
             job.confirmToken = crypto.randomBytes(4).toString('hex');
             job.approvedAt = Date.now();
             job.state = 'approved';
+            this.appendEvent(job, 'approved', { note: 'operator approved on the confirm page' });
             log.info(`MCP job ${job.id} approved by operator`);
             this.page(res, 200, this.approvedPage(job));
             return;
@@ -239,6 +382,7 @@ export class JobManager {
         if (req.method === 'POST' && action === 'reject') {
             job.state = 'rejected';
             job.confirmToken = null;
+            this.appendEvent(job, 'rejected', { note: 'operator rejected on the confirm page' });
             log.info(`MCP job ${job.id} rejected by operator`);
             this.page(res, 200, '<h2>Rejected</h2><p>The job will not run.</p>');
             return;
@@ -259,10 +403,20 @@ export class JobManager {
         const approvedPreview = approvedLines.length > 80
             ? [...approvedLines.slice(0, 40), `... ${approvedLines.length - 80} lines elided ...`, ...approvedLines.slice(-40)].join('\n')
             : approvedGcode;
+        // Approval hand-off (operator request 2026-09-05): when an agent is
+        // already waiting in start_gcode_job, the click IS the start - no code
+        // to copy. The code is still printed small in case the agent's wait
+        // timed out a moment ago (it stays valid for 15 minutes).
+        const handoff = job.agentWaiting && approvalHandoff() === 'agent'
+            ? `<p style="background:#e6ffed;border:1px solid #2ea043;padding:10px">
+                   <strong>Handed to the waiting agent.</strong> Your click starts
+                   <strong>${escapeHtml(job.name)}</strong> now - nothing to copy.
+                   Fallback code if the agent reports it stopped waiting: <code>${job.confirmToken}</code></p>`
+            : `<p>Give this one-time code to the agent to start <strong>${escapeHtml(job.name)}</strong>:</p>
+               <p style="font-size:2em;font-family:monospace;letter-spacing:0.2em">${job.confirmToken}</p>`;
         return `
             <h2>Approved</h2>
-            <p>Give this one-time code to the agent to start <strong>${escapeHtml(job.name)}</strong>:</p>
-            <p style="font-size:2em;font-family:monospace;letter-spacing:0.2em">${job.confirmToken}</p>
+            ${handoff}
             <p>It expires 15 minutes after approval and works once
                (a batch of moves: once per approved step).</p>
             <h3>This code will run exactly:</h3>

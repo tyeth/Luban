@@ -5,6 +5,9 @@ import config from '../../configstore';
 import { mcpBroadcast } from '../index';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCameras } from '../camera';
+import { recordGcodeTiming } from '../diagnostics';
+import { jobManager } from '../jobs';
+import { noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { landmarkStore } from '../landmarks';
@@ -38,23 +41,100 @@ const gcodeLog = logger('service:mcp:gcode');
  * broadcast is invisible to anyone reading the process log, and a headless
  * session debugging "controller said ok but nothing moved" needs the reply.
  */
-export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string): Promise<{ result: number; text?: string }> {
-    mcpBroadcast('mcp:gcode', { tool, gcode });
-    gcodeLog.info(`[${tool}] > ${gcode.replace(/\r?\n/g, ' | ')}`);
+// Direct-gcode sequence: every command through this gate bumps it, so the
+// motion engine can tell whether its position of record is still current
+// (positionOfRecord.ts). The timing stamps feed diagnostics.ts: idle time
+// between the controller's previous reply and the next send is engine +
+// sensor window only, so a long one inside a job means late timers.
+let gcodeSequence = 0;
+let lastReplyAt: number | null = null;
+const SLOW_IDLE_MS = 750;
+const SLOW_IDLE_IGNORE_MS = 15000; // beyond this it is a human/agent pause, not pacing
+
+export function currentGcodeSequence(): number {
+    return gcodeSequence;
+}
+
+export interface SentGcode {
+    result: number;
+    text?: string;
+    /** Value of currentGcodeSequence() for this command. */
+    sequence: number;
+    /** Send -> controller reply. */
+    execMs: number;
+}
+
+/**
+ * Optional timing the motion engine attaches to a send so an idle gap can be
+ * attributed: enteredAt = when the engine was entered for this move;
+ * lastSense = the sensor wait that preceded it (probing.ts lastSense).
+ */
+export interface SendTiming {
+    enteredAt?: number;
+    lastSense?: { kind: string; windowMs: number; elapsedMs: number; endedAt: number; contact: boolean } | null;
+    /** probing.ts step trace: "label+ms" marks since the previous reply. */
+    trace?: string;
+}
+
+export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string, timing?: SendTiming): Promise<SentGcode> {
+    gcodeSequence += 1;
+    const sequence = gcodeSequence;
+    const sentAt = Date.now();
+    const idleMs = lastReplyAt === null ? null : sentAt - lastReplyAt;
+    // Breakdown of the idle gap (previous reply -> this send):
+    //   replyToSenseEndMs: previous reply -> end of the runner's sensor wait
+    //   senseMs / senseWindowMs: that wait's actual vs requested length
+    //   senseEndToEngineMs: sensor wait end -> engine entry (runner logic)
+    //   engineMs: engine entry -> send (overtravel check, snapshot, record)
+    const breakdown: { [key: string]: number | string | boolean } = {};
+    if (timing && timing.enteredAt) {
+        breakdown.engineMs = sentAt - timing.enteredAt;
+        const sense = timing.lastSense;
+        if (sense && lastReplyAt !== null && sense.endedAt >= lastReplyAt) {
+            breakdown.replyToSenseEndMs = sense.endedAt - lastReplyAt;
+            breakdown.senseMs = sense.elapsedMs;
+            breakdown.senseWindowMs = sense.windowMs;
+            breakdown.senseKind = sense.kind;
+            breakdown.senseEndToEngineMs = timing.enteredAt - sense.endedAt;
+        }
+        if (timing.trace) {
+            breakdown.trace = timing.trace;
+        }
+    }
+    mcpBroadcast('mcp:gcode', { tool, gcode, idleMs, ...breakdown });
+    const breakdownText = Object.keys(breakdown).length
+        ? ` [${Object.keys(breakdown).map((key) => `${key}=${breakdown[key]}`).join(' ')}]`
+        : '';
+    gcodeLog.info(`[${tool}] > ${gcode.replace(/\r?\n/g, ' | ')}${idleMs === null ? '' : ` (idle ${idleMs}ms)`}${breakdownText}`);
+    const slowIdle = idleMs !== null && idleMs > SLOW_IDLE_MS && idleMs < SLOW_IDLE_IGNORE_MS && jobManager.getActive() !== null;
+    if (slowIdle) {
+        mcpBroadcast('mcp:activity', {
+            tool: 'diagnostics',
+            phase: 'slow_step',
+            ms: idleMs,
+            note: `${tool}: ${idleMs} ms from the controller's previous reply to this send (engine + sensor window only - `
+                + 'compare event_loop_stall / sense_overrun events around it)',
+        });
+    }
     // Crash-guard bracket: the HTTP channel executes synchronously, so the
     // await spans the motion window - a contact-sensor trigger inside it
     // that no procedure expects is treated as a collision (probeFeed).
     probeFeedService.motionBegin();
+    noteDirectGcodeStart();
     let executed;
     try {
         executed = await channel.executeGcode(gcode);
     } finally {
         probeFeedService.motionEnd();
+        noteDirectGcodeEnd();
     }
+    const execMs = Date.now() - sentAt;
+    lastReplyAt = Date.now();
     const response = executed.text || (executed.result === 0 ? 'ok' : `result=${executed.result}`);
-    mcpBroadcast('mcp:gcode', { tool, response });
-    gcodeLog.info(`[${tool}] < ${String(response).replace(/\r?\n/g, ' | ')}`);
-    return executed;
+    mcpBroadcast('mcp:gcode', { tool, response, execMs });
+    gcodeLog.info(`[${tool}] < ${String(response).replace(/\r?\n/g, ' | ')} (exec ${execMs}ms)`);
+    recordGcodeTiming(tool, execMs, idleMs, slowIdle);
+    return { ...executed, sequence, execMs };
 }
 
 async function sleep(ms: number): Promise<void> {

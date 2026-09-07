@@ -13,6 +13,7 @@ import {
     TRAVEL_FEED,
     assertChannelReady,
     assertMachineReadyForProcedure,
+    descendInSegments,
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
@@ -199,7 +200,7 @@ export function planToolSetterRun(args: {
         throw new McpToolError('bit_length_mm must be the approximate protrusion of the fitted bit in mm '
             + '(0-300), as stated by the operator.');
     }
-    const coarseStepMm = Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 2);
+    const coarseStepMm = Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1); // operator law 2026-09-05: never 2 mm
     const fineStepMm = Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5);
     const backoffMm = Math.min(Math.max(Number(args.backoff_mm) || 0.3, fineStepMm), 2);
     // 200ms default is tuned to the operator's local-broker latency; the
@@ -270,7 +271,7 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
     } else {
         lines.push(
             `G0 X${c.centerX.toFixed(3)} Y${c.centerY.toFixed(3)}; XY to setter centre at current (post-home) Z`,
-            `G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; travel to start height`,
+            `G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; descend to start height in <= 5 mm segments under the crash guard (a hit before it aborts)`,
         );
     }
     let z = plan.startZ;
@@ -374,8 +375,18 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             }
             announce('travel-xy', z, `XY to (${c.centerX}, ${c.centerY})`);
             await moveMachineSettled('toolsetter:travel', { x: c.centerX, y: c.centerY }, TRAVEL_FEED);
-            announce('travel-z', plan.startZ);
-            await moveMachineSettled('toolsetter:travel', { z: plan.startZ }, TRAVEL_FEED);
+            announce('travel-z', plan.startZ, 'in <= 5 mm segments under the crash guard (operator law 2026-09-05)');
+            // A long single move toward the setter cannot be stopped once sent;
+            // segments of <= 5 mm. Contact ABOVE the start height means the bit
+            // is longer than declared - a collision, not a measurement - so the
+            // setter channels are NOT expected during the travel: the crash
+            // guard latches asynchronously and the next segment is refused.
+            probeFeedService.clearExpectedContact();
+            try {
+                await descendInSegments('toolsetter:travel', z, plan.startZ, contactChannels, plan.sensorDelayMs);
+            } finally {
+                probeFeedService.setExpectedContact(contactChannels);
+            }
         }
 
         // Phase 2: coarse descent, sensor-checked after every settled step,

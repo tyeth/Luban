@@ -1,16 +1,23 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention (planProbeSequence takes
 // the probe_sequence arguments verbatim).
+import { ObstacleBox, checkMotion, describeViolations, sequenceMotion } from './envelopeChecks';
 import { mcpBroadcast } from './index';
+import { landmarkStore } from './landmarks';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
     FINE_FEED,
     MAX_RETREAT_MM,
     ProcedureAbort,
+    ProcedureStopped,
     TRAVEL_FEED,
     assertChannelReady,
+    RECHECK_TOLERANCE_MM,
     assertMachineReadyForProcedure,
+    descendInSegments,
+    expectMachinePosition,
+    knownMachinePosition,
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
@@ -55,6 +62,15 @@ interface SequenceStepProbe {
     unit: { x: number; y: number; z: number };
     maxTravelMm: number;
     start: { x: number; y: number; z: number }; // simulated position at march start
+    /**
+     * Reaching max_travel_mm without contact: record a no_contact result and
+     * carry on with the next step (default), or abort the whole sequence.
+     * Operator, 2026-09-06 (job 5ad5fcce6b3a): a side march that missed the
+     * stock at a corner aborted a six-op program with five ops complete -
+     * "less than ideal usually". The limit itself was approved, so a miss is
+     * a measurement ("nothing within N mm"), not a fault.
+     */
+    onMiss: 'continue' | 'abort';
 }
 type SequenceStep = SequenceStepHop | SequenceStepDescend | SequenceStepProbe;
 
@@ -78,7 +94,7 @@ export function planProbeSequence(args: {
     backoff_mm?: number;
     sensor_delay_ms?: number;
     confirm_passes?: number;
-}): ProbeSequencePlan {
+}, extraObstacles: ObstacleBox[] = []): ProbeSequencePlan {
     if (!Array.isArray(args.steps) || args.steps.length < 1 || args.steps.length > 60) {
         throw new McpToolError('steps is required: 1-60 entries of {kind: hop|descend|probe, ...}.');
     }
@@ -151,12 +167,17 @@ export function planProbeSequence(args: {
             if (!inEnvelope(limit.x, limit.y) || limit.z < 0) {
                 throw new McpToolError(`${at}: the march limit leaves the machine envelope.`);
             }
+            const onMissRaw = raw.on_miss === undefined ? 'continue' : String(raw.on_miss);
+            if (onMissRaw !== 'continue' && onMissRaw !== 'abort') {
+                throw new McpToolError(`${at}: on_miss must be "continue" (default: record no_contact, carry on) or "abort".`);
+            }
             steps.push({
                 kind: 'probe',
                 name,
                 unit,
                 maxTravelMm: travel,
                 start: { ...virtual },
+                onMiss: onMissRaw,
             });
             names.add(name);
             probeCount += 1;
@@ -171,9 +192,18 @@ export function planProbeSequence(args: {
         throw new McpToolError('The sequence has no probe steps - use move_z / a gcode job for pure motion.');
     }
 
+    // Law 4 (mcp/48): every hop, descend column and march is checked against
+    // the obstacle landmarks and the program's transient keep-out boxes at
+    // staging - refused, not left for the operator to spot on the page.
+    const violations = checkMotion(sequenceMotion({ hopZ, staged, steps }), [...landmarkStore.obstacleBoxes(), ...extraObstacles], { traverseZ: hopZ });
+    if (violations.length) {
+        throw new McpToolError(`Sequence refused (law 4, landmarks are obstacles): ${describeViolations(violations)}. `
+            + 'Raise the descend / march Z above the clearance, move the step, or have the operator adjust the landmark.');
+    }
+
     return {
         steps,
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 2),
+        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
         fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
         backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
         sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
@@ -226,8 +256,8 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
             lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to traverse height (law 2)`);
             lines.push(`G1 X${step.x.toFixed(3)} Y${step.y.toFixed(3)} F${TRAVEL_FEED}; hop`);
         } else if (step.kind === 'descend') {
-            lines.push(`G1 Z${(step.z + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend fast to ${DESCENT_GUARD_MM} mm above target`);
-            lines.push(`; ...guarded final approach (operator, 2026-09-02): 1 mm steps, sensor-checked after each -`);
+            lines.push(`G1 Z${(step.z + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend (<= 5 mm segments (crash guard armed)) to ${DESCENT_GUARD_MM} mm above target`);
+            lines.push('; ...guarded final approach (operator, 2026-09-02): 1 mm steps, sensor-checked after each -');
             lines.push('; ANY contact during a descent aborts and latches the CRASH alarm.');
             for (let gz = step.z + DESCENT_GUARD_MM - 1; gz > step.z - 1e-9; gz -= 1) {
                 const zz = Math.max(gz, step.z);
@@ -250,7 +280,8 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
                 lines.push(`G1 ${text} F${COARSE_FEED}; coarse ${n} - settle, check probe, stop at contact`);
             }
             lines.push(`; ...on contact: retreat/release, ${plan.fineStepMm} mm fine approach, `
-                + `${plan.confirmPasses} confirm cycle(s) (lift ${plan.backoffMm} mm); ABORTS at the limit without contact`);
+                + `${plan.confirmPasses} confirm cycle(s) (lift ${plan.backoffMm} mm); at the limit without contact: `
+                + `${step.onMiss === 'abort' ? 'ABORTS the sequence' : 'records no_contact, retreats and CONTINUES with the next step (on_miss: continue)'}`);
             lines.push(`G1 X${step.start.x.toFixed(3)} Y${step.start.y.toFixed(3)} Z${step.start.z.toFixed(3)} `
                 + `F${TRAVEL_FEED}; retreat to the march start (also on any abort)`);
             lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to traverse height`);
@@ -283,10 +314,14 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
     const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
     const results: {
         name: string;
-        contactMachine: { x: number; y: number; z: number };
-        contactDistanceMm: number;
+        status: 'contact' | 'no_contact';
+        contactMachine: { x: number; y: number; z: number } | null;
+        contactDistanceMm: number | null;
         confirmPassContacts: number[];
         spreadMm: number;
+        /** no_contact: where the march ended (its approved limit), machine coords. */
+        limitMachine?: { x: number; y: number; z: number };
+        maxTravelMm?: number;
     }[] = [];
 
     let stepIndex = 0;
@@ -301,9 +336,18 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
             } else if (step.kind === 'descend') {
                 probeFeedService.clearExpectedContact();
                 const guardTop = step.z + DESCENT_GUARD_MM;
-                const zNow = getPositionSnapshot().machine.z;
+                // Verified position (record) over a single heartbeat - see
+                // probing.knownMachinePosition (job 42df7b9351b7).
+                const known = knownMachinePosition();
+                const zNow = known.position.z;
+                if (zNow !== null && zNow < step.z - RECHECK_TOLERANCE_MM) {
+                    throw new ProcedureAbort(`Descend step ${stepIndex}: the toolhead is at machine Z${zNow} (${known.source}), BELOW the `
+                        + `planned descent target Z${step.z} - a descent never rises. Re-stage from a verified position.`);
+                }
                 if (zNow !== null && zNow > guardTop + 1e-9) {
-                    await moveMachineSettled(`seq:descend:${stepIndex}`, { z: guardTop }, TRAVEL_FEED);
+                    // Operator law 2026-09-05: descents in <= 5 mm sensor-checked
+                    // segments, never one long move toward the work.
+                    await descendInSegments(`seq:descend:${stepIndex}`, zNow, guardTop, 'probe', plan.sensorDelayMs);
                 }
                 let gz = Math.min(zNow === null ? guardTop : Math.max(zNow, step.z), guardTop);
                 while (gz - step.z > 1e-9) {
@@ -319,14 +363,14 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 announce(`descend-${stepIndex}`, `Z${step.z} (guarded final ${DESCENT_GUARD_MM} mm)`);
             } else {
                 // Re-verify the walk matches the simulation before marching.
-                const now = getPositionSnapshot().machine;
-                if (now.x === null || now.y === null || now.z === null
-                    || Math.abs(now.x - step.start.x) > 0.5
-                    || Math.abs(now.y - step.start.y) > 0.5
-                    || Math.abs(now.z - step.start.z) > 0.5) {
-                    throw new ProcedureAbort(`March "${step.name}": machine at `
-                        + `(${now.x}, ${now.y}, ${now.z}) but the plan expects `
-                        + `(${step.start.x}, ${step.start.y}, ${step.start.z}).`);
+                // Every preceding move already verified its own arrival, so
+                // the engine's position of record and an either-frame reading
+                // of the heartbeat decide (positionOfRecord.ts; jobs
+                // 44abebd9bab3 and 1db4902a4cd6, 2026-09-05).
+                const check = await expectMachinePosition(step.start, `March "${step.name}"`,
+                    (message) => new ProcedureAbort(message));
+                if (check.note) {
+                    announce(`recheck-${stepIndex}`, check.note);
                 }
                 probeFeedService.setExpectedContact(['probe']);
                 const move = async (tool: string, s: number, feed: number) => {
@@ -347,7 +391,29 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                     }
                 }
                 if (coarseContactS === null) {
-                    throw new ProcedureAbort(`March "${step.name}": no contact within ${step.maxTravelMm} mm.`);
+                    if (step.onMiss === 'abort') {
+                        throw new ProcedureAbort(`March "${step.name}": no contact within ${step.maxTravelMm} mm (on_miss: abort).`);
+                    }
+                    // A miss is a measurement: nothing within the approved
+                    // travel. Record it, retreat to the start, raise, carry on.
+                    const limit = pointAlong(step.start, step.unit, step.maxTravelMm);
+                    results.push({
+                        name: step.name,
+                        status: 'no_contact',
+                        contactMachine: null,
+                        contactDistanceMm: null,
+                        confirmPassContacts: [],
+                        spreadMm: 0,
+                        limitMachine: limit,
+                        maxTravelMm: step.maxTravelMm,
+                    });
+                    announce(`no-contact-${step.name}`, `nothing within ${step.maxTravelMm} mm (limit at ${limit.x}, ${limit.y}, ${limit.z}); continuing`);
+                    await moveMachineSettled(`seq:retreat:${step.name}`, {
+                        x: step.start.x, y: step.start.y, z: step.start.z,
+                    }, TRAVEL_FEED);
+                    probeFeedService.clearExpectedContact();
+                    await moveMachineSettled(`seq:raise:${step.name}`, { z: plan.hopZ }, TRAVEL_FEED);
+                    continue;
                 }
                 let released = false;
                 while (s > 1e-9 && coarseContactS - s < MAX_RETREAT_MM + 1e-9) {
@@ -411,6 +477,7 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 const contact = pointAlong(step.start, step.unit, measuredS);
                 results.push({
                     name: step.name,
+                    status: 'contact',
                     contactMachine: contact,
                     contactDistanceMm: measuredS,
                     confirmPassContacts: passContacts,
@@ -428,13 +495,17 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
             }
         }
 
-        announce('sequence-complete', `${results.length} contacts`);
+        const contacts = results.filter((r) => r.status === 'contact');
+        const misses = results.filter((r) => r.status === 'no_contact').map((r) => r.name);
+        announce('sequence-complete', `${contacts.length} contacts${misses.length ? `, ${misses.length} no_contact (${misses.join(', ')})` : ''}`);
         return {
             results,
+            contactCount: contacts.length,
+            noContactProbes: misses,
             phases,
-            note: `Probe sequence complete: ${results.length} contacts, all MACHINE coordinates. `
-                + 'Worst confirm spread '
-                + `${Math.max(...results.map((r) => r.spreadMm)).toFixed(3)} mm.`,
+            note: `Probe sequence complete: ${contacts.length} contacts${misses.length ? `, ${misses.length} march(es) found nothing within their approved travel (${misses.join(', ')})` : ''}, `
+                + 'all MACHINE coordinates. Worst confirm spread '
+                + `${(contacts.length ? Math.max(...contacts.map((r) => r.spreadMm)) : 0).toFixed(3)} mm.`,
         };
     } catch (err) {
         const isTrip = !!probeFeedService.getTrip();
@@ -452,8 +523,10 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
             }
         }
         if (err instanceof ProcedureAbort) {
-            throw new McpToolError(`Probe sequence aborted at step ${stepIndex}: ${err.message} `
-                + `Completed contacts: ${JSON.stringify(results)} Phases: ${JSON.stringify(phases)}`);
+            const partial = { results, phases, aborted: true, abortedAtStep: stepIndex };
+            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+            throw new Ctor(`Probe sequence aborted at step ${stepIndex}: ${err.message} `
+                + `${results.length} contact(s) measured before the abort are on the job record.`, partial);
         }
         throw err;
     } finally {

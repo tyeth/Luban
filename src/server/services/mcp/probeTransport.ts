@@ -14,7 +14,9 @@ export type ProbeTransportKind = 'mqtt' | 'gpio';
  * the overtravel/crash latch, reconnection). Implementations extend
  * EventEmitter and emit:
  *
- *   'reading' (channel: ProbeChannel, value: string) - the sensor CHANGED
+ *   'reading' (channel: ProbeChannel, value: string, meta?: ReadingMeta) - the sensor CHANGED
+ *             (meta.sentAt: the transport's own wall-clock ms at detection, when it has one,
+ *             so the server can measure pipe latency)
  *   'refresh' (channel: ProbeChannel, value: string) - polled, unchanged
  *             (freshness only; MQTT never emits it, polling GPIO does)
  *   'error'   (err: Error)  - after connect() resolved; connect failures reject
@@ -23,6 +25,12 @@ export type ProbeTransportKind = 'mqtt' | 'gpio';
  * A closed transport is not reusable - the service builds a new one from
  * freshly resolved configuration on every (re)connect.
  */
+/** Optional per-reading timing from a transport that stamps its readings. */
+export interface ReadingMeta {
+    /** Wall-clock ms (same host clock) when the transport detected the change. */
+    sentAt?: number;
+}
+
 export interface ProbeTransport {
     connect(): Promise<void>;
     end(): void;

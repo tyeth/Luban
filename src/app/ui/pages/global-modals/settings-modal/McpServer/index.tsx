@@ -49,6 +49,12 @@ interface McpTransportSettings {
     active: 'mqtt' | 'gpio';
 }
 
+interface McpSensorSettings {
+    toolSetter: boolean;
+    probe: boolean;
+    envOverrides: string[];
+}
+
 interface McpStatus {
     running: boolean;
     port: number | null;
@@ -57,12 +63,27 @@ interface McpStatus {
         enabled: boolean;
         port: number;
         source: 'env' | 'config';
+        allowLan: boolean;
+        allowLanSource: 'env' | 'config' | 'default';
     };
+    lanUrls: string[];
     transport: McpTransportSettings;
+    sensors: McpSensorSettings;
     mqtt: McpMqttSettings;
     gpio: McpGpioSettings;
+    buffers?: {
+        jobEventLimit: number;
+        jobEventLimitRange: [number, number];
+        jobEventLimitSource: 'env' | 'config' | 'default';
+        diagnosticsRecentLimit: number;
+        diagnosticsRecentLimitRange: [number, number];
+        diagnosticsRecentLimitSource: 'env' | 'config' | 'default';
+    };
+    approval?: {
+        handoff: 'agent' | 'code';
+        source: 'env' | 'config' | 'default';
+    };
 }
-
 const MQTT_FIELDS: Array<{ name: keyof McpMqttSettings['values']; labelKey: string; placeholder?: string; channel?: string }> = [
     { name: 'host', labelKey: 'key-App/Settings/McpServer-MQTT host', placeholder: 'io.adafruit.com' },
     { name: 'port', labelKey: 'key-App/Settings/McpServer-MQTT port', placeholder: '8883 (TLS)' },
@@ -108,6 +129,9 @@ const McpServer: React.FC = () => {
     const [status, setStatus] = useState<McpStatus | null>(null);
     const [enabled, setEnabled] = useState(false);
     const [port, setPort] = useState('');
+    const [allowLan, setAllowLan] = useState(false);
+    const [toolSetterEnabled, setToolSetterEnabled] = useState(true);
+    const [probeEnabled, setProbeEnabled] = useState(true);
     const [transport, setTransport] = useState('');
     const [mqtt, setMqtt] = useState<{ [field: string]: string }>({});
     const [inverted, setInverted] = useState<{ [channel: string]: boolean }>({});
@@ -115,6 +139,12 @@ const McpServer: React.FC = () => {
     const [mqttPassTouched, setMqttPassTouched] = useState(false);
     const [gpio, setGpio] = useState<{ [field: string]: string }>({});
     const [gpioInverted, setGpioInverted] = useState<{ [channel: string]: boolean }>({});
+    // Diagnostic buffer sizes; '' = server default. Stored values only (an
+    // env override disables the field).
+    const [jobEventLimit, setJobEventLimit] = useState('');
+    const [diagnosticsRecentLimit, setDiagnosticsRecentLimit] = useState('');
+    // Job approval hand-off: true = a waiting agent starts on the operator's click.
+    const [approvalHandoffAgent, setApprovalHandoffAgent] = useState(true);
 
     useEffect(() => {
         api.getMcpStatus()
@@ -123,8 +153,19 @@ const McpServer: React.FC = () => {
                 setStatus(body);
                 setEnabled(body.settings.enabled);
                 setPort(String(body.settings.port));
+                setAllowLan(!!body.settings.allowLan);
+                if (body.sensors) {
+                    setToolSetterEnabled(body.sensors.toolSetter !== false);
+                    setProbeEnabled(body.sensors.probe !== false);
+                }
                 setTransport(body.transport ? body.transport.stored : '');
-
+                if (body.buffers) {
+                    setJobEventLimit(body.buffers.jobEventLimitSource === 'config' ? String(body.buffers.jobEventLimit) : '');
+                    setDiagnosticsRecentLimit(body.buffers.diagnosticsRecentLimitSource === 'config' ? String(body.buffers.diagnosticsRecentLimit) : '');
+                }
+                if (body.approval) {
+                    setApprovalHandoffAgent(body.approval.handoff !== 'code');
+                }
                 const { inverted: mqttInvertedNames, ...mqttValues } = body.mqtt.values;
                 setMqtt({ ...mqttValues });
                 setInverted(parseInvertedFlags(mqttInvertedNames));
@@ -150,7 +191,17 @@ const McpServer: React.FC = () => {
         }
         const gpioUpdate: { [field: string]: string } = { ...gpio };
         gpioUpdate.inverted = CHANNELS.filter((channel) => gpioInverted[channel]).join(',');
-        await api.setMcpSettings({ enabled, port: value, transport, mqtt: mqttUpdate, gpio: gpioUpdate });
+        await api.setMcpSettings({
+            enabled,
+            port: value,
+            allowLan,
+            sensors: { toolSetter: toolSetterEnabled, probe: probeEnabled },
+            transport,
+            mqtt: mqttUpdate,
+            gpio: gpioUpdate,
+            buffers: { jobEventLimit, diagnosticsRecentLimit },
+            approvalHandoff: approvalHandoffAgent ? 'agent' : 'code',
+        });
     };
 
     useEffect(() => {
@@ -230,8 +281,92 @@ const McpServer: React.FC = () => {
                         className={styles['port-input']}
                     />
                     <div className={styles['port-tips']}>
-                        {i18n._('key-App/Settings/McpServer-Local agents connect at')} http://127.0.0.1:&lt;port&gt;/mcp. {i18n._('key-App/Settings/McpServer-Loopback only; never reachable from the network')}
+                        {i18n._('key-App/Settings/McpServer-Local agents connect at')} http://127.0.0.1:&lt;port&gt;/mcp. {allowLan
+                            ? i18n._('key-App/Settings/McpServer-LAN access is ON: hosts on this machine\'s own subnets are accepted too.')
+                            : i18n._('key-App/Settings/McpServer-Loopback only; never reachable from the network')}
                     </div>
+                </div>
+                <div className="sm-flex align-center margin-bottom-8 margin-top-8">
+                    <Switch
+                        checked={allowLan}
+                        onChange={(checked) => setAllowLan(checked)}
+                        disabled={!enabled || !!(status && status.settings && status.settings.allowLanSource === 'env')}
+                    />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Allow access from the local network (same subnet only; applies after restart)')}</span>
+                </div>
+                {allowLan && (
+                    <div className="margin-bottom-8" style={{ color: '#FF4D4F' }}>
+                        {i18n._('key-App/Settings/McpServer-WARNING: there is no authentication. Anyone on your local network can then command the machine. Only enable on a trusted network, and never leave the machine unattended.')}
+                        {status && status.lanUrls && status.lanUrls.length > 0 && (
+                            <div style={{ color: 'inherit' }}>{i18n._('key-App/Settings/McpServer-LAN URLs:')} {status.lanUrls.join(', ')}</div>
+                        )}
+                        {status && status.settings && status.settings.allowLanSource === 'env' && (
+                            <div>{i18n._('key-App/Settings/McpServer-Overridden by LUBAN_MCP_ALLOW_LAN')}</div>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            <div className="border-bottom-normal padding-bottom-4 margin-top-16">
+                <span>{i18n._('key-App/Settings/McpServer-Job approval')}</span>
+            </div>
+            <div className="margin-top-8">
+                <div className="sm-flex align-center">
+                    <Switch
+                        checked={approvalHandoffAgent}
+                        onChange={(checked) => setApprovalHandoffAgent(checked)}
+                        disabled={!enabled || !!(status && status.approval && status.approval.source === 'env')}
+                    />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Hand approval to the waiting agent (your click on the confirm page starts the job; no code to copy)')}</span>
+                </div>
+                <div className={styles['port-tips']}>
+                    {i18n._('key-App/Settings/McpServer-Off: the confirm page shows a one-time code you must relay to the agent yourself. Either way only your click in the browser authorises motion.')}
+                    {status && status.approval && status.approval.source === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_APPROVAL_HANDOFF` : ''}
+                </div>
+            </div>
+
+            <div className="border-bottom-normal padding-bottom-4 margin-top-16">
+                <span>{i18n._('key-App/Settings/McpServer-Diagnostic buffers')}</span>
+            </div>
+            <div className="margin-top-8">
+                <div className={styles['port-tips']}>
+                    {i18n._('key-App/Settings/McpServer-Long procedures (surface scans, bed surveys) write several events per step; raise the job event limit so the whole record survives. Applies immediately; empty = default.')}
+                </div>
+                <div className="sm-flex align-center margin-top-8">
+                    <span style={LABEL_STYLE}>{i18n._('key-App/Settings/McpServer-Job event log (events kept per job)')}</span>
+                    <Input
+                        value={jobEventLimit}
+                        onChange={(e) => {
+                            if (/^\d*$/.test(e.target.value)) {
+                                setJobEventLimit(e.target.value);
+                            }
+                        }}
+                        disabled={!enabled || !!(status && status.buffers && status.buffers.jobEventLimitSource === 'env')}
+                        className={styles['port-input']}
+                        placeholder={status && status.buffers ? String(status.buffers.jobEventLimit) : '2000'}
+                    />
+                    <span className="margin-left-8">
+                        {status && status.buffers ? `${status.buffers.jobEventLimitRange[0]}-${status.buffers.jobEventLimitRange[1]}` : ''}
+                        {status && status.buffers && status.buffers.jobEventLimitSource === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_JOB_EVENT_LIMIT` : ''}
+                    </span>
+                </div>
+                <div className="sm-flex align-center margin-top-8">
+                    <span style={LABEL_STYLE}>{i18n._('key-App/Settings/McpServer-Recent timing records (per diagnostics list)')}</span>
+                    <Input
+                        value={diagnosticsRecentLimit}
+                        onChange={(e) => {
+                            if (/^\d*$/.test(e.target.value)) {
+                                setDiagnosticsRecentLimit(e.target.value);
+                            }
+                        }}
+                        disabled={!enabled || !!(status && status.buffers && status.buffers.diagnosticsRecentLimitSource === 'env')}
+                        className={styles['port-input']}
+                        placeholder={status && status.buffers ? String(status.buffers.diagnosticsRecentLimit) : '40'}
+                    />
+                    <span className="margin-left-8">
+                        {status && status.buffers ? `${status.buffers.diagnosticsRecentLimitRange[0]}-${status.buffers.diagnosticsRecentLimitRange[1]}` : ''}
+                        {status && status.buffers && status.buffers.diagnosticsRecentLimitSource === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_DIAGNOSTICS_RECENT_LIMIT` : ''}
+                    </span>
                 </div>
             </div>
 
@@ -241,6 +376,15 @@ const McpServer: React.FC = () => {
             <div className="margin-top-8">
                 <div className="margin-bottom-8">
                     {i18n._('key-App/Settings/McpServer-External tool setter, overtravel and touch probe sensors report over this feed. Applies at the next feed connection.')}
+                </div>
+                <div className="sm-flex align-center margin-bottom-8">
+                    <Switch checked={toolSetterEnabled} onChange={(checked) => setToolSetterEnabled(checked)} disabled={!enabled} />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Tool setter (contact + overtravel sensors)')}</span>
+                    <Switch className="margin-left-16" checked={probeEnabled} onChange={(checked) => setProbeEnabled(checked)} disabled={!enabled} />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Touch probe')}</span>
+                </div>
+                <div className="margin-bottom-8">
+                    {i18n._('key-App/Settings/McpServer-A disabled sensor is never bound: no pill, no readings, and procedures that need it refuse. If the USB sensor bridge is unplugged the feed just reports "not detected" and keeps retrying quietly - disable the sensors here when you know it will be absent.')}
                 </div>
                 <div className="sm-flex align-center margin-bottom-8">
                     <span style={LABEL_STYLE}>{i18n._('key-App/Settings/McpServer-Transport')}</span>

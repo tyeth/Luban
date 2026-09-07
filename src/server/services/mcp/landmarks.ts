@@ -4,6 +4,7 @@ import path from 'path';
 
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
+import { ObstacleBox, segmentHitsBox2D } from './envelopeChecks';
 
 const log = logger('service:mcp:landmarks');
 
@@ -113,35 +114,20 @@ export class LandmarkStore {
             if (l.clearanceZ === null || toolheadZ >= l.clearanceZ) {
                 return false;
             }
-            const bx0 = l.machine.x0 - marginMm;
-            const by0 = l.machine.y0 - marginMm;
-            const bx1 = l.machine.x1 + marginMm;
-            const by1 = l.machine.y1 + marginMm;
-            // 2D segment-vs-AABB slab test.
-            const dx = x1 - x0;
-            const dy = y1 - y0;
-            let tMin = 0;
-            let tMax = 1;
-            for (const [p, d, lo, hi] of [[x0, dx, bx0, bx1], [y0, dy, by0, by1]] as [number, number, number, number][]) {
-                if (Math.abs(d) < 1e-12) {
-                    if (p < lo || p > hi) {
-                        return false;
-                    }
-                } else {
-                    let t1 = (lo - p) / d;
-                    let t2 = (hi - p) / d;
-                    if (t1 > t2) {
-                        [t1, t2] = [t2, t1];
-                    }
-                    tMin = Math.max(tMin, t1);
-                    tMax = Math.min(tMax, t2);
-                    if (tMin > tMax) {
-                        return false;
-                    }
-                }
-            }
-            return true;
+            return segmentHitsBox2D(x0, y0, x1, y1, l.machine, marginMm);
         });
+    }
+
+    /**
+     * Obstacle landmarks (clearanceZ set) for the procedure planners
+     * (envelopeChecks), in 'crossing' mode: a landmark's clearance forbids
+     * TRAVERSING across its box low, not probing inside it - the rotary-axis
+     * landmark covers the whole stock, and probing the stock is the job.
+     */
+    public obstacleBoxes(): ObstacleBox[] {
+        return this.load().landmarks
+            .filter((l) => l.clearanceZ !== null)
+            .map((l) => ({ name: l.name, machine: { ...l.machine }, clearanceZ: l.clearanceZ as number, mode: 'crossing' as const }));
     }
 
     /**

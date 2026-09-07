@@ -1,3 +1,4 @@
+import os from 'os';
 import http from 'http';
 
 import logger from '../../lib/logger';
@@ -47,6 +48,76 @@ export function isAllowedOrigin(origin: string | undefined): boolean {
 
 export function isLoopback(address: string | undefined): boolean {
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+function ipv4ToInt(address: string): number | null {
+    const parts = address.split('.');
+    if (parts.length !== 4) {
+        return null;
+    }
+    let value = 0;
+    for (const part of parts) {
+        const n = Number(part);
+        if (!Number.isInteger(n) || n < 0 || n > 255) {
+            return null;
+        }
+        value = (value * 256) + n;
+    }
+    return value;
+}
+
+/**
+ * IPv4 addresses of this machine's own non-internal interfaces, with their
+ * netmasks - the subnets an operator on "the local network" sits on.
+ */
+export function localSubnets(): { address: string; netmask: string }[] {
+    const result: { address: string; netmask: string }[] = [];
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name] || []) {
+            if (!iface.internal && (iface.family === 'IPv4' || (iface.family as unknown) === 4)) {
+                result.push({ address: iface.address, netmask: iface.netmask });
+            }
+        }
+    }
+    return result;
+}
+
+/**
+ * True when the remote address is on one of this machine's own IPv4 subnets
+ * (mcpAllowLan). IPv4-mapped IPv6 is unwrapped; other IPv6 is refused - the
+ * LAN option is deliberately narrow, not "anything routable".
+ */
+export function isLocalSubnetAddress(address: string | undefined): boolean {
+    if (!address) {
+        return false;
+    }
+    const plain = address.startsWith('::ffff:') ? address.slice(7) : address;
+    const remote = ipv4ToInt(plain);
+    if (remote === null) {
+        return false;
+    }
+    for (const subnet of localSubnets()) {
+        const local = ipv4ToInt(subnet.address);
+        const mask = ipv4ToInt(subnet.netmask);
+        if (local === null || mask === null) {
+            continue;
+        }
+        // eslint-disable-next-line no-bitwise
+        if (((remote & mask) >>> 0) === ((local & mask) >>> 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Browser origins acceptable in LAN mode: a host on one of our subnets. */
+export function isLocalSubnetOrigin(origin: string | undefined): boolean {
+    if (!origin) {
+        return true;
+    }
+    const match = origin.match(/^https?:\/\/([0-9.]+)(:\d+)?$/);
+    return !!match && isLocalSubnetAddress(match[1]);
 }
 
 export class McpServer {

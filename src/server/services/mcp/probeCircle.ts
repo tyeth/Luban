@@ -11,6 +11,7 @@ import {
     TRAVEL_FEED,
     assertChannelReady,
     assertMachineReadyForProcedure,
+    descendInSegments,
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
@@ -216,7 +217,7 @@ export function describeProbeCirclePlanAsGcode(plan: ProbeCirclePlan): string {
         if (!plan.inside) {
             lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; lift to safe traverse height`);
             lines.push(`G1 X${point.startXY.x.toFixed(3)} Y${point.startXY.y.toFixed(3)} F${TRAVEL_FEED}; approach start`);
-            lines.push(`G1 Z${(plan.probeZ + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend fast to ${DESCENT_GUARD_MM} mm above probing depth`);
+            lines.push(`G1 Z${(plan.probeZ + DESCENT_GUARD_MM).toFixed(3)} F${TRAVEL_FEED}; descend (<= 5 mm segments (crash guard armed)) to ${DESCENT_GUARD_MM} mm above probing depth`);
             lines.push(`; ...guarded final approach: ${DESCENT_GUARD_MM} x 1 mm sensor-checked steps to Z${plan.probeZ.toFixed(3)} -`);
             lines.push(`G1 Z${plan.probeZ.toFixed(3)} F${COARSE_FEED}; ANY contact during descent aborts + latches CRASH`);
         }
@@ -349,7 +350,9 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
                 probeFeedService.clearExpectedContact();
                 await moveMachineSettled(`circle:hop:${label}`, { z: plan.hopZ }, TRAVEL_FEED);
                 await moveMachineSettled(`circle:hop:${label}`, { ...point.startXY }, TRAVEL_FEED);
-                await moveMachineSettled(`circle:descend:${label}`, { z: plan.probeZ + DESCENT_GUARD_MM }, TRAVEL_FEED);
+                // Operator law 2026-09-05: descents in <= 5 mm sensor-checked
+                // segments, never one long move toward the work.
+                await descendInSegments(`circle:descend:${label}`, plan.hopZ, plan.probeZ + DESCENT_GUARD_MM, 'probe', plan.sensorDelayMs);
                 let gz = plan.probeZ + DESCENT_GUARD_MM;
                 while (gz - plan.probeZ > 1e-9) {
                     const t0 = Date.now();

@@ -15,7 +15,11 @@ shifted exactly, without ever re-touching the stock.
 
 - Probe feed connected (`get_probe_feed_status` to check; `connect_probe_feed`
   if not - the feed auto-connects at start when configured) and the machine
-  homed and idle. The tool setter's overtravel switch is a tripwire ONLY while
+  homed and idle. If the status shows `unavailable: true` / `bridge: not
+  detected`, the USB sensor bridge is unplugged - tell the operator, do not
+  work around it. If a tool refuses with "the tool setter is disabled
+  (Settings -> MCP Server)", the operator switched that sensor off in the app;
+  ask them to enable it - never proceed without the sensor. The tool setter's overtravel switch is a tripwire ONLY while
   this procedure (or other MCP motion) is running: pushing the setter past
   contact mid-run latches the alarm; by hand with the machine idle it just
   flashes the Workspace pill. The Workspace -> Connection pills (Tool Setter /
@@ -24,8 +28,11 @@ shifted exactly, without ever re-touching the stock.
   (`get_tool_setter_config`; the operator sets them once with
   `set_tool_setter_config` — on this machine the park is Z at the homing
   height, X at the far end, Y free).
-- Every motion step below stages a job the OPERATOR approves on a confirm page;
-  the one-time code they give you goes to `start_gcode_job`.
+- Every motion step below stages a job the OPERATOR approves on a confirm page.
+  Call `start_gcode_job` with `wait_for_approval_ms` (e.g. 110000) right after
+  staging: their click starts it with nothing to copy (`approved: false` on
+  timeout means call again). If hand-off is disabled in their settings, the
+  one-time code they give you goes in as `confirm_token`.
 
 ## Two flows — ask which one the operator is using
 

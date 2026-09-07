@@ -115,7 +115,7 @@ export function planProbeVector(args: {
             y: Number((start.y + unit.y * travel).toFixed(3)),
             z: Number((start.z + unit.z * travel).toFixed(3)),
         },
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 2),
+        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
         fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
         backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
         sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
@@ -152,9 +152,9 @@ export function describeProbeVectorPlanAsGcode(plan: ProbeVectorPlan): string {
     const dir = `(${plan.unit.x}, ${plan.unit.y}, ${plan.unit.z})`;
     const lines = [
         '; TOUCH PROBE VECTOR MEASUREMENT (server-driven, sensor-gated on the probe channel)',
-        `; march along unit direction ${dir} from the staging position, max travel ${plan.maxTravelMm} mm`
-            + (plan.maxTravelMm < plan.requestedTravelMm
-                ? ` (requested ${plan.requestedTravelMm}, clamped to the machine envelope)` : ''),
+        `; march along unit direction ${dir} from the staging position, max travel ${plan.maxTravelMm} mm${
+            plan.maxTravelMm < plan.requestedTravelMm
+                ? ` (requested ${plan.requestedTravelMm}, clamped to the machine envelope)` : ''}`,
         '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the probe feed is checked',
         '; before the next line. The march stops at first contact; running the full ladder',
         `; without contact ABORTS at (${plan.limit.x}, ${plan.limit.y}, ${plan.limit.z}).`,

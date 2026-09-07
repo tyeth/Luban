@@ -1,3 +1,5 @@
+import * as fs from 'fs-extra';
+import path from 'path';
 import {
     SnapmakerA150Machine,
     SnapmakerA250Machine,
@@ -8,8 +10,11 @@ import {
     SnapmakerOriginalMachine,
     SnapmakerRayMachine,
 } from '../../../../app/machines';
+
+import DataStorage from '../../../DataStorage';
 import config from '../../configstore';
 import { connectionManager } from '../../machine/ConnectionManager';
+import { ZERO_OFFSET_ACCEPT_BEATS, directGcodeQuiet, judgeOffsetReport } from '../positionOfRecord';
 import { McpToolError, ToolRegistry } from '../registry';
 
 const MACHINES = [
@@ -44,6 +49,45 @@ function findMachine(identifier: string) {
     return MACHINES.find((machine) => machine.identifier === identifier) || null;
 }
 
+export interface AppMachineSettings {
+    /** Machine identifier as selected in Luban, e.g. "Snapmaker 2.0 A350". */
+    series: string | null;
+    /** Selected toolhead per function: printingToolhead / laserToolhead / cncToolhead. */
+    toolHead: { [kind: string]: string };
+    /** Installed add-on module identifiers, e.g. "snapmaker-2.0-bracing-kit-module". */
+    modules: string[];
+}
+
+/**
+ * The machine the OPERATOR selected in Luban's Machine Settings - series,
+ * toolheads and add-on modules (quick-swap kit, bracing kit). Read fresh from
+ * the app's own persisted store (userData/machine.json, state.machine) on
+ * every call, so a settings change - the app returns to its home page when
+ * the machine config changes - is honoured immediately. This is the single
+ * source of truth for what is installed; nothing is duplicated in the
+ * server configstore.
+ */
+export function readAppMachineSettings(): AppMachineSettings | null {
+    try {
+        const file = path.join(DataStorage.userDataDir, 'machine.json');
+        if (!fs.existsSync(file)) {
+            return null;
+        }
+        const store = fs.readJsonSync(file);
+        const machine = store && store.state && store.state.machine;
+        if (!machine || typeof machine !== 'object') {
+            return null;
+        }
+        return {
+            series: typeof machine.series === 'string' ? machine.series : null,
+            toolHead: machine.toolHead && typeof machine.toolHead === 'object' ? machine.toolHead : {},
+            modules: Array.isArray(machine.modules) ? machine.modules.map(String) : [],
+        };
+    } catch (err) {
+        return null;
+    }
+}
+
 /**
  * Build volume of a machine by identifier, or null when unknown.
  */
@@ -73,11 +117,14 @@ export interface PositionSnapshot {
     work: { x: number | null; y: number | null; z: number | null };
     machine: { x: number | null; y: number | null; z: number | null };
     originOffset: { x: number; y: number; z: number };
+    originOffsetSource: 'heartbeat' | 'cached' | 'assumed-zero';
     b: number | null;
     isFourAxis: boolean;
     isHomed: boolean | null;
     machineStatus: string | null;
     reportAgeMs: number;
+    /** The beat's own timestamp (ms epoch) - compare beats with this, never with Date.now() - reportAgeMs (1 ms jitter made one beat look like two). */
+    reportedAt: number;
     convention: string;
     warnings: string[];
 }
@@ -110,6 +157,24 @@ export function assertFreshHeartbeat(what: string): void {
  * Position from the latest heartbeat, shared by get_position and the
  * capture tools. Throws McpToolError when unavailable.
  */
+let lastKnownOriginOffset: { x: number; y: number; z: number; at: number } | null = null;
+// Zero-offset transient tracking (see getPositionSnapshot / judgeOffsetReport).
+let zeroOffsetStreak = 0;
+let zeroOffsetSeenAt: number | null = null;
+let zeroOffsetBeats = 0;
+const ZERO_OFFSET_QUIET_MS = 3000;
+
+/** Diagnostics: how the origin offset is currently being resolved. */
+export function originOffsetDiagnostics() {
+    return {
+        lastKnownOriginOffset,
+        zeroOffsetStreak,
+        zeroOffsetAcceptBeats: ZERO_OFFSET_ACCEPT_BEATS,
+        /** Snapshots that set a zero-offset report aside as a G53-window transient. */
+        zeroOffsetTransientsSeen: zeroOffsetBeats,
+    };
+}
+
 export function getPositionSnapshot(): PositionSnapshot {
     const status = connectionManager.getConnectionStatus();
     if (!status.connected) {
@@ -131,11 +196,67 @@ export function getPositionSnapshot(): PositionSnapshot {
         y: axisValue(pos.y),
         z: axisValue(pos.z),
     };
-    const offset = {
-        x: axisValue(originOffset.x) || 0,
-        y: axisValue(originOffset.y) || 0,
-        z: axisValue(originOffset.z) || 0,
+    const warnings: string[] = [];
+    // The SSTP status poll rebuilds originOffset from data.offsetX/Y/Z on
+    // every beat. A beat that lands inside a move's G53...G54 window (or any
+    // beat the firmware sends without offsets) used to fall through `|| 0`
+    // and silently reframe machine coordinates as work coordinates - which
+    // aborted a probe_sequence march re-check on 2026-09-05 (job
+    // 44abebd9bab3: settled at machine (170,199,240), re-check read
+    // (119,77,-88)). Missing offsets now reuse the last complete offset seen
+    // on this connection and say so; callers that verify position should
+    // re-read once when a check fails (see probeSequence).
+    const reported = {
+        x: axisValue(originOffset.x),
+        y: axisValue(originOffset.y),
+        z: axisValue(originOffset.z),
     };
+    // Zero-offset transient (G53-window beat: offsets read 0,0,0 and pos is
+    // in machine coordinates) - see positionOfRecord.judgeOffsetReport. A
+    // zero that contradicts the cached non-zero offset counts one streak per
+    // DISTINCT beat and is believed only once the streak reaches
+    // ZERO_OFFSET_ACCEPT_BEATS.
+    // Only QUIET beats count towards believing a zero offset: while direct
+    // gcode is in flight (or replied within the last ZERO_OFFSET_QUIET_MS) a
+    // zero is the G53-window artefact by construction - a scan stepping
+    // every second produced runs of them and the 3-beat streak accepted the
+    // zero 28 times in one run (2026-09-05). A real re-zero from the
+    // touchscreen happens with the machine idle and is believed after 3
+    // quiet beats (~6 s).
+    const reportedAllZero = reported.x === 0 && reported.y === 0 && reported.z === 0;
+    if (reportedAllZero) {
+        if (zeroOffsetSeenAt !== state.timestamp) {
+            zeroOffsetSeenAt = state.timestamp;
+            if (directGcodeQuiet(ZERO_OFFSET_QUIET_MS)) {
+                zeroOffsetStreak += 1;
+            } else {
+                zeroOffsetStreak = 0;
+            }
+        }
+    } else {
+        zeroOffsetStreak = 0;
+        zeroOffsetSeenAt = null;
+    }
+    const cached = lastKnownOriginOffset ? { x: lastKnownOriginOffset.x, y: lastKnownOriginOffset.y, z: lastKnownOriginOffset.z } : null;
+    const judged = judgeOffsetReport(reported, cached, zeroOffsetStreak);
+    const offset = judged.offset;
+    const offsetSource = judged.source;
+    if (judged.cache && (judged.source === 'heartbeat')) {
+        lastKnownOriginOffset = { ...judged.cache, at: state.timestamp };
+    }
+    if (judged.transientZero) {
+        zeroOffsetBeats += 1;
+        warnings.push('The latest heartbeat reports a zero work-origin offset while this connection has seen '
+            + `(${offset.x}, ${offset.y}, ${offset.z}) - a G53-window beat (pos is then in machine coordinates); `
+            + `using the last complete offset (zero would be believed after ${ZERO_OFFSET_ACCEPT_BEATS} consecutive beats).`);
+    } else if (judged.source === 'cached' && lastKnownOriginOffset) {
+        warnings.push('The latest heartbeat carried no work-origin offset; machine coordinates use the '
+            + `last complete offset (${offset.x}, ${offset.y}, ${offset.z}) seen ${((state.timestamp - lastKnownOriginOffset.at) / 1000).toFixed(1)}s earlier. `
+            + 'Re-read before trusting a position check.');
+    } else if (judged.source === 'assumed-zero') {
+        warnings.push('No work-origin offset has been reported on this connection yet; machine coordinates '
+            + 'ASSUME a zero offset and may be wrong - query_firmware_position and re-verify.');
+    }
     const machine = {
         x: work.x === null ? null : work.x - offset.x,
         y: work.y === null ? null : work.y - offset.y,
@@ -146,11 +267,10 @@ export function getPositionSnapshot(): PositionSnapshot {
     // reporting positions in an unselected workspace, so derived machine
     // coordinates land outside the build volume (e.g. Z 656 on a 325 mm
     // machine). Flag it rather than let an agent trust it.
-    const warnings: string[] = [];
     const reportAgeMs = Date.now() - state.timestamp;
     if (reportAgeMs > HEARTBEAT_STALE_MS) {
         warnings.push(`STALE: the last heartbeat is ${(reportAgeMs / 1000).toFixed(0)}s old `
-            + `(period ~1s) - the machine connection has likely dropped without the server `
+            + '(period ~1s) - the machine connection has likely dropped without the server '
             + 'noticing (observed live 2026-09-02). Do NOT trust this position; reconnect and '
             + 're-verify before any motion.');
     }
@@ -174,11 +294,13 @@ export function getPositionSnapshot(): PositionSnapshot {
         work,
         machine,
         originOffset: offset,
+        originOffsetSource: offsetSource,
         b: axisValue(pos.b),
         isFourAxis: !!pos.isFourAxis,
         isHomed: (state as { isHomed?: boolean }).isHomed ?? null,
         machineStatus: (state as { status?: string }).status || null,
         reportAgeMs,
+        reportedAt: state.timestamp,
         convention: 'machine = work - originOffset; heartbeat reports work coordinates',
         warnings,
     };
@@ -188,7 +310,9 @@ export function registerMachineTools(registry: ToolRegistry): void {
     registry.register({
         name: 'get_machine_profile',
         description: 'Machine profile: build volume, per-toolhead work ranges, and kinematics '
-            + '(which element moves per axis). Defaults to the connected machine. Read-only.',
+            + '(which element moves per axis). Defaults to the connected machine, else the one '
+            + 'selected in Luban Machine Settings; installed add-on modules (bracing kit, quick-swap) '
+            + 'come from those same settings. Read-only.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -201,10 +325,11 @@ export function registerMachineTools(registry: ToolRegistry): void {
         },
         handler: async (args: { identifier?: string }) => {
             const status = connectionManager.getConnectionStatus();
-            const identifier = args.identifier || status.machineIdentifier;
+            const appSettings = readAppMachineSettings();
+            const identifier = args.identifier || status.machineIdentifier || (appSettings && appSettings.series) || '';
             if (!identifier) {
-                throw new McpToolError('No machine connected and no identifier given. '
-                    + `Known identifiers: ${MACHINES.map((m) => m.identifier).join(', ')}`);
+                throw new McpToolError('No machine connected, none selected in Luban Machine Settings, and no '
+                    + `identifier given. Known identifiers: ${MACHINES.map((m) => m.identifier).join(', ')}`);
             }
 
             const machine = findMachine(identifier);
@@ -216,17 +341,14 @@ export function registerMachineTools(registry: ToolRegistry): void {
             const state = connectionManager.getLatestMachineState();
 
             // Add-on modules (quick-swap kit, bracing kit) translate the work
-            // envelope by workRangeOffset. Which ones are physically installed
-            // cannot be detected - the operator records it in configstore key
-            // mcpInstalledModules (array or comma-separated identifiers).
+            // envelope by workRangeOffset. Which ones are installed cannot be
+            // detected from the machine - it is whatever the operator selected
+            // in Luban's Machine Settings (readAppMachineSettings).
             const modules = (machine.metadata.modules || []).map((module) => ({
                 identifier: module.identifier,
                 workRangeOffset: module.workRangeOffset || null,
             }));
-            const installedRaw = config.get('mcpInstalledModules');
-            const installedModules = (Array.isArray(installedRaw)
-                ? installedRaw.map(String)
-                : String(installedRaw || '').split(',').map((s) => s.trim()).filter(Boolean))
+            const installedModules = (appSettings ? appSettings.modules : [])
                 .filter((id) => modules.some((module) => module.identifier === id));
             const netOffset = [0, 0, 0];
             for (const module of modules) {
@@ -255,6 +377,8 @@ export function registerMachineTools(registry: ToolRegistry): void {
                 })),
                 modules,
                 installedModules,
+                installedModulesSource: appSettings ? 'Luban Machine Settings (machine.json)' : 'unavailable - machine.json not found',
+                machineSettings: appSettings,
                 netWorkRangeOffset: hasOffset ? netOffset : null,
                 // null means "not recorded" - do not guess kinematics.
                 kinematics: KINEMATICS_BY_IDENTIFIER[machine.identifier] || null,
