@@ -16,7 +16,7 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 | Key | Meaning |
 |---|---|
 | `mcpEnabled`, `mcpPort` | Start the server on 127.0.0.1:port (default 40889). Legacy: `mcpPort` alone enables when `mcpEnabled` was never written. |
-| `mcpAllowLan` | Default off = loopback only. On: bind every interface but accept only clients (and browser origins) on this machine's own IPv4 subnets; confirm-page links use the LAN address. **No authentication exists** — anyone on that subnet can command the machine; the pane warns in red. Env `LUBAN_MCP_ALLOW_LAN` overrides. Applies at the next start. |
+| `mcpAllowLan` | Default off = loopback only. On: bind every interface but accept only clients (and browser origins) on this machine's own IPv4 subnets; confirm-page links use the LAN address. **No authentication exists** — anyone on that subnet can command the machine; the pane warns in red (the OAuth endpoints in `oauth.ts` grant everyone, see Architecture). Env `LUBAN_MCP_ALLOW_LAN` overrides. Applies at the next start. |
 | `mcpToolSetterEnabled`, `mcpProbeToolEnabled` | Default on. Off = that sensor's channel is never bound on any transport (overtravel follows the tool setter): no pill, no readings, and procedures needing it refuse with a clear message. Use when the sensor or the USB bridge is not fitted. Env `LUBAN_MCP_TOOLSETTER_ENABLED` / `LUBAN_MCP_PROBE_ENABLED` override. |
 | `mcpCameraUrl` | HTTP(S) snapshot URL; takes precedence over ffmpeg. |
 | `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg capture — DirectShow on Windows (device = friendly name), v4l2 on Linux (device = a `list_cameras` entry, preferably the stable `/dev/v4l/by-id/… (Name)` form; a bare `/dev/videoN` works but renumbers on replug). Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. |
@@ -77,10 +77,29 @@ transport is hand-rolled stateless Streamable HTTP (JSON-RPC over `POST /mcp`): 
 embeds Node 16 and the official SDK needs ≥ 18. Zero added dependencies anywhere —
 `jpeg-js` (tracking) was already in the tree; the lockfile has never changed.
 
+**OAuth shim, not authentication (2026-09-07).** Claude Code / Claude Desktop run the MCP
+authorization flow against an `http` server before their first JSON-RPC call — metadata
+discovery, Dynamic Client Registration, authorization code + PKCE, token exchange — and refused
+to connect when the steps 404'd ("Dynamic Client Registration rejected (HTTP 404)"). `oauth.ts`
+answers every step: `/.well-known/oauth-protected-resource[/mcp]`,
+`/.well-known/oauth-authorization-server[/mcp]` (+ `openid-configuration` alias), `POST
+/register`, `GET /authorize`, `POST /token`. It grants everyone: `/authorize` redirects straight
+back with a code (no login page — the human decision points are the job confirm pages), `/token`
+hands out an opaque bearer, and `/mcp` never checks tokens (never 401s, so clients without the
+flow — ChatGPT's tunnel-client, curl — and tokens from before a restart keep working). The
+trust boundary is unchanged: every route sits behind the same loopback / `mcpAllowLan` subnet
+gate in `index.ts`. What the flow buys is attribution — the registered `client_name` labels
+`tool …` log lines (`tool probe_point [Claude Code (luban_…)] <- …`) and the `initialize` line.
+Redirect URIs must be loopback http(s) or a private-use scheme; an unknown `client_id` (server
+restarted, client kept its registration) is still granted if its redirect URI is loopback. Same
+fix also made the server's own per-request address check honour `mcpAllowLan` — it hard-coded
+loopback, so LAN clients the outer gate admitted still got `403 loopback only` on `/mcp`.
+
 ```
 mcp/
-  index.ts       start/stop, config resolution, routing (/mcp, /confirm), mcpBroadcast
+  index.ts       start/stop, config resolution, routing (/mcp, /confirm, oauth), mcpBroadcast
   McpServer.ts   JSON-RPC transport, per-call logging + mcp:activity broadcast
+  oauth.ts       OAuth 2.1 / DCR shim for clients that insist on it; grants all, labels logs
   registry.ts    tool registration/dispatch; McpToolError = tool-level failure
   jobs.ts        JobManager + human confirm pages (/confirm/<id>); job kinds file|direct
   validator.ts   static gcode inspection (extents, spindle, distance-mode hazards)
