@@ -10,6 +10,7 @@ import { probeFeedService, resolveActiveProbeConfig } from './probeFeed';
 import { ToolRegistry } from './registry';
 import { registerCalibrationTools } from './tools/calibration';
 import { registerCameraTools } from './tools/camera';
+import { registerCamTools } from './tools/cam';
 import { registerGcodeTools } from './tools/gcode';
 import { registerLandmarkTools } from './tools/landmarks';
 import { registerMachineTools } from './tools/machine';
@@ -175,6 +176,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerProbeTools(registry);
     registerToolSetterTools(registry, baseUrl);
     registerProbingTools(registry, baseUrl);
+    registerCamTools(registry, baseUrl);
     registeredToolCount = registry.list().length;
 
     broadcaster = socketServer || null;

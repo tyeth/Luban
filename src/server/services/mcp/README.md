@@ -407,6 +407,99 @@ off the previous contact, never a fresh approach from the outside line). Surface
 same idea as `hop_mode: "stepped"` (`hop_lift_mm`) in place of the fixed `z_safe_delta_mm` hop
 whose only answer to a contact was to abort; `guarded` stays the default.
 
+**CAM-generated probing programs — `run_probing_gcode` (mcp/49, 2026-09-07).** Fusion 360,
+FreeCAD, any Grbl/Marlin post or a hand-written file supplies the probing toolpath as gcode; the
+server PARSES and TRANSLATES it (`probeGcode.ts` pure parser/simulator, `probeCam.ts`
+planner/runner) — never sends it raw, because the firmware has no G38 cycle and a raw program
+obeys none of the motion laws. `G38.2`/`G38.3` become the shared sensor-gated march toward the
+programmed target (the travel limit; retreat to the cycle start; G38.2 without contact aborts
+per Grbl unless `on_miss: "continue"`); `G38.4`/`G38.5` become a probe-away (coarse steps until
+the probe releases, then on to the target); `G0`/`G1` links follow law 2 (`link_mode: "raise"`:
+traverse at the safe height and guarded segmented descent to the programmed Z; `"stepped"`: a
+touch-probing traverse at the programmed height that lifts on contact); `G4` dwells; `G90/G91`,
+`G53`, `G20/G21` honoured; programmed feeds ignored. Refused at staging with the line number:
+`M3/M4` (spindle with the probe fitted), `M0/M1`, `M6`, `G28`, `G92`/`G55-59`, arcs, macro
+variables. Coordinates are the CAM's WCS (work frame) unless `frame: "machine"` or `G53`. Probe
+metadata in a comment before a cycle — `(PROBE id=3 name=top nominal=10,20,0 normal=0,0,1
+tol=0.1,-0.1)` — supplies nominals, normals and tolerances. The confirm page enumerates every
+translated step beside its original line; the keep-out check runs like any procedure. The
+**inspection report** (`inspectionReport.ts`, pure) is stored as JSON on the job and rendered by
+`report_format` / `get_inspection_report`: `fusion` = Fusion 360 inspection results in the exact
+shape Autodesk's own "result generator probing.cps" writes (verified 2026-09-07, see
+[docs/FUSION_POST_REVIEW.md](docs/FUSION_POST_REVIEW.md)): `START` / `RESULTSFILE` / `DOCUMENTID` /
+`MODELVERSION` / `TIMESTAMP`, per toolpath `TOOLPATHID` / `TOOLPATH` / `G331` (CAD transform) /
+`G330` (work plane; the 3+2 station's B goes in its `B` word), per point `G800` (nominal XYZ 4 dp,
+normal IJK 6 dp, `O` = inspect surface offset, `U`/`L` tolerances with `L` signed) and `G801`
+(measured TIP-CENTRE XYZ, `R` = stylus radius — Fusion subtracts it itself), then `END`; a miss =
+nominal only. A `(RESULTS documentid= modelversion= toolpathid= toolpath=)` comment in the program
+fills the envelope. Also `csv`, `grbl` (`[PRB:x,y,z:1]`). Per probe the tip-centre contact in both
+frames, the B station, travel, distance short of the target, confirm spread, and the deviation of
+the SURFACE (tip centre minus one tip radius along the normal — the review caught the raw tip centre
+being compared, a bias of one stylus radius) with a tolerance verdict; without a stored tip
+diameter the deviation is null rather than wrong. Files land under the app data dir
+`mcp-inspection/<job>.<ext>`. Aborts keep the partial report.
+
+**Test material for the translator (2026-09-07 survey, `docs/CAM_TEST_CATALOGUE.md`).** A second
+Opus agent catalogued 827 files from 22 sources: hobby-ecosystem probing routines (almost all are
+parameterised macros with `#`, `[expr]`, `%VAR` or O-words - exactly one upstream program, Adam
+Lange's MIT `probe_surface.ngc`, parses unmodified and is now a regression fixture), Autodesk post
+outputs, genuine and broken Fusion results files, PC-DMIS/QIF/DMIS/Renishaw/Heidenhain report
+samples, and the standard artefacts (ring gauge, gauge block, 1-2-3 block, ISO 10360-5 sphere)
+with pass bands. Six derived fixtures live in `docs/examples/cam-tests/` (each names its source and
+transformation) and the ten-item verification set - six software assertions, four on the machine
+with an artefact - is the plan for the first hardware runs. The survey also surfaced two parser
+gaps, both fixed: nested parentheses inside a comment (`(MSG, do (this))`) and Grbl `$J=` jog
+lines in sender macros (skipped with a warning); and the UGS hole-centre routine's `G53` links
+under `G91` are taken as absolute machine coordinates with a warning. Not yet built: the Renishaw
+`SIZE/ANG/POSN … ACTUAL … TOL … DEV` printout, which Fusion's importer also reads for Probe WCS /
+Probe Geometry results - the highest-value second report format.
+
+**The Renishaw printout — `report_format: "renishaw"`.** Fusion imports Probe WCS / Probe Geometry
+results not as G800/G801 but as the Renishaw Inspection Plus print-out (verified from Autodesk's
+result generator and the Inspection Plus manual, appendix G), so the same report renders as
+`COMPONENT NO / FEATURE NO` blocks with `SIZE D<nominal>   ACTUAL <measured>   TOL <t>   DEV <d>`,
+`POSN X/Y/Z … TOL TP … DEV`, and the `+++++OUT OF TOL+++++ ERROR` / `+++++OUT OF POS+++++ ERROR TP
+… RADIAL` lines, inside the same `START … END` envelope. Points are reduced to FEATURES by their
+`(PROBE group= role= feature= nominal_size= nominal_center= tol_size= tol_pos=)` metadata: roles
+`x_minus`/`x_plus`/`y_minus`/`y_plus` give a size along the axis and a centre, a lone point a `POSN`
+on the axis of its normal; sizes and centres are of the SURFACE (tip centre minus one tip radius
+along each point's normal), so bosses and holes come out right with no special case. Unit-tested on
+a 25 mm boss (surfaces one radius outside each tip centre), an out-of-tolerance case with the radial
+error, and a hole with a missed point.
+
+**Snapmaker firmware facts for the translator (2026-09-07, from Snapmaker/Snapmaker2-Controller and
+the wiki's supported-gcode page).** The controller is a customised Marlin 2.0: `G0/G1` (with a `B`
+word), `G4`, `G20/G21`, `G28`, `G53`, `G90/G91`, `G92` are supported and verified by Snapmaker;
+`M3/M4` are "modified" (P = power). `G38_PROBE_TARGET` and `G38_PROBE_AWAY` are compiled in
+(`Marlin/Configuration_adv.h`), so the firmware has a native `G38.2`–`G38.5` — but it probes the
+Z-min probe endstop, the 3DP head's proximity sensor path, not the CNC touch probe on the MCP's GPIO.
+The MCP therefore keeps translating every cycle into its own sensor-gated march and never sends a
+G38 to the controller. Whatever dialect a program arrives in (Fusion post, Grbl sender macro,
+LinuxCNC, hand-written), the parser maps it onto the codes the controller actually runs (`G90` /
+`G53` / `G1` / `G54` batches and `G0 B` rotations) or refuses it by line.
+
+**A probing-capable Fusion post: [docs/post/snapmaker-probing.cps](docs/post/snapmaker-probing.cps).**
+Snapmaker's own posts are "all rights reserved" with no probing, so this one is written from
+scratch (AGPL like the repository) to the review's outline: probing and Inspect Surface operations
+only; each cycle becomes a law-2 approach (`G53 G0 Z<traverse>`, `G0 XY`, `G0 Z`), a `(PROBE …)`
+comment with nominal, normal, tolerances, feature, group and role, and one `G38.2` whose target lies
+a generous `minOvertravel` (15 mm) past the expected surface; 3+2 via `optimizeMachineAngles2(1)`
+(post-transformed XYZ) and a bare `G0 B` after a raise; a `(RESULTS …)` comment per operation; no
+M3/M6/G28/G92/arcs; simultaneous multi-axis and PCD cycles refused. Cycle geometry is written from
+the Autodesk cycle parameters (`probeClearance`, `probeOvertravel`, `approach1/2`, `width1/2`,
+`probeSpacing`, `depth`) and **has not been run in a Fusion installation** — verify each cycle type in
+the post editor before trusting it; the rotary axis offset property must match the WCS origin.
+
+**3+2 stations in a CAM program.** A bare `G0 B<angle>` line is a rotation: the translator raises
+to the traverse height first (law 2, enumerated on the page) and runs `rotate_b` (absolute, direct
+path, verified by M114 / the heartbeat's `b`); `B` with X/Y/Z, incremental `B` and `A`/`C` are
+refused. The review found no probing-capable Snapmaker post exists: Snapmaker's 3-axis post is a
+2018 Marlin post with no probing, and its "4-axis" post is an unmodified Autodesk Fanuc post with
+Renishaw macros (refused line by line here) whose `writeRetract` emits no motion before a `B`
+word. The review's patch outline for a `snapmaker-probing.cps` (post-transformed XYZ + bare `B`,
+`G38.2` per cycle type with `(PROBE …)` metadata, raise before every rotation, no M3/G28/G92) is in
+the same document.
+
 **Traverse height beats a landmark clearance above it (job 34d787bdb2d7, 2026-09-06).** The
 `rotary-axis` landmark declares clearance 328 (the homing height) while the operator's safe
 traverse height is 320, so a sequence hop at 320 out of the rotary footprint was refused by the
@@ -657,7 +750,8 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   `MaterialTestGcodeParams.jsx` — revert before staging.
 - **Stack**: stacked single-commit PRs `mcp/N-*`, each targeting the previous branch
   (#15 → #79 as of 2026-09-05, then `mcp/46-position-of-record` (#80), `mcp/47-timing-inline-g53` (#81),
-  `mcp/48-new-stock-survey`; next `mcp/49`. #70 stale-
+  `mcp/48-new-stock-survey` (#82), `mcp/49-cam-probing-gcode` (#83), `mcp/50-simulator-spec` (#84, docs);
+  next `mcp/51`. #70 stale-
   heartbeat, #71 probe_sequence, #72 GPIO probe feed, #73 Linux/mac packaging, #74 machine
   settings + docs, #75 sensor toggles + LAN, #76 job events + even survey, #77 offset
   transient + detached procedures, #78 surface scans, #79 console input leak, mcp/46 position

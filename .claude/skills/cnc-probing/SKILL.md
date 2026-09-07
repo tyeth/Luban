@@ -336,6 +336,28 @@ be narrow or offset from the estimate, keep `spacing_mm` at 5 or less. Also an o
 `hop_mode: "stepped"` with `hop_lift_mm` (contact lifts and continues) instead of a big
 `z_safe_delta_mm`.
 
+**A probing program from CAM (Fusion 360 / FreeCAD / Grbl post): `run_probing_gcode`.**
+Pass the program text as `gcode` with a `reason`; it is translated, never sent raw:
+each `G38.2`/`G38.3` becomes a sensor-gated march to its target (the travel limit, so
+post the cycles with GENEROUS travel - the same lesson as the outline: a short cycle
+silently misses), `G38.4`/`G38.5` a probe-away until release, links follow law 2
+(`link_mode` "raise" default; "stepped" for touch-probing links at the programmed
+height). Feeds in the file are ignored; M3/M4, M0/M1, M6, G28, G92, arcs and `#`
+macros are refused with the line number - fix the post, do not strip lines by hand
+without telling the operator. Coordinates are the CAM WCS (work frame) unless `frame:
+"machine"`; the work origin must be live on the heartbeat. Put `(PROBE id=.. name=..
+nominal=x,y,z normal=i,j,k tol=u,l)` before a cycle so the report carries nominals and
+tolerance verdicts. Read `reportText` (default `fusion` = Fusion "inspection results"
+G800/G801 text the CAM imports; `csv`, `grbl`, `json`) or call `get_inspection_report`
+for another format; the file path under `mcp-inspection/` is in `files`. Use
+`report_format: "renishaw"` for Probe WCS / Probe Geometry features (Fusion imports the
+Renishaw print-out for those) - it needs `group=`/`role=` (`x_minus`, `x_plus`, `y_minus`,
+`y_plus`) and `feature=`/`nominal_size=`/`nominal_center=`/`tol_size=`/`tol_pos=` in the
+`(PROBE …)` comments; `fusion` is for Inspect Surface points. The repo ships a Fusion post
+that writes all of this (`docs/post/snapmaker-probing.cps`, unverified in Fusion) and a
+firmware note: the Snapmaker controller compiles G38 in but on the 3DP probe input, so the
+MCP always translates - never expect a raw G38 to touch the CNC probe.
+
 **Landmarks vs the traverse height.** The rotary landmark says clearance 328; the traverse
 height is 320. Hops at the traverse height are lawful and exempt from crossing landmarks;
 so are marches (they stop on contact). A refusal naming a landmark therefore means a LOW
