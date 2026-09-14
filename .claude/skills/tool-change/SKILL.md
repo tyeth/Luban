@@ -39,6 +39,11 @@ shifted exactly, without ever re-touching the stock.
 
 ## Two flows — ask which one the operator is using
 
+Ask it in the same single message as the other unknowns (both tools' approximate protrusion,
+whether the work origin was set with the tool now fitted). Flow A is four approvals — measure
+old, park, measure new, apply — each announced; the swap itself is the operator's hands and
+their word, never inferred.
+
 **A. MCP-managed offset** (operator at the computer): measure old → park → swap
 → measure new → `apply_tool_length_offset` shifts the work origin. Steps below.
 
@@ -63,7 +68,8 @@ operator raises it slightly from the touchscreen first.
 ## The sequence (flow A)
 
 1. **Measure the old tool** — `run_tool_setter` with the operator-stated
-   `bit_length_mm`. Skip only if the last stored measurement
+   `bit_length_mm` — the tool's PROTRUSION from the collet in mm (a length, never its
+   cutting diameter; declare it low rather than high). Skip only if the last stored measurement
    (`get_tool_setter_config` → `measurements.last`) is from this same tool,
    this session, and the operator confirms nothing has moved.
 2. **Park** — `goto_tool_change_position`. One approval, two

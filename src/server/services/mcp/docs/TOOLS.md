@@ -18,17 +18,17 @@ session.
 ## G-code jobs
 
 - `validate_gcode` — static inspection: extents, spindle state, distance-mode hazards, and the FRAME the job declares (G53 own-line = machine, G54..G59 = work; inline `G53 G0` flagged - the firmware ignores it; G92 flagged). Free, run before submitting.
-- `submit_gcode_job` — stage a file job; returns the confirm-page URL. REFUSED unless the job declares its frame: `G53` on its own line before the first move (machine), or `G54..G59` in the file / `frame: "work"` for a Luban/slicer export (work; the file is never modified). `frame: "machine"` without a literal G53 is refused. The confirm page shows Frame and machine-resolved Z extents.
-- `start_gcode_job` — run an approved job; returns the result if it lands within `wait_ms` (default 25 s), else `running`.
-- `get_gcode_job_status` — event log plus stored result and `ending` (why it ended: completed | stopped-by-agent | stopped-by-operator | withdrawn | rejected-by-operator | crash-alarm | overtravel-alarm | unexpected-contact | controller-rejected | timeout | operation-failure | machine-stopped | completion-unverified, with reason and measured count); a stopped or failed procedure keeps every completed station under `result`. Long-poll with `wait_ms` / `since_event` instead of spinning.
+- `submit_gcode_job {gcode, name, frame?: "machine"|"work", head_type?}` — stage a file job (the gcode TEXT, not a path); returns the confirm-page URL — deliver it to the operator as the last line of your message, alone. REFUSED unless the job declares its frame: `G53` on its own line before the first move (machine), or `G54..G59` in the file / `frame: "work"` for a Luban/slicer export (work; the file is never modified). `frame: "machine"` without a literal G53 is refused. The confirm page shows Frame and machine-resolved Z extents.
+- `start_gcode_job {job_id, wait_for_approval_ms?, wait_ms?, confirm_token?}` — call right after staging with `wait_for_approval_ms` (e.g. 110000): the operator's click on the confirm page starts the job; `approved: false, timed_out: true` means call again, never restage. Procedures return the result if it lands within `wait_ms` (default 25 s), else `running` — long-poll `get_gcode_job_status`.
+- `get_gcode_job_status {job_id, wait_ms?, since_event?}` — event log plus stored result and `ending` (why it ended: completed | stopped-by-agent | stopped-by-operator | withdrawn | rejected-by-operator | crash-alarm | overtravel-alarm | unexpected-contact | controller-rejected | timeout | operation-failure | machine-stopped | completion-unverified, with reason and measured count); a stopped or failed procedure keeps every completed station under `result`. Long-poll with `wait_ms` / `since_event` instead of spinning.
 - `stop_gcode_job` — procedures stop cooperatively at the next step and raise; file jobs get a firmware stop. Partial result kept.
 
 ## Direct motion (each is one approved job)
 
-- `home` — machine home (`G28`). Default first step after (re)connecting; raises Z first and clears stale position state.
+- `home` — machine home (`G53;G28;G54`; also homes B). Default first step after (re)connecting; raises Z first and clears the NOT-HOMED state. It is not a remedy for a `get_position` reliability of `awaiting-resync` or `stale` — a rejected or aged beat is a reporting fault, not a position fault, and motion is refused until the record recovers on its own (next coherent beat, ~2 s).
 - `goto_work_origin` — move to work X0 Y0. Distinct from `home`.
-- `move_z` — single Z target or a `z_targets` batch. Only on the operator's explicit request.
-- `traverse_xy` — law-2 TRANSPORT: an absolute XY target or an ordered `targets` series at the traverse height (machine Z328), one approval, one `start_gcode_job` per leg, like `move_z`. Refused unless the head is already at/above `mcpSafeTraverseZ` (no override); every leg checked against landmarks and the travel; Z never written; default frame machine (`G53` per step). Use this, never a hand-written file job, to move the head.
+- `move_z {z | z_targets[], coordinate_system: "machine"|"work", feed_rate?, reason}` — single Z target or a batch; one approval covers the list, one `start_gcode_job` per step. Only on the operator's explicit request.
+- `traverse_xy {x?, y? | targets: [{x?, y?}], coordinate_system?: "machine" (default) | "work", feed_rate?, reason}` — law-2 TRANSPORT: an absolute XY target or an ordered `targets` series at the traverse height (machine Z328), one approval, one `start_gcode_job` per leg, like `move_z`. Refused unless the head is already at/above `mcpSafeTraverseZ` (no override); every leg checked against landmarks and the travel; Z never written; default frame machine (`G53` per step). Use this, never a hand-written file job, to move the head.
 - `move_and_capture` — one guarded XY move followed by a position-stamped frame; the unit of visual alignment.
 - `goto_tool_change_position` — two approved steps: Z up, then XY to the operator-set park spot.
 
@@ -84,7 +84,8 @@ session.
 - The endmill is always in the spindle; never plan as if the collet is empty.
 - Any XY move over 1 mm is planned at the safe traverse height - machine Z328 (home). Landmarks are honoured literally: a hop at 328 clears them on its own merits, a lower hop is checked like any low segment.
 - No Z motion without a direct request. "Home" always means machine home.
-- Approval covers one bounded series of moves and never carries forward.
+- Approval covers one bounded series of moves and never carries forward. A staged procedure or program is ONE approval for every move inside its envelope — the efficient lawful form.
+- Every motion tool stages a job: call `start_gcode_job` with `wait_for_approval_ms` after staging; the operator's click starts it. Hand the confirm URL over as the last line of the message, alone.
 - Agents plan, stage, record and quote in MACHINE coordinates. Every staged job declares its frame or is refused; `G90`/`G91` is distance mode, not a frame; never a bare frameless `Z`.
 - The work origin is the operator's (touchscreen, Luban, tool-change wizard). Read it fresh from `get_position`; never assume it; never write it except through `apply_tool_length_offset`.
 - `get_position.machine` is the judged position of record with a `reliability`; a reading more than 50 mm outside the travel is a bug, never a position, and is ignored until the next coherent beat. Do not derive a machine position from one heartbeat by hand.

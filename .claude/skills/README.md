@@ -6,9 +6,11 @@ it and point back to it rather than repeating it.
 | Skill | Load when | Holds |
 |---|---|---|
 | [`cnc-motion-rules`](cnc-motion-rules/SKILL.md) | Before ANY motion, position or coordinate reasoning | The seven motion laws, coordinate doctrine (machine coords; the frame handshake; the work origin is the operator's), `get_position.reliability` semantics, sanctioned exceptions, vocabulary, recording rules |
-| [`cnc-probing`](cnc-probing/SKILL.md) | Touch-probe measurement, surface scans, bed survey, probe calibration | Tool-specific envelopes and parameters, probing programs, CAM probing, event budgets |
+| [`cnc-probing`](cnc-probing/SKILL.md) | Touch-probe measurement, surface scans, probe calibration | Find-then-scan programs, envelopes and parameters, event budgets; CAM probing in `references/cam-probing.md` |
 | [`cnc-visual-alignment`](cnc-visual-alignment/SKILL.md) | Camera frames → millimetres, visual servo, landmarks in frame | Metric rectification pipeline, calibration keyed by Y/Z/depth plane, frame-reading heuristics |
 | [`tool-change`](tool-change/SKILL.md) | Swapping bits without re-touching the stock | Tool-setter flows A (MCP offset via `apply_tool_length_offset`) and B (touchscreen wizard) |
+
+For a plain transit or a plain "run this file", `cnc-motion-rules` alone is enough (§7–§8 carry the canonical calls).
 
 Rules of the house that every skill shares:
 

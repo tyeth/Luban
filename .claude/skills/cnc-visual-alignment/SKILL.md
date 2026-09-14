@@ -31,13 +31,12 @@ better frames.
 | Authoritative frame check | `query_firmware_position` | Raw M114 from the controller. When heartbeat-derived numbers look wrong, this is the truth. |
 | Frames | `list_cameras`, `capture_frame` | Every frame is stamped with the firmware-reported position it was taken at. That stamp is what makes calibration possible — never discard it. |
 | Camera device | `mcpCameraDevice` (operator config) | Windows names cameras by DirectShow friendly name; Linux `list_cameras` returns stable `/dev/v4l/by-id/… (Name)` entries (plain `/dev/videoN` renumbers on replug). The operator pins one; a vanished device is an error to report, never a silent substitution — and with two cameras attached, confirm which is the toolhead cam from a frame (at home it sees the enclosure's silver extrusion up close) before trusting any calibration. |
-| Machine home | `home` | Sends `G53;G28;G54` like Luban's own button. **Homing also homes B: stock indexed on the rotary rotates.** Warn the operator before homing when a rotary is fitted. |
+| Machine home | `home` | `G53;G28;G54`; also homes B (rotary stock rotates) — `cnc-motion-rules` §5. |
 | Work origin | `goto_work_origin` | XY only, at the current Z. Distinct from homing — never conflate the two. |
 | Single guarded move | `move_and_capture` | ONE bounded XY move at current Z, settle, capture. No Z parameter by design. |
 | Servo step | `visual_servo` | One clamped correction per call; the loop lives in you, not the tool. |
 | Calibration store | `set_/get_/delete_camera_calibration` | 2×2 pixel-delta→mm matrix, keyed by the machine Y and Z it was derived at. |
-| Z, every step | `move_z` | One operator-confirmed step per target, `coordinate_system: "machine"`. Never a Z word in a hand-written file job — a bare `Z0` is frameless and the MCP refuses undeclared frames. |
-| XY transport beyond the jog cap | `traverse_xy` | Absolute XY target or series at the traverse height (machine Z328), one approval, one `start_gcode_job` per leg; refused below 328, landmark-checked, Z never written. The 100 mm `move_and_capture` cap is for vision nudges - do not chain them and do not hand-write a file job. |
+| Z / XY transport / programs | `move_z`, `traverse_xy`, `submit_gcode_job` | Canonical calls and rules: `cnc-motion-rules` §7–§8. |
 | Anything compound (sequences, cutting) | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. Only the operator's click on the confirm page authorises motion — call `start_gcode_job` with `wait_for_approval_ms` to start on that click, or pass the one-time code they relay as `confirm_token`. |
 
 ### Machine semantics you must not re-derive wrongly (verified on the A350)
@@ -59,6 +58,25 @@ better frames.
   which it was captured — which is exactly how the calibration store is keyed.
 - The repeatable *board-viewing* camera pose is the pre-home park (machine X0 Y0), not
   machine home — at home the work area is out of frame entirely.
+
+## Choosing a viewing pose (do this before any metric work)
+
+The camera rides the toolhead and looks **−X**, seeing roughly **90–150 mm to the toolhead's
+−X side**, and Y is the platform axis, so the arithmetic is: **toolhead X ≈ feature X + 90…150,
+toolhead Y ≈ feature Y**, at the traverse height Z328. The offset is a rig constant — read it
+from the stored landmark notes (`get_stored_state`) or ask; do not estimate it from a frame. A
+viewing pose is ONE `traverse_xy` at 328 (one approval), never a chain of `move_and_capture`
+calls; `move_and_capture` is for ≤ 100 mm nudges once the feature is in frame. Then
+`capture_frame`, describe what IS in the frame by evidence, and put the frame in front of the
+operator if identities are in doubt — a frame FINDS things, it clears nothing (law 3).
+
+## Whole-bed survey (`survey_bed`)
+
+At the traverse height: a serpentine grid, one settled frame per waypoint, saved to disk with a
+machine-position index; `pitch_mm` is a MAXIMUM (each axis divided evenly into steps no larger
+than it, min 20). Cover the full reachable envelope — on this rig the far-X column is the only
+view of the bed centre-right. Read the frames from disk; landmarks near each position are the
+identities the operator already stated.
 
 ## Measuring: the pipeline
 
