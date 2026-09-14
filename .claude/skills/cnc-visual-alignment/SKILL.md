@@ -5,6 +5,9 @@ description: "Measure CNC stock and position a toolhead from webcam frames — v
 
 # CNC visual alignment from a toolhead camera
 
+> **Load `cnc-motion-rules` first; do not plan motion without it.** The motion laws,
+> coordinate doctrine and position-of-record rules live there and are assumed here.
+
 Turn webcam frames into real millimetres and drive the toolhead to something you can see.
 The geometry is the easy half; the hard half is the failure modes that make a confident
 number wrong, and the machine semantics that make a correct number mean the wrong thing.
@@ -33,16 +36,22 @@ better frames.
 | Single guarded move | `move_and_capture` | ONE bounded XY move at current Z, settle, capture. No Z parameter by design. |
 | Servo step | `visual_servo` | One clamped correction per call; the loop lives in you, not the tool. |
 | Calibration store | `set_/get_/delete_camera_calibration` | 2×2 pixel-delta→mm matrix, keyed by the machine Y and Z it was derived at. |
-| Anything compound, and all Z | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. Only the operator's click on the confirm page authorises motion — call `start_gcode_job` with `wait_for_approval_ms` to start on that click, or pass the one-time code they relay as `confirm_token`. |
+| Z, every step | `move_z` | One operator-confirmed step per target, `coordinate_system: "machine"`. Never a Z word in a hand-written file job — a bare `Z0` is frameless and the MCP refuses undeclared frames. |
+| Anything compound (transport beyond the jog cap, sequences) | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. Only the operator's click on the confirm page authorises motion — call `start_gcode_job` with `wait_for_approval_ms` to start on that click, or pass the one-time code they relay as `confirm_token`. |
 
 ### Machine semantics you must not re-derive wrongly (verified on the A350)
 
 - The controller has **G53 (machine workspace) and G54+ (numbered work workspaces)**; the
-  heartbeat position is in the *currently selected* workspace. `machine = work − originOffset`.
+  heartbeat position is in the *currently selected* workspace. `machine = work − originOffset` is Luban's display convention — the MCP applies it for you with
+  frame and reliability judgement; never do the subtraction by hand on one beat (read
+  `get_position.reliability`).
 - **Machine home is X−19 Y342 Z328** — the X switch sits 19 mm left of work-area zero, and
   **home is not the origin**. Homing takes ~15–20 s.
-- **Work origins are operator-set per workspace and persist across homing.** Do not assume a
-  home reset them, and do not assume they match the current stock setup either — verify.
+- **Work origins are operator-set per workspace; they persist across homing but NOT across a
+  machine reboot** — re-verify `originOffset` after every (re)connect. Do not assume a home
+  reset them, and do not assume they match the current stock setup either — verify. Agents
+  plan and record in MACHINE coordinates (`cnc-motion-rules` §2); the work origin is the
+  operator's to set, never yours.
 - "Home"/"homing" ALWAYS means machine home. Going to work X0 Y0 is "goto work origin".
 - The camera is **toolhead-mounted**: it rides X and Z; the **platform moves under it in Y**.
   So a pixel→machine mapping is valid only at the machine Y (scale also changes with Z) at
@@ -133,8 +142,9 @@ Never compute a machine coordinate from one frame and drive to it. With the MCP:
 This loop is immune to lens distortion, unknown camera mounting, and an imperfect
 homography, because it only ever measures a *difference* near the target.
 
-Z positioning is not part of the servo: raise or lower Z via a one-line `submit_gcode_job`
-through the operator's confirm page. Refuse to servo from a height where parallax exceeds
+Z positioning is not part of the servo: raise or lower Z via `move_z` with
+`coordinate_system: "machine"` — one operator-confirmed step per target, never a Z word in a
+hand-written file job. Refuse to servo from a height where parallax exceeds
 the tolerance you are claiming.
 
 ## Reading a toolhead-camera frame (hardware-learned, the hard way)

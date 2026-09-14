@@ -1,90 +1,39 @@
 ---
 name: cnc-probing
-description: "Measure work with the spindle touch probe and the whole-bed camera survey via the Luban MCP tools (probe_point, probe_vector, probe_sequence, probe_circle, probe_surface_path/grid flatness scans, survey_bed, run_tool_setter with accept_probe_contact) — including the motion laws written in the aftermath of a probe-destroying crash. Use whenever the user wants to probe stock, find surfaces/edges, check flatness or map a surface height, survey the bed, or calibrate the touch probe."
+description: "Measure work with the spindle touch probe and the whole-bed camera survey via the Luban MCP tools (probe_point, probe_vector, probe_sequence, probe_circle, probe_surface_path/grid flatness scans, survey_bed, run_tool_setter with accept_probe_contact) — under the motion laws of the cnc-motion-rules skill (load that first). Use whenever the user wants to probe stock, find surfaces/edges, check flatness or map a surface height, survey the bed, or calibrate the touch probe."
 ---
 
-# CNC probing: the probe, the survey, and the motion laws
+# CNC probing: the probe and the survey
+
+> **Load `cnc-motion-rules` first; do not plan motion without it.** The motion laws,
+> coordinate doctrine and position-of-record rules live there and are assumed here.
 
 The spindle touch probe turns contact into coordinates; the bed survey turns
 the camera into context. Between them sit the motion laws — written after a
 real crash (2026-09-01) in which an XY traverse at a fabricated "clearance"
 height drove the probe into the rotary stock and destroyed it.
 
-## The motion laws (operator law — never overridden on model judgment)
+## The motion laws
 
-1. **One motion per instruction, and no inferred approvals.** When the
-   operator enumerates steps, execute exactly the step they name and stop.
-   NEVER chain motion calls in a single command (`&&`, one script, one
-   turn) — each motion needs a decision point in front of it. The crash
-   happened because step 2 fired 117 ms after step 1 succeeded, with no
-   chance to intervene. A motion is authorized ONLY by an explicit
-   imperative in the operator's latest message ("home it", "go", "run the
-   probe"). A motion mentioned in passing — "take a photo before homing",
-   "then we'll traverse", an approved plan that lists it — is context, not
-   a command: announce the next motion and WAIT for the word (violated
-   2026-09-02: homed off the back of "before homing").
-2. **X/Y traverses happen at top gantry height — ALL of them.** Any XY move
-   over 1 mm is planned at the safe traverse height, with no exceptions: not
-   between probe points, not "local hops" above a measured feature top, not
-   at any other "measured safe" height (operator, 2026-09-02: "x/y motion
-   over 1mm is never below gantry height"). Retreat Z FIRST, traverse, then
-   descend at the destination. The only sub-gantry XY motion is fine
-   positioning of <= 1 mm (touch-test nudges, probe march steps). Enforced:
-   direct XY moves below `mcpSafeTraverseZ` (default 320) are refused
-   without `operator_confirmed_clearance` — which only the operator's
-   explicit words authorise, and which is for emergencies, not for planning
-   around this law.
-3. **Never fabricate clearance.** Only measured numbers or operator-stated
-   numbers count for heights. Visual inference from survey frames is for
-   FINDING things, not for clearing them — the crash analysis misread the
-   same stock's orientation twice from photos. If a height is unknown, ask,
-   or measure from a proven-safe height with `probe_point`.
-4. **Landmarks are obstacles.** Give bed fixtures a `clearance_z` in
-   `set_landmark`; XY paths crossing their box below it are refused.
-5. **Contact sensors are crash sensors.** While MCP motion is in flight (every
-   procedure move via `moveMachineSettled`, and `move_and_capture`), a trigger
-   on a probe channel that no procedure declared as expected trips a CRASH
-   alarm: job stopped, connection closed, motion latched until the operator
-   clears it. The overtravel switch latches the same way, but ONLY while a
-   procedure or MCP motion is in progress (operator rule, 2026-09-04) - the
-   operator pressing it by hand with the machine idle just flashes the
-   Workspace pill red and logs `overtravel_unarmed`; it is not an alarm. A
-   latched alarm shows as an ALARM pill in Workspace -> Connection; the
-   operator clears it there (Clear alarm button) or via
-   `clear_overtravel_alarm` - never you on your own judgment. Do not
-   disconnect the probe feed while anything might move.
-6. **Chat is not a motion gate — the staged job is.** Deliberate traverses
-   and descents go through `submit_gcode_job` / staged procedures, so the
-   operator authorises the literal gcode by clicking approve on the confirm
-   page. After staging, call `start_gcode_job` with `wait_for_approval_ms`
-   (e.g. 110000): it starts the moment they click, with nothing to copy, and
-   returns `approved: false, timed_out: true` if they have not clicked yet -
-   call again, never restage. If the operator has hand-off disabled, they
-   relay the one-time code as `confirm_token` instead. A "go" in chat is only permission to STAGE; interpretation
-   of chat wording is exactly what fails (see law 1's violations). Direct
-   move tools are for small vision nudges only. Home (re-prove position)
-   before a traverse whenever position state has any doubt — including
-   after any motion that wasn't part of the agreed sequence.
-7. **Use tools for their purpose, through the MCP surface only.**
-   `move_and_capture` is a vision reposition, not a goto — its required
-   `reason` is shown to the operator, and rapid sequential direct moves are
-   refused (pacing guard). A script looping motion calls is an unsupervised
-   procedure without a confirm page: use `survey_bed`, `move_z` batches,
-   probing procedures, or `submit_gcode_job` instead. Never touch the
-   backend, configstore, or machine directly while the app runs — the
-   guards live in the tools.
+**Canonical text: the `cnc-motion-rules` skill.** The seven laws live there — one motion per
+instruction and no inferred approvals; ALL XY moves over 1 mm at the traverse height (machine
+Z328); never fabricate clearance; landmarks are obstacles; contact sensors are crash sensors;
+chat is not a motion gate, the staged job is; tools for their purpose, through the MCP surface
+only — together with the coordinate doctrine, the `get_position.reliability` states and the
+before-any-motion checklist. This file keeps only what is specific to probing.
 
 ## Recording rules
 
-- **Machine coordinates only** (operator, 2026-09-02): datums, landmarks and
-  measurements are recorded in the machine frame. Work origins are volatile —
-  a machine reboot mints a new one — so saved work coordinates are meaningless
-  later. Re-verify `originOffset` after every (re)connect.
-- **Heartbeat freshness is a precondition**: a stale report (>10 s; period is
-  ~1 s) means the connection dropped without the server noticing (seen live —
-  5.7 min of stale state served as truth). Motion and staging refuse on
-  staleness; an M114 that returns no position text is a dead connection, not
-  a success.
+See `cnc-motion-rules` §2 and §6: machine coordinates only; every height carries its frame,
+toolhead-vs-surface, the tool fitted, the B angle and the date; the work origin is the
+operator's and dies on a machine reboot; any coordinate more than 50 mm outside machine bounds
+is a bug, never a position.
+
+- **Heartbeat freshness is a precondition**: a stale report (>10 s; the WiFi status poll runs
+  every 2 s) means the connection dropped without the server noticing (seen live — 5.7 min of
+  stale state served as truth). Motion and staging refuse on staleness and on
+  `reliability: awaiting-resync`; an M114 that returns no position text is a dead connection,
+  not a success.
 
 ## Probe calibration (do once per probe fitting)
 
@@ -95,8 +44,10 @@ fine for a sprung probe). On this rig the setter's switch is softer than the
 probe's axial spring, so the setter fires first; either channel confirms.
 
 - Setter surface = machine Z 100.5 (trigger 175.5 with the 75 mm reference).
-- Probe effective length = measured trigger Z − 100.5 (measured 71.1 mm,
-  2026-09-01, spread 0 across three passes).
+- Probe effective length = measured trigger Z − 100.5. The LIVE value is
+  `get_stored_state → geometry.probe.effectiveLength` (store it with `set_probe_geometry`
+  after measuring); figures remembered in text (71.1 pre-crash, 71.2, 71.3) are historical
+  — never convert a contact Z with one of them.
 - **Any probed surface height = probe contact toolhead Z − probe length.**
 
 ## Point probing
@@ -358,10 +309,14 @@ that writes all of this (`docs/post/snapmaker-probing.cps`, unverified in Fusion
 firmware note: the Snapmaker controller compiles G38 in but on the 3DP probe input, so the
 MCP always translates - never expect a raw G38 to touch the CNC probe.
 
-**Landmarks vs the traverse height.** The rotary landmark says clearance 328; the traverse
-height is 320. Hops at the traverse height are lawful and exempt from crossing landmarks;
-so are marches (they stop on contact). A refusal naming a landmark therefore means a LOW
-hop or a descent column enters or leaves its box - fix the plan, do not touch the landmark.
+**Landmarks vs the traverse height.** The traverse height is machine Z328 (home) and every
+stored landmark clearance is at or below it, so a hop at the traverse height passes the
+crossing check on its own merits — there is no exemption. A hop BELOW 328 (a surface-scan
+hop, a stepped link) is checked against crossing landmarks like any low segment; marches are
+exempt because they stop on contact. A refusal naming a landmark therefore means a low hop or
+a descent column enters or leaves its box - fix the plan, do not touch the landmark. The
+tailstock inside the `rotary-axis` box is UNMEASURED: treat Y < 110 there as a `keep_out`
+volume until it has been probed.
 
 Hardware test order for a new program: B0 half without rotations first, then one
 rotation, then the whole program - and compare `derived` with the operator's calipers.

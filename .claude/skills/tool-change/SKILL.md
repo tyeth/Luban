@@ -5,6 +5,9 @@ description: "Change the CNC tool and keep the work origin true — measure the 
 
 # Tool change without losing the work origin
 
+> **Load `cnc-motion-rules` first; do not plan motion without it.** The motion laws,
+> coordinate doctrine and position-of-record rules live there and are assumed here.
+
 A tool change replaces the one physical thing the work origin Z was calibrated
 through: the tool tip. The tool setter (fixed switch on the bed, probe feed
 channel `toolsetter`) measures each tool's trigger height, and the difference
@@ -72,6 +75,8 @@ operator raises it slightly from the touchscreen first.
 5. **Shift the work origin** — `apply_tool_length_offset` (defaults to those
    two measurements). It stages a single `G92` — nothing moves; the work frame
    shifts by `new − old`. A longer tool makes the current work Z read LOWER.
+   This is the ONE sanctioned work-origin write (`cnc-motion-rules` §4): it mirrors what
+   the touchscreen wizard does after its two operator confirmations. Never `G92` by hand.
 6. **Verify** — `get_position`: `originOffset.z` must have changed by the
    delta, and the operator should sanity-check the displayed work Z against
    physical reality before any cutting.
