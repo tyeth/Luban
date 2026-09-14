@@ -78,7 +78,8 @@ operator raises it slightly from the touchscreen first.
    it. Ask them for the new tool's approximate length.
 4. **Measure the new tool** — `run_tool_setter` with the new `bit_length_mm`.
    The measurement history now holds previous = old tool, last = new tool.
-5. **Shift the work origin** — `apply_tool_length_offset` (defaults to those
+5. **Shift the work origin** — `apply_tool_length_offset {"reason": "..."}` then
+   `start_gcode_job {job_id, wait_for_approval_ms: 110000}` (defaults to those
    two measurements). It stages a single `G92` — nothing moves; the work frame
    shifts by `new − old`. A longer tool makes the current work Z read LOWER.
    This is the ONE sanctioned work-origin write (`cnc-motion-rules` §4): it mirrors what

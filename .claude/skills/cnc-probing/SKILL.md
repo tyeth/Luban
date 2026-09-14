@@ -77,7 +77,7 @@ machine coordinates and every contact Z is TOOLHEAD Z.
   event budget) or `spacing_mm` (a MAXIMUM; stations = `floor(length / spacing) + 1`, both
   ends included — 164→176 at 0.2 is 61 stations, 164.1→175.9 is 60). Result: per-station XYZ or
   `no_contact`, Z min/max/range, best-fit line slope, flatness = residual peak-to-valley.
-- `probe_surface_grid` — serpentine grid (`x_min..y_max` or `center_x/center_y` + `size`;
+- `probe_surface_grid` — serpentine grid (`x_min..y_max` or `center_x/center_y` + `size_x_mm/size_y_mm`;
   `pitch_mm` maximum or `x_count/y_count`, max 400 stations). Result: `zMatrix`, best-fit plane
   (tilt X/Y), per-point residuals, flatness, a text `heightMap` with +Y up.
 

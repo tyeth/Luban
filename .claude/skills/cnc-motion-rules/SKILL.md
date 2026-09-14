@@ -26,7 +26,8 @@ item, quoting the tool result — not an essay):
    head is below 328, the retreat is its own `move_z` step and needs its own word from the
    operator: ask "may I raise Z to machine 328 first?" — a transit request is not authority to
    move Z.
-4. **Obstacles.** The same `get_stored_state` call: does the path cross a landmark box below
+4. **Obstacles.** The same `get_stored_state` call: does the path — the whole SEGMENT from
+   where the toolhead is to where it is going, not the destination point — cross a landmark box below
    its `clearanceZ`? `clearanceZ == 328` passes (the test is at-or-above). A box the operator
    states in chat is a planning obstacle immediately; write it with `set_landmark` only when
    they ask; if chat and the store disagree, stop and ask which is current.
@@ -34,11 +35,16 @@ item, quoting the tool result — not an essay):
 6. **Authority.** An explicit imperative in the operator's LATEST message is necessary — not
    sufficient. It authorises STAGING; the click on the confirm page authorises the motion. An
    imperative on a rejected or stale position ("home it to fix the reading") is still refused
-   by the tools, and you say why (§3).
+   by the tools, and you say why (§3). **Staging is half a call.** Every staging tool is
+   followed by `start_gcode_job {job_id, wait_for_approval_ms: 110000}` — the call that puts
+   the confirm page in front of the operator and runs on their click. A plan that stages and
+   never starts is a plan that never runs: write both calls or neither.
 7. **Ask once.** Before staging anything, list every unknown the whole procedure needs — the Y
    of a feature, a diameter bound, a clear Z, what an ambiguous word means, which tool-change
    flow — and ask them in ONE message. A question per turn is the most expensive mistake an
-   agent makes on this machine. If the prompt already answers everything, ask nothing.
+   agent makes on this machine. If the prompt already answers everything, ask nothing. A
+   question you ask is a question you WAIT for: the first tool call that uses an answer comes
+   after the answer, never before it.
 
 **Fast path.** For a transit that starts at or above Z328 and writes no Z, `get_position` +
 `get_stored_state` discharge items 1–5 in one breath: quote the two results and stage
@@ -89,8 +95,8 @@ item, quoting the tool result — not an essay):
    `submit_gcode_job`, and every `probe_*` / `run_tool_setter` / `probe_program`. After
    staging, call `start_gcode_job {job_id, wait_for_approval_ms: 110000}` (a keep-alive, not a
    review budget — it does not scale with job size); `approved: false, timed_out: true` means
-   call again, never restage. With hand-off disabled the operator relays the one-time code as
-   `confirm_token`. **Deliver the confirm URL as the LAST LINE of your message, alone, plain —
+   call again, never restage. The operator never relays a code through chat. **Deliver the
+   confirm URL as the LAST LINE of your message, alone, plain —
    no tool call after it in the same turn** (the desktop client has hidden it otherwise), with
    one sentence above it saying what they are approving. When the operator says "don't bother
    me with confirmations": one click per whole procedure IS the minimum — offer the one-approval
@@ -146,10 +152,12 @@ edge (Y340 is 2 mm from the limit) with the margin said aloud.
 (machine), **toolhead Z vs physical surface** (surface = contact Z − probe or tool length), the
 tool fitted, the B angle for anything on the rotary, and the date. **Probe length**: an operator
 naming a length in chat tells you WHICH probe is fitted, not its calibration — read
-`get_stored_state → geometry.probe.effectiveLength`; if unset, measure it
-(`run_tool_setter accept_probe_contact`, then `set_probe_geometry`) and count that as one extra
-approval in the plan you announce; if it disagrees with what they said, ask before converting
-anything. Figures remembered from text (71.1, 71.2, 71.3) are historical.
+`get_stored_state → geometry.probe.effectiveLength`. It is normally set — plan on the stored
+value and do not budget an approval for measuring it. Only after you have READ an empty store do
+you add one measurement (`run_tool_setter accept_probe_contact`, then `set_probe_geometry`,
+§8) and announce it; if store and operator disagree by more than 0.3 mm, ask before converting
+anything. The same subtraction gives a cutting tool's surface height: contact Z − fitted tool
+length, in machine Z. Figures remembered from text (71.1, 71.2, 71.3) are historical.
 
 ## 3. Position of record — what `get_position` means
 
@@ -235,19 +243,35 @@ This is what the machine is for, and it is one approval:
 
 ## 8. Canonical calls (real argument names — copy these, do not guess)
 
+Every staging call below is followed by its start call — they are one instruction. Write
+the pair every time; the start call is what reaches the operator's click.
+
 ```jsonc
 // Transport at the traverse height (default frame machine; series form: "targets": [{"x","y"}, ...])
 traverse_xy {"x": 290, "y": 105, "coordinate_system": "machine", "reason": "..."}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
 // Z, one operator-confirmed step per target
 move_z {"z": 328, "coordinate_system": "machine", "reason": "..."}
-// A Luban export
-submit_gcode_job {"gcode": "<file text>", "name": "pocket.nc", "frame": "work"}
-// Start on the click; poll to the end
 start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+// A Luban export (the file text, unchanged)
+submit_gcode_job {"gcode": "<file text>", "name": "pocket.nc", "frame": "work"}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+// Poll any running job to its end; ending.kind says why it ended
 get_gcode_job_status {"job_id": "<id>", "wait_ms": 110000, "since_event": <next_event_index>}
-// Tool setter: bit_length_mm is the fitted tool's protrusion (a length)
+// Tool setter: bit_length_mm is the fitted tool's protrusion (a length, never a diameter)
 run_tool_setter {"bit_length_mm": 40, "reason": "..."}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+// Measure the touch probe itself (only after reading an EMPTY store), then record it
+run_tool_setter {"bit_length_mm": 70, "accept_probe_contact": true, "reason": "..."}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+set_probe_geometry {"probe_effective_length": 71.28, "reason": "run_tool_setter job <id>, 2026-09-14"}
+// Tool change, flow A, step 4 of 4: shift work Z by new − old (defaults to the last two measurements)
+apply_tool_length_offset {"reason": "..."}            // or {"old_trigger_z": 100.5, "new_trigger_z": 98.2, "reason": "..."}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
 ```
+
+`probe_program` (below) is also staged and started the same way — one `start_gcode_job` after
+it, one click for every op inside.
 
 **Find the top, then scan it — the two-op program (one approval).** Use it whenever a height is
 unknown: the first op measures, the second references the measurement.
@@ -269,6 +293,12 @@ probe_program {
   ]
 }
 ```
+
+For flatness swap the second op for a grid: `{"id": "map", "kind": "surface_grid", "x_min": 140,
+"x_max": 200, "y_min": 135, "y_max": 260, "pitch_mm": 10, "start_z_machine": {"from":
+"find.top.z", "plus": 3, "between": [178, 328]}, "expected_z_machine": {"from": "find.top.z",
+"between": [178, 328]}, "hop_mode": "stepped", "z_safe_delta_mm": 5}` (stepped: an unknown top may vary by more than the hop) — and keep it out of the
+chuck jaws' reach (Y ≳ 269 on this rig; box it with `keep_out` or narrow the grid).
 
 Reference grammar: `{"from": "<opId>.<probeName>.<x|y|z>" | "<opId>.summary.<field>" |
 "axis.<x|z_contact|z_physical|tip_radius|probe_length>", "plus"?: n|path, "minus"?: n|path,
