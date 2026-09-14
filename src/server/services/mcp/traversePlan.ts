@@ -65,6 +65,12 @@ export class TraversePlanError extends Error {
 export const XY_BOUNDS_LOW_MARGIN_MM = 25;
 export const XY_BOUNDS_HIGH_MARGIN_MM = 40;
 export const MAX_TRAVERSE_TARGETS = 20;
+/**
+ * "At the traverse height" allows the heartbeat's float noise: home reports
+ * machine Z 327.9989959716797 for a 328 home (seen live 2026-09-14), and an
+ * exact >= 328 refused every traverse from home.
+ */
+export const TRAVERSE_Z_TOLERANCE_MM = 0.05;
 /** The direct-batch separator start_gcode_job and the confirm page know. */
 export const STEP_SEPARATOR = '\n; --- next approved step ---\n';
 
@@ -97,7 +103,7 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
     // Law 2: every XY move over 1 mm happens at the traverse height. There is
     // deliberately no override here - transport that cannot happen at the
     // traverse height is not transport, it is a procedure with its own envelope.
-    if (currentMachine.z < traverseZ - 1e-6) {
+    if (currentMachine.z < traverseZ - TRAVERSE_Z_TOLERANCE_MM) {
         throw new TraversePlanError(`Refused: the toolhead is at machine Z ${f3(currentMachine.z)}, below the traverse height `
             + `${traverseZ} (law 2: all XY over 1 mm at top gantry height). Raise Z with move_z (coordinate_system "machine") first.`);
     }
@@ -111,7 +117,10 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
 
     const steps: TraverseStep[] = [];
     const segments: MotionSegment[] = [];
-    let fromMachine: Xyz = { ...currentMachine };
+    // Within tolerance of the traverse height the head IS at the traverse height:
+    // plan the segments there so the landmark check does not fail on 1 um.
+    const planZ = Math.max(currentMachine.z, traverseZ);
+    let fromMachine: Xyz = { ...currentMachine, z: planZ };
     let total = 0;
     targets.forEach((raw, i) => {
         const hasX = raw.x !== undefined && raw.x !== null;
@@ -135,7 +144,7 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
                     + `the travel on ${outside.join('/')} (X ${bounds.min.x}..${bounds.max.x}, Y ${bounds.min.y}..${bounds.max.y}).`);
             }
         }
-        const to: Xyz = { x: m.x, y: m.y, z: currentMachine.z };
+        const to: Xyz = { x: m.x, y: m.y, z: planZ };
         const distanceMm = Math.hypot(to.x - fromMachine.x, to.y - fromMachine.y);
         total += distanceMm;
         segments.push({ what: `step ${i + 1}`, kind: 'hop', from: { ...fromMachine }, to: { ...to } });

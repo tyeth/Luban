@@ -2,6 +2,7 @@
 // MCP tool arguments are snake_case by convention (planToolSetterRun takes
 // the run_tool_setter arguments verbatim).
 import logger from '../../lib/logger';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 import config from '../configstore';
 import { mcpBroadcast } from './index';
 import { ProbeChannel, probeFeedService } from './probeFeed';
@@ -369,7 +370,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             // after the 2026-09-01 probe crash) - the bit never sweeps across
             // the bed below the safe traverse Z.
             const z = position.machine.z;
-            if (z === null || z < safeTraverseZ()) {
+            if (z === null || z < safeTraverseZ() - TRAVERSE_Z_TOLERANCE_MM) {
                 throw new ProcedureAbort(`XY travel to the setter refused at machine Z ${z === null ? 'unknown' : z.toFixed(1)} - `
                     + `below the safe traverse height ${safeTraverseZ()}. Raise Z first (move_z, operator-confirmed).`);
             }

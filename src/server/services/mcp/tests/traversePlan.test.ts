@@ -45,6 +45,13 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(plan.name.startsWith('xy-traverse machine -> (290.0, 105.0)'));
     }],
 
+    ['home reports 327.9989959716797 for Z328: that IS the traverse height (live refusal 2026-09-14)', () => {
+        const plan = planTraverseXy(input({ currentMachine: { x: -19, y: 342, z: 327.9989959716797 } }));
+        assert.equal(plan.steps.length, 1, 'the rotary landmark (clearance 328) must not refuse a 1 um shortfall either');
+        assert.equal(plan.steps[0].to.z, 328, 'segments are planned at the traverse height');
+        refuses(() => planTraverseXy(input({ currentMachine: { x: -19, y: 342, z: 327.9 } })), 'below the traverse height');
+    }],
+
     ['refused below the traverse height, with no override', () => {
         refuses(() => planTraverseXy(input({ currentMachine: { x: 100, y: 100, z: 320 } })), 'below the traverse height 328');
     }],

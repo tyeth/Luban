@@ -10,6 +10,7 @@ import { jobManager } from '../jobs';
 import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
+import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
 import { assertFreshHeartbeat, PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
@@ -307,7 +308,8 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     const machineZ = before.machine.z;
     if (args.operator_confirmed_clearance !== true && machineZ !== null) {
         const traverseFloor = safeTraverseZ();
-        if (machineZ < traverseFloor) {
+        // Tolerance: home reports 327.999 for Z328 (heartbeat float noise).
+        if (machineZ < traverseFloor - TRAVERSE_Z_TOLERANCE_MM) {
             throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the safe `
                 + `traverse height ${traverseFloor} (top gantry). Retreat Z first (move_z, operator-`
                 + 'confirmed), then traverse, then descend at the destination. Only the operator\'s '
