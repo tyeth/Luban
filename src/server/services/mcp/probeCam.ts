@@ -277,6 +277,7 @@ export function describeProbeCamPlanAsGcode(plan: ProbeCamPlan): string {
         ...plan.warnings.map((w) => `; WARNING ${w}`),
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)}) - re-verified before motion`,
         'G90',
+        'G53;',
     ];
     for (const step of plan.parsed.steps) {
         if (step.kind === 'note') {

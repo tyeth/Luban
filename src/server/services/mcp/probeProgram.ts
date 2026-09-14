@@ -268,7 +268,7 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
             const swept = sweptRadius !== null && seeds.axis
                 ? `\n; swept cylinder (this stock): axis X${seeds.axis.x}, physical Z${seeds.axis.z_physical}, radius ${sweptRadius} -> the probe tip clears it with the toolhead at Z >= ${(seeds.axis.z_contact + sweptRadius).toFixed(3)}`
                 : '';
-            previews.push({ id, text: `; ROTATE STOCK: B -> ${b} deg (absolute), requires toolhead machine Z >= ${requireZ}${swept}\nG90\nG0 B${b.toFixed(3)} F${ROTATE_FEED}; verified by M114 (B within 0.05 deg)` });
+            previews.push({ id, text: `; ROTATE STOCK: B -> ${b} deg (absolute), requires toolhead machine Z >= ${requireZ}${swept}\nG90\nG53;\nG0 B${b.toFixed(3)} F${ROTATE_FEED}; verified by M114 (B within 0.05 deg)` });
             return;
         }
 

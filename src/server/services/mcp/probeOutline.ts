@@ -343,6 +343,7 @@ export function describeProbeOutlinePlanAsGcode(plan: ProbeOutlinePlan): string 
         `; march: coarse ${plan.march.coarseStepMm} mm F${COARSE_FEED}, fine ${plan.march.fineStepMm}, backoff ${plan.march.backoffMm}, ${plan.march.confirmPasses} confirm pass(es), sensor ${plan.march.sensorDelayMs} ms`,
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)}) - re-verified before motion`,
         'G90',
+        'G53;',
         `G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to the safe traverse height (law 2)`,
     ];
     const first = plan.topPoints[0];

@@ -432,8 +432,29 @@ export class JobManager {
             : gcodeText;
 
         const warnings = v.warnings.length
-            ? `<ul>${v.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`
+            ? `<div style="background:#fff3cd;border:1px solid #b8860b;padding:10px"><ul style="margin:0">${v.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul></div>`
             : '<p>None.</p>';
+        // The frame row is what lets the operator validate a Z without trusting
+        // chat: which workspace the moves run in, and where its Z lands in
+        // machine coordinates (operator law 2026-09-14).
+        const frame = v.frame;
+        const offsetNote = v.originOffsetZAtStaging === null ? '' : `; work-origin Z offset ${v.originOffsetZAtStaging} at staging`;
+        let frameText = 'UNDECLARED';
+        if (frame && frame.declared === 'machine') {
+            frameText = `MACHINE (G53 at line ${frame.line})`;
+        } else if (frame && frame.declared === 'work') {
+            frameText = frame.source === 'argument'
+                ? `WORK - declared by the submit argument; the file selects no workspace${offsetNote}`
+                : `WORK (${frame.workspaceSelects.join('/')} at line ${frame.line})${offsetNote}`;
+        } else if (v.motionLineCount === 0) {
+            frameText = 'n/a (no motion)';
+        }
+        let machineZ = 'UNRESOLVED - see warnings';
+        if (v.machineZExtents) {
+            machineZ = range(v.machineZExtents);
+        } else if (v.motionLineCount === 0) {
+            machineZ = '-';
+        }
 
         let directBanner = '';
         if (job.kind === 'direct') {
@@ -460,7 +481,9 @@ export class JobManager {
                 <tr><td>Lines / motion lines</td><td>${v.lineCount} / ${v.motionLineCount}</td></tr>
                 <tr><td>X extents</td><td>${range(v.extents.x)}</td></tr>
                 <tr><td>Y extents</td><td>${range(v.extents.y)}</td></tr>
-                <tr><td>Z extents</td><td>${range(v.extents.z)}</td></tr>
+                <tr><td><strong>Frame</strong></td><td><strong>${escapeHtml(frameText)}</strong></td></tr>
+                <tr><td>Z extents (as written)</td><td>${range(v.extents.z)}</td></tr>
+                <tr><td><strong>Z extents, MACHINE</strong></td><td><strong>${escapeHtml(machineZ)}</strong></td></tr>
                 <tr><td>B extents</td><td>${range(v.extents.b)}</td></tr>
                 <tr><td>Feed rates</td><td>${range(v.feedRates)}</td></tr>
                 <tr><td>Spindle</td><td>on x${v.spindle.onCommands}, off x${v.spindle.offCommands}, max S ${v.spindle.maxS === null ? '-' : v.spindle.maxS}</td></tr>

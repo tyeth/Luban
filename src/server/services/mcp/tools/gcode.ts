@@ -10,7 +10,7 @@ import { matchFrame } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
 import { clearProcedureStop, procedureStopRequested, requestProcedureStop } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
-import { validateGcode } from '../validator';
+import { JobFrame, resolveJobFrame, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
 import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
 
@@ -21,6 +21,30 @@ import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, get
 // page mints (see jobs.ts).
 
 const HEAD_TYPES = ['cnc', 'laser', 'printing'];
+const JOB_FRAMES: JobFrame[] = ['machine', 'work'];
+
+/**
+ * Live context for resolveJobFrame(): the work-origin Z offset the position
+ * of record currently holds and whether it can be trusted for resolving a
+ * work-frame job's extents to machine coordinates. With no machine or no
+ * heartbeat a machine-frame job can still be staged; a work-frame one is
+ * accepted with its machine extents marked unresolved.
+ */
+function stagingFrameContext(frameArgument: JobFrame | null) {
+    let originOffsetZ: number | null = null;
+    let offsetReliable = false;
+    let machineZMax: number | null = null;
+    try {
+        const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+        machineZMax = size ? size.z : null;
+        const position = getPositionSnapshot();
+        originOffsetZ = position.originOffset.z;
+        offsetReliable = position.originOffsetSource === 'heartbeat' && position.warnings.length === 0;
+    } catch (err) {
+        // Not connected / no heartbeat yet: resolution falls back to "unresolved".
+    }
+    return { frameArgument, originOffsetZ, offsetReliable, machineZMax };
+}
 
 interface JobChannel {
     executeGcode?: (gcode: string) => Promise<{ result: number; text?: string }>;
@@ -240,11 +264,20 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 gcode: { type: 'string', description: 'Complete G-code text.' },
                 name: { type: 'string', description: 'Short job name shown to the operator.' },
                 head_type: { type: 'string', enum: HEAD_TYPES, description: 'Toolhead kind. Default cnc.' },
+                frame: {
+                    type: 'string',
+                    enum: JOB_FRAMES,
+                    description: 'Coordinate frame the job runs in. A job that declares its frame in the gcode (G53 on its own line before '
+                        + 'the first move = machine; G54..G59 = work) needs no argument. A Luban/slicer export that selects no '
+                        + 'workspace MUST pass frame: "work" - the file is never modified. frame: "machine" without a literal G53 is '
+                        + 'refused (the controller runs undeclared files in the selected work workspace). A job that declares nothing '
+                        + 'and passes nothing is REFUSED: G90/G91 is distance mode, not a frame.',
+                },
             },
             required: ['gcode', 'name'],
             additionalProperties: false,
         },
-        handler: async (args: { gcode?: string; name?: string; head_type?: string }) => {
+        handler: async (args: { gcode?: string; name?: string; head_type?: string; frame?: string }) => {
             if (typeof args.gcode !== 'string' || !args.gcode.trim()) {
                 throw new McpToolError('gcode must be a non-empty string.');
             }
@@ -256,7 +289,18 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 throw new McpToolError(`head_type must be one of: ${HEAD_TYPES.join(', ')}`);
             }
 
-            const validation = validateGcode(args.gcode);
+            const frameArgument = args.frame === undefined || args.frame === null ? null : String(args.frame) as JobFrame;
+            if (frameArgument !== null && !JOB_FRAMES.includes(frameArgument)) {
+                throw new McpToolError(`frame must be one of: ${JOB_FRAMES.join(', ')}`);
+            }
+            // The frame handshake (operator law 2026-09-14): an agent-authored job
+            // must say which coordinate frame it runs in, or it does not reach the
+            // confirm page. The gcode itself is never edited to add a declaration.
+            const resolved = resolveJobFrame(validateGcode(args.gcode), stagingFrameContext(frameArgument));
+            if (resolved.refusal) {
+                throw new McpToolError(resolved.refusal);
+            }
+            const validation = resolved.report;
             const job = jobManager.submit(args.gcode, args.name, headType, validation);
 
             return {
@@ -670,7 +714,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
             const stepGcode = (t: number) => (coordinateSystem === 'machine'
                 ? `G90\nG53;\nG1 Z${t.toFixed(3)} F${feedRate};\nG54;`
-                : `G90\nG1 Z${t.toFixed(3)} F${feedRate}`);
+                : `G90\nG54;\nG1 Z${t.toFixed(3)} F${feedRate}`);
             const steps = targets.map(stepGcode);
             const isBatch = targets.length > 1;
             const delta = targetZ - currentZ;

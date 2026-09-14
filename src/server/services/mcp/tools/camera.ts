@@ -367,7 +367,9 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     recentDirectMoves.push(pacingNow);
 
     const move = `G0 X${target.x.toFixed(3)} Y${target.y.toFixed(3)} F${feedRate}`;
-    const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : move;
+    // Every MCP-emitted motion declares its frame (operator law 2026-09-14):
+    // G53 for machine coordinates, an explicit G54 for the work workspace.
+    const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : `G54;\n${move}`;
     const issuedAt = Date.now();
     const executed = await sendGcodeVisible(channel, `move - ${reason.slice(0, 60)}`, gcode);
     if (executed.result !== 0) {
