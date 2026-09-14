@@ -12,6 +12,7 @@
  * server (config/settings.base is ESM-only and breaks ts-node).
  */
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
+import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as traversePlanTests } from './traversePlan.test';
 import { tests as validatorTests } from './validator.test';
@@ -23,6 +24,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['machinePosition', machinePositionTests],
     ['envelopeChecks', envelopeChecksTests],
     ['traversePlan', traversePlanTests],
+    ['jobEnding', jobEndingTests],
 ];
 
 let passed = 0;

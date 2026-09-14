@@ -18,6 +18,7 @@ import {
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
+    isProcedureAbort,
 } from './probing';
 import { McpToolError } from './registry';
 import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -564,7 +565,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
                 log.error(`Tool setter abort retreat failed: ${retreatErr.message}`);
             }
         }
-        if (err instanceof ProcedureAbort) {
+        if (isProcedureAbort(err)) {
             throw new McpToolError(`Tool setter run aborted: ${err.message} `
                 + `Phases completed: ${JSON.stringify(phases)}`);
         }

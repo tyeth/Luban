@@ -34,6 +34,7 @@ import {
     moveMachineSettled,
     procedureStopRequested,
     rotateB,
+    isProcedureStopped,
 } from './probing';
 import {
     RefResolveError,
@@ -497,7 +498,7 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                 }
                 const completed = report.filter((r) => r.status === 'completed').length;
                 const tail = trip ? 'A safety alarm is latched - the operator must clear it.' : 'Machine raised to the traverse height.';
-                const Ctor = stop || err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+                const Ctor = stop || isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
                 throw new Ctor(`Program "${plan.name}" stopped at op "${op.id}" (${index + 1}/${plan.ops.length}): ${message} `
                     + `${completed} earlier op(s) completed; their results are on the job record under result.ops. ${tail}`,
                 programResult(plan, report, op.id, startedAt, phases));

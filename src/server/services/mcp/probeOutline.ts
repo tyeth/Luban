@@ -37,6 +37,8 @@ import {
     knownMachinePosition,
     moveMachineSettled,
     senseAfter,
+    isProcedureAbort,
+    isProcedureStopped,
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
@@ -593,8 +595,8 @@ export async function runProbeOutlineProcedure(plan: ProbeOutlinePlan): Promise<
                 // Logged by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
-            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+        if (isProcedureAbort(err)) {
+            const Ctor = isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
             throw new Ctor(`Stock outline aborted: ${err.message} ${topSamples.length} top sample(s) and ${contacts.length} side march(es) so far are on the job record.`, build(true));
         }
         throw err;

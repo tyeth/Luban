@@ -6,6 +6,7 @@ import path from 'path';
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { JobEnding } from './jobEnding';
 import { GcodeValidationReport } from './validator';
 
 const log = logger('service:mcp:jobs');
@@ -113,6 +114,12 @@ export interface McpJob {
     // Set when the job reaches a terminal state (completed / stopped).
     endedAt: number | null;
     error: string | null;
+    /**
+     * Why the job ended - finished, stopped by the agent/operator, withdrawn,
+     * rejected, alarm, unexpected contact, controller refusal, timeout, failure -
+     * so a reader never has to infer it from state + error text.
+     */
+    ending: JobEnding | null;
     // Everything that happened to the job, in order: state changes, the
     // runner's phase announcements, gcode sent/replies while it was the active
     // job, file-job progress. Returned by get_gcode_job_status so an agent
@@ -185,6 +192,7 @@ export class JobManager {
             startedAt: null,
             endedAt: null,
             error: null,
+            ending: null,
             events: [],
             eventSeq: 0,
             result: null,
@@ -310,6 +318,7 @@ export class JobManager {
             startedAt: job.startedAt,
             endedAt: job.endedAt,
             error: job.error,
+            ending: job.ending,
             terminal: this.isTerminal(job),
             result: job.result,
             eventCount: job.events.length,
@@ -382,6 +391,8 @@ export class JobManager {
         if (req.method === 'POST' && action === 'reject') {
             job.state = 'rejected';
             job.confirmToken = null;
+            job.endedAt = Date.now();
+            job.ending = { kind: 'rejected-by-operator', reason: 'operator rejected on the confirm page', at: job.endedAt };
             this.appendEvent(job, 'rejected', { note: 'operator rejected on the confirm page' });
             log.info(`MCP job ${job.id} rejected by operator`);
             this.page(res, 200, '<h2>Rejected</h2><p>The job will not run.</p>');

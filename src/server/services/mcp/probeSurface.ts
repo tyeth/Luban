@@ -24,6 +24,8 @@ import {
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
+    isProcedureAbort,
+    isProcedureStopped,
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
@@ -923,11 +925,11 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                 // Logged by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
+        if (isProcedureAbort(err)) {
             // Keep the class (a program runner tells a requested stop from a
             // fault) and carry the completed stations as the partial result.
             const partial = { ...buildResult(plan, results, phases), aborted: true, abortedAtStation: stationIndex };
-            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+            const Ctor = isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
             throw new Ctor(`Surface ${plan.kind} scan aborted at station ${stationIndex}: ${err.message} `
                 + `${results.filter((r) => r.status === 'contact').length} station(s) measured before the abort are on the job record.`, partial);
         }

@@ -15,6 +15,7 @@ import {
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
+    isProcedureAbort,
 } from './probing';
 import { McpToolError } from './registry';
 import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -335,7 +336,7 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
                 // by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
+        if (isProcedureAbort(err)) {
             throw new McpToolError(`Probe run aborted: ${err.message} Phases completed: ${JSON.stringify(phases)}`);
         }
         throw err;

@@ -5,6 +5,7 @@ import * as fs from 'fs-extra';
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpJob, TERMINAL_JOB_STATES, approvalHandoff, jobManager } from '../jobs';
+import { classifyProcedureEnding, countMeasured } from '../jobEnding';
 import { summarizeJobTiming } from '../jobTiming';
 import { landmarkStore } from '../landmarks';
 import { matchFrame } from '../positionOfRecord';
@@ -193,6 +194,10 @@ function watchFileJobCompletion(job: McpJob): void {
     let idleStreak = 0;
     let unreadableStreak = 0;
     let lastProgress = -1;
+    // The machine pauses a file job when the enclosure door opens (or on the
+    // operator's pause): record each transition so the ending can say so.
+    let lastStatus: string | null = null;
+    let pausedSeen = 0;
     const release = () => {
         if (jobManager.getActive() === job) {
             jobManager.setActive(null);
@@ -213,6 +218,7 @@ function watchFileJobCompletion(job: McpJob): void {
                 clearInterval(timer);
                 job.error = 'Completion unverified: machine state became unreadable after the job '
                     + 'started (connection lost?). The job may still be running on the machine.';
+                job.ending = { kind: 'completion-unverified', reason: job.error, at: Date.now() };
                 jobManager.appendEvent(job, 'completion_unverified', { note: job.error });
                 log.warn(`MCP file job ${job.id}: ${job.error}`);
                 release();
@@ -223,6 +229,11 @@ function watchFileJobCompletion(job: McpJob): void {
         if (FILE_JOB_ACTIVE_STATUSES.includes(status)) {
             sawActive = true;
             idleStreak = 0;
+            if ((status === 'paused' || status === 'pausing') && lastStatus !== 'paused' && lastStatus !== 'pausing') {
+                pausedSeen += 1;
+                jobManager.appendEvent(job, 'paused', { note: 'machine paused the file job - enclosure door interlock or operator pause; it resumes from the machine' });
+            }
+            lastStatus = status;
             // Progress from the heartbeat, recorded every 5 % so the event
             // log shows the job advancing without a reader having to poll.
             const state = connectionManager.getLatestMachineState() as { gcodePrintingInfo?: { progress?: number } } | null;
@@ -236,6 +247,7 @@ function watchFileJobCompletion(job: McpJob): void {
             }
             return;
         }
+        lastStatus = status;
         if (status === 'idle') {
             idleStreak += 1;
             const needed = sawActive ? FILE_JOB_IDLE_DEBOUNCE_POLLS : FILE_JOB_NEVER_SEEN_ACTIVE_IDLE_POLLS;
@@ -243,6 +255,11 @@ function watchFileJobCompletion(job: McpJob): void {
                 clearInterval(timer);
                 job.state = 'completed';
                 job.endedAt = Date.now();
+                job.ending = {
+                    kind: 'completed',
+                    reason: `machine interpreter finished the file${pausedSeen ? ` (paused ${pausedSeen}x on the way - door interlock or operator pause)` : ''}`,
+                    at: job.endedAt,
+                };
                 jobManager.appendEvent(job, 'completed', {
                     note: `heartbeat idle for ${idleStreak}s${sawActive ? '' : ' (job too short for an active heartbeat to be observed)'}`,
                 });
@@ -472,6 +489,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         job.result = { ...(outcome as object), timing: summarizeJobTiming(job.events) };
                         job.state = 'completed';
                         job.endedAt = Date.now();
+                        job.ending = { kind: 'completed', reason: 'procedure finished', at: job.endedAt, measured: countMeasured(outcome) };
                         jobManager.appendEvent(job, 'completed', { note: 'procedure finished; result stored on the job' });
                         return { ok: true as const, outcome };
                     })
@@ -479,20 +497,28 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         // What the procedure measured before it ended stays on
                         // the record (stations, contacts, completed ops).
                         const partial = (err as { partial?: object }).partial;
-                        if (partial) {
-                            job.result = { ...partial, timing: summarizeJobTiming(job.events) };
-                        }
                         job.error = err.message;
                         job.endedAt = Date.now();
                         const stop = procedureStopRequested();
+                        const trip = probeFeedService.getTrip();
+                        job.ending = classifyProcedureEnding({
+                            message: err.message,
+                            stopReason: stop ? stop.reason : null,
+                            trip: trip ? { kind: trip.kind, channel: (trip as { channel?: string }).channel } : null,
+                            at: job.endedAt,
+                            measured: countMeasured(partial),
+                        });
+                        // Whatever was measured before the end stays on the record, with
+                        // the ending beside it - a stopped run is a result, not a loss.
+                        job.result = { ...(partial || {}), ending: job.ending, timing: summarizeJobTiming(job.events) };
                         if (stop) {
                             job.state = 'stopped';
-                            jobManager.appendEvent(job, 'stopped', { note: `stopped on request (${stop.reason}): ${err.message}` });
+                            jobManager.appendEvent(job, 'stopped', { note: `stopped on request (${stop.reason}): ${err.message}`, ending: job.ending });
                             log.info(`Procedure job ${job.id} stopped on request: ${err.message}`);
                         } else {
                             job.state = 'start_failed';
-                            jobManager.appendEvent(job, 'failed', { note: err.message });
-                            log.error(`Procedure job ${job.id} failed: ${err.message}`);
+                            jobManager.appendEvent(job, 'failed', { note: err.message, ending: job.ending });
+                            log.error(`Procedure job ${job.id} failed (${job.ending.kind}): ${err.message}`);
                         }
                         return { ok: false as const, error: err.message };
                     })
@@ -560,6 +586,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         job.state = 'start_failed';
                         job.error = `Controller rejected the move: ${executed.text || executed.result}`;
                         job.endedAt = Date.now();
+                        job.ending = { kind: 'controller-rejected', reason: job.error, at: job.endedAt };
                         jobManager.appendEvent(job, 'failed', { note: job.error });
                         throw new McpToolError(job.error);
                     }
@@ -598,6 +625,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 }
                 job.state = 'completed';
                 job.endedAt = Date.now();
+                job.ending = { kind: 'completed', reason: 'direct move(s) done and settled', at: job.endedAt };
                 jobManager.appendEvent(job, 'completed', { note: 'direct move(s) done' });
                 return {
                     job: jobManager.describe(job),
@@ -974,8 +1002,12 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
     registry.register({
         name: 'get_gcode_job_status',
-        description: 'Job record, its event log (state changes, runner phases, gcode traffic while '
-            + 'active, file-job progress), the stored procedure result, and live machine progress. '
+        description: 'Job record with `ending` - why it ended: completed | stopped-by-agent | stopped-by-operator | '
+            + 'withdrawn | rejected-by-operator | crash-alarm | overtravel-alarm | unexpected-contact | controller-rejected | '
+            + 'timeout | operation-failure | machine-stopped | completion-unverified, with the reason and how many stations/ops '
+            + 'were measured - its event log (state changes, runner phases, gcode traffic while active, file-job progress and '
+            + 'pauses), the stored procedure result (a stopped or failed run keeps every completed station under result, with '
+            + 'result.ending beside it), and live machine progress. '
             + 'LONG-POLL: pass wait_ms (up to 120000) and it returns as soon as the job reaches a '
             + 'terminal state or new events arrive past since_event - use this instead of tight '
             + 'polling or reading server logs. Read-only.',
@@ -1056,6 +1088,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     // Not running yet: withdraw it so the approval cannot start it later.
                     job.state = 'stopped';
                     job.endedAt = Date.now();
+                    job.ending = { kind: 'withdrawn', reason: 'withdrawn by the agent before it started', at: job.endedAt };
                     jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
                     return { ok: true, stopped: true, stopping: false, note: 'Procedure withdrawn before it started.', job: jobManager.describe(job) };
                 }
@@ -1073,7 +1106,8 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     stopping: !stopped,
                     requestedAt: request.requestedAt,
                     note: stopped
-                        ? `Procedure ${job.state}; completed measurements are in result (${job.error || 'no error'}).`
+                        ? `Procedure ${job.state} (${job.ending ? job.ending.kind : 'ending unknown'}${job.ending && job.ending.measured !== undefined ? `, ${job.ending.measured} measured` : ''}); `
+                            + `completed measurements are in result (${job.error || 'no error'}).`
                         : `Stop requested ${Date.now() - request.requestedAt} ms ago; the runner is finishing its current step and raising. Long-poll get_gcode_job_status.`,
                     job: jobManager.describe(job),
                 };
@@ -1086,6 +1120,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (stopped.ok) {
                 job.state = 'stopped';
                 job.endedAt = Date.now();
+                job.ending = { kind: 'machine-stopped', reason: `firmware stop sent by the agent${stopped.text ? `: ${stopped.text}` : ''}`, at: job.endedAt };
                 jobManager.appendEvent(job, 'stopped', { note: `stop sent by the agent${stopped.text ? `: ${stopped.text}` : ''}` });
                 if (jobManager.getActive() === job) {
                     jobManager.setActive(null);
