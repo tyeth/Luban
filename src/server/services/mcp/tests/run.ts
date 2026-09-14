@@ -13,6 +13,7 @@
  */
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as machinePositionTests } from './machinePosition.test';
+import { tests as traversePlanTests } from './traversePlan.test';
 import { tests as validatorTests } from './validator.test';
 
 type TestCase = [string, () => void];
@@ -21,6 +22,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['validator', validatorTests],
     ['machinePosition', machinePositionTests],
     ['envelopeChecks', envelopeChecksTests],
+    ['traversePlan', traversePlanTests],
 ];
 
 let passed = 0;

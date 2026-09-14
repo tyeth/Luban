@@ -131,6 +131,7 @@ mcp/
   landmarks.ts   named landmark store (machine boxes, clearances) -> obstacle boxes
   diagnostics.ts event-loop / heartbeat / gcode / sensor timing; publishes mcp:position
   jobTiming.ts   per-kind timing summary from a job's event log
+  traversePlan.ts  pure: traverse_xy planner (law-2 XY transport at the traverse height, landmark-checked)
   tests/         `npm run test:mcp` - node:assert tests for the pure modules
   tools/         status, machine, gcode, camera, calibration, probe, toolsetter
 ```
@@ -765,7 +766,7 @@ when a beat was rejected); `get_mcp_diagnostics.machinePosition` counts rejected
 resyncs and disconnects. Unit tests: `tests/machinePosition.test.ts` (the recorded incidents are
 the fixtures).
 
-## Tool surface (47)
+## Tool surface (48)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·

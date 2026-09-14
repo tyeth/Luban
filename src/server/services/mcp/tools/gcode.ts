@@ -6,13 +6,15 @@ import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpJob, TERMINAL_JOB_STATES, approvalHandoff, jobManager } from '../jobs';
 import { summarizeJobTiming } from '../jobTiming';
+import { landmarkStore } from '../landmarks';
 import { matchFrame } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
 import { clearProcedureStop, procedureStopRequested, requestProcedureStop } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
+import { planTraverseXy } from '../traversePlan';
 import { JobFrame, resolveJobFrame, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
-import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
+import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 
 // Motion policy (#23): compound motion leaves this process only as a G-code
 // file submitted through the same prepare/start path as "Start on Luban",
@@ -64,6 +66,41 @@ function getJobChannel(): JobChannel {
     return channel;
 }
 
+interface DirectTarget {
+    frame: 'work' | 'machine';
+    x?: number;
+    y?: number;
+    z?: number;
+}
+
+/**
+ * Absolute target of a direct-move gcode (whichever of X/Y/Z the G1 line
+ * names), for settle verification. G53-wrapped moves are machine-frame;
+ * plain ones are work-frame (move_z / traverse_xy declare G54 explicitly).
+ */
+function parseDirectTarget(gcode: string): DirectTarget | undefined {
+    const line = gcode.match(/G0*1[^;\n]*/i);
+    if (!line) {
+        return undefined;
+    }
+    const axis = (letter: string): number | undefined => {
+        const m = line[0].match(new RegExp(`${letter}(-?\\d+(?:\\.\\d+)?)`, 'i'));
+        return m ? Number(m[1]) : undefined;
+    };
+    const target: DirectTarget = { frame: gcode.includes('G53') ? 'machine' : 'work', x: axis('X'), y: axis('Y'), z: axis('Z') };
+    if (target.x === undefined && target.y === undefined && target.z === undefined) {
+        return undefined;
+    }
+    return target;
+}
+
+function describeDirectTarget(t: DirectTarget): string {
+    return (['x', 'y', 'z'] as const)
+        .filter((axis) => t[axis] !== undefined)
+        .map((axis) => `${axis.toUpperCase()} ${t[axis]}`)
+        .join(' ');
+}
+
 /**
  * Wait until the heartbeat is settled AND, when the executed gcode names an
  * absolute Z target, until the reported Z actually matches it. Two identical
@@ -74,7 +111,7 @@ function getJobChannel(): JobChannel {
  */
 async function waitForStableHeartbeat(
     issuedAt: number,
-    expect?: { frame: 'work' | 'machine'; z: number }
+    expect?: DirectTarget
 ): Promise<{ position: PositionSnapshot | null; verified: boolean; warning?: string }> {
     const deadline = issuedAt + 45000;
     let previous: string | null = null;
@@ -101,9 +138,11 @@ async function waitForStableHeartbeat(
             // Machine-frame targets accept a report in either frame: a beat
             // inside the move's G53 window carries machine coordinates with
             // the offset still populated (positionOfRecord.ts).
+            const wanted = { x: expect.x, y: expect.y, z: expect.z };
+            const axes = (['x', 'y', 'z'] as const).filter((axis) => wanted[axis] !== undefined);
             const atTarget = expect.frame === 'work'
-                ? (now.work.z !== null && Math.abs(now.work.z - expect.z) <= 0.15)
-                : matchFrame(now.work, now.originOffset, { z: expect.z }, 0.15) !== null;
+                ? axes.every((axis) => now.work[axis] !== null && Math.abs((now.work[axis] as number) - (wanted[axis] as number)) <= 0.15)
+                : matchFrame(now.work, now.originOffset, wanted, 0.15) !== null;
             if (!atTarget) {
                 continue; // settled, but not AT the target yet - keep waiting
             }
@@ -114,24 +153,13 @@ async function waitForStableHeartbeat(
         position: last,
         verified: false,
         warning: expect
-            ? `Timed out waiting for the heartbeat to report ${expect.frame} Z ${expect.z}; the position `
+            ? `Timed out waiting for the heartbeat to report ${expect.frame} ${describeDirectTarget(expect)}; the position `
                 + 'shown is the last read and may be stale - verify with query_firmware_position.'
             : 'Timed out waiting for a settled heartbeat; the position shown may be stale - verify with '
                 + 'query_firmware_position.',
     };
 }
 
-/**
- * Absolute Z target of a direct-move gcode, for settle verification.
- * G53-wrapped moves are machine-frame; plain ones are work-frame.
- */
-function parseZTarget(gcode: string): { frame: 'work' | 'machine'; z: number } | undefined {
-    const match = gcode.match(/G0*1[^;\n]*?Z(-?\d+(?:\.\d+)?)/i);
-    if (!match) {
-        return undefined;
-    }
-    return { frame: gcode.includes('G53') ? 'machine' : 'work', z: Number(match[1]) };
-}
 
 function machineStatus(): string | null {
     const state = connectionManager.getLatestMachineState();
@@ -545,7 +573,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                             warning: 'wait_until_moved was false: the move was accepted but not awaited - '
                                 + 'poll get_position (or query_firmware_position) before relying on position.',
                         }
-                        : await waitForStableHeartbeat(issuedAt, parseZTarget(executable));
+                        : await waitForStableHeartbeat(issuedAt, parseDirectTarget(executable));
                     jobManager.appendEvent(job, 'settled', { position: settle.position, verified: settle.verified });
                 } finally {
                     jobManager.setActive(null);
@@ -775,6 +803,141 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     : 'Ask the operator to open confirm_url, review the DIRECT-move banner '
                         + '(current Z, target, delta, feed), and approve. Their one-time code passed to '
                         + 'start_gcode_job executes the move; the position then persists.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'traverse_xy',
+        description: 'Law-2 TRANSPORT: an absolute XY move, or an ordered series (max 20), at the traverse height - '
+            + 'staged for ONE operator approval and executed one step per start_gcode_job call on the direct path, '
+            + 'exactly like move_z. Refused unless the toolhead is already at or above mcpSafeTraverseZ (328 = home Z) - '
+            + 'raise it with move_z (coordinate_system "machine") first; there is deliberately no override. Every '
+            + 'segment is checked against the stored landmarks and every target against the travel; Z is never '
+            + 'written. Default frame MACHINE (G53 declared on every step; work-frame steps declare G54). This is the '
+            + 'transport tool - move_and_capture is a <= 100 mm vision nudge, and hand-written file jobs for transport '
+            + 'are how a frameless "G0 Z0" got staged on 2026-09-12. NOT door-interlocked - the operator supervises.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                x: { type: 'number', description: 'Absolute target X (single move). Omit to keep the current X.' },
+                y: { type: 'number', description: 'Absolute target Y (single move). Omit to keep the current Y.' },
+                targets: {
+                    type: 'array',
+                    minItems: 1,
+                    maxItems: 20,
+                    items: {
+                        type: 'object',
+                        properties: { x: { type: 'number' }, y: { type: 'number' } },
+                        additionalProperties: false,
+                    },
+                    description: 'Ordered targets {x?, y?} (an omitted axis keeps its previous value); one approval covers the '
+                        + 'exact list, one start_gcode_job call per step. Mutually exclusive with x/y.',
+                },
+                coordinate_system: {
+                    type: 'string',
+                    enum: ['machine', 'work'],
+                    description: 'Frame of the targets. Default MACHINE (agents plan in machine coordinates).',
+                },
+                feed_rate: { type: 'number', description: 'mm/min, default 1500, max 3000.' },
+                reason: { type: 'string', description: 'Shown to the operator: why this transport is needed.' },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Staged default for execution (start_gcode_job can override per call). Default true: each '
+                        + 'step blocks until the heartbeat verifiably reports the target XY. false: steps return on '
+                        + 'controller accept with position_verified: false - poll get_position.',
+                },
+            },
+            required: ['reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: {
+            x?: number;
+            y?: number;
+            targets?: Array<{ x?: number; y?: number }>;
+            coordinate_system?: string;
+            feed_rate?: number;
+            reason?: string;
+            wait_until_moved?: boolean;
+        }) => {
+            probeFeedService.assertNoOvertravel();
+            const single = args.x !== undefined || args.y !== undefined;
+            if (single === (args.targets !== undefined)) {
+                throw new McpToolError('Provide x and/or y for a single move, or targets for a series - not both, not neither.');
+            }
+            const targets = args.targets !== undefined ? args.targets : [{ x: args.x, y: args.y }];
+            const coordinateSystem = args.coordinate_system || 'machine';
+            if (coordinateSystem !== 'machine' && coordinateSystem !== 'work') {
+                throw new McpToolError('coordinate_system must be "machine" or "work".');
+            }
+            const feedRate = Math.min(Math.max(Number(args.feed_rate) || 1500, 50), 3000);
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+
+            assertFreshHeartbeat('staging an XY traverse');
+            const position = getPositionSnapshot();
+            if (position.machineStatus !== 'idle') {
+                throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
+            }
+            if (position.isHomed !== true) {
+                throw new McpToolError('Machine does not report homed; home before any XY transport.');
+            }
+            const state = connectionManager.getLatestMachineState() as { headStatus?: unknown; headPower?: unknown } | null;
+            const headPower = Number(state && state.headPower);
+            if ((Number.isFinite(headPower) && headPower > 0) || (state && (state.headStatus === true || state.headStatus === 'on'))) {
+                throw new McpToolError('Toolhead appears to be on; refusing to traverse.');
+            }
+            const { x: mx, y: my, z: mz } = position.machine;
+            if (mx === null || my === null || mz === null) {
+                throw new McpToolError('Current machine position unknown; cannot plan the traverse.');
+            }
+            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+            let plan;
+            try {
+                plan = planTraverseXy({
+                    targets,
+                    frame: coordinateSystem,
+                    currentMachine: { x: mx, y: my, z: mz },
+                    originOffset: position.originOffset,
+                    bounds: size ? { min: { x: 0, y: 0, z: 0 }, max: { x: size.x, y: size.y, z: size.z } } : null,
+                    traverseZ: safeTraverseZ(),
+                    feedRate,
+                    obstacles: landmarkStore.obstacleBoxes(),
+                    reason,
+                });
+            } catch (err) {
+                if ((err as Error).name === 'TraversePlanError') {
+                    throw new McpToolError((err as Error).message);
+                }
+                throw err;
+            }
+            const isBatch = plan.steps.length > 1;
+            const validation = validateGcode(plan.reviewText);
+            const stepGcodes = isBatch ? plan.steps.map((step) => step.gcode) : undefined;
+            const job = jobManager.submit(plan.reviewText, plan.name, 'cnc', validation, 'direct', stepGcodes);
+            job.waitUntilMoved = args.wait_until_moved !== false;
+
+            return {
+                job: jobManager.describe(job),
+                current_machine: { x: mx, y: my, z: mz },
+                traverse_z: safeTraverseZ(),
+                coordinate_system: coordinateSystem,
+                feed_rate: feedRate,
+                steps: plan.steps.map((step) => ({
+                    target: step.target,
+                    machine: { x: step.to.x, y: step.to.y },
+                    distance_mm: Number(step.distanceMm.toFixed(1)),
+                })),
+                total_distance_mm: Number(plan.totalDistanceMm.toFixed(1)),
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: isBatch
+                    ? 'Ask the operator to open confirm_url, review the DIRECT-move banner, the frame and every leg, and '
+                        + 'approve once. Then call start_gcode_job once PER STEP (wait_for_approval_ms on the first); each '
+                        + 'call executes the next approved leg and settles. The series can be abandoned at any point.'
+                    : 'Ask the operator to open confirm_url, review the DIRECT-move banner (frame, from, to, distance, '
+                        + 'feed, Z unchanged) and approve; start_gcode_job with wait_for_approval_ms executes the move.',
             };
         },
     });

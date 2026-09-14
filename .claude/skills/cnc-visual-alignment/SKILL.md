@@ -37,7 +37,8 @@ better frames.
 | Servo step | `visual_servo` | One clamped correction per call; the loop lives in you, not the tool. |
 | Calibration store | `set_/get_/delete_camera_calibration` | 2×2 pixel-delta→mm matrix, keyed by the machine Y and Z it was derived at. |
 | Z, every step | `move_z` | One operator-confirmed step per target, `coordinate_system: "machine"`. Never a Z word in a hand-written file job — a bare `Z0` is frameless and the MCP refuses undeclared frames. |
-| Anything compound (transport beyond the jog cap, sequences) | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. Only the operator's click on the confirm page authorises motion — call `start_gcode_job` with `wait_for_approval_ms` to start on that click, or pass the one-time code they relay as `confirm_token`. |
+| XY transport beyond the jog cap | `traverse_xy` | Absolute XY target or series at the traverse height (machine Z328), one approval, one `start_gcode_job` per leg; refused below 328, landmark-checked, Z never written. The 100 mm `move_and_capture` cap is for vision nudges - do not chain them and do not hand-write a file job. |
+| Anything compound (sequences, cutting) | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. Only the operator's click on the confirm page authorises motion — call `start_gcode_job` with `wait_for_approval_ms` to start on that click, or pass the one-time code they relay as `confirm_token`. |
 
 ### Machine semantics you must not re-derive wrongly (verified on the A350)
 

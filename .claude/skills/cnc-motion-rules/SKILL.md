@@ -86,8 +86,10 @@ Run through this every time, in order, and say the answers out loud in your repl
 7. **Use tools for their purpose, through the MCP surface only.** `move_and_capture` is a
    vision reposition, not transport — its `reason` is shown to the operator, travel is capped
    (`mcpMaxJogDistance`, 100 mm, a safety cap on the non-interlocked path that the assistant
-   never raises), and rapid sequential direct moves are refused. Transport is a staged job at
-   the traverse height. Z goes through `move_z` (one confirm per step, `coordinate_system:
+   never raises), and rapid sequential direct moves are refused. Transport is `traverse_xy`: an
+   XY target or series at the traverse height, one operator approval, one `start_gcode_job` per
+   leg, refused below 328 with no override, landmark-checked, Z never written - never a
+   hand-written file job. Z goes through `move_z` (one confirm per step, `coordinate_system:
    "machine"`). A script looping motion calls is an unsupervised procedure without a confirm
    page. Never touch the backend, configstore, or machine directly while the app runs — the
    guards live in the tools.

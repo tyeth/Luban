@@ -1,4 +1,4 @@
-# Luban MCP tool surface (47 tools)
+# Luban MCP tool surface (48 tools)
 
 Terse per-tool reference. Machines: A350 = CNC, F350 = printer. Motion tools stage a job and
 need one operator click on the confirm page; nothing moves on an agent's word alone. Results
@@ -28,6 +28,7 @@ session.
 - `home` — machine home (`G28`). Default first step after (re)connecting; raises Z first and clears stale position state.
 - `goto_work_origin` — move to work X0 Y0. Distinct from `home`.
 - `move_z` — single Z target or a `z_targets` batch. Only on the operator's explicit request.
+- `traverse_xy` — law-2 TRANSPORT: an absolute XY target or an ordered `targets` series at the traverse height (machine Z328), one approval, one `start_gcode_job` per leg, like `move_z`. Refused unless the head is already at/above `mcpSafeTraverseZ` (no override); every leg checked against landmarks and the travel; Z never written; default frame machine (`G53` per step). Use this, never a hand-written file job, to move the head.
 - `move_and_capture` — one guarded XY move followed by a position-stamped frame; the unit of visual alignment.
 - `goto_tool_change_position` — two approved steps: Z up, then XY to the operator-set park spot.
 
