@@ -454,7 +454,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 dx: { type: 'number', description: 'Path direction X component (with dy and length_mm) when end_x/end_y are not given. Magnitude ignored.' },
                 dy: { type: 'number', description: 'Path direction Y component.' },
                 length_mm: { type: 'number', description: 'Path length along dx/dy (1-400).' },
-                stations: { type: 'number', description: 'Station count including both ends (2-60). Alternative: spacing_mm.' },
+                stations: { type: 'number', description: 'Station count including both ends (2-400; above 60 the confirm page warns about duration and the event budget). Alternative: spacing_mm.' },
                 spacing_mm: {
                     type: 'number',
                     description: 'MAXIMUM spacing: the length is divided evenly into steps no larger than this, both ends '

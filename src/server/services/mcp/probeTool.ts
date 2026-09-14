@@ -2,6 +2,7 @@
 // MCP tool arguments are snake_case by convention (planProbePoint takes the
 // probe_point arguments verbatim).
 import { mcpBroadcast } from './index';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
@@ -75,8 +76,14 @@ export function planProbePoint(args: {
     if (x === null || y === null || z === null) {
         throw new McpToolError('Current machine position unknown; cannot anchor the probe envelope.');
     }
+    // A start within tolerance of the traverse height IS the traverse height:
+    // home reports 327.999 for Z328, and using the raw value put a 1 um
+    // 'retreat to 327.999' followed by 'finish at 328.000' on the confirm page
+    // (operator, 2026-09-14). Commanded positions never carry heartbeat noise.
+    const traverseZ = safeTraverseZ();
+    const startZ = z >= traverseZ - TRAVERSE_Z_TOLERANCE_MM ? traverseZ : z;
 
-    let limitCoord = { x, y, z }[axis] + direction * maxTravelMm;
+    let limitCoord = { x, y, z: startZ }[axis] + direction * maxTravelMm;
     // Clamp to the same envelope the direct-move guards use (machine
     // -25..size+40 for X/Y; Z never below 0).
     const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
@@ -85,14 +92,14 @@ export function planProbePoint(args: {
     } else if (size) {
         limitCoord = Math.min(Math.max(limitCoord, -25), size[axis] + 40);
     }
-    if (Math.abs(limitCoord - { x, y, z }[axis]) < 0.5) {
+    if (Math.abs(limitCoord - { x, y, z: startZ }[axis]) < 0.5) {
         throw new McpToolError('The clamped probe travel is under 0.5 mm - already at the envelope edge.');
     }
 
     return {
         axis,
         direction: direction as 1 | -1,
-        start: { x, y, z },
+        start: { x, y, z: startZ },
         maxTravelMm,
         limitCoord: Number(limitCoord.toFixed(3)),
         coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm

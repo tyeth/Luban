@@ -1,3 +1,7 @@
+/** Path stations above this only WARN on the confirm page (duration, event budget); the ceiling is the grid's. */
+export const MANY_STATIONS = 60;
+export const MAX_PATH_STATIONS = 400;
+
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention (the planners take the
 // probe_surface_path / probe_surface_grid arguments verbatim).
@@ -161,8 +165,10 @@ export function planPathStations(args: {
     let count: number;
     if (args.stations !== undefined) {
         count = Math.round(requireFinite(args.stations, 'stations'));
-        if (count < 2 || count > 60) {
-            throw new SurfacePlanError('stations must be 2-60.');
+        // Station count is a time/event budget, not a safety line: above
+        // MANY_STATIONS the confirm preview warns, the ceiling matches the grid's.
+        if (count < 2 || count > MAX_PATH_STATIONS) {
+            throw new SurfacePlanError(`stations must be 2-${MAX_PATH_STATIONS}.`);
         }
     } else if (args.spacing_mm !== undefined) {
         const spacing = requireFinite(args.spacing_mm, 'spacing_mm');
@@ -172,8 +178,8 @@ export function planPathStations(args: {
         // Spacing is a MAXIMUM: the length is divided evenly into steps no
         // larger than it, so both ends are covered (same rule as survey_bed).
         count = Math.max(1, Math.ceil(lengthMm / spacing - 1e-9)) + 1;
-        if (count > 60) {
-            throw new SurfacePlanError(`spacing_mm ${spacing} over ${lengthMm.toFixed(1)} mm gives ${count} stations (max 60).`);
+        if (count > MAX_PATH_STATIONS) {
+            throw new SurfacePlanError(`spacing_mm ${spacing} over ${lengthMm.toFixed(1)} mm gives ${count} stations (max ${MAX_PATH_STATIONS}).`);
         }
     } else {
         throw new SurfacePlanError('Give either stations (count) or spacing_mm.');
