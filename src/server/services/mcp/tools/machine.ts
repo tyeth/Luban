@@ -119,13 +119,19 @@ function axisValue(value: unknown): number | null {
 /**
  * The minimum toolhead machine Z for X/Y traverses - OPERATOR LAW after the
  * 2026-09-01 probe crash: "always retreat to top gantry height (home
- * effectively) before x/y moves". Default 320 (home Z is 328 on the A350);
- * override via configstore mcpSafeTraverseZ. Anything lower needs the
- * operator's explicit clearance for that specific corridor.
+ * effectively) before x/y moves". Default 328 = home Z on the A350 (operator
+ * decision 2026-09-14: the earlier 320 left 8 mm of unverified headroom over
+ * the rotary landmark's clearance 328 - its tailstock is unmeasured - and the
+ * crossing-landmark exemption at traverse height covered that up). Override
+ * via configstore mcpSafeTraverseZ. In-procedure sub-motions keep their own
+ * tool-specific envelopes and are checked against landmarks like any low
+ * segment; every procedure ends raised to this height.
  */
+export const DEFAULT_SAFE_TRAVERSE_Z = 328;
+
 export function safeTraverseZ(): number {
     const raw = Number(config.get('mcpSafeTraverseZ'));
-    return Number.isFinite(raw) && raw > 0 ? raw : 320;
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SAFE_TRAVERSE_Z;
 }
 
 export interface PositionSnapshot {

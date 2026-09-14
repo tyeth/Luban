@@ -196,7 +196,7 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    traverse height — no local hops above a measured feature, no other "measured safe"
    heights. Retreat, traverse, descend — in that order. Sub-gantry XY is only fine
    positioning <= 1 mm (touch nudges, probe march steps). Enforced: direct XY below
-   `mcpSafeTraverseZ` (default 320) refused without `operator_confirmed_clearance`, which
+   `mcpSafeTraverseZ` (default 328 = home Z since 2026-09-14) refused without `operator_confirmed_clearance`, which
    is for emergencies on the operator's explicit words, not a planning device.
 3. **No fabricated clearances** — only measured or operator-stated heights count. Visual
    inference finds things; it never clears them.
@@ -519,15 +519,17 @@ word. The review's patch outline for a `snapmaker-probing.cps` (post-transformed
 `G38.2` per cycle type with `(PROBE …)` metadata, raise before every rotation, no M3/G28/G92) is in
 the same document.
 
-**Traverse height beats a landmark clearance above it (job 34d787bdb2d7, 2026-09-06).** The
-`rotary-axis` landmark declares clearance 328 (the homing height) while the operator's safe
-traverse height is 320, so a sequence hop at 320 out of the rotary footprint was refused by the
-new planner check and a six-op program lost its last op. Law 2 defines the traverse height as
-safe for XY by decree: segments at or above `mcpSafeTraverseZ` are exempt from CROSSING landmarks
-(`checkMotion({traverseZ})`); a program `keep_out` VOLUME can still refuse them (it is the
-agent's explicit box). Marches (sensor-gated approaches that stop on contact) are exempt from
-crossing landmarks too — probing INTO the rotary footprint from outside is the job — never from
-volumes.
+**Traverse height and landmark clearances (revised 2026-09-14).** Job 34d787bdb2d7 (2026-09-06) lost
+its last op because the `rotary-axis` landmark declares clearance 328 (the homing height) while
+the traverse height was then 320: a hop at 320 out of the rotary footprint was refused. The fix at
+the time exempted segments at or above `mcpSafeTraverseZ` from CROSSING landmarks - which also
+let a traverse cross the rotary box, tailstock included, with 8 mm of headroom nobody had
+measured. Operator decision: `mcpSafeTraverseZ` now defaults to **328** (= home Z), and the
+exemption is REMOVED - a hop at 328 passes every stored clearance on its own merits, a hop below
+328 (a surface-scan hop, a stepped link) is checked against crossing landmarks like any low
+segment, marches stay exempt (they stop on contact), and a program `keep_out` VOLUME refuses at
+any Z below its clearance. In-procedure sub-motions keep their tool-specific envelopes; every
+procedure ends raised to 328. `get_stored_state.limits.safeTraverseZMm` reports the live value.
 
 **A missed march is a measurement, not a fault (2026-09-06, job 5ad5fcce6b3a).** The agent's
 six-op centre-finding program aborted on its LAST op because the first south-side march started

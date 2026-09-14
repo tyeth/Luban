@@ -104,7 +104,7 @@ export function pointInBox2D(x: number, y: number, box: { x0: number; y0: number
 export function checkMotion(
     segments: MotionSegment[],
     obstacles: ObstacleBox[],
-    options: { margin?: number; traverseZ?: number } = {}
+    options: { margin?: number; /** informational: the planner's hop height */ traverseZ?: number } = {}
 ): Violation[] {
     const margin = options.margin === undefined ? OBSTACLE_MARGIN_MM : options.margin;
     const out: Violation[] = [];
@@ -114,15 +114,12 @@ export function checkMotion(
             if (lowZ >= ob.clearanceZ - 1e-9) {
                 continue;
             }
-            // Law 2 defines the safe traverse height (mcpSafeTraverseZ, 320):
-            // XY travel there is safe by the operator's decree, so a stored
-            // landmark whose clearance sits above it (the rotary-axis landmark
-            // says 328, the homing height) cannot refuse a traverse-height hop
-            // (job 34d787bdb2d7 lost its sixth op to exactly that). A program
-            // keep_out VOLUME still can - it is this clamping's explicit box.
-            if (ob.mode === 'crossing' && options.traverseZ !== undefined && lowZ >= options.traverseZ - 1e-9) {
-                continue;
-            }
+            // No traverse-height exemption (removed 2026-09-14). The safe
+            // traverse height is now 328 = home Z, at or above every stored
+            // clearance, so a hop there passes the clearance test on its own
+            // merits; a hop BELOW it is checked like any low segment. The old
+            // clamp (traverse 320 < the rotary landmark's 328) let a traverse
+            // cross the unmeasured tailstock with 8 mm of unverified headroom.
             if (!segmentHitsBox2D(seg.from.x, seg.from.y, seg.to.x, seg.to.y, ob.machine, margin)) {
                 continue;
             }
