@@ -52,6 +52,7 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
     // Verbose mode: also show machine heartbeat state and MCP tool activity
     const verboseRef = useRef(false);
     const lastVerboseLineRef = useRef('');
+    const lastPositionLineRef = useRef('');
     // Verbose lines are timestamped so the operator can measure real
     // latencies (e.g. a commanded move vs the heartbeat reporting it).
     const stamp = () => {
@@ -106,8 +107,13 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
                 }
             }
         },
-        // Heartbeat state, printed only in verbose mode and only on change
-        // (the heartbeat ticks ~1/s; repeating identical lines is noise).
+        // Raw heartbeat report, printed only in verbose mode and only on change
+        // (the status poll runs every 2 s; repeating identical lines is noise).
+        // This prints the controller's OWN words - the reported position and
+        // offset - and never derives a machine position from them: a beat
+        // inside a move's G53 window carries either frame, and the old
+        // `work - offset` here printed Z 555 / Z 656 artefacts as positions.
+        // The judged machine position arrives separately as mcp:position.
         'Marlin:state': (options) => {
             if (!verboseRef.current) {
                 return;
@@ -116,13 +122,9 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
             const pos = state.pos || {};
             const off = state.originOffset || {};
             const fmt = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(2) : '?');
-            const fmtMachine = (v, o) => (
-                Number.isFinite(Number(v)) && Number.isFinite(Number(o))
-                    ? (Number(v) - Number(o)).toFixed(2) : '?'
-            );
             const b = pos.isFourAxis ? ` B${fmt(pos.b)}` : '';
-            const line = `pos work(${fmt(pos.x)}, ${fmt(pos.y)}, ${fmt(pos.z)})${b}`
-                + ` machine(${fmtMachine(pos.x, off.x)}, ${fmtMachine(pos.y, off.y)}, ${fmtMachine(pos.z, off.z)})`
+            const line = `report pos(${fmt(pos.x)}, ${fmt(pos.y)}, ${fmt(pos.z)})${b}`
+                + ` offset(${fmt(off.x)}, ${fmt(off.y)}, ${fmt(off.z)})`
                 + ` ${state.status || ''}`;
             if (line === lastVerboseLineRef.current) {
                 return;
@@ -130,6 +132,33 @@ function Console({ widgetId, widgetActions, minimized, isDefault, clearRenderSta
             lastVerboseLineRef.current = line;
             const terminal = terminalRef.current;
             terminal && terminal.writeln(color.blackBright(stamp() + line));
+        },
+        // The machine POSITION OF RECORD as the MCP server judged it - the one
+        // machine value every motion guard uses, with its reliability. A
+        // rejected beat prints the held position and says so instead of a
+        // number outside the travel.
+        'mcp:position': (options) => {
+            if (!verboseRef.current) {
+                return;
+            }
+            const { machine, reliability, b, rejectedReason } = options || {};
+            const m = machine || {};
+            const fmt = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(2) : '?');
+            const bText = Number.isFinite(Number(b)) ? ` B${fmt(b)}` : '';
+            const held = reliability === 'awaiting-resync' ? 'held ' : '';
+            const line = `machine(${held}${fmt(m.x)}, ${fmt(m.y)}, ${fmt(m.z)})${bText} [${reliability || '?'}`
+                + `${rejectedReason ? `: ${rejectedReason}` : ''}]`;
+            if (line === lastPositionLineRef.current) {
+                return;
+            }
+            lastPositionLineRef.current = line;
+            const terminal = terminalRef.current;
+            if (!terminal) {
+                return;
+            }
+            const paint = reliability === 'verified' || reliability === 'heartbeat' || reliability === 'cached-offset'
+                ? color.blackBright : color.yellow;
+            terminal.writeln(paint(stamp() + line));
         },
         // Exact gcode sent by MCP tools on the direct path, and the
         // controller's reply - shows which coordinate frame each move ran in.

@@ -4,7 +4,7 @@ import { getPositionOfRecord, getTrustedOffset } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
 import { ToolRegistry } from '../registry';
 import { currentGcodeSequence } from './camera';
-import { originOffsetDiagnostics } from './machine';
+import { machinePositionDiagnostics } from './machine';
 
 // Seed tool: read-only report of the machine connection. Proves the bridge
 // from the MCP endpoint to ConnectionManager; every later tool (#8-#13)
@@ -28,7 +28,8 @@ export function registerStatusTools(registry: ToolRegistry): void {
         name: 'get_mcp_diagnostics',
         description: 'Timing evidence for slow or aborted procedures, read-only: server event-loop stalls, '
             + 'machine heartbeat cadence/gaps/frame flips, direct-gcode pacing (exec and idle ms), sensor pipe '
-            + 'latency, the probe feed status and the motion engine\'s current position of record. The same '
+            + 'latency, the probe feed status and the machine position of record (rejected beats by reason, resyncs, '
+            + 'disconnects, the trusted offset). The same '
             + 'signals appear as job events (event_loop_stall, heartbeat_gap, heartbeat_frame_flip, slow_step, '
             + 'sense_overrun, position-estimated, and idleMs/execMs on gcode events) so read '
             + 'get_gcode_job_status first and use this for the totals.',
@@ -42,7 +43,7 @@ export function registerStatusTools(registry: ToolRegistry): void {
                 ...diagnosticsSnapshot(),
                 probeFeed: probeFeedService.status(),
                 positionOfRecord: getPositionOfRecord(currentGcodeSequence()),
-                originOffset: { ...originOffsetDiagnostics(), trustedByEngine: getTrustedOffset() },
+                machinePosition: { ...machinePositionDiagnostics(), trustedOffsetByEngine: getTrustedOffset() },
                 gcodeSequence: currentGcodeSequence(),
             };
         },

@@ -24,7 +24,7 @@ import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedur
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import { getMachineSizeByIdentifier, getPositionSnapshot, requireReliableMachine, safeTraverseZ } from './machine';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -559,6 +559,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
         }) => {
             probeFeedService.assertNoOvertravel();
             const position = getPositionSnapshot();
+            requireReliableMachine(position, 'a bed survey');
             const { x, y, z } = position.machine;
             if (x === null || y === null || z === null) {
                 throw new McpToolError('Current machine position unknown.');

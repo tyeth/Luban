@@ -7,7 +7,7 @@ import { connectionManager } from '../../machine/ConnectionManager';
 import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCameras } from '../camera';
 import { recordGcodeTiming } from '../diagnostics';
 import { jobManager } from '../jobs';
-import { noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
+import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { landmarkStore } from '../landmarks';
@@ -46,14 +46,11 @@ const gcodeLog = logger('service:mcp:gcode');
 // (positionOfRecord.ts). The timing stamps feed diagnostics.ts: idle time
 // between the controller's previous reply and the next send is engine +
 // sensor window only, so a long one inside a job means late timers.
-let gcodeSequence = 0;
 let lastReplyAt: number | null = null;
 const SLOW_IDLE_MS = 750;
 const SLOW_IDLE_IGNORE_MS = 15000; // beyond this it is a human/agent pause, not pacing
 
-export function currentGcodeSequence(): number {
-    return gcodeSequence;
-}
+export { currentGcodeSequence } from '../positionOfRecord';
 
 export interface SentGcode {
     result: number;
@@ -77,8 +74,7 @@ export interface SendTiming {
 }
 
 export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string, timing?: SendTiming): Promise<SentGcode> {
-    gcodeSequence += 1;
-    const sequence = gcodeSequence;
+    const sequence = bumpGcodeSequence();
     const sentAt = Date.now();
     const idleMs = lastReplyAt === null ? null : sentAt - lastReplyAt;
     // Breakdown of the idle gap (previous reply -> this send):

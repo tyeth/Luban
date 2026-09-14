@@ -13,7 +13,7 @@ import {
     setToolSetterConfig,
 } from '../toolSetter';
 import { validateGcode } from '../validator';
-import { getPositionSnapshot } from './machine';
+import { getPositionSnapshot, requireReliableMachine } from './machine';
 
 export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
@@ -227,6 +227,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                     + 'tool_change_x / tool_change_z (and optionally _y) via set_tool_setter_config.');
             }
             const position = getPositionSnapshot();
+            requireReliableMachine(position, 'this tool-setter operation');
             if (position.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
             }
@@ -302,6 +303,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             }
 
             const position = getPositionSnapshot();
+            requireReliableMachine(position, 'this tool-setter operation');
             if (position.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
             }

@@ -52,6 +52,15 @@ export function mcpBroadcast(eventName: string, options?: object): void {
     broadcaster && broadcaster.broadcast(eventName, options);
 }
 
+/**
+ * UI-only broadcast, NOT recorded on the active job: high-rate telemetry such
+ * as the judged machine position (mcp:position, one per 2 s heartbeat) would
+ * otherwise crowd a long scan's capped event log.
+ */
+export function mcpBroadcastLive(eventName: string, options?: object): void {
+    broadcaster && broadcaster.broadcast(eventName, options);
+}
+
 function validPort(raw: unknown): number | null {
     const port = Number(raw);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {

@@ -274,6 +274,26 @@ export function getTrustedOffset(): Xyz | null {
     return trustedOffset;
 }
 
+/** Forget the engine's trusted offset - on every (re)connection: work origins die on a machine reboot. */
+export function clearTrustedOffset(): void {
+    trustedOffset = null;
+}
+
+// Direct-gcode sequence: every send bumps it, and the position of record is
+// valid only for the sequence it was recorded at (any other gcode invalidates
+// it). It lives here, in the pure module, so tools/machine.ts can read it
+// without importing the channel code in tools/camera.ts.
+let gcodeSequence = 0;
+
+export function bumpGcodeSequence(): number {
+    gcodeSequence += 1;
+    return gcodeSequence;
+}
+
+export function currentGcodeSequence(): number {
+    return gcodeSequence;
+}
+
 // Direct-gcode activity, so the snapshot can tell a G53-window beat (a
 // command is in flight, or replied within the last couple of seconds - the
 // status poll's data may predate its processing) from a quiet beat.
