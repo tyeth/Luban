@@ -205,6 +205,8 @@ export function machinePositionDiagnostics() {
         /** Rejected -> accepted transitions: "rectified on the next sync". */
         resyncs: machinePosition.resyncs,
         disconnects: machinePosition.disconnects,
+        /** When the state was last forgotten (a disconnect); null on the first connection. */
+        resetAt: machinePosition.resetAt,
         lastAccepted: machinePosition.lastAccepted,
         lastJudgement: last
             ? { reliability: last.reliability, frame: last.frame, accepted: last.accepted, rejectedReason: last.rejectedReason, reasons: last.reasons }
