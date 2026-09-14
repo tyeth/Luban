@@ -102,7 +102,8 @@ mcp/
   oauth.ts       OAuth 2.1 / DCR shim for clients that insist on it; grants all, labels logs
   registry.ts    tool registration/dispatch; McpToolError = tool-level failure
   jobs.ts        JobManager + human confirm pages (/confirm/<id>); job kinds file|direct
-  validator.ts   static gcode inspection (extents, spindle, distance-mode hazards)
+  validator.ts   static gcode inspection (extents, spindle, distance-mode hazards) + the FRAME
+                 handshake (G53/G54 tracking, resolveJobFrame refuses undeclared jobs)
   camera.ts      capture providers, frame cache (last 12, frameId), sticky device
   tracking.ts    zero-mean NCC template matching between cached frames
   calibration.ts Y/Z-keyed pixel->mm calibration store (userDataDir, persists)
@@ -118,6 +119,19 @@ mcp/
   probeTool.ts / probeVector.ts / probeSequence.ts / probeCircle.ts   staged probe procedures
   surfaceScan.ts pure station planning + flatness statistics (no imports; unit-tested alone)
   probeSurface.ts probe_surface_path / probe_surface_grid plan builders + runner
+  probeOutline.ts probe_stock_outline: top points + side marches -> centre/size/yaw
+  probeProgram.ts probe_program: many ops, one approval, references between ops
+  programRefs.ts pure reference resolution ({from, plus, mid, ...}) with operator bounds
+  probeGcode.ts  CAM probing-program parser (G38.x, links, rotations) - pure
+  inspectionReport.ts  Fusion / Renishaw / csv / grbl / json report renderers - pure
+  envelopeChecks.ts  pure keep-out geometry: checkMotion(segments, obstacles) for planners
+  positionOfRecord.ts  pure: frame matching, controller-echo record, offset judgement,
+                 the gcode sequence counter
+  machinePosition.ts  pure: the judged machine position of record + reliability state
+  landmarks.ts   named landmark store (machine boxes, clearances) -> obstacle boxes
+  diagnostics.ts event-loop / heartbeat / gcode / sensor timing; publishes mcp:position
+  jobTiming.ts   per-kind timing summary from a job's event log
+  tests/         `npm run test:mcp` - node:assert tests for the pure modules
   tools/         status, machine, gcode, camera, calibration, probe, toolsetter
 ```
 
@@ -554,6 +568,18 @@ waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping,
 
 ## Safety model (operator-defined, non-negotiable)
 
+- **Every staged job declares its coordinate frame, or it is refused** (2026-09-14, after a
+  work-frame `G0 Z0` transit job reached the confirm page reading "Z 0 .. 0, warnings: none").
+  `G53` on its own line before the first move = MACHINE; `G54..G59` in the file, or
+  `frame: "work"` on `submit_gcode_job` for a Luban/slicer export that selects no workspace =
+  WORK (the file is never modified); `frame: "machine"` without a literal `G53` is refused, and
+  so is a job that declares nothing. The confirm page shows **Frame** and the **machine-resolved Z
+  extents** (work-frame Z through the live origin offset), so the operator validates a Z without
+  trusting chat. `G92`, mixed frames, out-of-travel Z and a work-frame absolute `Z0` are loud
+  warnings. Every MCP emitter declares too (`G53;` in every planner preview, an explicit `G54;`
+  before a work-frame `move_z` / `move_and_capture`). See "Coordinate frames and the position
+  of record" below. Agent guidance: `.claude/skills/cnc-motion-rules/SKILL.md` (canonical) and
+  `.claude/skills/README.md`.
 - **Compound motion and all cutting goes out as gcode FILES** through the same
   `prepare_print`/`start_print` path as Luban's Start button, so the controller job state
   machine and the enclosure **door interlock** apply (fork issue #23). The direct
@@ -698,7 +724,48 @@ waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping,
   the agent click Approve for one bounded series of moves, that authority ends with that
   series ("no approvals carry forwards in CNC work").
 
-## Tool surface (40)
+## Coordinate frames and the position of record (2026-09-14)
+
+**Frames.** The controller has `G53` (machine workspace) and `G54..G59` (work workspaces whose
+origin the operator sets). `G90`/`G91` is distance mode and says nothing about the frame. On this
+controller `G53` on its own line is modal until a `G54..G59` reselects a work workspace - every
+emitter here relies on it (`G90` / `G53;` / moves / `G54;`; Luban's Home is `G53;G28;G54`) - and an
+inline `G53 G0 ...` is NOT honoured (the move runs in the selected workspace; `validateGcode` flags
+it). Agents plan, stage, record and quote in MACHINE coordinates; the work origin belongs to the
+operator, Luban and the firmware (touchscreen, tool-change wizard), persists across homing, dies
+on a machine reboot, and is written by the MCP only through `apply_tool_length_offset`.
+
+**The position of record** (`machinePosition.ts`, consumed via `getPositionSnapshot`). The 2 s
+WiFi status poll can land inside a move's `G53;...G54;` window and carry either frame with the
+offset populated, zeroed or missing; hand-deriving `machine = work - originOffset` on such a beat
+produced Z 555 / Z 656 "positions" that passed the traverse-height guard and every landmark
+clearance, and the Workspace console printed its own copy of the subtraction. Now ONE judge sees
+each distinct beat and returns `machine` + `reliability`:
+
+| `reliability` | Meaning | Motion / staging |
+|---|---|---|
+| `verified` | the controller's echo of the last commanded move (positionOfRecord) is still valid for the current gcode sequence - it outranks the beat | allowed |
+| `heartbeat` | coherent beat, offset reported by the controller | allowed |
+| `cached-offset` | coherent beat, missing/zero offset replaced by the last complete one (a zero is believed only after 3 quiet beats) | allowed |
+| `awaiting-resync` | the beat was REJECTED - derived value more than 50 mm outside the travel, a frame-flip signature (raw jumped by exactly the offset), or no offset reported yet - and `machine` is the last accepted position with its own timestamp | **refused** until the next coherent beat |
+| `stale` | no report for more than 10 s | **refused** |
+
+Rules the judge follows, in the operator's words: an incoherent beat is IGNORED, never
+reinterpreted - the next coherent sync rectifies it; a coordinate more than 50 mm outside machine
+bounds is a mistake, never a position; nothing is assumed when no offset has been reported. All
+state (cached offset, zero streak, previous accepted raw, last accepted position, trusted offset,
+echo record) is forgotten on every (re)connection. `assertFreshHeartbeat` - in front of every
+procedure start, direct move, job start and Z staging, never inside a runner's per-move loop -
+refuses on `awaiting-resync`/`stale`, so a rejected G53-window beat can delay a start by one poll
+period but cannot abort a running procedure or reach a guard as a number. `get_position` returns
+the judgement (`reliability`, `frame`, `reasons`, the rejected beat's `derived` value for
+diagnostics); the console shows the raw report as `report pos(...) offset(...)` and the judged
+position as a separate `mcp:position` line (`machine(held ...) [awaiting-resync: out-of-bounds]`
+when a beat was rejected); `get_mcp_diagnostics.machinePosition` counts rejected beats by reason,
+resyncs and disconnects. Unit tests: `tests/machinePosition.test.ts` (the recorded incidents are
+the fixtures).
+
+## Tool surface (47)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
@@ -785,7 +852,9 @@ Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
   Never `gh auth switch`, never store the token.
 - eslint judged against baseline (pre-existing errors in ConnectionManager/SstpHttpChannel
   stay); `npx tsc -p tsconfig-server.json --noEmit` filtered to `services/mcp` must be
-  clean.
+  clean; `npm run test:mcp` (node:assert tests for the pure modules - validator,
+  machinePosition, envelopeChecks; add a `tests/*.test.ts` and register it in `tests/run.ts`)
+  must pass.
 - **Timing diagnostics (`diagnostics.ts`, 2026-09-05)**: in job 1db4902a4cd6 the 0.1 mm fine
   steps took ~370 ms at the controller plus a 100 ms sensor window, yet one step in four
   idled 1.3–2.1 s between the controller's reply and the next send, and the resumptions fell

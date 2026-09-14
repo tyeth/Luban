@@ -10,15 +10,15 @@ session.
 - `get_stored_state` — everything known in one call: calibrations, landmarks, tool region, limits, camera, connection, probe feed. Start here.
 - `get_connection_status` — is Luban connected to a machine, over what channel.
 - `get_machine_profile` — kinematics, work envelope, toolhead module offsets.
-- `get_position` — machine and work coordinates together, warns when firmware reporting is incoherent.
+- `get_position` — the machine POSITION OF RECORD: judged machine coordinates with `reliability` (verified | heartbeat | cached-offset | awaiting-resync | stale), the frame it rests on and `reasons`, plus the raw work report and originOffset. Motion refuses unless verified/heartbeat/cached-offset; never derive machine = work − offset yourself.
 - `query_firmware_position` — raw `M114`; use when `get_position` looks suspect.
-- `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures.
+- `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures; `machinePosition` counts rejected heartbeats by reason (out-of-bounds, frame-flip, no-offset-yet), resyncs and disconnects.
 - `get_job_timing` — where a job's time went, from its event log; works for running, done and failed jobs.
 
 ## G-code jobs
 
-- `validate_gcode` — static inspection: extents vs envelope, spindle state, distance-mode hazards. Free, run before submitting.
-- `submit_gcode_job` — stage a file or direct-command job; returns the confirm-page URL for the operator.
+- `validate_gcode` — static inspection: extents, spindle state, distance-mode hazards, and the FRAME the job declares (G53 own-line = machine, G54..G59 = work; inline `G53 G0` flagged - the firmware ignores it; G92 flagged). Free, run before submitting.
+- `submit_gcode_job` — stage a file job; returns the confirm-page URL. REFUSED unless the job declares its frame: `G53` on its own line before the first move (machine), or `G54..G59` in the file / `frame: "work"` for a Luban/slicer export (work; the file is never modified). `frame: "machine"` without a literal G53 is refused. The confirm page shows Frame and machine-resolved Z extents.
 - `start_gcode_job` — run an approved job; returns the result if it lands within `wait_ms` (default 25 s), else `running`.
 - `get_gcode_job_status` — event log plus stored result; long-poll with `wait_ms` / `since_event` instead of spinning.
 - `stop_gcode_job` — procedures stop cooperatively at the next step and raise; file jobs get a firmware stop. Partial result kept.
@@ -81,6 +81,10 @@ session.
 ## Standing rules the tools assume
 
 - The endmill is always in the spindle; never plan as if the collet is empty.
-- Any XY move over 1 mm is planned at safe traverse height.
+- Any XY move over 1 mm is planned at the safe traverse height - machine Z328 (home). Landmarks are honoured literally: a hop at 328 clears them on its own merits, a lower hop is checked like any low segment.
 - No Z motion without a direct request. "Home" always means machine home.
 - Approval covers one bounded series of moves and never carries forward.
+- Agents plan, stage, record and quote in MACHINE coordinates. Every staged job declares its frame or is refused; `G90`/`G91` is distance mode, not a frame; never a bare frameless `Z`.
+- The work origin is the operator's (touchscreen, Luban, tool-change wizard). Read it fresh from `get_position`; never assume it; never write it except through `apply_tool_length_offset`.
+- `get_position.machine` is the judged position of record with a `reliability`; a reading more than 50 mm outside the travel is a bug, never a position, and is ignored until the next coherent beat. Do not derive a machine position from one heartbeat by hand.
+- Canonical agent guidance: `.claude/skills/cnc-motion-rules/SKILL.md`.
