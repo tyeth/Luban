@@ -6,6 +6,7 @@ import path from 'path';
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { JobEnding } from './jobEnding';
 import { GcodeValidationReport } from './validator';
 
 const log = logger('service:mcp:jobs');
@@ -113,6 +114,12 @@ export interface McpJob {
     // Set when the job reaches a terminal state (completed / stopped).
     endedAt: number | null;
     error: string | null;
+    /**
+     * Why the job ended - finished, stopped by the agent/operator, withdrawn,
+     * rejected, alarm, unexpected contact, controller refusal, timeout, failure -
+     * so a reader never has to infer it from state + error text.
+     */
+    ending: JobEnding | null;
     // Everything that happened to the job, in order: state changes, the
     // runner's phase announcements, gcode sent/replies while it was the active
     // job, file-job progress. Returned by get_gcode_job_status so an agent
@@ -185,6 +192,7 @@ export class JobManager {
             startedAt: null,
             endedAt: null,
             error: null,
+            ending: null,
             events: [],
             eventSeq: 0,
             result: null,
@@ -310,6 +318,7 @@ export class JobManager {
             startedAt: job.startedAt,
             endedAt: job.endedAt,
             error: job.error,
+            ending: job.ending,
             terminal: this.isTerminal(job),
             result: job.result,
             eventCount: job.events.length,
@@ -382,6 +391,8 @@ export class JobManager {
         if (req.method === 'POST' && action === 'reject') {
             job.state = 'rejected';
             job.confirmToken = null;
+            job.endedAt = Date.now();
+            job.ending = { kind: 'rejected-by-operator', reason: 'operator rejected on the confirm page', at: job.endedAt };
             this.appendEvent(job, 'rejected', { note: 'operator rejected on the confirm page' });
             log.info(`MCP job ${job.id} rejected by operator`);
             this.page(res, 200, '<h2>Rejected</h2><p>The job will not run.</p>');
@@ -432,8 +443,29 @@ export class JobManager {
             : gcodeText;
 
         const warnings = v.warnings.length
-            ? `<ul>${v.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`
+            ? `<div style="background:#fff3cd;border:1px solid #b8860b;padding:10px"><ul style="margin:0">${v.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul></div>`
             : '<p>None.</p>';
+        // The frame row is what lets the operator validate a Z without trusting
+        // chat: which workspace the moves run in, and where its Z lands in
+        // machine coordinates (operator law 2026-09-14).
+        const frame = v.frame;
+        const offsetNote = v.originOffsetZAtStaging === null ? '' : `; work-origin Z offset ${v.originOffsetZAtStaging} at staging`;
+        let frameText = 'UNDECLARED';
+        if (frame && frame.declared === 'machine') {
+            frameText = `MACHINE (G53 at line ${frame.line})`;
+        } else if (frame && frame.declared === 'work') {
+            frameText = frame.source === 'argument'
+                ? `WORK - declared by the submit argument; the file selects no workspace${offsetNote}`
+                : `WORK (${frame.workspaceSelects.join('/')} at line ${frame.line})${offsetNote}`;
+        } else if (v.motionLineCount === 0) {
+            frameText = 'n/a (no motion)';
+        }
+        let machineZ = 'UNRESOLVED - see warnings';
+        if (v.machineZExtents) {
+            machineZ = range(v.machineZExtents);
+        } else if (v.motionLineCount === 0) {
+            machineZ = '-';
+        }
 
         let directBanner = '';
         if (job.kind === 'direct') {
@@ -460,7 +492,9 @@ export class JobManager {
                 <tr><td>Lines / motion lines</td><td>${v.lineCount} / ${v.motionLineCount}</td></tr>
                 <tr><td>X extents</td><td>${range(v.extents.x)}</td></tr>
                 <tr><td>Y extents</td><td>${range(v.extents.y)}</td></tr>
-                <tr><td>Z extents</td><td>${range(v.extents.z)}</td></tr>
+                <tr><td><strong>Frame</strong></td><td><strong>${escapeHtml(frameText)}</strong></td></tr>
+                <tr><td>Z extents (as written)</td><td>${range(v.extents.z)}</td></tr>
+                <tr><td><strong>Z extents, MACHINE</strong></td><td><strong>${escapeHtml(machineZ)}</strong></td></tr>
                 <tr><td>B extents</td><td>${range(v.extents.b)}</td></tr>
                 <tr><td>Feed rates</td><td>${range(v.feedRates)}</td></tr>
                 <tr><td>Spindle</td><td>on x${v.spindle.onCommands}, off x${v.spindle.offCommands}, max S ${v.spindle.maxS === null ? '-' : v.spindle.maxS}</td></tr>

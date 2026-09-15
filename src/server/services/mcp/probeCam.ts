@@ -41,6 +41,8 @@ import {
     senseAfter,
     senseReleaseAfter,
     sleep,
+    isProcedureAbort,
+    isProcedureStopped,
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
@@ -277,6 +279,7 @@ export function describeProbeCamPlanAsGcode(plan: ProbeCamPlan): string {
         ...plan.warnings.map((w) => `; WARNING ${w}`),
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)}) - re-verified before motion`,
         'G90',
+        'G53;',
     ];
     for (const step of plan.parsed.steps) {
         if (step.kind === 'note') {
@@ -616,8 +619,8 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
                 // Logged by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
-            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+        if (isProcedureAbort(err)) {
+            const Ctor = isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
             throw new Ctor(`CAM probing program aborted: ${err.message} ${records.length} probe cycle(s) recorded so far are on the job record (partial report written).`,
                 build(err.message));
         }

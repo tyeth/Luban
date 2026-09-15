@@ -5,14 +5,17 @@ import * as fs from 'fs-extra';
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpJob, TERMINAL_JOB_STATES, approvalHandoff, jobManager } from '../jobs';
+import { classifyProcedureEnding, countMeasured } from '../jobEnding';
 import { summarizeJobTiming } from '../jobTiming';
+import { landmarkStore } from '../landmarks';
 import { matchFrame } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
 import { clearProcedureStop, procedureStopRequested, requestProcedureStop } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
-import { validateGcode } from '../validator';
+import { planTraverseXy } from '../traversePlan';
+import { JobFrame, resolveJobFrame, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
-import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
+import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 
 // Motion policy (#23): compound motion leaves this process only as a G-code
 // file submitted through the same prepare/start path as "Start on Luban",
@@ -21,6 +24,30 @@ import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, get
 // page mints (see jobs.ts).
 
 const HEAD_TYPES = ['cnc', 'laser', 'printing'];
+const JOB_FRAMES: JobFrame[] = ['machine', 'work'];
+
+/**
+ * Live context for resolveJobFrame(): the work-origin Z offset the position
+ * of record currently holds and whether it can be trusted for resolving a
+ * work-frame job's extents to machine coordinates. With no machine or no
+ * heartbeat a machine-frame job can still be staged; a work-frame one is
+ * accepted with its machine extents marked unresolved.
+ */
+function stagingFrameContext(frameArgument: JobFrame | null) {
+    let originOffsetZ: number | null = null;
+    let offsetReliable = false;
+    let machineZMax: number | null = null;
+    try {
+        const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+        machineZMax = size ? size.z : null;
+        const position = getPositionSnapshot();
+        originOffsetZ = position.originOffset.z;
+        offsetReliable = position.originOffsetSource === 'heartbeat' && position.warnings.length === 0;
+    } catch (err) {
+        // Not connected / no heartbeat yet: resolution falls back to "unresolved".
+    }
+    return { frameArgument, originOffsetZ, offsetReliable, machineZMax };
+}
 
 interface JobChannel {
     executeGcode?: (gcode: string) => Promise<{ result: number; text?: string }>;
@@ -40,6 +67,41 @@ function getJobChannel(): JobChannel {
     return channel;
 }
 
+interface DirectTarget {
+    frame: 'work' | 'machine';
+    x?: number;
+    y?: number;
+    z?: number;
+}
+
+/**
+ * Absolute target of a direct-move gcode (whichever of X/Y/Z the G1 line
+ * names), for settle verification. G53-wrapped moves are machine-frame;
+ * plain ones are work-frame (move_z / traverse_xy declare G54 explicitly).
+ */
+function parseDirectTarget(gcode: string): DirectTarget | undefined {
+    const line = gcode.match(/G0*1[^;\n]*/i);
+    if (!line) {
+        return undefined;
+    }
+    const axis = (letter: string): number | undefined => {
+        const m = line[0].match(new RegExp(`${letter}(-?\\d+(?:\\.\\d+)?)`, 'i'));
+        return m ? Number(m[1]) : undefined;
+    };
+    const target: DirectTarget = { frame: gcode.includes('G53') ? 'machine' : 'work', x: axis('X'), y: axis('Y'), z: axis('Z') };
+    if (target.x === undefined && target.y === undefined && target.z === undefined) {
+        return undefined;
+    }
+    return target;
+}
+
+function describeDirectTarget(t: DirectTarget): string {
+    return (['x', 'y', 'z'] as const)
+        .filter((axis) => t[axis] !== undefined)
+        .map((axis) => `${axis.toUpperCase()} ${t[axis]}`)
+        .join(' ');
+}
+
 /**
  * Wait until the heartbeat is settled AND, when the executed gcode names an
  * absolute Z target, until the reported Z actually matches it. Two identical
@@ -50,7 +112,7 @@ function getJobChannel(): JobChannel {
  */
 async function waitForStableHeartbeat(
     issuedAt: number,
-    expect?: { frame: 'work' | 'machine'; z: number }
+    expect?: DirectTarget
 ): Promise<{ position: PositionSnapshot | null; verified: boolean; warning?: string }> {
     const deadline = issuedAt + 45000;
     let previous: string | null = null;
@@ -77,9 +139,11 @@ async function waitForStableHeartbeat(
             // Machine-frame targets accept a report in either frame: a beat
             // inside the move's G53 window carries machine coordinates with
             // the offset still populated (positionOfRecord.ts).
+            const wanted = { x: expect.x, y: expect.y, z: expect.z };
+            const axes = (['x', 'y', 'z'] as const).filter((axis) => wanted[axis] !== undefined);
             const atTarget = expect.frame === 'work'
-                ? (now.work.z !== null && Math.abs(now.work.z - expect.z) <= 0.15)
-                : matchFrame(now.work, now.originOffset, { z: expect.z }, 0.15) !== null;
+                ? axes.every((axis) => now.work[axis] !== null && Math.abs((now.work[axis] as number) - (wanted[axis] as number)) <= 0.15)
+                : matchFrame(now.work, now.originOffset, wanted, 0.15) !== null;
             if (!atTarget) {
                 continue; // settled, but not AT the target yet - keep waiting
             }
@@ -90,24 +154,13 @@ async function waitForStableHeartbeat(
         position: last,
         verified: false,
         warning: expect
-            ? `Timed out waiting for the heartbeat to report ${expect.frame} Z ${expect.z}; the position `
+            ? `Timed out waiting for the heartbeat to report ${expect.frame} ${describeDirectTarget(expect)}; the position `
                 + 'shown is the last read and may be stale - verify with query_firmware_position.'
             : 'Timed out waiting for a settled heartbeat; the position shown may be stale - verify with '
                 + 'query_firmware_position.',
     };
 }
 
-/**
- * Absolute Z target of a direct-move gcode, for settle verification.
- * G53-wrapped moves are machine-frame; plain ones are work-frame.
- */
-function parseZTarget(gcode: string): { frame: 'work' | 'machine'; z: number } | undefined {
-    const match = gcode.match(/G0*1[^;\n]*?Z(-?\d+(?:\.\d+)?)/i);
-    if (!match) {
-        return undefined;
-    }
-    return { frame: gcode.includes('G53') ? 'machine' : 'work', z: Number(match[1]) };
-}
 
 function machineStatus(): string | null {
     const state = connectionManager.getLatestMachineState();
@@ -141,6 +194,10 @@ function watchFileJobCompletion(job: McpJob): void {
     let idleStreak = 0;
     let unreadableStreak = 0;
     let lastProgress = -1;
+    // The machine pauses a file job when the enclosure door opens (or on the
+    // operator's pause): record each transition so the ending can say so.
+    let lastStatus: string | null = null;
+    let pausedSeen = 0;
     const release = () => {
         if (jobManager.getActive() === job) {
             jobManager.setActive(null);
@@ -161,6 +218,7 @@ function watchFileJobCompletion(job: McpJob): void {
                 clearInterval(timer);
                 job.error = 'Completion unverified: machine state became unreadable after the job '
                     + 'started (connection lost?). The job may still be running on the machine.';
+                job.ending = { kind: 'completion-unverified', reason: job.error, at: Date.now() };
                 jobManager.appendEvent(job, 'completion_unverified', { note: job.error });
                 log.warn(`MCP file job ${job.id}: ${job.error}`);
                 release();
@@ -171,6 +229,11 @@ function watchFileJobCompletion(job: McpJob): void {
         if (FILE_JOB_ACTIVE_STATUSES.includes(status)) {
             sawActive = true;
             idleStreak = 0;
+            if ((status === 'paused' || status === 'pausing') && lastStatus !== 'paused' && lastStatus !== 'pausing') {
+                pausedSeen += 1;
+                jobManager.appendEvent(job, 'paused', { note: 'machine paused the file job - enclosure door interlock or operator pause; it resumes from the machine' });
+            }
+            lastStatus = status;
             // Progress from the heartbeat, recorded every 5 % so the event
             // log shows the job advancing without a reader having to poll.
             const state = connectionManager.getLatestMachineState() as { gcodePrintingInfo?: { progress?: number } } | null;
@@ -184,6 +247,7 @@ function watchFileJobCompletion(job: McpJob): void {
             }
             return;
         }
+        lastStatus = status;
         if (status === 'idle') {
             idleStreak += 1;
             const needed = sawActive ? FILE_JOB_IDLE_DEBOUNCE_POLLS : FILE_JOB_NEVER_SEEN_ACTIVE_IDLE_POLLS;
@@ -191,6 +255,11 @@ function watchFileJobCompletion(job: McpJob): void {
                 clearInterval(timer);
                 job.state = 'completed';
                 job.endedAt = Date.now();
+                job.ending = {
+                    kind: 'completed',
+                    reason: `machine interpreter finished the file${pausedSeen ? ` (paused ${pausedSeen}x on the way - door interlock or operator pause)` : ''}`,
+                    at: job.endedAt,
+                };
                 jobManager.appendEvent(job, 'completed', {
                     note: `heartbeat idle for ${idleStreak}s${sawActive ? '' : ' (job too short for an active heartbeat to be observed)'}`,
                 });
@@ -240,11 +309,20 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 gcode: { type: 'string', description: 'Complete G-code text.' },
                 name: { type: 'string', description: 'Short job name shown to the operator.' },
                 head_type: { type: 'string', enum: HEAD_TYPES, description: 'Toolhead kind. Default cnc.' },
+                frame: {
+                    type: 'string',
+                    enum: JOB_FRAMES,
+                    description: 'Coordinate frame the job runs in. A job that declares its frame in the gcode (G53 on its own line before '
+                        + 'the first move = machine; G54..G59 = work) needs no argument. A Luban/slicer export that selects no '
+                        + 'workspace MUST pass frame: "work" - the file is never modified. frame: "machine" without a literal G53 is '
+                        + 'refused (the controller runs undeclared files in the selected work workspace). A job that declares nothing '
+                        + 'and passes nothing is REFUSED: G90/G91 is distance mode, not a frame.',
+                },
             },
             required: ['gcode', 'name'],
             additionalProperties: false,
         },
-        handler: async (args: { gcode?: string; name?: string; head_type?: string }) => {
+        handler: async (args: { gcode?: string; name?: string; head_type?: string; frame?: string }) => {
             if (typeof args.gcode !== 'string' || !args.gcode.trim()) {
                 throw new McpToolError('gcode must be a non-empty string.');
             }
@@ -256,7 +334,18 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 throw new McpToolError(`head_type must be one of: ${HEAD_TYPES.join(', ')}`);
             }
 
-            const validation = validateGcode(args.gcode);
+            const frameArgument = args.frame === undefined || args.frame === null ? null : String(args.frame) as JobFrame;
+            if (frameArgument !== null && !JOB_FRAMES.includes(frameArgument)) {
+                throw new McpToolError(`frame must be one of: ${JOB_FRAMES.join(', ')}`);
+            }
+            // The frame handshake (operator law 2026-09-14): an agent-authored job
+            // must say which coordinate frame it runs in, or it does not reach the
+            // confirm page. The gcode itself is never edited to add a declaration.
+            const resolved = resolveJobFrame(validateGcode(args.gcode), stagingFrameContext(frameArgument));
+            if (resolved.refusal) {
+                throw new McpToolError(resolved.refusal);
+            }
+            const validation = resolved.report;
             const job = jobManager.submit(args.gcode, args.name, headType, validation);
 
             return {
@@ -400,6 +489,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         job.result = { ...(outcome as object), timing: summarizeJobTiming(job.events) };
                         job.state = 'completed';
                         job.endedAt = Date.now();
+                        job.ending = { kind: 'completed', reason: 'procedure finished', at: job.endedAt, measured: countMeasured(outcome) };
                         jobManager.appendEvent(job, 'completed', { note: 'procedure finished; result stored on the job' });
                         return { ok: true as const, outcome };
                     })
@@ -407,20 +497,28 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         // What the procedure measured before it ended stays on
                         // the record (stations, contacts, completed ops).
                         const partial = (err as { partial?: object }).partial;
-                        if (partial) {
-                            job.result = { ...partial, timing: summarizeJobTiming(job.events) };
-                        }
                         job.error = err.message;
                         job.endedAt = Date.now();
                         const stop = procedureStopRequested();
+                        const trip = probeFeedService.getTrip();
+                        job.ending = classifyProcedureEnding({
+                            message: err.message,
+                            stopReason: stop ? stop.reason : null,
+                            trip: trip ? { kind: trip.kind, channel: (trip as { channel?: string }).channel } : null,
+                            at: job.endedAt,
+                            measured: countMeasured(partial),
+                        });
+                        // Whatever was measured before the end stays on the record, with
+                        // the ending beside it - a stopped run is a result, not a loss.
+                        job.result = { ...(partial || {}), ending: job.ending, timing: summarizeJobTiming(job.events) };
                         if (stop) {
                             job.state = 'stopped';
-                            jobManager.appendEvent(job, 'stopped', { note: `stopped on request (${stop.reason}): ${err.message}` });
+                            jobManager.appendEvent(job, 'stopped', { note: `stopped on request (${stop.reason}): ${err.message}`, ending: job.ending });
                             log.info(`Procedure job ${job.id} stopped on request: ${err.message}`);
                         } else {
                             job.state = 'start_failed';
-                            jobManager.appendEvent(job, 'failed', { note: err.message });
-                            log.error(`Procedure job ${job.id} failed: ${err.message}`);
+                            jobManager.appendEvent(job, 'failed', { note: err.message, ending: job.ending });
+                            log.error(`Procedure job ${job.id} failed (${job.ending.kind}): ${err.message}`);
                         }
                         return { ok: false as const, error: err.message };
                     })
@@ -488,6 +586,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         job.state = 'start_failed';
                         job.error = `Controller rejected the move: ${executed.text || executed.result}`;
                         job.endedAt = Date.now();
+                        job.ending = { kind: 'controller-rejected', reason: job.error, at: job.endedAt };
                         jobManager.appendEvent(job, 'failed', { note: job.error });
                         throw new McpToolError(job.error);
                     }
@@ -501,7 +600,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                             warning: 'wait_until_moved was false: the move was accepted but not awaited - '
                                 + 'poll get_position (or query_firmware_position) before relying on position.',
                         }
-                        : await waitForStableHeartbeat(issuedAt, parseZTarget(executable));
+                        : await waitForStableHeartbeat(issuedAt, parseDirectTarget(executable));
                     jobManager.appendEvent(job, 'settled', { position: settle.position, verified: settle.verified });
                 } finally {
                     jobManager.setActive(null);
@@ -526,6 +625,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 }
                 job.state = 'completed';
                 job.endedAt = Date.now();
+                job.ending = { kind: 'completed', reason: 'direct move(s) done and settled', at: job.endedAt };
                 jobManager.appendEvent(job, 'completed', { note: 'direct move(s) done' });
                 return {
                     job: jobManager.describe(job),
@@ -670,7 +770,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
             const stepGcode = (t: number) => (coordinateSystem === 'machine'
                 ? `G90\nG53;\nG1 Z${t.toFixed(3)} F${feedRate};\nG54;`
-                : `G90\nG1 Z${t.toFixed(3)} F${feedRate}`);
+                : `G90\nG54;\nG1 Z${t.toFixed(3)} F${feedRate}`);
             const steps = targets.map(stepGcode);
             const isBatch = targets.length > 1;
             const delta = targetZ - currentZ;
@@ -736,6 +836,141 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
     });
 
     registry.register({
+        name: 'traverse_xy',
+        description: 'Law-2 TRANSPORT: an absolute XY move, or an ordered series (max 20), at the traverse height - '
+            + 'staged for ONE operator approval and executed one step per start_gcode_job call on the direct path, '
+            + 'exactly like move_z. Refused unless the toolhead is already at or above mcpSafeTraverseZ (328 = home Z) - '
+            + 'raise it with move_z (coordinate_system "machine") first; there is deliberately no override. Every '
+            + 'segment is checked against the stored landmarks and every target against the travel; Z is never '
+            + 'written. Default frame MACHINE (G53 declared on every step; work-frame steps declare G54). This is the '
+            + 'transport tool - move_and_capture is a <= 100 mm vision nudge, and hand-written file jobs for transport '
+            + 'are how a frameless "G0 Z0" got staged on 2026-09-12. NOT door-interlocked - the operator supervises.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                x: { type: 'number', description: 'Absolute target X (single move). Omit to keep the current X.' },
+                y: { type: 'number', description: 'Absolute target Y (single move). Omit to keep the current Y.' },
+                targets: {
+                    type: 'array',
+                    minItems: 1,
+                    maxItems: 20,
+                    items: {
+                        type: 'object',
+                        properties: { x: { type: 'number' }, y: { type: 'number' } },
+                        additionalProperties: false,
+                    },
+                    description: 'Ordered targets {x?, y?} (an omitted axis keeps its previous value); one approval covers the '
+                        + 'exact list, one start_gcode_job call per step. Mutually exclusive with x/y.',
+                },
+                coordinate_system: {
+                    type: 'string',
+                    enum: ['machine', 'work'],
+                    description: 'Frame of the targets. Default MACHINE (agents plan in machine coordinates).',
+                },
+                feed_rate: { type: 'number', description: 'mm/min, default 1500, max 3000.' },
+                reason: { type: 'string', description: 'Shown to the operator: why this transport is needed.' },
+                wait_until_moved: {
+                    type: 'boolean',
+                    description: 'Staged default for execution (start_gcode_job can override per call). Default true: each '
+                        + 'step blocks until the heartbeat verifiably reports the target XY. false: steps return on '
+                        + 'controller accept with position_verified: false - poll get_position.',
+                },
+            },
+            required: ['reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: {
+            x?: number;
+            y?: number;
+            targets?: Array<{ x?: number; y?: number }>;
+            coordinate_system?: string;
+            feed_rate?: number;
+            reason?: string;
+            wait_until_moved?: boolean;
+        }) => {
+            probeFeedService.assertNoOvertravel();
+            const single = args.x !== undefined || args.y !== undefined;
+            if (single === (args.targets !== undefined)) {
+                throw new McpToolError('Provide x and/or y for a single move, or targets for a series - not both, not neither.');
+            }
+            const targets = args.targets !== undefined ? args.targets : [{ x: args.x, y: args.y }];
+            const coordinateSystem = args.coordinate_system || 'machine';
+            if (coordinateSystem !== 'machine' && coordinateSystem !== 'work') {
+                throw new McpToolError('coordinate_system must be "machine" or "work".');
+            }
+            const feedRate = Math.min(Math.max(Number(args.feed_rate) || 1500, 50), 3000);
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+
+            assertFreshHeartbeat('staging an XY traverse');
+            const position = getPositionSnapshot();
+            if (position.machineStatus !== 'idle') {
+                throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
+            }
+            if (position.isHomed !== true) {
+                throw new McpToolError('Machine does not report homed; home before any XY transport.');
+            }
+            const state = connectionManager.getLatestMachineState() as { headStatus?: unknown; headPower?: unknown } | null;
+            const headPower = Number(state && state.headPower);
+            if ((Number.isFinite(headPower) && headPower > 0) || (state && (state.headStatus === true || state.headStatus === 'on'))) {
+                throw new McpToolError('Toolhead appears to be on; refusing to traverse.');
+            }
+            const { x: mx, y: my, z: mz } = position.machine;
+            if (mx === null || my === null || mz === null) {
+                throw new McpToolError('Current machine position unknown; cannot plan the traverse.');
+            }
+            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+            let plan;
+            try {
+                plan = planTraverseXy({
+                    targets,
+                    frame: coordinateSystem,
+                    currentMachine: { x: mx, y: my, z: mz },
+                    originOffset: position.originOffset,
+                    bounds: size ? { min: { x: 0, y: 0, z: 0 }, max: { x: size.x, y: size.y, z: size.z } } : null,
+                    traverseZ: safeTraverseZ(),
+                    feedRate,
+                    obstacles: landmarkStore.obstacleBoxes(),
+                    reason,
+                });
+            } catch (err) {
+                if ((err as Error).name === 'TraversePlanError') {
+                    throw new McpToolError((err as Error).message);
+                }
+                throw err;
+            }
+            const isBatch = plan.steps.length > 1;
+            const validation = validateGcode(plan.reviewText);
+            const stepGcodes = isBatch ? plan.steps.map((step) => step.gcode) : undefined;
+            const job = jobManager.submit(plan.reviewText, plan.name, 'cnc', validation, 'direct', stepGcodes);
+            job.waitUntilMoved = args.wait_until_moved !== false;
+
+            return {
+                job: jobManager.describe(job),
+                current_machine: { x: mx, y: my, z: mz },
+                traverse_z: safeTraverseZ(),
+                coordinate_system: coordinateSystem,
+                feed_rate: feedRate,
+                steps: plan.steps.map((step) => ({
+                    target: step.target,
+                    machine: { x: step.to.x, y: step.to.y },
+                    distance_mm: Number(step.distanceMm.toFixed(1)),
+                })),
+                total_distance_mm: Number(plan.totalDistanceMm.toFixed(1)),
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: isBatch
+                    ? 'Ask the operator to open confirm_url, review the DIRECT-move banner, the frame and every leg, and '
+                        + 'approve once. Then call start_gcode_job once PER STEP (wait_for_approval_ms on the first); each '
+                        + 'call executes the next approved leg and settles. The series can be abandoned at any point.'
+                    : 'Ask the operator to open confirm_url, review the DIRECT-move banner (frame, from, to, distance, '
+                        + 'feed, Z unchanged) and approve; start_gcode_job with wait_for_approval_ms executes the move.',
+            };
+        },
+    });
+
+    registry.register({
         name: 'get_job_timing',
         description: 'Where a job\'s time went, computed from its event log (works for running, completed and failed jobs; '
             + 'completed procedures also carry it as result.timing): per command kind (coarse, fine, confirm, backoff, '
@@ -767,8 +1002,12 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
     registry.register({
         name: 'get_gcode_job_status',
-        description: 'Job record, its event log (state changes, runner phases, gcode traffic while '
-            + 'active, file-job progress), the stored procedure result, and live machine progress. '
+        description: 'Job record with `ending` - why it ended: completed | stopped-by-agent | stopped-by-operator | '
+            + 'withdrawn | rejected-by-operator | crash-alarm | overtravel-alarm | unexpected-contact | controller-rejected | '
+            + 'timeout | operation-failure | machine-stopped | completion-unverified, with the reason and how many stations/ops '
+            + 'were measured - its event log (state changes, runner phases, gcode traffic while active, file-job progress and '
+            + 'pauses), the stored procedure result (a stopped or failed run keeps every completed station under result, with '
+            + 'result.ending beside it), and live machine progress. '
             + 'LONG-POLL: pass wait_ms (up to 120000) and it returns as soon as the job reaches a '
             + 'terminal state or new events arrive past since_event - use this instead of tight '
             + 'polling or reading server logs. Read-only.',
@@ -849,6 +1088,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     // Not running yet: withdraw it so the approval cannot start it later.
                     job.state = 'stopped';
                     job.endedAt = Date.now();
+                    job.ending = { kind: 'withdrawn', reason: 'withdrawn by the agent before it started', at: job.endedAt };
                     jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
                     return { ok: true, stopped: true, stopping: false, note: 'Procedure withdrawn before it started.', job: jobManager.describe(job) };
                 }
@@ -866,7 +1106,8 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     stopping: !stopped,
                     requestedAt: request.requestedAt,
                     note: stopped
-                        ? `Procedure ${job.state}; completed measurements are in result (${job.error || 'no error'}).`
+                        ? `Procedure ${job.state} (${job.ending ? job.ending.kind : 'ending unknown'}${job.ending && job.ending.measured !== undefined ? `, ${job.ending.measured} measured` : ''}); `
+                            + `completed measurements are in result (${job.error || 'no error'}).`
                         : `Stop requested ${Date.now() - request.requestedAt} ms ago; the runner is finishing its current step and raising. Long-poll get_gcode_job_status.`,
                     job: jobManager.describe(job),
                 };
@@ -879,6 +1120,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (stopped.ok) {
                 job.state = 'stopped';
                 job.endedAt = Date.now();
+                job.ending = { kind: 'machine-stopped', reason: `firmware stop sent by the agent${stopped.text ? `: ${stopped.text}` : ''}`, at: job.endedAt };
                 jobManager.appendEvent(job, 'stopped', { note: `stop sent by the agent${stopped.text ? `: ${stopped.text}` : ''}` });
                 if (jobManager.getActive() === job) {
                     jobManager.setActive(null);

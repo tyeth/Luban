@@ -28,6 +28,7 @@
   "scripts": {
     "postinstall": "npm run pkgsync && npm run electron-rebuild",
     "commit": "npx git-cz",
+    "test:mcp": "ts-node --project src/server/services/mcp/tests/tsconfig.json --transpile-only src/server/services/mcp/tests/run.ts",
     "pkgsync": "node build/pkgsync.js",
     "update-i18n": "gulp i18nextServer i18nextApp",
     "prepare": "npm run clean",

@@ -20,6 +20,7 @@ import { ProbeChannel, probeFeedService, resolveSensorEnabled, sensorLabel } fro
 import { McpToolError } from './registry';
 import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
 import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot } from './tools/machine';
+import { ProcedureAbort, ProcedureStopped } from './procedureAbort';
 
 // The shared sensor-gated motion engine: settled single moves on the direct
 // path, contact/release sensing against a probe feed channel, and the
@@ -81,18 +82,9 @@ export function takeStepTrace(since: number | null): string | undefined {
     return text;
 }
 
-export class ProcedureAbort extends Error {
-    /** Partial result (completed stations / ops) so an abort never loses what was measured. */
-    public partial?: object;
-
-    public constructor(message: string, partial?: object) {
-        super(message);
-        this.partial = partial;
-    }
-}
-
-/** Thrown at the first step boundary after requestProcedureStop(): a graceful, operator/agent-initiated stop. */
-export class ProcedureStopped extends ProcedureAbort {}
+// Abort classes live in procedureAbort.ts (pure, unit-tested): test them with
+// isProcedureAbort / isProcedureStopped, never instanceof (see that file).
+export { ProcedureAbort, ProcedureStopped, isProcedureAbort, isProcedureStopped } from './procedureAbort';
 
 // ---------------------------------------------------------------- cooperative stop
 //

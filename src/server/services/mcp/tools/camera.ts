@@ -7,9 +7,10 @@ import { connectionManager } from '../../machine/ConnectionManager';
 import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCameras } from '../camera';
 import { recordGcodeTiming } from '../diagnostics';
 import { jobManager } from '../jobs';
-import { noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
+import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
+import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
 import { assertFreshHeartbeat, PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
@@ -46,14 +47,11 @@ const gcodeLog = logger('service:mcp:gcode');
 // (positionOfRecord.ts). The timing stamps feed diagnostics.ts: idle time
 // between the controller's previous reply and the next send is engine +
 // sensor window only, so a long one inside a job means late timers.
-let gcodeSequence = 0;
 let lastReplyAt: number | null = null;
 const SLOW_IDLE_MS = 750;
 const SLOW_IDLE_IGNORE_MS = 15000; // beyond this it is a human/agent pause, not pacing
 
-export function currentGcodeSequence(): number {
-    return gcodeSequence;
-}
+export { currentGcodeSequence } from '../positionOfRecord';
 
 export interface SentGcode {
     result: number;
@@ -77,8 +75,7 @@ export interface SendTiming {
 }
 
 export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string, timing?: SendTiming): Promise<SentGcode> {
-    gcodeSequence += 1;
-    const sequence = gcodeSequence;
+    const sequence = bumpGcodeSequence();
     const sentAt = Date.now();
     const idleMs = lastReplyAt === null ? null : sentAt - lastReplyAt;
     // Breakdown of the idle gap (previous reply -> this send):
@@ -311,7 +308,8 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     const machineZ = before.machine.z;
     if (args.operator_confirmed_clearance !== true && machineZ !== null) {
         const traverseFloor = safeTraverseZ();
-        if (machineZ < traverseFloor) {
+        // Tolerance: home reports 327.999 for Z328 (heartbeat float noise).
+        if (machineZ < traverseFloor - TRAVERSE_Z_TOLERANCE_MM) {
             throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the safe `
                 + `traverse height ${traverseFloor} (top gantry). Retreat Z first (move_z, operator-`
                 + 'confirmed), then traverse, then descend at the destination. Only the operator\'s '
@@ -367,7 +365,9 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     recentDirectMoves.push(pacingNow);
 
     const move = `G0 X${target.x.toFixed(3)} Y${target.y.toFixed(3)} F${feedRate}`;
-    const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : move;
+    // Every MCP-emitted motion declares its frame (operator law 2026-09-14):
+    // G53 for machine coordinates, an explicit G54 for the work workspace.
+    const gcode = coordinateSystem === 'machine' ? `G53;\n${move};\nG54;` : `G54;\n${move}`;
     const issuedAt = Date.now();
     const executed = await sendGcodeVisible(channel, `move - ${reason.slice(0, 60)}`, gcode);
     if (executed.result !== 0) {

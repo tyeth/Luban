@@ -8,7 +8,7 @@ import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 import { GEOMETRY_FIELDS, geometrySettings, setGeometryValues } from '../rotaryGeometry';
 import { getToolSetterConfig } from '../toolSetter';
-import { readAppMachineSettings } from './machine';
+import { readAppMachineSettings, safeTraverseZ } from './machine';
 
 // Named scene landmarks (#50) and the stored-state overview (#53): operator
 // knowledge captured once, surfaced every session, so no agent spends moves
@@ -166,6 +166,8 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 expectedToolRegion: toolRegion,
                 limits: {
                     maxJogDistanceMm: Number(config.get('mcpMaxJogDistance')) || 100,
+                    /** Machine Z every XY move over 1 mm happens at (law 2); 328 = home Z. */
+                    safeTraverseZMm: safeTraverseZ(),
                 },
                 camera: {
                     url: config.get('mcpCameraUrl') || null,

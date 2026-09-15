@@ -24,6 +24,8 @@ import {
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
+    isProcedureAbort,
+    isProcedureStopped,
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
@@ -32,6 +34,7 @@ import {
     CircleProfile,
     ContactSample,
     HOP_SEGMENT_MM,
+    MANY_STATIONS,
     SurfacePlanError,
     SurfaceStation,
     assertHopsWithin,
@@ -433,6 +436,10 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
         ';     (the FIRST station finding nothing aborts - no measured reference).',
         `;   * the deepest toolhead Z this scan can EVER command is Z${plan.absoluteFloorZ} (floor_z_machine).`,
         '; The approach to station 1 and the final raise are full law-2 moves at the traverse height.',
+        ...(plan.stations.length > MANY_STATIONS
+            ? [`; WARNING: ${plan.stations.length} stations - roughly ${Math.round(plan.stations.length * 8 / 60)} min of probing and about `
+                + `${100 + plan.stations.length * 110} job events (the log keeps mcpJobEventLimit; the stored result is never trimmed).`]
+            : []),
         '; overtravel feed trips -> job stop + connection close + latched alarm',
         'G90',
         'G53;',
@@ -918,11 +925,11 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                 // Logged by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
+        if (isProcedureAbort(err)) {
             // Keep the class (a program runner tells a requested stop from a
             // fault) and carry the completed stations as the partial result.
             const partial = { ...buildResult(plan, results, phases), aborted: true, abortedAtStation: stationIndex };
-            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+            const Ctor = isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
             throw new Ctor(`Surface ${plan.kind} scan aborted at station ${stationIndex}: ${err.message} `
                 + `${results.filter((r) => r.status === 'contact').length} station(s) measured before the abort are on the job record.`, partial);
         }

@@ -13,7 +13,7 @@ import {
     setToolSetterConfig,
 } from '../toolSetter';
 import { validateGcode } from '../validator';
-import { getPositionSnapshot } from './machine';
+import { getPositionSnapshot, machinePositionDiagnostics, requireReliableMachine } from './machine';
 
 export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
@@ -227,6 +227,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                     + 'tool_change_x / tool_change_z (and optionally _y) via set_tool_setter_config.');
             }
             const position = getPositionSnapshot();
+            requireReliableMachine(position, 'this tool-setter operation');
             if (position.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
             }
@@ -272,7 +273,11 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             + 'difference between the last two tool setter measurements (new - previous; overridable '
             + 'via explicit old/new trigger Zs), so work Z keeps meaning the same physical plane with '
             + 'the new tool. Stages a single G92 for operator confirmation - nothing moves; the work '
-            + 'coordinate frame shifts. Verify with get_position afterwards.',
+            + 'coordinate frame shifts. This is the ONE sanctioned work-origin write: it does what the '
+            + 'touchscreen manual tool-change wizard does after its two operator confirmations. The two '
+            + 'stored measurements must be an ordered old/new pair taken since the machine last '
+            + '(re)connected (work origins die on a reboot) unless old/new trigger Zs are passed '
+            + 'explicitly. Verify with get_position afterwards.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -295,6 +300,24 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                     + 'Either run run_tool_setter before and after the change, or pass old_trigger_z / '
                     + `new_trigger_z explicitly. Stored: ${JSON.stringify(measurements)}`);
             }
+            // The stored pair must really be old -> new on THIS connection: a
+            // measurement from before a reconnect may belong to a work origin the
+            // machine has since forgotten (operator law 2026-09-14). Explicit
+            // trigger Zs bypass this - the operator vouches for them.
+            const explicit = args.old_trigger_z !== undefined || args.new_trigger_z !== undefined;
+            if (!explicit && measurements.previous && measurements.last) {
+                if (measurements.last.at < measurements.previous.at) {
+                    throw new McpToolError('The stored measurements are not an old -> new pair (the "last" one is older than the '
+                        + '"previous" one). Re-measure, or pass old_trigger_z / new_trigger_z explicitly.');
+                }
+                const resetAt = machinePositionDiagnostics().resetAt;
+                if (resetAt !== null && (measurements.previous.at < resetAt || measurements.last.at < resetAt)) {
+                    throw new McpToolError('A stored measurement predates the machine\'s last (re)connection at '
+                        + `${new Date(resetAt).toISOString()} - the work origin it was taken against may no longer exist `
+                        + '(work origins die on a machine reboot). Re-measure both tools, or pass old_trigger_z / '
+                        + 'new_trigger_z explicitly if the operator vouches for them.');
+                }
+            }
             const deltaMm = Number((newZ - oldZ).toFixed(3));
             if (Math.abs(deltaMm) > 50) {
                 throw new McpToolError(`Computed length difference ${deltaMm} mm exceeds the 50 mm sanity `
@@ -302,6 +325,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             }
 
             const position = getPositionSnapshot();
+            requireReliableMachine(position, 'this tool-setter operation');
             if (position.machineStatus !== 'idle') {
                 throw new McpToolError(`Machine is ${position.machineStatus || 'in an unknown state'}, not idle.`);
             }
@@ -312,13 +336,24 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             // toolhead height, so the SAME position must now read delta LESS
             // work Z: G92 Z(current work Z - delta). Nothing moves.
             const newWorkZ = Number((position.work.z - deltaMm).toFixed(3));
+            // machine = work - offset and machine does not move, so the offset
+            // shifts by -delta and work Z0 lands delta higher on the machine scale.
+            const offsetAfter = Number((position.originOffset.z - deltaMm).toFixed(3));
             const gcode = [
                 `; tool length offset: new tool trigger Z ${newZ} vs old ${oldZ} -> ${deltaMm >= 0 ? '+' : ''}${deltaMm} mm ${deltaMm >= 0 ? 'longer' : 'shorter'}`,
-                `; current work Z reads ${position.work.z}; after this G92 it reads ${newWorkZ} (no motion)`,
-                '; work origin Z shifts so work Z 0 stays on the same physical plane with the new tool',
+                '; frame: WORK - this G92 rewrites the work origin Z of the selected workspace; the toolhead does NOT move',
+                `; toolhead stays at machine Z ${position.machine.z}; current work Z reads ${position.work.z}; after this G92 it reads ${newWorkZ}`,
+                `; work-origin Z offset ${position.originOffset.z} -> ${offsetAfter}; work Z0 = machine Z ${(-position.originOffset.z).toFixed(3)} -> ${(-offsetAfter).toFixed(3)}`,
+                '; the ONE sanctioned work-origin write: what the touchscreen tool-change wizard does after its two confirmations',
                 `G92 Z${newWorkZ.toFixed(3)}`,
             ].join('\n');
             const validation = validateGcode(gcode);
+            // The generic validator warning points at this tool as the sanctioned
+            // path - on this tool's own page it would only confuse. Say it plainly.
+            validation.warnings = validation.warnings.filter((w) => !w.startsWith('Contains G92'));
+            validation.warnings.push('This job rewrites the WORK ORIGIN Z by G92 - the sanctioned tool-length path (mirrors the '
+                + `touchscreen wizard). Nothing moves. Work Z0 moves from machine Z ${(-position.originOffset.z).toFixed(3)} to `
+                + `${(-offsetAfter).toFixed(3)}.`);
             const job = jobManager.submit(
                 gcode,
                 `tool-offset ${deltaMm >= 0 ? '+' : ''}${deltaMm}mm - ${String(args.reason).slice(0, 40)}`,
@@ -333,6 +368,9 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 delta_mm: deltaMm,
                 current_work_z: position.work.z,
                 work_z_after: newWorkZ,
+                machine_z: position.machine.z,
+                origin_offset_z_before: position.originOffset.z,
+                origin_offset_z_after: offsetAfter,
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: 'Operator reviews the G92 (no motion - the work frame shifts by the tool '
                     + 'length difference) and approves; start_gcode_job executes it. Verify with '

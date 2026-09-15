@@ -2,6 +2,7 @@
 // MCP tool arguments are snake_case by convention (planProbeVector takes the
 // probe_vector arguments verbatim).
 import { mcpBroadcast } from './index';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
@@ -76,7 +77,13 @@ export function planProbeVector(args: {
     if (x === null || y === null || z === null) {
         throw new McpToolError('Current machine position unknown; cannot anchor the probe envelope.');
     }
-    const start = { x, y, z };
+    // A start within tolerance of the traverse height IS the traverse height:
+    // home reports 327.999 for Z328, and using the raw value put a 1 um
+    // 'retreat to 327.999' followed by 'finish at 328.000' on the confirm page
+    // (operator, 2026-09-14). Commanded positions never carry heartbeat noise.
+    const traverseZ = safeTraverseZ();
+    const startZ = z >= traverseZ - TRAVERSE_Z_TOLERANCE_MM ? traverseZ : z;
+    const start = { x, y, z: startZ };
 
     // Clamp the travel SCALAR so the entire segment stays inside the same
     // envelope the direct-move guards use (machine -25..size+40 for X/Y,

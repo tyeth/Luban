@@ -24,7 +24,8 @@ import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedur
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
+import { getMachineSizeByIdentifier, getPositionSnapshot, requireReliableMachine, safeTraverseZ } from './machine';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -453,7 +454,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 dx: { type: 'number', description: 'Path direction X component (with dy and length_mm) when end_x/end_y are not given. Magnitude ignored.' },
                 dy: { type: 'number', description: 'Path direction Y component.' },
                 length_mm: { type: 'number', description: 'Path length along dx/dy (1-400).' },
-                stations: { type: 'number', description: 'Station count including both ends (2-60). Alternative: spacing_mm.' },
+                stations: { type: 'number', description: 'Station count including both ends (2-400; above 60 the confirm page warns about duration and the event budget). Alternative: spacing_mm.' },
                 spacing_mm: {
                     type: 'number',
                     description: 'MAXIMUM spacing: the length is divided evenly into steps no larger than this, both ends '
@@ -559,11 +560,12 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
         }) => {
             probeFeedService.assertNoOvertravel();
             const position = getPositionSnapshot();
+            requireReliableMachine(position, 'a bed survey');
             const { x, y, z } = position.machine;
             if (x === null || y === null || z === null) {
                 throw new McpToolError('Current machine position unknown.');
             }
-            if (z < safeTraverseZ() && args.operator_confirmed_clearance !== true) {
+            if (z < safeTraverseZ() - TRAVERSE_Z_TOLERANCE_MM && args.operator_confirmed_clearance !== true) {
                 throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the safe traverse height `
                     + `${safeTraverseZ()} (top gantry - operator law for all X/Y motion) - raise Z `
                     + '(move_z), or pass operator_confirmed_clearance: true only on the operator\'s '

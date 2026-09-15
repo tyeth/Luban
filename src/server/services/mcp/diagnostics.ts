@@ -1,7 +1,9 @@
 import logger from '../../lib/logger';
 import config from '../configstore';
 import { connectionManager } from '../machine/ConnectionManager';
-import { mcpBroadcast } from './index';
+import { mcpBroadcast, mcpBroadcastLive } from './index';
+import { isFrameFlip } from './machinePosition';
+import { getPositionSnapshot, noteMachineDisconnected } from './tools/machine';
 
 // Timing diagnostics for the sensor-gated motion engine.
 //
@@ -157,13 +159,43 @@ function startLoopMonitor(): void {
     loopTimer.unref();
 }
 
+/**
+ * Publish the judged position of record once per beat for the Workspace
+ * console (and, later, a DRO): the same machine value and reliability the
+ * motion guards use, so the operator and the agent read ONE position.
+ */
+function publishPosition(): void {
+    try {
+        const snapshot = getPositionSnapshot();
+        mcpBroadcastLive('mcp:position', {
+            machine: snapshot.machine,
+            reliability: snapshot.reliability,
+            frame: snapshot.frame,
+            b: snapshot.b,
+            reportedAt: snapshot.reportedAt,
+            machineReportedAt: snapshot.machineReportedAt,
+            rejectedReason: snapshot.judged.rejectedReason,
+            derived: snapshot.judged.accepted ? undefined : snapshot.judged.derived,
+        });
+    } catch (err) {
+        // Not connected / no heartbeat: nothing to publish.
+    }
+}
+
 function watchHeartbeat(): void {
     const state = connectionManager.getLatestMachineState() as {
         timestamp?: number;
         pos?: { x?: unknown; y?: unknown; z?: unknown };
         originOffset?: { x?: unknown; y?: unknown; z?: unknown };
     } | null;
-    if (!state || !state.timestamp || state.timestamp === heartbeat.lastAt) {
+    if (!state) {
+        // Channel closed (or not connected yet): the position of record must
+        // not carry the previous connection's offsets into the next one.
+        noteMachineDisconnected();
+        lastRaw = null;
+        return;
+    }
+    if (!state.timestamp || state.timestamp === heartbeat.lastAt) {
         return;
     }
     const at = state.timestamp;
@@ -200,14 +232,12 @@ function watchHeartbeat(): void {
     }
     if (raw.x !== null && raw.y !== null && raw.z !== null) {
         if (lastRaw && offset.x !== null && offset.y !== null && offset.z !== null) {
-            // A report in the other frame differs from the previous one by
-            // exactly the offset on every axis the offset is non-zero on -
-            // no real move does that on all axes at once.
-            const axes = (['x', 'y', 'z'] as const).filter((axis) => Math.abs(offset[axis] as number) > 0.5);
-            const delta = { x: raw.x - lastRaw.x, y: raw.y - lastRaw.y, z: raw.z - lastRaw.z };
-            const flipped = axes.length > 0 && (
-                axes.every((axis) => Math.abs(delta[axis] + (offset[axis] as number)) <= 0.5)
-                || axes.every((axis) => Math.abs(delta[axis] - (offset[axis] as number)) <= 0.5)
+            // The frame-flip signature (machinePosition.isFrameFlip): the same
+            // test the position of record uses to REJECT the beat.
+            const flipped = isFrameFlip(
+                { x: raw.x, y: raw.y, z: raw.z },
+                lastRaw,
+                { x: offset.x as number, y: offset.y as number, z: offset.z as number }
             );
             if (flipped) {
                 heartbeat.frameFlipBeats += 1;
@@ -221,6 +251,7 @@ function watchHeartbeat(): void {
         }
         lastRaw = { x: raw.x, y: raw.y, z: raw.z };
     }
+    publishPosition();
 }
 
 /** Called by sendGcodeVisible for every direct command. */

@@ -15,6 +15,7 @@ import {
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
+    isProcedureAbort,
 } from './probing';
 import { DESCENT_GUARD_MM } from './probeSequence';
 import { McpToolError } from './registry';
@@ -548,7 +549,7 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
                 // Logged by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
+        if (isProcedureAbort(err)) {
             throw new McpToolError(`Circle probe aborted: ${err.message} Phases completed: ${JSON.stringify(phases)}`);
         }
         throw err;

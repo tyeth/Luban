@@ -5,6 +5,9 @@ description: "Change the CNC tool and keep the work origin true — measure the 
 
 # Tool change without losing the work origin
 
+> **Load `cnc-motion-rules` first; do not plan motion without it.** The motion laws,
+> coordinate doctrine and position-of-record rules live there and are assumed here.
+
 A tool change replaces the one physical thing the work origin Z was calibrated
 through: the tool tip. The tool setter (fixed switch on the bed, probe feed
 channel `toolsetter`) measures each tool's trigger height, and the difference
@@ -36,6 +39,11 @@ shifted exactly, without ever re-touching the stock.
 
 ## Two flows — ask which one the operator is using
 
+Ask it in the same single message as the other unknowns (both tools' approximate protrusion,
+whether the work origin was set with the tool now fitted). Flow A is four approvals — measure
+old, park, measure new, apply — each announced; the swap itself is the operator's hands and
+their word, never inferred.
+
 **A. MCP-managed offset** (operator at the computer): measure old → park → swap
 → measure new → `apply_tool_length_offset` shifts the work origin. Steps below.
 
@@ -60,7 +68,8 @@ operator raises it slightly from the touchscreen first.
 ## The sequence (flow A)
 
 1. **Measure the old tool** — `run_tool_setter` with the operator-stated
-   `bit_length_mm`. Skip only if the last stored measurement
+   `bit_length_mm` — the tool's PROTRUSION from the collet in mm (a length, never its
+   cutting diameter; declare it low rather than high). Skip only if the last stored measurement
    (`get_tool_setter_config` → `measurements.last`) is from this same tool,
    this session, and the operator confirms nothing has moved.
 2. **Park** — `goto_tool_change_position`. One approval, two
@@ -69,9 +78,12 @@ operator raises it slightly from the touchscreen first.
    it. Ask them for the new tool's approximate length.
 4. **Measure the new tool** — `run_tool_setter` with the new `bit_length_mm`.
    The measurement history now holds previous = old tool, last = new tool.
-5. **Shift the work origin** — `apply_tool_length_offset` (defaults to those
+5. **Shift the work origin** — `apply_tool_length_offset {"reason": "..."}` then
+   `start_gcode_job {job_id, wait_for_approval_ms: 110000}` (defaults to those
    two measurements). It stages a single `G92` — nothing moves; the work frame
    shifts by `new − old`. A longer tool makes the current work Z read LOWER.
+   This is the ONE sanctioned work-origin write (`cnc-motion-rules` §4): it mirrors what
+   the touchscreen wizard does after its two operator confirmations. Never `G92` by hand.
 6. **Verify** — `get_position`: `originOffset.z` must have changed by the
    delta, and the operator should sanity-check the displayed work Z against
    physical reality before any cutting.

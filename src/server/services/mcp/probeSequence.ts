@@ -21,6 +21,8 @@ import {
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
+    isProcedureAbort,
+    isProcedureStopped,
 } from './probing';
 import { McpToolError } from './registry';
 import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -522,9 +524,9 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 // Logged by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
+        if (isProcedureAbort(err)) {
             const partial = { results, phases, aborted: true, abortedAtStep: stepIndex };
-            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+            const Ctor = isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
             throw new Ctor(`Probe sequence aborted at step ${stepIndex}: ${err.message} `
                 + `${results.length} contact(s) measured before the abort are on the job record.`, partial);
         }

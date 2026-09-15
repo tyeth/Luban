@@ -37,6 +37,8 @@ import {
     knownMachinePosition,
     moveMachineSettled,
     senseAfter,
+    isProcedureAbort,
+    isProcedureStopped,
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
@@ -343,6 +345,7 @@ export function describeProbeOutlinePlanAsGcode(plan: ProbeOutlinePlan): string 
         `; march: coarse ${plan.march.coarseStepMm} mm F${COARSE_FEED}, fine ${plan.march.fineStepMm}, backoff ${plan.march.backoffMm}, ${plan.march.confirmPasses} confirm pass(es), sensor ${plan.march.sensorDelayMs} ms`,
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)}) - re-verified before motion`,
         'G90',
+        'G53;',
         `G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to the safe traverse height (law 2)`,
     ];
     const first = plan.topPoints[0];
@@ -592,8 +595,8 @@ export async function runProbeOutlineProcedure(plan: ProbeOutlinePlan): Promise<
                 // Logged by the activity stream.
             }
         }
-        if (err instanceof ProcedureAbort) {
-            const Ctor = err instanceof ProcedureStopped ? ProcedureStopped : ProcedureAbort;
+        if (isProcedureAbort(err)) {
+            const Ctor = isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
             throw new Ctor(`Stock outline aborted: ${err.message} ${topSamples.length} top sample(s) and ${contacts.length} side march(es) so far are on the job record.`, build(true));
         }
         throw err;
