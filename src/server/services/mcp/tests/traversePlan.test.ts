@@ -1,7 +1,7 @@
 import { strict as assert } from 'assert';
 
 import { ObstacleBox } from '../envelopeChecks';
-import { TraversePlanError, TraversePlanInput, planTraverseXy } from '../traversePlan';
+import { TraversePlanError, TraversePlanInput, planAbortRaise, planTraverseXy, mayDescend } from '../traversePlan';
 
 const BOUNDS = { min: { x: 0, y: 0, z: 0 }, max: { x: 320, y: 340, z: 330 } };
 const OFFSET = { x: -51, y: -122, z: -328 };
@@ -94,6 +94,34 @@ export const tests: Array<[string, () => void]> = [
 
     ['a lower configured traverse height with the head at that height refuses crossing the rotary box', () => {
         refuses(() => planTraverseXy(input({ traverseZ: 320, currentMachine: { x: -19, y: 342, z: 320 } })), 'rotary-axis');
+    }],
+
+    ['abort retreat law: job fd7fa6cb6396 aborted at home (Z 327.999) - nothing is sent, never a plunge to the start height', () => {
+        const atHome = planAbortRaise(327.9989959716797, 328);
+        assert.equal(atHome.action, 'skip', 'the head is already at the top within the float tolerance');
+        assert.equal(atHome.targetZ, 328);
+        const exact = planAbortRaise(328, 328);
+        assert.equal(exact.action, 'skip');
+    }],
+
+    ['abort retreat law: below the top the retreat is a Z-only raise TO the traverse height, whatever the start height was', () => {
+        const midDescent = planAbortRaise(205.5, 328);
+        assert.equal(midDescent.action, 'raise');
+        assert.equal(midDescent.targetZ, 328);
+        const justUnder = planAbortRaise(327.9, 328);
+        assert.equal(justUnder.action, 'raise', '0.1 mm under the top is a real shortfall, not float noise');
+        const unknown = planAbortRaise(null, 328);
+        assert.equal(unknown.action, 'raise', 'an unknown Z still gets the one move that cannot descend');
+        assert.equal(unknown.targetZ, 328);
+        assert.ok(unknown.reason.includes('unknown'));
+    }],
+
+    ['mayDescend: a "back to the start" leg is skipped only when the start is below the head', () => {
+        assert.equal(mayDescend(328, 205.5), true, 'abort before the tool-setter travel: start height is 122 mm below');
+        assert.equal(mayDescend(200, 205.5), false, 'mid-march: the start is above the contact - retreating to it is a lift');
+        assert.equal(mayDescend(205.5, 205.5), false);
+        assert.equal(mayDescend(205.52, 205.5), false, 'within the float tolerance is not a descent');
+        assert.equal(mayDescend(null, 205.5), true, 'unknown Z: a descent cannot be ruled out, so the leg is skipped and only the raise runs');
     }],
 
     ['empty, over-long and axis-less target lists are refused', () => {

@@ -2,7 +2,7 @@
 // MCP tool arguments are snake_case by convention (planProbePoint takes the
 // probe_point arguments verbatim).
 import { mcpBroadcast } from './index';
-import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
+import { TRAVERSE_Z_TOLERANCE_MM, mayDescend } from './traversePlan';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
@@ -16,6 +16,8 @@ import {
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
+    abortRaiseToTop,
+    knownMachinePosition,
 } from './probing';
 import { McpToolError } from './registry';
 import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -138,7 +140,7 @@ export function describeProbePlanAsGcode(plan: ProbePointPlan): string {
         `; ...on contact: retreat ${plan.coarseStepMm} mm steps until released, approach in ${plan.fineStepMm} mm`,
         `; steps to contact, then ${plan.confirmPasses} quick confirm cycles (lift ${plan.backoffMm} mm, wait for release,`,
         `; re-approach). Result = median contact ${word} (spread reported).`,
-        `G1 ${word}${plan.start[plan.axis].toFixed(3)} F${TRAVEL_FEED}; retreat to the start ${word} when done (also on any abort)`,
+        `G1 ${word}${plan.start[plan.axis].toFixed(3)} F${TRAVEL_FEED}; retreat to the start ${word} when done (an ABORT raises straight up to the traverse height instead)`,
     );
     const traverse = safeTraverseZ();
     if (plan.start.z < traverse) {
@@ -323,14 +325,18 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         const isTrip = !!probeFeedService.getTrip();
         if (!isTrip) {
             try {
-                await move('probe:abort-retreat', startCoord, TRAVEL_FEED);
-                announce('abort-retreated', startCoord);
-                const traverse = safeTraverseZ();
-                const reading = probeFeedService.getReading('probe');
-                if (plan.start.z < traverse && (!reading || !reading.triggered)) {
-                    await moveMachineSettled('probe:abort-raise', { z: traverse }, TRAVEL_FEED);
-                    announce('abort-raised', traverse, 'safe traverse height');
+                // Back off along the probed axis to the start (away from the
+                // face) - unless that leg would DESCEND, i.e. the abort came
+                // before a Z march ever left its start (traverse refused,
+                // station check failed): then the raise is the whole retreat.
+                const known = knownMachinePosition().position;
+                if (plan.axis !== 'z' || !mayDescend(known.z, startCoord)) {
+                    await move('probe:abort-retreat', startCoord, TRAVEL_FEED);
+                    announce('abort-retreated', startCoord);
+                } else {
+                    announce('abort-retreat-skipped', startCoord, 'the start coordinate is below the head - not descending on an abort');
                 }
+                await abortRaiseToTop('probe', (phase, z, note) => announce(phase, z ?? startCoord, note), { holdIfTriggered: 'probe' });
             } catch (retreatErr) {
                 // The abort itself already reports; retreat failure is logged
                 // by the activity stream.

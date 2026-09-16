@@ -19,8 +19,9 @@ import {
 import { ProbeChannel, probeFeedService, resolveSensorEnabled, sensorLabel } from './probeFeed';
 import { McpToolError } from './registry';
 import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
-import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot } from './tools/machine';
+import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot, safeTraverseZ } from './tools/machine';
 import { ProcedureAbort, ProcedureStopped } from './procedureAbort';
+import { planAbortRaise } from './traversePlan';
 
 // The shared sensor-gated motion engine: settled single moves on the direct
 // path, contact/release sensing against a probe feed channel, and the
@@ -478,6 +479,49 @@ export async function moveMachineSettled(
         probeFeedService.motionEnd();
     }
 }
+/**
+ * The one retreat every aborted procedure shares (operator law 2026-09-16):
+ * STRAIGHT UP to the traverse height, never to a start height, never down.
+ * Job fd7fa6cb6396 (tool setter, aborted before its travel at Z 327.999) was
+ * "retreated" to its start height - a 122 mm plunge from home at the home XY.
+ *
+ * - The overtravel trip closes the connection: no motion is attempted.
+ * - `holdIfTriggered`: a probe still reading contact means the tip is against
+ *   something - lifting could drag it; hold for the operator (unchanged).
+ * - Already at the top (within the heartbeat's float noise): nothing is sent.
+ * - Otherwise a Z-ONLY G53 move to the traverse height - from any known or
+ *   unknown position inside the volume this is the one move that cannot descend.
+ *
+ * `announce(phase, z, note)` gets the target Z on a raise, the current Z on
+ * a skip, and null when the position is unknown and nothing moved.
+ */
+export async function abortRaiseToTop(
+    tool: string,
+    announce: (phase: string, z: number | null, note: string) => void,
+    options: { holdIfTriggered?: ProbeChannel } = {}
+): Promise<void> {
+    if (probeFeedService.getTrip()) {
+        announce('abort-no-retreat', null, 'overtravel latched - the connection is being closed, no motion issued');
+        return;
+    }
+    if (options.holdIfTriggered) {
+        const reading = probeFeedService.getReading(options.holdIfTriggered);
+        if (reading && reading.triggered) {
+            announce('abort-held', null, `${options.holdIfTriggered} still triggered - holding position for the operator`);
+            return;
+        }
+    }
+    const { position } = knownMachinePosition();
+    const decision = planAbortRaise(position.z, safeTraverseZ());
+    if (decision.action === 'skip') {
+        announce('abort-raise-skipped', position.z, decision.reason);
+        return;
+    }
+    probeFeedService.clearExpectedContact();
+    await moveMachineSettled(`${tool}:abort-raise`, { z: decision.targetZ }, TRAVEL_FEED);
+    announce('abort-raised', decision.targetZ, `traverse height - ${decision.reason}`);
+}
+
 
 
 /**

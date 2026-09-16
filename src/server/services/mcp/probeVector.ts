@@ -2,7 +2,7 @@
 // MCP tool arguments are snake_case by convention (planProbeVector takes the
 // probe_vector arguments verbatim).
 import { mcpBroadcast } from './index';
-import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
+import { TRAVERSE_Z_TOLERANCE_MM, mayDescend } from './traversePlan';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
@@ -15,6 +15,8 @@ import {
     moveMachineSettled,
     senseAfter,
     senseReleaseAfter,
+    abortRaiseToTop,
+    knownMachinePosition,
 } from './probing';
 import { McpToolError } from './registry';
 import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -189,7 +191,7 @@ export function describeProbeVectorPlanAsGcode(plan: ProbeVectorPlan): string {
         `; approach in ${plan.fineStepMm} mm steps to contact, then ${plan.confirmPasses} quick confirm cycles`,
         `; (lift ${plan.backoffMm} mm along the reverse vector, wait for release, re-approach).`,
         '; Result = median contact distance -> machine XYZ (spread reported).',
-        `G1 X${plan.start.x.toFixed(3)} Y${plan.start.y.toFixed(3)} Z${plan.start.z.toFixed(3)} F${TRAVEL_FEED}; retreat to the start when done (also on any abort)`,
+        `G1 X${plan.start.x.toFixed(3)} Y${plan.start.y.toFixed(3)} Z${plan.start.z.toFixed(3)} F${TRAVEL_FEED}; retreat to the start when done (an ABORT raises straight up to the traverse height instead)`,
     );
     const traverse = safeTraverseZ();
     if (plan.start.z < traverse) {
@@ -352,14 +354,17 @@ export async function runProbeVectorProcedure(plan: ProbeVectorPlan): Promise<ob
         const isTrip = !!probeFeedService.getTrip();
         if (!isTrip) {
             try {
-                await move('probe-vec:abort-retreat', 0, TRAVEL_FEED);
-                announce('abort-retreated', 0);
-                const traverse = safeTraverseZ();
-                const reading = probeFeedService.getReading('probe');
-                if (plan.start.z < traverse && (!reading || !reading.triggered)) {
-                    await moveMachineSettled('probe-vec:abort-raise', { z: traverse }, TRAVEL_FEED);
-                    announce('abort-raised', 0, `safe traverse height Z${traverse}`);
+                // Back along the vector to the start - unless the start is
+                // BELOW the head (abort before the march began): no descent
+                // on an abort, the raise is the whole retreat.
+                const known = knownMachinePosition().position;
+                if (!mayDescend(known.z, plan.start.z)) {
+                    await move('probe-vec:abort-retreat', 0, TRAVEL_FEED);
+                    announce('abort-retreated', 0);
+                } else {
+                    announce('abort-retreat-skipped', 0, 'the march start is below the head - not descending on an abort');
                 }
+                await abortRaiseToTop('probe-vec', (phase, z, note) => announce(phase, 0, z === null ? note : `Z${z.toFixed(3)} - ${note}`), { holdIfTriggered: 'probe' });
             } catch (retreatErr) {
                 // Logged by the activity stream.
             }

@@ -50,7 +50,7 @@ item, quoting the tool result — not an essay):
 `get_stored_state` discharge items 1–5 in one breath: quote the two results and stage
 `traverse_xy` (§8). One approval, no questions.
 
-## 1. The seven motion laws
+## 1. The eight motion laws
 
 1. **One motion per instruction, and no inferred approvals.** When the operator enumerates
    steps, execute exactly the step they name and stop. NEVER chain motion calls in a single
@@ -108,6 +108,14 @@ item, quoting the tool result — not an essay):
    forbids file jobs as TRANSPORT, not file jobs. A script looping motion calls is an
    unsupervised procedure without a confirm page. Never touch the backend, configstore, or
    machine directly while the app runs.
+8. **An abort retreats STRAIGHT UP to the traverse height — never to a "start height", never
+   down.** This is what the server does on every procedure abort (`abortRaiseToTop`): no motion
+   if the overtravel trip is closing the connection; HOLD if the probe still reads contact (the
+   operator frees it); nothing sent if the head is already at the top; otherwise one Z-only
+   move to `mcpSafeTraverseZ`. It is also what YOU do when recovering by hand: after any abort,
+   refusal or doubt, the first motion is `move_z` to the traverse height, then re-prove position
+   (`get_position`), then plan again. Never "return to where the procedure started" — before
+   the travel, the start height is BELOW the head (appendix A, 2026-09-16).
 
 ## 2. Coordinate doctrine
 
@@ -321,3 +329,7 @@ approximate height and shorten it — a long limit costs time, not safety.
 - **2026-09-14.** The heartbeat's `machine = work − offset` on a beat sampled inside a `G53`
   window produced Z 555 / Z 656 "positions" that passed every guard, and once read a verified
   Z320 as Z−8. §3, the position of record.
+- **2026-09-16.** `run_tool_setter` (deployed build pre-dating the 327.999 tolerance fix) refused
+  its XY travel at home and its abort path "retreated to the start height": `G1 Z205.500` from
+  Z328 at the home XY (174.5, 340), inside the rotary landmark — a 122 mm plunge with no XY move
+  ever sent. Law 8, `abortRaiseToTop`.

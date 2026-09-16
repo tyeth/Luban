@@ -16,6 +16,7 @@ import {
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
+    abortRaiseToTop,
 } from './probing';
 import { DESCENT_GUARD_MM } from './probeSequence';
 import { McpToolError } from './registry';
@@ -540,8 +541,7 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
                         await moveMachineSettled('circle:abort-recentre', { x: plan.center.x, y: plan.center.y }, TRAVEL_FEED);
                         announce('abort-recentred', `(${plan.center.x}, ${plan.center.y})`);
                     }
-                    await moveMachineSettled('circle:abort-lift', { z: plan.hopZ }, TRAVEL_FEED);
-                    announce('abort-lifted', `Z${plan.hopZ}`);
+                    await abortRaiseToTop('circle', (phase, z, note) => announce(phase, z === null ? note : `Z${z} - ${note}`));
                 } else {
                     announce('abort-held', 'probe still triggered - holding position for the operator');
                 }
