@@ -242,6 +242,16 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
 8. **The MCP surface is the only interface** — no agent may touch the machine, its
    configstore, or the backend APIs directly while the app runs; every guard lives in the
    tools, so bypassing them bypasses all of it.
+9. **An abort retreats STRAIGHT UP to the traverse height — never to a start height, never
+   down** (operator, 2026-09-16). Job fd7fa6cb6396: `run_tool_setter` aborted BEFORE its
+   travel (the pre-fix traverse check read home as 327.999 < 328) and the old "retreat to
+   start height" then plunged the head 122 mm to Z 205.5 at the home XY, inside the rotary
+   landmark. Every procedure's abort path now goes through `abortRaiseToTop` (probing.ts):
+   overtravel trip = no motion; a probe still reading contact = hold for the operator; at
+   the top already (float tolerance) = nothing sent; otherwise one Z-only G53 move to
+   `mcpSafeTraverseZ`. The along-axis "back to the start" legs of `probe_point` /
+   `probe_vector` are skipped when the start is below the head (`mayDescend`). The
+   decision is pure and unit-tested (`planAbortRaise`, tests/traversePlan.test.ts).
 
 ### Surface scans — the one bounded exception to law 2 (operator-authorised 2026-09-05)
 

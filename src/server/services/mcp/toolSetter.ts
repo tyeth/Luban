@@ -19,6 +19,7 @@ import {
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
+    abortRaiseToTop,
 } from './probing';
 import { McpToolError } from './registry';
 import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -301,9 +302,9 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
     );
     if (plan.stayAtTrigger) {
         lines.push('; HOLD AT TRIGGER when done: the tip stays in contact for the touchscreen manual-swap',
-            `; wizard - NO final retreat. (Any ABORT still retreats to Z ${plan.startZ.toFixed(3)}.)`);
+            '; wizard - NO final retreat. (Any ABORT raises straight up to the traverse height instead.)');
     } else {
-        lines.push(`G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; retreat to start height when done (also on any abort)`);
+        lines.push(`G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; retreat to start height when done (an ABORT instead raises straight up to the traverse height)`);
     }
     lines.push('G54;');
     return lines.join('\n');
@@ -554,16 +555,15 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         };
         return result as unknown as object;
     } catch (err) {
-        // Best-effort retreat to the safe start height, unless the failure is
-        // the overtravel latch itself (the connection is being force-closed).
-        const isTrip = !!probeFeedService.getTrip();
-        if (!isTrip) {
-            try {
-                await moveMachineSettled('toolsetter:abort-retreat', { z: plan.startZ }, TRAVEL_FEED);
-                announce('abort-retreated', plan.startZ);
-            } catch (retreatErr) {
-                log.error(`Tool setter abort retreat failed: ${retreatErr.message}`);
-            }
+        // Best-effort retreat STRAIGHT UP to the traverse height - never to the
+        // start height: job fd7fa6cb6396 aborted before its travel (at home) and
+        // "retreat to start height" plunged 122 mm at the home XY. The helper
+        // skips the move when the overtravel latch is closing the connection or
+        // the head is already at the top.
+        try {
+            await abortRaiseToTop('toolsetter', (phase, z, note) => announce(phase, z ?? currentZ, note));
+        } catch (retreatErr) {
+            log.error(`Tool setter abort retreat failed: ${retreatErr.message}`);
         }
         if (isProcedureAbort(err)) {
             throw new McpToolError(`Tool setter run aborted: ${err.message} `

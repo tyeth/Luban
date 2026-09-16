@@ -182,3 +182,46 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
         : `xy-traverse ${frame} -> (${last.target.x.toFixed(1)}, ${last.target.y.toFixed(1)}) ${total.toFixed(0)}mm - ${input.reason.slice(0, 40)}`;
     return { steps, header, reviewText, name, totalDistanceMm: total };
 }
+
+/**
+ * Abort retreat law (operator, 2026-09-16): an aborted procedure retreats
+ * STRAIGHT UP to the traverse height (the Z top), never to its start height
+ * and never downward. Job fd7fa6cb6396: the tool setter aborted BEFORE its
+ * travel (traverse check at Z 327.999 vs 328) and the old "retreat to start
+ * height" plunged the head 122 mm from home to Z 205.5 at the home XY, inside
+ * the rotary landmark. Pure: decided from the known machine Z alone.
+ */
+export interface AbortRaiseDecision {
+    /** raise = issue a Z-only move to targetZ; skip = already at the top. */
+    action: 'raise' | 'skip';
+    targetZ: number;
+    reason: string;
+}
+
+export function planAbortRaise(currentZ: number | null, traverseZ: number): AbortRaiseDecision {
+    if (currentZ !== null && currentZ >= traverseZ - TRAVERSE_Z_TOLERANCE_MM) {
+        return {
+            action: 'skip',
+            targetZ: traverseZ,
+            reason: `already at the traverse height (machine Z ${currentZ.toFixed(3)} vs ${traverseZ})`,
+        };
+    }
+    return {
+        action: 'raise',
+        targetZ: traverseZ,
+        reason: currentZ === null
+            ? `machine Z unknown - a Z-only move to the traverse height ${traverseZ} is the one retreat that cannot descend`
+            : `raise from machine Z ${currentZ.toFixed(3)} to the traverse height ${traverseZ}`,
+    };
+}
+
+/**
+ * True when a move from `fromZ` to `toZ` may LOWER the head: `toZ` is below
+ * the known Z (beyond the heartbeat's float noise), or the Z is unknown and a
+ * descent cannot be ruled out. An abort path uses this to skip any "back to
+ * the start" leg - the start of a Z march is above the contact only once the
+ * march has begun; before that it is below the head.
+ */
+export function mayDescend(fromZ: number | null, toZ: number): boolean {
+    return fromZ === null || toZ < fromZ - TRAVERSE_Z_TOLERANCE_MM;
+}

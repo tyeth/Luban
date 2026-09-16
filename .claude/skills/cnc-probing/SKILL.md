@@ -5,7 +5,7 @@ description: "Measure work with the spindle touch probe via the Luban MCP tools 
 
 # CNC probing: the touch probe
 
-> **Load `cnc-motion-rules` first; do not plan motion without it.** The seven laws, the coordinate
+> **Load `cnc-motion-rules` first; do not plan motion without it.** The eight laws, the coordinate
 > doctrine, `get_position.reliability`, the canonical calls and the two-op find-then-scan program
 > live there (§8). This file holds only what is specific to probing. The bed camera survey lives
 > in `cnc-visual-alignment`.

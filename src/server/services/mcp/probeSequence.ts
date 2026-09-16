@@ -23,6 +23,7 @@ import {
     senseReleaseAfter,
     isProcedureAbort,
     isProcedureStopped,
+    abortRaiseToTop,
 } from './probing';
 import { McpToolError } from './registry';
 import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -285,7 +286,7 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
                 + `${plan.confirmPasses} confirm cycle(s) (lift ${plan.backoffMm} mm); at the limit without contact: `
                 + `${step.onMiss === 'abort' ? 'ABORTS the sequence' : 'records no_contact, retreats and CONTINUES with the next step (on_miss: continue)'}`);
             lines.push(`G1 X${step.start.x.toFixed(3)} Y${step.start.y.toFixed(3)} Z${step.start.z.toFixed(3)} `
-                + `F${TRAVEL_FEED}; retreat to the march start (also on any abort)`);
+                + `F${TRAVEL_FEED}; retreat to the march start (an ABORT raises straight up to the traverse height instead)`);
             lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to traverse height`);
         }
     }
@@ -513,13 +514,7 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
         const isTrip = !!probeFeedService.getTrip();
         if (!isTrip) {
             try {
-                const reading = probeFeedService.getReading('probe');
-                if (!reading || !reading.triggered) {
-                    await moveMachineSettled('seq:abort-raise', { z: plan.hopZ }, TRAVEL_FEED);
-                    announce('abort-raised', `Z${plan.hopZ}`);
-                } else {
-                    announce('abort-held', 'probe still triggered - holding position for the operator');
-                }
+                await abortRaiseToTop('seq', (phase, z, note) => announce(phase, z === null ? note : `Z${z} - ${note}`), { holdIfTriggered: 'probe' });
             } catch (retreatErr) {
                 // Logged by the activity stream.
             }

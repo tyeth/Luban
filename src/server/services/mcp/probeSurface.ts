@@ -26,6 +26,7 @@ import {
     senseReleaseAfter,
     isProcedureAbort,
     isProcedureStopped,
+    abortRaiseToTop,
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
@@ -913,14 +914,7 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
         const isTrip = !!probeFeedService.getTrip();
         if (!isTrip) {
             try {
-                const reading = probeFeedService.getReading('probe');
-                if (!reading || !reading.triggered) {
-                    probeFeedService.clearExpectedContact();
-                    await moveMachineSettled(`${plan.tool}:abort-raise`, { z: plan.hopZ }, TRAVEL_FEED);
-                    announce('abort-raised', `Z${plan.hopZ}`);
-                } else {
-                    announce('abort-held', 'probe still triggered - holding position for the operator');
-                }
+                await abortRaiseToTop(plan.tool, (phase, z, note) => announce(phase, z === null ? note : `Z${z} - ${note}`), { holdIfTriggered: 'probe' });
             } catch (retreatErr) {
                 // Logged by the activity stream.
             }
