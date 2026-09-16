@@ -1,5 +1,6 @@
 import config from '../configstore';
 import { getMcpStatus } from '../mcp';
+import { MAX_MAX_CLIENTS, MAX_STREAM_FPS, MIN_STREAM_FPS, STREAM_ENABLED_KEY, STREAM_FPS_KEY, STREAM_MAX_CLIENTS_KEY, cameraStreamService } from '../mcp/cameraStream';
 import { MAX_RECENT_LIMIT, MIN_RECENT_LIMIT, diagnosticsRecentLimit } from '../mcp/diagnostics';
 import { DEFAULT_BLINKA_ENV, resolveGpioFeedConfig } from '../mcp/gpioFeed';
 import { MAX_JOB_EVENT_LIMIT, MIN_JOB_EVENT_LIMIT, approvalHandoff, jobEventLimit } from '../mcp/jobs';
@@ -197,7 +198,7 @@ export const clearAlarm = (req, res) => {
  * omitted field is left unchanged (the pane omits an untouched password).
  */
 export const updateSettings = (req, res) => {
-    const { enabled, port, allowLan, sensors, mqtt, gpio, transport, buffers, approvalHandoff: handoff } = req.body || {};
+    const { enabled, port, allowLan, sensors, mqtt, gpio, transport, buffers, approvalHandoff: handoff, cameraStream } = req.body || {};
 
     if (port !== undefined) {
         const value = Number(port);
@@ -248,6 +249,35 @@ export const updateSettings = (req, res) => {
             }
             config.set(key, numeric);
         }
+    }
+    if (cameraStream && typeof cameraStream === 'object') {
+        // Live MJPEG camera view (cameraStream.ts). Applies immediately: off
+        // disconnects every stream client; fps / client cap take effect at
+        // the next loop start. An empty fps/maxClients returns to the default.
+        if (cameraStream.enabled !== undefined) {
+            config.set(STREAM_ENABLED_KEY, !!cameraStream.enabled);
+        }
+        const ranges = [
+            ['fps', STREAM_FPS_KEY, MIN_STREAM_FPS, MAX_STREAM_FPS],
+            ['maxClients', STREAM_MAX_CLIENTS_KEY, 1, MAX_MAX_CLIENTS],
+        ];
+        for (const [field, key, min, max] of ranges) {
+            if (cameraStream[field] === undefined) {
+                continue;
+            }
+            const value = String(cameraStream[field]).trim();
+            if (value === '') {
+                config.unset(key);
+                continue;
+            }
+            const numeric = Number(value);
+            if (!Number.isInteger(numeric) || numeric < min || numeric > max) {
+                res.status(ERR_BAD_REQUEST).send({ msg: `Invalid camera stream ${field}: ${value} (${min}-${max})` });
+                return;
+            }
+            config.set(key, numeric);
+        }
+        cameraStreamService.applySettings();
     }
     if (sensors && typeof sensors === 'object') {
         if (sensors.toolSetter !== undefined) {

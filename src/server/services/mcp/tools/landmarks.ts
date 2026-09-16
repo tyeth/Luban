@@ -3,6 +3,7 @@
 import config from '../../configstore';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { calibrationStore } from '../calibration';
+import { cameraStreamService } from '../cameraStream';
 import { Landmark, landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -173,6 +174,17 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                     url: config.get('mcpCameraUrl') || null,
                     device: config.get('mcpCameraDevice') || null,
                     lastGoodDevice: config.get('mcpCameraLastGood') || null,
+                    // Live MJPEG view for the operator's browser (cameraStream.ts).
+                    stream: (() => {
+                        const stream = cameraStreamService.status();
+                        return {
+                            enabled: stream.enabled,
+                            stream_url: stream.pageUrl,
+                            running: stream.running,
+                            clients: stream.clients,
+                            fps: stream.fps,
+                        };
+                    })(),
                 },
                 // From Luban's Machine Settings (machine.json), never a private key.
                 machineSettings: readAppMachineSettings(),

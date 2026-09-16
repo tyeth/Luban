@@ -19,9 +19,9 @@ const log = logger('service:mcp:camera');
 //   - ffmpeg: mcpFfmpegPath (or ffmpeg on PATH) reading the device named by
 //     mcpCameraDevice - DirectShow on Windows, v4l2 on Linux. macOS has no
 //     ffmpeg input wired up; use mcpCameraUrl there.
-const CAPTURE_TIMEOUT_MS = 15000;
+export const CAPTURE_TIMEOUT_MS = 15000;
 
-const FFMPEG_PROVIDER = process.platform === 'win32' ? 'ffmpeg-dshow' : 'ffmpeg-v4l2';
+export const FFMPEG_PROVIDER = process.platform === 'win32' ? 'ffmpeg-dshow' : 'ffmpeg-v4l2';
 
 export interface CapturedFrame {
     frameId: string;
@@ -30,6 +30,38 @@ export interface CapturedFrame {
     provider: string;
     device: string | null;
     capturedAt: number;
+    /** one-shot = this call opened the device; stream = served by the live MJPEG capture loop. */
+    source: 'one-shot' | 'stream';
+}
+
+/**
+ * The live MJPEG stream (cameraStream.ts) owns the camera device while it
+ * has browser clients - v4l2/DirectShow devices open for one process only -
+ * so every MCP capture is served from ITS latest frame for as long as it
+ * runs, and goes back to opening the device itself the moment it stops.
+ * Registered by the stream service at start; null = no stream feature.
+ */
+export interface LiveFrameSource {
+    /** True while the capture loop holds (or is about to hold) the device. */
+    isActive(): boolean;
+    /** A frame no older than the loop's own frame interval, or the next one. */
+    awaitFrame(): Promise<CapturedFrame>;
+}
+
+let liveSource: LiveFrameSource | null = null;
+
+export function setLiveFrameSource(source: LiveFrameSource | null): void {
+    liveSource = source;
+}
+
+// A one-shot ffmpeg capture in flight; the stream loop waits for it before
+// opening the device (two openers = one of them fails).
+let oneShotInFlight: Promise<unknown> | null = null;
+
+export async function oneShotCapturePending(): Promise<void> {
+    if (oneShotInFlight) {
+        await oneShotInFlight.catch(() => undefined);
+    }
 }
 
 // Recent frames kept in memory so track_feature can template-match between
@@ -38,7 +70,7 @@ export interface CapturedFrame {
 const FRAME_CACHE_LIMIT = 12;
 const frameCache = new Map<string, Buffer>();
 
-function cacheFrame(jpg: Buffer): string {
+export function cacheFrame(jpg: Buffer): string {
     const frameId = crypto.randomBytes(4).toString('hex');
     frameCache.set(frameId, jpg);
     while (frameCache.size > FRAME_CACHE_LIMIT) {
@@ -55,7 +87,7 @@ export function getCachedFrame(frameId: string): Buffer | null {
     return frameCache.get(frameId) || null;
 }
 
-function ffmpegBinary(): string {
+export function ffmpegBinary(): string {
     return config.get('mcpFfmpegPath') || 'ffmpeg';
 }
 
@@ -150,7 +182,8 @@ export async function listCameras(): Promise<{ provider: string; devices: string
     return { provider: 'ffmpeg-dshow', devices };
 }
 
-async function captureViaHttp(url: string): Promise<CapturedFrame> {
+/** One GET of an HTTP snapshot source; shared by the one-shot capture and the stream's poller. */
+export async function fetchHttpSnapshot(url: string): Promise<{ body: Buffer; mimeType: string }> {
     return new Promise((resolve, reject) => {
         const client = url.startsWith('https') ? https : http;
         const req = client.get(url, { timeout: CAPTURE_TIMEOUT_MS }, (res) => {
@@ -168,14 +201,7 @@ async function captureViaHttp(url: string): Promise<CapturedFrame> {
                     reject(new McpToolError(`Snapshot URL returned ${contentType}, not an image.`));
                     return;
                 }
-                resolve({
-                    frameId: cacheFrame(body),
-                    imageBase64: body.toString('base64'),
-                    mimeType: contentType,
-                    provider: 'http',
-                    device: url,
-                    capturedAt: Date.now(),
-                });
+                resolve({ body, mimeType: contentType });
             });
         });
         req.on('timeout', () => {
@@ -188,12 +214,28 @@ async function captureViaHttp(url: string): Promise<CapturedFrame> {
     });
 }
 
-async function captureViaFfmpeg(): Promise<CapturedFrame> {
-    // Device choice is sticky: enumeration order is not stable across
-    // restarts, and a capture that silently falls back to a different
-    // (possibly dead virtual) camera is worse than an error. The last
-    // device that produced a frame is remembered and preferred; a missing
-    // device is an error, never a substitution.
+async function captureViaHttp(url: string): Promise<CapturedFrame> {
+    const { body, mimeType } = await fetchHttpSnapshot(url);
+    return {
+        frameId: cacheFrame(body),
+        imageBase64: body.toString('base64'),
+        mimeType,
+        provider: 'http',
+        device: url,
+        capturedAt: Date.now(),
+        source: 'one-shot',
+    };
+}
+
+/**
+ * Which ffmpeg input the configured camera is, as ffmpeg arguments. Device
+ * choice is sticky: enumeration order is not stable across restarts, and a
+ * capture that silently falls back to a different (possibly dead virtual)
+ * camera is worse than an error. The last device that produced a frame is
+ * remembered and preferred; a missing device is an error, never a
+ * substitution. Shared by the one-shot capture and the live stream loop.
+ */
+export async function resolveFfmpegInput(): Promise<{ device: string; inputArgs: string[] }> {
     if (process.platform !== 'win32' && process.platform !== 'linux') {
         throw new McpToolError(`No ffmpeg camera input is wired up for ${process.platform}. `
             + 'Set mcpCameraUrl to an HTTP snapshot URL instead.');
@@ -228,6 +270,16 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
     const inputArgs = process.platform === 'win32'
         ? ['-f', 'dshow', '-i', `video=${device}`]
         : ['-f', 'v4l2', '-i', (String(device).match(/^(\/dev\/\S+)/) || [])[1] || String(device)];
+    return { device: String(device), inputArgs };
+}
+
+/** Remember the device that just produced a frame (the sticky choice). */
+export function noteCameraLastGood(device: string): void {
+    config.set('mcpCameraLastGood', device);
+}
+
+async function captureViaFfmpeg(): Promise<CapturedFrame> {
+    const { device, inputArgs } = await resolveFfmpegInput();
 
     const outPath = path.join(DataStorage.tmpDir, `mcp-frame-${crypto.randomBytes(4).toString('hex')}.jpg`);
     try {
@@ -249,22 +301,28 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
             throw new McpToolError(`ffmpeg capture from "${device}" failed after retry: `
                 + `${stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' ')}`);
         }
-        config.set('mcpCameraLastGood', String(device));
+        noteCameraLastGood(device);
         const body = await fs.readFile(outPath);
         return {
             frameId: cacheFrame(body),
             imageBase64: body.toString('base64'),
             mimeType: 'image/jpeg',
             provider: FFMPEG_PROVIDER,
-            device: String(device),
+            device,
             capturedAt: Date.now(),
+            source: 'one-shot',
         };
     } finally {
         fs.remove(outPath).catch(() => undefined);
     }
 }
 
-export async function captureFrame(): Promise<CapturedFrame> {
+/** True when some capture source is configured (URL, pinned device, or a remembered one). */
+export function isCameraConfigured(): boolean {
+    return !!(config.get('mcpCameraUrl') || config.get('mcpCameraDevice') || config.get('mcpCameraLastGood'));
+}
+
+async function captureOneShot(): Promise<CapturedFrame> {
     const cameraUrl = config.get('mcpCameraUrl');
     if (cameraUrl) {
         log.debug(`Capturing frame via HTTP snapshot: ${cameraUrl}`);
@@ -272,4 +330,21 @@ export async function captureFrame(): Promise<CapturedFrame> {
     }
     log.debug(`Capturing frame via ${FFMPEG_PROVIDER}`);
     return captureViaFfmpeg();
+}
+
+export async function captureFrame(): Promise<CapturedFrame> {
+    if (liveSource && liveSource.isActive()) {
+        // The stream loop holds the device: its next fresh frame IS the capture.
+        log.debug('Capturing frame from the live stream loop');
+        return liveSource.awaitFrame();
+    }
+    const pending = captureOneShot();
+    oneShotInFlight = pending;
+    try {
+        return await pending;
+    } finally {
+        if (oneShotInFlight === pending) {
+            oneShotInFlight = null;
+        }
+    }
 }

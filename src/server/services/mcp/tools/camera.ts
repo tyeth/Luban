@@ -5,6 +5,7 @@ import config from '../../configstore';
 import { mcpBroadcast } from '../index';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCameras } from '../camera';
+import { cameraStreamService } from '../cameraStream';
 import { recordGcodeTiming } from '../diagnostics';
 import { jobManager } from '../jobs';
 import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
@@ -194,6 +195,10 @@ function frameContent(frame: CapturedFrame, meta: object): object {
                         provider: frame.provider,
                         device: frame.device,
                         capturedAt: frame.capturedAt,
+                        // 'stream' = served by the live MJPEG loop an operator is
+                        // watching (/camera); 'one-shot' = this call opened the device.
+                        source: frame.source,
+                        stream_url: cameraStreamService.isEnabled() ? cameraStreamService.urls().page : null,
                         expectedToolRegion: expectedToolRegion(),
                         nearbyLandmarks: nearbyLandmarks(),
                     },
@@ -449,9 +454,25 @@ export function registerCameraTools(registry: ToolRegistry): void {
     registry.register({
         name: 'list_cameras',
         description: 'List available capture sources: the configured snapshot URL, or DirectShow '
-            + 'video devices found by ffmpeg. Read-only.',
+            + 'video devices found by ffmpeg. Also reports the live MJPEG stream (stream_url: a page '
+            + 'the OPERATOR opens in a browser to watch the camera; not for the agent to fetch). Read-only.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        handler: async () => listCameras() as unknown as object,
+        handler: async () => {
+            const cameras = await listCameras();
+            const stream = cameraStreamService.status();
+            return {
+                ...cameras,
+                stream: {
+                    enabled: stream.enabled,
+                    stream_url: stream.pageUrl,
+                    mjpeg_url: stream.streamUrl,
+                    snapshot_url: stream.snapshotUrl,
+                    running: stream.running,
+                    clients: stream.clients,
+                    fps: stream.fps,
+                },
+            } as unknown as object;
+        },
     });
 
     registry.register({
@@ -459,7 +480,9 @@ export function registerCameraTools(registry: ToolRegistry): void {
         description: 'Capture one frame from the workshop camera (configstore: mcpCameraUrl for an '
             + 'HTTP snapshot source, else ffmpeg with mcpCameraDevice/mcpFfmpegPath). The frame is '
             + 'stamped with the firmware-reported position it was taken at, when a machine is '
-            + 'connected. No motion.',
+            + 'connected. While an operator watches the live stream (/camera) the frame comes from '
+            + 'that loop (camera.source = "stream", one shared device); otherwise this call opens the '
+            + 'device itself. No motion.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         handler: async () => {
             const frame = await captureFrame();

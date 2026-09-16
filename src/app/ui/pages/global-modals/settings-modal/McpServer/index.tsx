@@ -55,6 +55,19 @@ interface McpSensorSettings {
     envOverrides: string[];
 }
 
+interface McpCameraStreamStatus {
+    enabled: boolean;
+    source: 'env' | 'config' | 'default';
+    fps: number;
+    maxClients: number;
+    pageUrl: string | null;
+    streamUrl: string | null;
+    running: boolean;
+    clients: number;
+    device: string | null;
+    lastError: string | null;
+}
+
 interface McpStatus {
     running: boolean;
     port: number | null;
@@ -83,6 +96,7 @@ interface McpStatus {
         handoff: 'agent' | 'code';
         source: 'env' | 'config' | 'default';
     };
+    cameraStream?: McpCameraStreamStatus;
 }
 const MQTT_FIELDS: Array<{ name: keyof McpMqttSettings['values']; labelKey: string; placeholder?: string; channel?: string }> = [
     { name: 'host', labelKey: 'key-App/Settings/McpServer-MQTT host', placeholder: 'io.adafruit.com' },
@@ -145,6 +159,10 @@ const McpServer: React.FC = () => {
     const [diagnosticsRecentLimit, setDiagnosticsRecentLimit] = useState('');
     // Job approval hand-off: true = a waiting agent starts on the operator's click.
     const [approvalHandoffAgent, setApprovalHandoffAgent] = useState(true);
+    // Live MJPEG camera view served by the MCP server (/camera). Applies at
+    // once on save: off disconnects every viewer. '' fps = server default.
+    const [cameraStreamEnabled, setCameraStreamEnabled] = useState(false);
+    const [cameraStreamFps, setCameraStreamFps] = useState('');
 
     useEffect(() => {
         api.getMcpStatus()
@@ -165,6 +183,11 @@ const McpServer: React.FC = () => {
                 }
                 if (body.approval) {
                     setApprovalHandoffAgent(body.approval.handoff !== 'code');
+                }
+                if (body.cameraStream) {
+                    setCameraStreamEnabled(!!body.cameraStream.enabled);
+                    setCameraStreamFps(body.cameraStream.storedFps === undefined || body.cameraStream.storedFps === null
+                        ? '' : String(body.cameraStream.storedFps));
                 }
                 const { inverted: mqttInvertedNames, ...mqttValues } = body.mqtt.values;
                 setMqtt({ ...mqttValues });
@@ -201,7 +224,12 @@ const McpServer: React.FC = () => {
             gpio: gpioUpdate,
             buffers: { jobEventLimit, diagnosticsRecentLimit },
             approvalHandoff: approvalHandoffAgent ? 'agent' : 'code',
+            cameraStream: { enabled: cameraStreamEnabled, fps: cameraStreamFps },
         });
+        // The stream toggle applies immediately; refresh the live URL / state.
+        api.getMcpStatus()
+            .then((res) => setStatus((res as { body: McpStatus }).body))
+            .catch(() => undefined);
     };
 
     useEffect(() => {
@@ -322,6 +350,51 @@ const McpServer: React.FC = () => {
                 <div className={styles['port-tips']}>
                     {i18n._('key-App/Settings/McpServer-Off: the confirm page shows a one-time code you must relay to the agent yourself. Either way only your click in the browser authorises motion.')}
                     {status && status.approval && status.approval.source === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_APPROVAL_HANDOFF` : ''}
+                </div>
+            </div>
+
+            <div className="border-bottom-normal padding-bottom-4 margin-top-16">
+                <span>{i18n._('key-App/Settings/McpServer-Camera')}</span>
+            </div>
+            <div className="margin-top-8">
+                <div className="sm-flex align-center">
+                    <Switch
+                        checked={cameraStreamEnabled}
+                        onChange={(checked) => setCameraStreamEnabled(checked)}
+                        disabled={!enabled || !!(status && status.cameraStream && status.cameraStream.source === 'env')}
+                    />
+                    <span className="margin-left-8">{i18n._('key-App/Settings/McpServer-Live camera stream in the browser (MJPEG at /camera on the MCP port; applies on save)')}</span>
+                </div>
+                {cameraStreamEnabled && status && status.cameraStream && status.cameraStream.pageUrl && (
+                    <div className="margin-top-8">
+                        {i18n._('key-App/Settings/McpServer-Watch at:')}{' '}
+                        <a href={status.cameraStream.pageUrl} target="_blank" rel="noopener noreferrer">{status.cameraStream.pageUrl}</a>
+                        {status.running
+                            ? ` — ${status.cameraStream.running
+                                ? `${i18n._('key-App/Settings/McpServer-streaming to')} ${status.cameraStream.clients} ${i18n._('key-App/Settings/McpServer-viewer(s)')}`
+                                : i18n._('key-App/Settings/McpServer-idle until a browser opens it')}`
+                            : ` — ${i18n._('key-App/Settings/McpServer-Not running this session')}`}
+                        {status.cameraStream.lastError ? ` — ${status.cameraStream.lastError}` : ''}
+                    </div>
+                )}
+                <div className={styles['port-tips']}>
+                    {i18n._('key-App/Settings/McpServer-One capture loop owns the camera while someone watches; agent captures (capture_frame, move_and_capture, visual servo) are served from the same frames, so both work at once. Off: /camera answers 404 and viewers are disconnected. Default: on once a camera is configured.')}
+                    {status && status.cameraStream && status.cameraStream.source === 'env' ? ` — ${i18n._('key-App/Settings/McpServer-Overridden by environment variable')} LUBAN_MCP_CAMERA_STREAM_ENABLED` : ''}
+                </div>
+                <div className="sm-flex align-center margin-top-8">
+                    <span style={LABEL_STYLE}>{i18n._('key-App/Settings/McpServer-Stream frame rate (fps)')}</span>
+                    <Input
+                        value={cameraStreamFps}
+                        onChange={(e) => {
+                            if (/^\d*$/.test(e.target.value)) {
+                                setCameraStreamFps(e.target.value);
+                            }
+                        }}
+                        disabled={!enabled || !cameraStreamEnabled}
+                        className={styles['port-input']}
+                        placeholder={status && status.cameraStream ? String(status.cameraStream.fps) : '5'}
+                    />
+                    <span className="margin-left-8">1-15; {i18n._('key-App/Settings/McpServer-applies when the stream next starts')}</span>
                 </div>
             </div>
 
