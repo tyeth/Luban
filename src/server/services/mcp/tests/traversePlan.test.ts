@@ -1,7 +1,7 @@
 import { strict as assert } from 'assert';
 
 import { ObstacleBox } from '../envelopeChecks';
-import { TraversePlanError, TraversePlanInput, planAbortRaise, planTraverseXy, mayDescend } from '../traversePlan';
+import { TraversePlanError, TraversePlanInput, mayDescend, planRaiseToTop, planToolSetterEnd, planTraverseXy } from '../traversePlan';
 
 const BOUNDS = { min: { x: 0, y: 0, z: 0 }, max: { x: 320, y: 340, z: 330 } };
 const OFFSET = { x: -51, y: -122, z: -328 };
@@ -97,23 +97,51 @@ export const tests: Array<[string, () => void]> = [
     }],
 
     ['abort retreat law: job fd7fa6cb6396 aborted at home (Z 327.999) - nothing is sent, never a plunge to the start height', () => {
-        const atHome = planAbortRaise(327.9989959716797, 328);
+        const atHome = planRaiseToTop(327.9989959716797, 328);
         assert.equal(atHome.action, 'skip', 'the head is already at the top within the float tolerance');
         assert.equal(atHome.targetZ, 328);
-        const exact = planAbortRaise(328, 328);
+        const exact = planRaiseToTop(328, 328);
         assert.equal(exact.action, 'skip');
     }],
 
     ['abort retreat law: below the top the retreat is a Z-only raise TO the traverse height, whatever the start height was', () => {
-        const midDescent = planAbortRaise(205.5, 328);
+        const midDescent = planRaiseToTop(205.5, 328);
         assert.equal(midDescent.action, 'raise');
         assert.equal(midDescent.targetZ, 328);
-        const justUnder = planAbortRaise(327.9, 328);
+        const justUnder = planRaiseToTop(327.9, 328);
         assert.equal(justUnder.action, 'raise', '0.1 mm under the top is a real shortfall, not float noise');
-        const unknown = planAbortRaise(null, 328);
+        const unknown = planRaiseToTop(null, 328);
         assert.equal(unknown.action, 'raise', 'an unknown Z still gets the one move that cannot descend');
         assert.equal(unknown.targetZ, 328);
         assert.ok(unknown.reason.includes('unknown'));
+    }],
+
+    ['issue #91: a COMPLETED tool setter run ends at the traverse height - a Z-only raise from the trigger, never the start height', () => {
+        // The live rig: trigger ~175.5 with the 75 mm reference, start height ~235, top 328.
+        const done = planToolSetterEnd(false, 175.5, 328);
+        assert.equal(done.action, 'raise');
+        assert.equal(done.targetZ, 328, 'the raise targets the traverse height, not the 235 start height');
+        assert.ok(done.reason.includes('raise from machine Z 175.500 to the traverse height 328'), done.reason);
+        // The success path and the abort path make the same decision from the same Z.
+        assert.deepEqual(done, planRaiseToTop(175.5, 328));
+    }],
+
+    ['issue #91: already at the traverse height (float noise included) - nothing is sent', () => {
+        const atTop = planToolSetterEnd(false, 327.9989959716797, 328);
+        assert.equal(atTop.action, 'skip');
+        assert.equal(atTop.targetZ, 328);
+        assert.equal(planToolSetterEnd(false, 328, 328).action, 'skip');
+        assert.equal(planToolSetterEnd(false, 327.9, 328).action, 'raise', '0.1 mm under the top is a real shortfall');
+    }],
+
+    ['issue #91: stay_at_trigger (touchscreen swap wizard) holds in contact - no retreat of any kind', () => {
+        const held = planToolSetterEnd(true, 175.5, 328);
+        assert.equal(held.action, 'hold');
+        assert.equal(held.targetZ, 175.5, 'the head stays at the measured trigger');
+        assert.ok(held.reason.includes('no retreat'), held.reason);
+        // Holding wins even when a raise would otherwise be due or skipped.
+        assert.equal(planToolSetterEnd(true, 328, 328).action, 'hold');
+        assert.equal(planToolSetterEnd(true, null, 328).action, 'hold');
     }],
 
     ['mayDescend: a "back to the start" leg is skipped only when the start is below the head', () => {

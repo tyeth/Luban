@@ -184,21 +184,24 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
 }
 
 /**
- * Abort retreat law (operator, 2026-09-16): an aborted procedure retreats
- * STRAIGHT UP to the traverse height (the Z top), never to its start height
- * and never downward. Job fd7fa6cb6396: the tool setter aborted BEFORE its
- * travel (traverse check at Z 327.999 vs 328) and the old "retreat to start
- * height" plunged the head 122 mm from home to Z 205.5 at the home XY, inside
- * the rotary landmark. Pure: decided from the known machine Z alone.
+ * Retreat law (operator, 2026-09-16; issue #91): a procedure ends - whether it
+ * aborts or completes - STRAIGHT UP at the traverse height (the Z top), never
+ * at its start height and never lower. Job fd7fa6cb6396: the tool setter
+ * aborted BEFORE its travel (traverse check at Z 327.999 vs 328) and the old
+ * "retreat to start height" plunged the head 122 mm from home to Z 205.5 at
+ * the home XY, inside the rotary landmark. The success path of run_tool_setter
+ * used to stop at the start height for the same reason (#91). Pure: decided
+ * from the known machine Z alone; shared by the abort and success paths
+ * (probing.ts raiseToTop / abortRaiseToTop).
  */
-export interface AbortRaiseDecision {
+export interface RaiseToTopDecision {
     /** raise = issue a Z-only move to targetZ; skip = already at the top. */
     action: 'raise' | 'skip';
     targetZ: number;
     reason: string;
 }
 
-export function planAbortRaise(currentZ: number | null, traverseZ: number): AbortRaiseDecision {
+export function planRaiseToTop(currentZ: number | null, traverseZ: number): RaiseToTopDecision {
     if (currentZ !== null && currentZ >= traverseZ - TRAVERSE_Z_TOLERANCE_MM) {
         return {
             action: 'skip',
@@ -213,6 +216,29 @@ export function planAbortRaise(currentZ: number | null, traverseZ: number): Abor
             ? `machine Z unknown - a Z-only move to the traverse height ${traverseZ} is the one retreat that cannot descend`
             : `raise from machine Z ${currentZ.toFixed(3)} to the traverse height ${traverseZ}`,
     };
+}
+
+/**
+ * How run_tool_setter ENDS (issue #91). `stay_at_trigger` (the touchscreen
+ * manual-swap wizard) holds the tip in contact at the trigger - no retreat at
+ * all; every other run ends exactly like an abort: a Z-only raise straight up
+ * to the traverse height, nothing sent if the head is already there. Never the
+ * start height. The runtime (probing.ts raiseToTop) applies planRaiseToTop to
+ * the position of record; the confirm page describes the same decision.
+ */
+export type ToolSetterEndDecision =
+    | { action: 'hold'; targetZ: number | null; reason: string }
+    | RaiseToTopDecision;
+
+export function planToolSetterEnd(holdAtTrigger: boolean, triggerZ: number | null, traverseZ: number): ToolSetterEndDecision {
+    if (holdAtTrigger) {
+        return {
+            action: 'hold',
+            targetZ: triggerZ,
+            reason: 'stay_at_trigger: the tip is held in contact at the trigger for the touchscreen manual-swap wizard - no retreat',
+        };
+    }
+    return planRaiseToTop(triggerZ, traverseZ);
 }
 
 /**

@@ -174,6 +174,8 @@ whole program — and compare `derived` with the operator's calipers.
 (`bit_length_mm` is the fitted tool's PROTRUSION in mm — a length, never a diameter; declare
 LOW). Setter surface = machine Z100.5, so effective length = measured trigger Z − 100.5; store
 it with `set_probe_geometry`. **Any probed surface height = contact toolhead Z − probe length.**
+The run ends with the head raised straight up to the traverse height (machine Z328, reported as
+`result.finalZ`), never at its start height — the next hop starts from there.
 
 ## Waiting on a job or procedure
 

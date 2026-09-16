@@ -21,7 +21,7 @@ import { McpToolError } from './registry';
 import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
 import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot, safeTraverseZ } from './tools/machine';
 import { ProcedureAbort, ProcedureStopped } from './procedureAbort';
-import { planAbortRaise } from './traversePlan';
+import { planRaiseToTop } from './traversePlan';
 
 // The shared sensor-gated motion engine: settled single moves on the direct
 // path, contact/release sensing against a probe feed channel, and the
@@ -479,47 +479,96 @@ export async function moveMachineSettled(
         probeFeedService.motionEnd();
     }
 }
+/** What raiseToTop did, so a runner can report the head's final Z honestly. */
+export interface RaiseToTopOutcome {
+    action: 'raised' | 'skipped' | 'held' | 'no-retreat';
+    /** Machine Z the head is at afterwards; null when unknown and nothing moved. */
+    z: number | null;
+    note: string;
+}
+
+/** Phase names announced by raiseToTop and the motion's event tag (`<tool>:<moveTag>`). */
+export interface RaiseToTopPhases {
+    noRetreat: string;
+    held: string;
+    skipped: string;
+    raised: string;
+    moveTag: string;
+}
+
+const ABORT_RAISE_PHASES: RaiseToTopPhases = {
+    noRetreat: 'abort-no-retreat',
+    held: 'abort-held',
+    skipped: 'abort-raise-skipped',
+    raised: 'abort-raised',
+    moveTag: 'abort-raise',
+};
+
 /**
- * The one retreat every aborted procedure shares (operator law 2026-09-16):
- * STRAIGHT UP to the traverse height, never to a start height, never down.
- * Job fd7fa6cb6396 (tool setter, aborted before its travel at Z 327.999) was
- * "retreated" to its start height - a 122 mm plunge from home at the home XY.
+ * The one retreat every procedure shares, at its end AND on abort (operator
+ * law 2026-09-16, issue #91): STRAIGHT UP to the traverse height, never to a
+ * start height, never down. Job fd7fa6cb6396 (tool setter, aborted before its
+ * travel at Z 327.999) was "retreated" to its start height - a 122 mm plunge
+ * from home at the home XY; the success path of run_tool_setter stopped at
+ * the same start height until #91.
  *
  * - The overtravel trip closes the connection: no motion is attempted.
  * - `holdIfTriggered`: a probe still reading contact means the tip is against
- *   something - lifting could drag it; hold for the operator (unchanged).
+ *   something - lifting could drag it; hold for the operator.
  * - Already at the top (within the heartbeat's float noise): nothing is sent.
  * - Otherwise a Z-ONLY G53 move to the traverse height - from any known or
  *   unknown position inside the volume this is the one move that cannot descend.
  *
+ * `clearExpectedContact` empties the expected-contact set right before the
+ * move (an abort's raise expects nothing to touch - a contact during it is a
+ * collision). A success-path lift off the tool setter leaves it alone: the
+ * lift starts IN contact and keeps the setter channels expected, as its old
+ * retreat did.
+ *
  * `announce(phase, z, note)` gets the target Z on a raise, the current Z on
  * a skip, and null when the position is unknown and nothing moved.
  */
-export async function abortRaiseToTop(
+export async function raiseToTop(
     tool: string,
     announce: (phase: string, z: number | null, note: string) => void,
-    options: { holdIfTriggered?: ProbeChannel } = {}
-): Promise<void> {
+    options: { holdIfTriggered?: ProbeChannel; phases?: RaiseToTopPhases; clearExpectedContact?: boolean } = {}
+): Promise<RaiseToTopOutcome> {
+    const phases = options.phases || ABORT_RAISE_PHASES;
     if (probeFeedService.getTrip()) {
-        announce('abort-no-retreat', null, 'overtravel latched - the connection is being closed, no motion issued');
-        return;
+        const note = 'overtravel latched - the connection is being closed, no motion issued';
+        announce(phases.noRetreat, null, note);
+        return { action: 'no-retreat', z: knownMachinePosition().position.z, note };
     }
     if (options.holdIfTriggered) {
         const reading = probeFeedService.getReading(options.holdIfTriggered);
         if (reading && reading.triggered) {
-            announce('abort-held', null, `${options.holdIfTriggered} still triggered - holding position for the operator`);
-            return;
+            const note = `${options.holdIfTriggered} still triggered - holding position for the operator`;
+            announce(phases.held, null, note);
+            return { action: 'held', z: knownMachinePosition().position.z, note };
         }
     }
     const { position } = knownMachinePosition();
-    const decision = planAbortRaise(position.z, safeTraverseZ());
+    const decision = planRaiseToTop(position.z, safeTraverseZ());
     if (decision.action === 'skip') {
-        announce('abort-raise-skipped', position.z, decision.reason);
-        return;
+        announce(phases.skipped, position.z, decision.reason);
+        return { action: 'skipped', z: position.z, note: decision.reason };
     }
-    probeFeedService.clearExpectedContact();
-    await moveMachineSettled(`${tool}:abort-raise`, { z: decision.targetZ }, TRAVEL_FEED);
-    announce('abort-raised', decision.targetZ, `traverse height - ${decision.reason}`);
+    if (options.clearExpectedContact) {
+        probeFeedService.clearExpectedContact();
+    }
+    await moveMachineSettled(`${tool}:${phases.moveTag}`, { z: decision.targetZ }, TRAVEL_FEED);
+    const note = `traverse height - ${decision.reason}`;
+    announce(phases.raised, decision.targetZ, note);
+    return { action: 'raised', z: decision.targetZ, note };
+}
+
+/** raiseToTop for an ABORT: the `abort-*` phase names, expected contact cleared before the raise. */
+export async function abortRaiseToTop(
+    tool: string,
+    announce: (phase: string, z: number | null, note: string) => void,
+    options: { holdIfTriggered?: ProbeChannel } = {}
+): Promise<RaiseToTopOutcome> {
+    return raiseToTop(tool, announce, { ...options, clearExpectedContact: true });
 }
 
 

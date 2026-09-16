@@ -107,9 +107,10 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             + 'not triggered. The confirm page shows the full motion envelope; after approval one '
             + 'start_gcode_job call runs the whole server-driven routine: XY to the centre, Z travel '
             + 'to the safe start height, 1 mm sensor-gated descent to a slow zone, 0.1 mm approach to '
-            + 'contact, then repeated quick lift-and-retest confirm cycles - retreats and reports the '
-            + 'median trigger Z, the per-pass contacts and spread, and the derived bit length. '
-            + 'A hard floor and the overtravel tripwire bound it (~1-2 minutes).',
+            + 'contact, then repeated quick lift-and-retest confirm cycles - then raises STRAIGHT UP '
+            + 'to the traverse height (machine Z328, never the start height; result.finalZ) and '
+            + 'reports the median trigger Z, the per-pass contacts and spread, and the derived bit '
+            + 'length. A hard floor and the overtravel tripwire bound it (~1-2 minutes).',
         inputSchema: {
             type: 'object',
             properties: {
@@ -182,6 +183,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                     center: { x: plan.config.centerX, y: plan.config.centerY },
                     expected_trigger_z: plan.expectedTriggerZ,
                     start_z: plan.startZ,
+                    end_z: plan.stayAtTrigger ? null : plan.endZ,
                     floor_z: plan.floorZ,
                     coarse_floor_z: plan.coarseFloorZ,
                     slow_zone_mm: plan.slowZoneMm,
