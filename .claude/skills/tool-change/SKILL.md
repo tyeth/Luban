@@ -71,7 +71,9 @@ operator raises it slightly from the touchscreen first.
    `bit_length_mm` — the tool's PROTRUSION from the collet in mm (a length, never its
    cutting diameter; declare it low rather than high). Skip only if the last stored measurement
    (`get_tool_setter_config` → `measurements.last`) is from this same tool,
-   this session, and the operator confirms nothing has moved.
+   this session, and the operator confirms nothing has moved. A completed run leaves the
+   head at the traverse height (machine Z328 — `result.finalZ`), never at its start height,
+   so the park move that follows needs no separate Z raise.
 2. **Park** — `goto_tool_change_position`. One approval, two
    `start_gcode_job` calls: Z rises to the park height first, then X/Y.
 3. **The operator swaps the tool by hand.** Wait for their word; never infer

@@ -115,7 +115,10 @@ item, quoting the tool result — not an essay):
    move to `mcpSafeTraverseZ`. It is also what YOU do when recovering by hand: after any abort,
    refusal or doubt, the first motion is `move_z` to the traverse height, then re-prove position
    (`get_position`), then plan again. Never "return to where the procedure started" — before
-   the travel, the start height is BELOW the head (appendix A, 2026-09-16).
+   the travel, the start height is BELOW the head (appendix A, 2026-09-16). A COMPLETED
+   `run_tool_setter` ends the same way (issue #91): raised straight up to the traverse height,
+   `result.finalZ` says where the head is — except `stay_at_trigger`, which holds the tip in
+   contact for the touchscreen wizard and retreats nowhere.
 
 ## 2. Coordinate doctrine
 

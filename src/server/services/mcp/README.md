@@ -251,7 +251,12 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    the top already (float tolerance) = nothing sent; otherwise one Z-only G53 move to
    `mcpSafeTraverseZ`. The along-axis "back to the start" legs of `probe_point` /
    `probe_vector` are skipped when the start is below the head (`mayDescend`). The
-   decision is pure and unit-tested (`planAbortRaise`, tests/traversePlan.test.ts).
+   decision is pure and unit-tested (`planRaiseToTop`, tests/traversePlan.test.ts).
+   **A completed `run_tool_setter` ends the same way** (issue #91): its success path is the
+   same shared `raiseToTop` — a Z-only raise from the trigger to the traverse height, never
+   back to its start height — so the head is left where the next XY move must start (law 2).
+   `result.finalZ` reports where it was actually left. `stay_at_trigger` (touchscreen swap
+   wizard) is the one exception: no retreat at all, the tip is held in contact.
 
 ### Surface scans — the one bounded exception to law 2 (operator-authorised 2026-09-05)
 
@@ -803,7 +808,8 @@ a fresh session) · `get_probe_feed_status` · `connect_probe_feed` / `disconnec
 with a reference bit, bit lengths — operator-stated) · `run_tool_setter` (tool height
 measurement: ONE operator approval covers a server-driven envelope-bounded routine — XY to
 centre, Z to `triggerZ + (longest−ref) + 50`, 1 mm sensor-gated descent, release, 0.1 mm
-approach, 0.3 mm backoff, ≥2 s/0.1 mm confirm pass, retreat; hard floor at expected
+approach, 0.3 mm backoff, ≥2 s/0.1 mm confirm pass, then a Z-only raise straight up to
+the traverse height — never the start height, law 9 / #91; hard floor at expected
 trigger − margin; requires the probe feed connected and the toolsetter sensor readable
 and untriggered; `store_as_reference` locks the measured Z in as the new reference;
 `stay_at_trigger` / `start_from_current` support the touchscreen swap wizard) ·

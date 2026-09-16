@@ -2,7 +2,7 @@
 // MCP tool arguments are snake_case by convention (planToolSetterRun takes
 // the run_tool_setter arguments verbatim).
 import logger from '../../lib/logger';
-import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
+import { TRAVERSE_Z_TOLERANCE_MM, planToolSetterEnd } from './traversePlan';
 import config from '../configstore';
 import { mcpBroadcast } from './index';
 import { ProbeChannel, probeFeedService } from './probeFeed';
@@ -20,6 +20,8 @@ import {
     senseReleaseAfter,
     isProcedureAbort,
     abortRaiseToTop,
+    raiseToTop,
+    RaiseToTopPhases,
 } from './probing';
 import { McpToolError } from './registry';
 import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -41,9 +43,12 @@ const log = logger('service:mcp:tool-setter');
 //   3. release: retreat in 1 mm steps until the feed reports released
 //   4. fine: descend in 0.1 mm steps until contact
 //   5. confirm: back off 0.3 mm, then descend 0.1 mm per >=2 s until contact
-//   6. retreat to startZ and report
+//   6. raise STRAIGHT UP to the traverse height (mcpSafeTraverseZ, machine
+//      Z328 = home) and report - never back to startZ (issue #91; the head
+//      ends where every following XY move must start, cnc-motion-rules law 2)
 // A hard floor (expected trigger Z for the declared bit minus a margin)
-// aborts the descent; the overtravel tripwire aborts everything at any time.
+// aborts the descent; the overtravel tripwire aborts everything at any time -
+// and an abort raises to the same traverse height (abortRaiseToTop).
 
 const CONFIG_KEY = 'mcpToolSetter';
 
@@ -149,6 +154,12 @@ export interface ToolSetterPlan {
     bitLengthMm: number;
     expectedTriggerZ: number;
     startZ: number;
+    /**
+     * Where the head ends on success: the traverse height (mcpSafeTraverseZ),
+     * a Z-only G53 raise from the trigger - never startZ (issue #91). Unused
+     * when stayAtTrigger holds the tip for the touchscreen wizard.
+     */
+    endZ: number;
     floorZ: number;
     // Bottom of the coarse ladder: coarse steps stop this far ABOVE the
     // expected trigger and the descent continues in fine steps, so a
@@ -230,6 +241,7 @@ export function planToolSetterRun(args: {
         bitLengthMm,
         expectedTriggerZ,
         startZ,
+        endZ: safeTraverseZ(),
         floorZ,
         coarseFloorZ: Math.min(Math.max(expectedTriggerZ + slowZoneMm, floorZ), startZ),
         slowZoneMm,
@@ -300,11 +312,12 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
         `; sensor to release, re-approach in ${plan.fineStepMm} mm steps to contact. Result = median of the`,
         '; cycle contacts (spread reported); a cycle never descends more than 0.5 mm below first contact.',
     );
-    if (plan.stayAtTrigger) {
+    const end = planToolSetterEnd(plan.stayAtTrigger, plan.expectedTriggerZ, plan.endZ);
+    if (end.action === 'hold') {
         lines.push('; HOLD AT TRIGGER when done: the tip stays in contact for the touchscreen manual-swap',
             '; wizard - NO final retreat. (Any ABORT raises straight up to the traverse height instead.)');
     } else {
-        lines.push(`G1 Z${plan.startZ.toFixed(3)} F${TRAVEL_FEED}; retreat to start height when done (an ABORT instead raises straight up to the traverse height)`);
+        lines.push(`G1 Z${end.targetZ.toFixed(3)} F${TRAVEL_FEED}; when done: raise STRAIGHT UP to the traverse height (machine Z${end.targetZ}) - never the start height; nothing is sent if already there; an ABORT raises the same way`);
     }
     lines.push('G54;');
     return lines.join('\n');
@@ -320,13 +333,25 @@ export interface ToolSetterResult {
     derivedBitLengthMm: number;
     phases: { phase: string; z: number; note?: string }[];
     storedAsReference: boolean;
+    /** Machine Z the head was left at: the traverse height on a normal run, the trigger Z when holding. */
+    finalZ: number | null;
     note: string;
     warning?: string;
 }
 
+/** Phase names the success-path raise announces (the abort path uses abort-*). */
+const SUCCESS_RETREAT_PHASES: RaiseToTopPhases = {
+    noRetreat: 'retreat-skipped',
+    held: 'retreat-skipped',
+    skipped: 'retreat-skipped',
+    raised: 'retreated',
+    moveTag: 'retreat',
+};
+
 /**
  * The operator-approved run. Every motion re-checks the overtravel latch;
- * any abort retreats to the start height when the machine still answers.
+ * success and abort alike end with a raise STRAIGHT UP to the traverse height
+ * (raiseToTop / abortRaiseToTop) when the machine still answers.
  */
 export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<object> {
     const contactChannels: ProbeChannel[] = plan.acceptProbeContact ? ['toolsetter', 'probe'] : ['toolsetter'];
@@ -501,18 +526,34 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         const spreadMm = Number((sorted[sorted.length - 1] - sorted[0]).toFixed(3));
         announce('measured', measuredZ, `median of [${passContacts.join(', ')}], spread ${spreadMm} mm`);
 
-        // Phase 6: retreat to the start height - unless the touchscreen
-        // manual-swap wizard needs the tip HELD at the trigger so the
-        // operator can confirm the matched position there.
+        // Phase 6: raise STRAIGHT UP to the traverse height (issue #91) -
+        // the same Z-only G53 move an abort makes, never back to the start
+        // height - unless the touchscreen manual-swap wizard needs the tip
+        // HELD at the trigger so the operator can confirm the matched
+        // position there. The setter channels stay expected during the lift:
+        // it starts in contact.
+        let finalZ: number | null;
+        let endNote: string;
         if (plan.stayAtTrigger) {
             const holdIssuedAt = Date.now();
             currentZ = measuredZ;
             await moveMachineSettled('toolsetter:hold', { z: currentZ }, FINE_FEED);
             await senseAfter(contactChannels, holdIssuedAt, plan.sensorDelayMs);
             announce('holding-at-trigger', measuredZ, 'NOT retreating - touchscreen wizard takes over');
+            finalZ = measuredZ;
+            endNote = ' HOLDING AT THE TRIGGER (in contact, no retreat): the operator confirms on the '
+                + 'touchscreen wizard from here - send no other motion until they say the swap flow is done.';
         } else {
-            await moveMachineSettled('toolsetter:retreat', { z: plan.startZ }, TRAVEL_FEED);
-            announce('retreated', plan.startZ);
+            const raised = await raiseToTop('toolsetter',
+                (phase, z, note) => announce(phase, z ?? currentZ, note),
+                { phases: SUCCESS_RETREAT_PHASES });
+            finalZ = raised.z;
+            if (raised.z !== null) {
+                currentZ = raised.z;
+            }
+            endNote = raised.action === 'raised' || raised.action === 'skipped'
+                ? ` Head left at the traverse height (machine Z ${raised.z}) - ${raised.note}.`
+                : ` Head NOT raised (${raised.note}) - machine Z ${raised.z === null ? 'unknown' : raised.z.toFixed(3)}.`;
         }
 
         const derivedBitLengthMm = c.referenceBitLengthMm + (measuredZ - c.triggerZ);
@@ -541,13 +582,11 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             derivedBitLengthMm: Number(derivedBitLengthMm.toFixed(3)),
             phases,
             storedAsReference,
+            finalZ,
             note: `Trigger at machine Z ${measuredZ.toFixed(3)} - median of ${plan.confirmPasses} confirm `
                 + `passes [${passContacts.join(', ')}], spread ${spreadMm} mm (+/- ${plan.fineStepMm} mm step `
                 + 'resolution). The derived bit length assumes the stored reference is exact; report it '
-                + `with that uncertainty.${plan.stayAtTrigger
-                    ? ' HOLDING AT THE TRIGGER (in contact, no retreat): the operator confirms on the '
-                        + 'touchscreen wizard from here - send no other motion until they say the swap flow is done.'
-                    : ''}`,
+                + `with that uncertainty.${endNote}`,
             warning: spreadMm > plan.fineStepMm + 1e-9
                 ? `Confirm passes spread ${spreadMm} mm exceeds one fine step - feed timing was unstable; `
                     + 'consider more confirm_passes or a longer sensor_delay_ms.'

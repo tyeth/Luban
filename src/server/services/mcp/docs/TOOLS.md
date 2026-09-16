@@ -59,7 +59,7 @@ session.
 
 - `set_tool_setter_config` — setter centre, trigger Z with a reference bit, known bit lengths. Operator-stated values only.
 - `get_tool_setter_config` — read it back.
-- `run_tool_setter` — tool height measurement as one approved, envelope-bounded routine: sensor-gated 1 mm descent, release, 0.1 mm approach, confirm pass, retreat. Hard floor below expected trigger. `store_as_reference` locks the new reference; `stay_at_trigger` / `start_from_current` support the swap wizard.
+- `run_tool_setter` — tool height measurement as one approved, envelope-bounded routine: sensor-gated 1 mm descent, release, 0.1 mm approach, confirm pass, then a Z-only raise straight up to the traverse height (machine Z328 — never the start height; `result.finalZ`). Hard floor below expected trigger. `store_as_reference` locks the new reference; `stay_at_trigger` / `start_from_current` support the swap wizard.
 - `apply_tool_length_offset` — confirmed `G92` shifting work Z by the new-minus-old tool length. Keeps the work origin true across a swap without re-touching stock.
 
 ## Touch-probe procedures (staged, one approval per circuit, results in machine coordinates)
