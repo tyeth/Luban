@@ -26,7 +26,7 @@ import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from 
 import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
 import { fovAt } from '../cameraGeometry';
-import { pitchForOverlap } from '../surveyMosaic';
+import { judgeSeams, pitchForOverlap } from '../surveyMosaic';
 import { modelContext, requireCameraModel } from './cameraModel';
 import { judgeCameraModel } from '../cameraModel';
 import { cameraModelStore } from '../cameraModelStore';
@@ -747,7 +747,12 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         try {
                             const rendered = renderMosaic(model, levelFrames, planeZ, out);
                             if (rendered) {
+                                const seams = judgeSeams(rendered.seams);
+                                if (seams.drifted) {
+                                    cameraModelStore.invalidate(model.id, `survey ${surveyId} seam mismatch`);
+                                }
                                 mosaics.push({
+                                    seams: { ...rendered.seams, ...seams },
                                     file: out,
                                     passZ: level,
                                     planeZ,

@@ -4,6 +4,9 @@ import {
     FramePlacement,
     MAX_MOSAIC_PX,
     MIN_PITCH_MM,
+    SEAM_MIN_PIXELS,
+    SEAM_STRUCTURAL_LIMIT,
+    judgeSeams,
     machineToMosaicPixel,
     mosaicPixelToMachine,
     pitchForOverlap,
@@ -89,5 +92,37 @@ export const tests: Array<[string, () => void]> = [
         const pitch = pitchForOverlap(100, 60, 0.3);
         const coverage = seamCoverage(frames([[0, 0], [pitch.x, 0]]));
         assert.ok(Math.abs(coverage.overlapFraction - 0.3) < 0.02, `${coverage.overlapFraction}`);
+    }],
+
+    // E4: the seams are the only free evidence that the camera has not moved.
+    ['overlaps that agree say the model still places the frames on each other', () => {
+        const j = judgeSeams({ pixels: 50_000, meanAbsDiff: 6, meanSignedDiff: 1 });
+        assert.equal(j.drifted, false);
+        assert.equal(j.conclusive, true);
+        assert.ok(/agree to/.test(j.note));
+    }],
+
+    ['overlaps that disagree mark the model unverified and say why', () => {
+        const j = judgeSeams({ pixels: 50_000, meanAbsDiff: 60, meanSignedDiff: 2 });
+        assert.equal(j.drifted, true);
+        assert.ok(j.structuralDiff > SEAM_STRUCTURAL_LIMIT);
+        assert.ok(/knocked or re-aimed/.test(j.note));
+        assert.ok(/verify_camera_model/.test(j.note), 'names the way back');
+    }],
+
+    ['a pure exposure difference is not disagreement', () => {
+        // Auto-exposure makes every frame a bit brighter or darker than its
+        // neighbour; that is not the camera having moved.
+        const j = judgeSeams({ pixels: 50_000, meanAbsDiff: 40, meanSignedDiff: 39 });
+        assert.equal(j.drifted, false, 'the offset is subtracted before judging');
+        assert.ok(j.structuralDiff < 2);
+    }],
+
+    ['too little shared ground is inconclusive, not a pass', () => {
+        const j = judgeSeams({ pixels: SEAM_MIN_PIXELS - 1, meanAbsDiff: 90, meanSignedDiff: 0 });
+        assert.equal(j.conclusive, false);
+        assert.equal(j.drifted, false, 'never condemns the model on noise');
+        assert.ok(/too little shared ground/.test(j.note));
+        assert.ok(/overlap_fraction/.test(j.note), 'says how to get a real check');
     }],
 ];

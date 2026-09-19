@@ -120,3 +120,62 @@ export function seamCoverage(frames: FramePlacement[]): SeamCheck {
     }
     return { pairs, overlapFraction: total > 0 ? Number((shared / total).toFixed(3)) : 0 };
 }
+
+export interface SeamStats {
+    /** Mosaic pixels two frames both claimed. */
+    pixels: number;
+    /** Mean |a - b| over those pixels, 0-255. */
+    meanAbsDiff: number;
+    /** Mean (a - b): a pure exposure difference between frames shows up here. */
+    meanSignedDiff: number;
+}
+
+export interface SeamJudgement {
+    /** What is left after the exposure difference is taken out: real disagreement. */
+    structuralDiff: number;
+    /** Enough shared pixels to mean anything. */
+    conclusive: boolean;
+    drifted: boolean;
+    note: string;
+}
+
+/** Below this the frames are telling the same story; above it they are not. */
+export const SEAM_STRUCTURAL_LIMIT = 25;
+/** Fewer shared pixels than this and the number is noise, not evidence. */
+export const SEAM_MIN_PIXELS = 5000;
+
+/**
+ * Whether the overlaps agree.
+ *
+ * The seams ARE the drift check: two frames that saw the same ground from
+ * different poses should land on the same mosaic pixels, so if they disagree
+ * the model no longer describes the camera - it was knocked, re-aimed or
+ * swapped. An overall brightness difference is not disagreement (auto-exposure
+ * does that between any two frames), so it is subtracted before judging.
+ */
+export function judgeSeams(stats: SeamStats): SeamJudgement {
+    const structural = Math.max(0, stats.meanAbsDiff - Math.abs(stats.meanSignedDiff));
+    const conclusive = stats.pixels >= SEAM_MIN_PIXELS;
+    const drifted = conclusive && structural > SEAM_STRUCTURAL_LIMIT;
+    if (!conclusive) {
+        return {
+            structuralDiff: Number(structural.toFixed(2)),
+            conclusive: false,
+            drifted: false,
+            note: `Only ${stats.pixels} overlapping pixels: too little shared ground to say whether the model still `
+                + 'describes the camera. Survey with a larger overlap_fraction if you want the seams to check it.',
+        };
+    }
+    return {
+        structuralDiff: Number(structural.toFixed(2)),
+        conclusive: true,
+        drifted,
+        note: drifted
+            ? `Frames disagree by ${structural.toFixed(1)} grey levels where they overlap, beyond the `
+                + `${SEAM_STRUCTURAL_LIMIT} expected from noise and exposure. The same ground is landing in different `
+                + 'places, so the camera has most likely been knocked or re-aimed since the model was solved. The '
+                + 'model is marked unverified: re-run verify_camera_model, and camera_bootstrap if that fails.'
+            : `Overlapping frames agree to ${structural.toFixed(1)} grey levels - the model still places them on top `
+                + 'of each other, which is the best evidence available that the camera has not moved.',
+    };
+}

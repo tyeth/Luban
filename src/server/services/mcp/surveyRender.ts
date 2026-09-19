@@ -3,7 +3,7 @@ import jpeg from 'jpeg-js';
 
 import { CameraModel } from './cameraModel';
 import { machineToPixel } from './cameraGeometry';
-import { FramePlacement, MosaicLayout, mosaicPixelToMachine, planMosaic } from './surveyMosaic';
+import { FramePlacement, MosaicLayout, SeamStats, mosaicPixelToMachine, planMosaic } from './surveyMosaic';
 
 // Composing a survey's frames into ONE picture indexed in machine
 // coordinates.
@@ -33,6 +33,8 @@ export interface RenderedMosaic {
     placements: Array<{ file: string; u0: number; v0: number; u1: number; v1: number }>;
     /** Mosaic pixels that no frame covered. */
     uncoveredFraction: number;
+    /** How much the frames disagreed where they overlapped - the drift check. */
+    seams: SeamStats;
 }
 
 interface DecodedFrame {
@@ -146,6 +148,13 @@ export function renderMosaic(
     const pixels = new Uint8Array(layout.widthPx * layout.heightPx * 4);
     const covered = new Uint8Array(layout.widthPx * layout.heightPx);
     const placements: RenderedMosaic['placements'] = [];
+    // Where a second frame claims a pixel the first already drew, the two are
+    // looking at the same ground from different poses. Comparing them costs
+    // nothing here and is the only free evidence about whether the model still
+    // describes the camera.
+    let seamPixels = 0;
+    let seamAbs = 0;
+    let seamSigned = 0;
 
     for (const { frame, placement } of placed) {
         const decoded = decode(frame.file);
@@ -176,12 +185,18 @@ export function renderMosaic(
                     continue;
                 }
                 const target = ((v * layout.widthPx) + u) * 4;
+                const from = ((sv * decoded.width) + su) * 4;
                 // First frame wins: a hard seam at the right coordinates says
-                // more than an average of two disagreeing views.
+                // more than an average of two disagreeing views. But measure
+                // the disagreement on the way past.
                 if (covered[(v * layout.widthPx) + u]) {
+                    const existing = (pixels[target] + pixels[target + 1] + pixels[target + 2]) / 3;
+                    const incoming = (decoded.data[from] + decoded.data[from + 1] + decoded.data[from + 2]) / 3;
+                    seamPixels += 1;
+                    seamAbs += Math.abs(existing - incoming);
+                    seamSigned += existing - incoming;
                     continue;
                 }
-                const from = ((sv * decoded.width) + su) * 4;
                 pixels[target] = decoded.data[from];
                 pixels[target + 1] = decoded.data[from + 1];
                 pixels[target + 2] = decoded.data[from + 2];
@@ -200,5 +215,14 @@ export function renderMosaic(
             uncovered += 1;
         }
     }
-    return { layout, placements, uncoveredFraction: Number((uncovered / covered.length).toFixed(4)) };
+    return {
+        layout,
+        placements,
+        uncoveredFraction: Number((uncovered / covered.length).toFixed(4)),
+        seams: {
+            pixels: seamPixels,
+            meanAbsDiff: seamPixels ? Number((seamAbs / seamPixels).toFixed(2)) : 0,
+            meanSignedDiff: seamPixels ? Number((seamSigned / seamPixels).toFixed(2)) : 0,
+        },
+    };
 }
