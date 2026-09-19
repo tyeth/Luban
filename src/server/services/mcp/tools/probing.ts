@@ -555,6 +555,14 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         + 'stated, never inferred.',
                 },
                 margin_mm: { type: 'number', description: 'Inset from the default bounds, default 10.' },
+                z_levels: {
+                    type: 'array',
+                    description: 'Machine Z heights to run the whole grid at, highest first; one approval covers the '
+                        + 'series. Every level must be at or above the motion floor. Each level is entered with XY '
+                        + 'STATIONARY, so the grid is a stack of flat passes and never a diagonal. Default: the '
+                        + 'current Z alone.',
+                    items: { type: 'number' },
+                },
                 x_min: { type: 'number', description: 'Machine-coord grid bounds. Defaults: margin..(size-margin).' },
                 x_max: { type: 'number', description: 'Set beyond the nominal size to cover reachable overtravel (e.g. the far-X column the camera angle otherwise misses - setup-specific, so state it explicitly).' },
                 y_min: { type: 'number' },
@@ -574,6 +582,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             overlap_fraction?: number;
             plane_z?: number;
             margin_mm?: number;
+            z_levels?: number[];
             x_min?: number;
             x_max?: number;
             y_min?: number;
@@ -597,6 +606,23 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
             if (!size) {
                 throw new McpToolError('Unknown machine size; cannot plan the grid.');
+            }
+            // Levels: highest first, deduplicated, and every one of them at or
+            // above the motion floor unless the operator has said otherwise.
+            const rawLevels = Array.isArray(args.z_levels) && args.z_levels.length ? args.z_levels.map(Number) : [z];
+            if (rawLevels.some((level) => !Number.isFinite(level))) {
+                throw new McpToolError('z_levels must be finite machine Z heights.');
+            }
+            if (rawLevels.length > 6) {
+                throw new McpToolError('At most 6 z_levels: each one is a full pass of the grid.');
+            }
+            const levels = [...new Set(rawLevels.map((level) => Number(level.toFixed(3))))].sort((a, b) => b - a);
+            const belowFloor = levels.filter((level) => level < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM);
+            if (belowFloor.length && args.operator_confirmed_clearance !== true) {
+                throw new McpToolError(`z_levels ${belowFloor.join(', ')} are below the motion floor ${motionFloorZ()} `
+                    + '(law 2 - the lowest Z any X/Y move may happen at). Raise them, or pass '
+                    + 'operator_confirmed_clearance: true only on the operator\'s explicit word that these heights '
+                    + 'clear everything on the bed.');
             }
             let pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
             let pitchNote = `pitch ${pitch} mm (stated)`;
@@ -655,13 +681,17 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             });
 
             const envelope = [
-                `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch}) at CURRENT machine Z ${z.toFixed(1)}`,
+                `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch})`,
+                `; ${levels.length} pass(es) at machine Z ${levels.join(', ')} - each entered with XY stationary`,
                 `; ${pitchNote}`,
                 '; one frame captured per waypoint after the move settles; frames saved to disk with a',
                 '; machine-position index. Each line is sent individually. Aborts on the first capture failure.',
                 'G90',
                 'G53;',
-                ...waypoints.map((w, i) => `G0 X${w.x.toFixed(1)} Y${w.y.toFixed(1)}; waypoint ${i + 1} + capture`),
+                ...levels.flatMap((level) => [
+                    `G1 Z${level.toFixed(3)}; enter the pass at this height, XY stationary`,
+                    ...waypoints.map((w, i) => `G0 X${w.x.toFixed(1)} Y${w.y.toFixed(1)}; Z${level} waypoint ${i + 1} + capture`),
+                ]),
                 'G54;',
             ].join('\n');
             const validation = validateGcode(envelope);
@@ -678,22 +708,29 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 const dir = path.join(DataStorage.userDataDir, 'mcp-surveys', surveyId);
                 fs.ensureDirSync(dir);
                 const frames: object[] = [];
-                for (let i = 0; i < waypoints.length; i++) {
-                    const w = waypoints[i];
-                    await moveMachineSettled('survey:move', { x: w.x, y: w.y }, TRAVEL_FEED * 4);
-                    let frame;
-                    try {
-                        frame = await captureFrame();
-                    } catch (err) {
-                        throw new McpToolError(`Capture failed at waypoint ${i + 1}/${waypoints.length} `
-                            + `(machine ${w.x}, ${w.y}): ${err.message}. Survey aborted; `
-                            + `${frames.length} frames saved in ${dir}.`);
+                for (const level of levels) {
+                    // Enter the pass with XY stationary: the grid is a stack of
+                    // flat passes, never a diagonal through unknown space.
+                    if (Math.abs(level - (getPositionSnapshot().machine.z ?? level)) > TRAVERSE_Z_TOLERANCE_MM) {
+                        await moveMachineSettled('survey:level', { z: level }, TRAVEL_FEED);
                     }
-                    const file = path.join(dir, `wp${String(i + 1).padStart(3, '0')}_x${w.x}_y${w.y}.jpg`);
-                    fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
-                    frames.push({ file, machine: { x: w.x, y: w.y, z }, capturedAt: frame.capturedAt });
+                    for (let i = 0; i < waypoints.length; i++) {
+                        const w = waypoints[i];
+                        await moveMachineSettled('survey:move', { x: w.x, y: w.y }, TRAVEL_FEED * 4);
+                        let frame;
+                        try {
+                            frame = await captureFrame();
+                        } catch (err) {
+                            throw new McpToolError(`Capture failed at waypoint ${i + 1}/${waypoints.length} of the `
+                                + `Z ${level} pass (machine ${w.x}, ${w.y}): ${err.message}. Survey aborted; `
+                                + `${frames.length} frames saved in ${dir}.`);
+                        }
+                        const file = path.join(dir, `z${level}_wp${String(i + 1).padStart(3, '0')}_x${w.x}_y${w.y}.jpg`);
+                        fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
+                        frames.push({ file, machine: { x: w.x, y: w.y, z: level }, capturedAt: frame.capturedAt });
+                    }
                 }
-                const index = { surveyId, machineZ: z, pitchMm: pitch, frames };
+                const index = { surveyId, machineZ: levels[0], zLevels: levels, planeZ, pitchMm: pitch, frames };
                 fs.writeJsonSync(path.join(dir, 'index.json'), index, { spaces: 2 });
                 return {
                     surveyId,
