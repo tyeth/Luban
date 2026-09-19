@@ -105,6 +105,11 @@ nothing. Mitigations built into the stack:
 
 ## 4. The stack
 
+**Status: all 27 PRs below are implemented on this branch stack (2026-09-19), each as its own
+commit with its tests, except F3, which adds the eval SCENARIOS - the fresh-agent rerun across
+Opus, Sonnet and Haiku has not been run. Nothing here has been exercised against the live
+machine: the Luban MCP server was not reachable from this session.**
+
 Every PR is small, single-concern, and stacked on the one before it. Each puts its
 **decision in a pure module** (no server imports) and its side effects in a thin caller, so
 each can carry real tests under `npm run test:mcp` (`tests/run.ts`, `[name, fn]` exports,
