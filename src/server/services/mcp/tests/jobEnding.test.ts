@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 
-import { classifyProcedureEnding, countMeasured } from '../jobEnding';
+import { McpJobKind, McpJobState, classifyProcedureEnding, countMeasured, planJobStop } from '../jobEnding';
 import { ProcedureAbort, ProcedureStopped, isProcedureAbort, isProcedureStopped } from '../procedureAbort';
 
 const T = 1_000;
@@ -61,5 +61,42 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(isProcedureStopped(stopped), 'the marker survives');
         assert.ok(!isProcedureAbort(new Error('plain')));
         assert.ok(!isProcedureAbort(null));
+    }],
+
+    // A2: stopping a job that never reached the machine. Live 2026-09-19 the
+    // agent could not withdraw a staged direct job and had to tell its
+    // operator in prose "do not approve job 245869890315".
+    ['a job that never reached the machine is withdrawn, whatever its kind', () => {
+        const kinds: McpJobKind[] = ['file', 'direct', 'procedure'];
+        const states: McpJobState[] = ['awaiting_confirmation', 'approved'];
+        for (const kind of kinds) {
+            for (const state of states) {
+                const plan = planJobStop(kind, state);
+                assert.equal(plan.action, 'withdraw', `${kind}/${state}`);
+                assert.ok(/confirm link is dead/.test(plan.note), `${kind}/${state} says the link is dead`);
+            }
+        }
+    }],
+
+    ['a running procedure is asked to stop at a step boundary, not withdrawn', () => {
+        assert.equal(planJobStop('procedure', 'started').action, 'request-procedure-stop');
+        // 'starting' keeps the pre-existing behaviour: the runner has not begun.
+        assert.equal(planJobStop('procedure', 'starting').action, 'withdraw');
+    }],
+
+    ['a file or direct job already handed to the machine gets the firmware stop', () => {
+        assert.equal(planJobStop('file', 'started').action, 'machine-stop');
+        assert.equal(planJobStop('file', 'starting').action, 'machine-stop');
+        assert.equal(planJobStop('direct', 'started').action, 'machine-stop');
+    }],
+
+    ['a terminal job is already ended, whatever its kind', () => {
+        const kinds: McpJobKind[] = ['file', 'direct', 'procedure'];
+        const terminal: McpJobState[] = ['rejected', 'start_failed', 'stopped', 'completed'];
+        for (const kind of kinds) {
+            for (const state of terminal) {
+                assert.equal(planJobStop(kind, state).action, 'already-ended', `${kind}/${state}`);
+            }
+        }
     }],
 ];

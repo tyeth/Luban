@@ -5,7 +5,7 @@ import * as fs from 'fs-extra';
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpJob, TERMINAL_JOB_STATES, approvalHandoff, jobManager } from '../jobs';
-import { classifyProcedureEnding, countMeasured } from '../jobEnding';
+import { classifyProcedureEnding, countMeasured, planJobStop } from '../jobEnding';
 import { summarizeJobTiming } from '../jobTiming';
 import { landmarkStore } from '../landmarks';
 import { matchFrame } from '../positionOfRecord';
@@ -1065,7 +1065,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             + 'run_tool_setter, survey) is a server-driven loop, so it stops at the next step boundary (within one '
             + '<= 1 mm step or sensor window), raises the head to the traverse height and keeps every completed '
             + 'station / contact / op on the job record (result, state "stopped"); this call waits up to wait_ms for '
-            + 'that. A FILE job is stopped on the machine (firmware stop_print). Result: {ok, stopped, stopping, job}.',
+            + 'that. A job that never reached the machine (any kind, awaiting confirmation or approved but not '
+            + 'started) is WITHDRAWN: it is marked stopped here and its confirm link dies, so an approval cannot '
+            + 'start it later. A file/direct job already handed over is stopped on the machine (firmware '
+            + 'stop_print). Result: {ok, stopped, stopping, withdrawn, note, job}.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1080,18 +1083,25 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
             }
-            if (job.kind === 'procedure') {
-                if (TERMINAL_JOB_STATES.includes(job.state)) {
-                    return { ok: true, stopped: true, stopping: false, note: `Procedure already ${job.state}.`, job: jobManager.describe(job) };
+            const plan = planJobStop(job.kind, job.state);
+            if (plan.action === 'already-ended') {
+                return { ok: true, stopped: true, stopping: false, withdrawn: false, note: plan.note, job: jobManager.describe(job) };
+            }
+            if (plan.action === 'withdraw') {
+                // Never handed to the machine: withdraw it here so the operator's
+                // confirm link cannot start it later. Before this only procedures
+                // were withdrawn and a staged file/direct job stayed approvable.
+                job.state = 'stopped';
+                job.endedAt = Date.now();
+                job.ending = { kind: 'withdrawn', reason: 'withdrawn by the agent before it started', at: job.endedAt };
+                job.confirmToken = null;
+                jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
+                if (jobManager.getActive() === job) {
+                    jobManager.setActive(null);
                 }
-                if (job.state !== 'started') {
-                    // Not running yet: withdraw it so the approval cannot start it later.
-                    job.state = 'stopped';
-                    job.endedAt = Date.now();
-                    job.ending = { kind: 'withdrawn', reason: 'withdrawn by the agent before it started', at: job.endedAt };
-                    jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
-                    return { ok: true, stopped: true, stopping: false, note: 'Procedure withdrawn before it started.', job: jobManager.describe(job) };
-                }
+                return { ok: true, stopped: true, stopping: false, withdrawn: true, note: plan.note, job: jobManager.describe(job) };
+            }
+            if (plan.action === 'request-procedure-stop') {
                 const request = requestProcedureStop('stop_gcode_job by the agent');
                 jobManager.appendEvent(job, 'stop-requested', { note: 'stop requested by the agent; the runner stops at the next step boundary and raises' });
                 const waitMs = Math.min(Math.max(Number(args.wait_ms) || 20000, 0), 120000);
@@ -1104,6 +1114,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     ok: true,
                     stopped,
                     stopping: !stopped,
+                    withdrawn: false,
                     requestedAt: request.requestedAt,
                     note: stopped
                         ? `Procedure ${job.state} (${job.ending ? job.ending.kind : 'ending unknown'}${job.ending && job.ending.measured !== undefined ? `, ${job.ending.measured} measured` : ''}); `
@@ -1128,7 +1139,11 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             }
             return {
                 ok: stopped.ok,
+                stopped: stopped.ok,
+                stopping: false,
+                withdrawn: false,
                 text: stopped.text || null,
+                note: plan.note,
                 job: jobManager.describe(job),
             };
         },

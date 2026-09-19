@@ -6,7 +6,7 @@ import path from 'path';
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
 import config from '../configstore';
-import { JobEnding } from './jobEnding';
+import { JobEnding, McpJobKind, McpJobState, TERMINAL_JOB_STATES } from './jobEnding';
 import { GcodeValidationReport } from './validator';
 
 const log = logger('service:mcp:jobs');
@@ -19,17 +19,11 @@ const log = logger('service:mcp:jobs');
 const CONFIRM_TOKEN_TTL_MS = 15 * 60 * 1000;
 const JOB_RETENTION_LIMIT = 50;
 
-export type McpJobState =
-    | 'awaiting_confirmation'
-    | 'approved'
-    | 'rejected'
-    | 'starting'
-    | 'started'
-    | 'start_failed'
-    | 'stopped'
-    | 'completed';
-
 /**
+ * The lifecycle types live in jobEnding.ts (pure) so the stop planner can be
+ * unit-tested without this server-bound module; they are re-exported here
+ * because every caller already imports them from jobs.
+ *
  * 'file' runs through prepare_print/start_print (door interlock applies, and
  * the machine interpreter returns to Z top at the job's finish position on
  * completion - XY holds, Z does not; operator-clarified 2026-09-02). 'direct'
@@ -40,7 +34,7 @@ export type McpJobState =
  * the operator approves a motion ENVELOPE and the runner steps within it
  * against live sensor feedback - also on the direct path, not interlocked.
  */
-export type McpJobKind = 'file' | 'direct' | 'procedure';
+export { McpJobState, McpJobKind, TERMINAL_JOB_STATES } from './jobEnding';
 
 export interface JobEvent {
     at: number;
@@ -94,7 +88,6 @@ export function jobEventLimit(): number {
     return Math.min(Math.max(Math.round(raw), MIN_JOB_EVENT_LIMIT), MAX_JOB_EVENT_LIMIT);
 }
 
-export const TERMINAL_JOB_STATES: McpJobState[] = ['rejected', 'start_failed', 'stopped', 'completed'];
 
 export interface McpJob {
     id: string;
