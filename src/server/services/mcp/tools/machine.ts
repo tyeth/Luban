@@ -118,21 +118,49 @@ function axisValue(value: unknown): number | null {
 }
 
 /**
- * The minimum toolhead machine Z for X/Y traverses - OPERATOR LAW after the
- * 2026-09-01 probe crash: "always retreat to top gantry height (home
- * effectively) before x/y moves". Default 328 = home Z on the A350 (operator
- * decision 2026-09-14: the earlier 320 left 8 mm of unverified headroom over
- * the rotary landmark's clearance 328 - its tailstock is unmeasured - and the
- * crossing-landmark exemption at traverse height covered that up). Override
- * via configstore mcpSafeTraverseZ. In-procedure sub-motions keep their own
- * tool-specific envelopes and are checked against landmarks like any low
- * segment; every procedure ends raised to this height.
+ * The PARK height: where a procedure hops between stations, retreats to on an
+ * abort, and ends. Default 328 = home Z on the A350. Override via configstore
+ * mcpSafeTraverseZ.
+ *
+ * This was also the minimum Z for any XY move until 2026-09-19, which is why
+ * it sits at the ceiling: the rotary landmark declares clearance 328 because
+ * that number had to cover a fitted touch probe, so the floor had to rise to
+ * meet it (README, job 34d787bdb2d7). With clearances stated as obstacle
+ * heights and the tool added at check time, the two can be separated again -
+ * see motionFloorZ below.
  */
 export const DEFAULT_SAFE_TRAVERSE_Z = 328;
 
 export function safeTraverseZ(): number {
     const raw = Number(config.get('mcpSafeTraverseZ'));
     return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SAFE_TRAVERSE_Z;
+}
+
+/**
+ * The MOTION FLOOR: the lowest machine Z at which an XY move over 1 mm may
+ * happen at all - law 2, which after the 2026-09-01 probe crash read "always
+ * retreat to top gantry height before x/y moves".
+ *
+ * Operator decision 2026-09-19: transport is allowed at 320 and above rather
+ * than only at the park height, with the heartbeat's float noise tolerated
+ * (so 319.95 up). What made that safe is that obstacle clearances are no
+ * longer a blanket ceiling: a landmark states its own height, the fitted
+ * tool's protrusion and a margin are added when a path is checked, and the
+ * traverse-height exemption from crossing checks stays REMOVED - a hop at 320
+ * is checked against every stored box exactly like any low segment.
+ *
+ * The residual risk is what the registry does not know about: 8 mm less blind
+ * protection for anything on the bed that has no landmark. Override via
+ * configstore mcpMotionFloorZ, which is the one setting that reverts this.
+ */
+export const DEFAULT_MOTION_FLOOR_Z = 320;
+
+export function motionFloorZ(): number {
+    const raw = Number(config.get('mcpMotionFloorZ'));
+    const floor = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MOTION_FLOOR_Z;
+    // Never above the park height: a floor the machine cannot legally sit at
+    // would refuse every traverse, which is the failure this replaced.
+    return Math.min(floor, safeTraverseZ());
 }
 
 export interface PositionSnapshot {

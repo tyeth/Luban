@@ -16,7 +16,13 @@ import { clearanceOptions } from '../clearanceContext';
 import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
-import { assertFreshHeartbeat, PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import {
+    assertFreshHeartbeat,
+    PositionSnapshot,
+    getMachineSizeByIdentifier,
+    getPositionSnapshot,
+    motionFloorZ,
+} from './machine';
 import { reliableForMotion } from '../machinePosition';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
@@ -330,11 +336,11 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     // about what is on the bed.
     const machineZ = before.machine.z;
     if (args.operator_confirmed_clearance !== true && machineZ !== null) {
-        const traverseFloor = safeTraverseZ();
+        const traverseFloor = motionFloorZ();
         // Tolerance: home reports 327.999 for Z328 (heartbeat float noise).
         if (machineZ < traverseFloor - TRAVERSE_Z_TOLERANCE_MM) {
-            throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the safe `
-                + `traverse height ${traverseFloor} (top gantry). Retreat Z first (move_z, operator-`
+            throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the motion `
+                + `floor ${traverseFloor} (law 2). Retreat Z first (move_z, operator-`
                 + 'confirmed), then traverse, then descend at the destination. Only the operator\'s '
                 + 'explicit word (operator_confirmed_clearance: true) authorises a lower corridor.');
         }

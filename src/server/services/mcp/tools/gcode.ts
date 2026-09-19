@@ -16,7 +16,14 @@ import { McpToolError, ToolRegistry } from '../registry';
 import { planTraverseXy } from '../traversePlan';
 import { JobFrame, TRANSPORT_REFUSAL, isPureTransport, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
-import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import {
+    PositionSnapshot,
+    assertFreshHeartbeat,
+    getMachineSizeByIdentifier,
+    getPositionSnapshot,
+    motionFloorZ,
+    safeTraverseZ,
+} from './machine';
 
 // Motion policy (#23): compound motion leaves this process only as a G-code
 // file submitted through the same prepare/start path as "Start on Luban",
@@ -960,6 +967,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     originOffset: position.originOffset,
                     bounds: size ? { min: { x: 0, y: 0, z: 0 }, max: { x: size.x, y: size.y, z: size.z } } : null,
                     traverseZ: safeTraverseZ(),
+                    motionFloorZ: motionFloorZ(),
                     feedRate,
                     obstacles: landmarkStore.obstacleBoxes(),
                     ...clearanceOptions(),

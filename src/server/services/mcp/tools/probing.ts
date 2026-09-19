@@ -25,7 +25,12 @@ import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
-import { getMachineSizeByIdentifier, getPositionSnapshot, requireReliableMachine, safeTraverseZ } from './machine';
+import {
+    getMachineSizeByIdentifier,
+    getPositionSnapshot,
+    motionFloorZ,
+    requireReliableMachine,
+} from './machine';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -565,9 +570,9 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             if (x === null || y === null || z === null) {
                 throw new McpToolError('Current machine position unknown.');
             }
-            if (z < safeTraverseZ() - TRAVERSE_Z_TOLERANCE_MM && args.operator_confirmed_clearance !== true) {
-                throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the safe traverse height `
-                    + `${safeTraverseZ()} (top gantry - operator law for all X/Y motion) - raise Z `
+            if (z < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM && args.operator_confirmed_clearance !== true) {
+                throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the motion floor `
+                    + `${motionFloorZ()} (law 2 - the lowest Z any X/Y move may happen at) - raise Z `
                     + '(move_z), or pass operator_confirmed_clearance: true only on the operator\'s '
                     + 'explicit word that this Z clears everything on the bed.');
             }

@@ -24,7 +24,7 @@ import {
     RaiseToTopPhases,
 } from './probing';
 import { McpToolError } from './registry';
-import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
+import { getPositionSnapshot, motionFloorZ, safeTraverseZ } from './tools/machine';
 
 const log = logger('service:mcp:tool-setter');
 
@@ -405,9 +405,9 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             // after the 2026-09-01 probe crash) - the bit never sweeps across
             // the bed below the safe traverse Z.
             const z = position.machine.z;
-            if (z === null || z < safeTraverseZ() - TRAVERSE_Z_TOLERANCE_MM) {
+            if (z === null || z < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM) {
                 throw new ProcedureAbort(`XY travel to the setter refused at machine Z ${z === null ? 'unknown' : z.toFixed(1)} - `
-                    + `below the safe traverse height ${safeTraverseZ()}. Raise Z first (move_z, operator-confirmed).`);
+                    + `below the motion floor ${motionFloorZ()}. Raise Z first (move_z, operator-confirmed).`);
             }
             announce('travel-xy', z, `XY to (${c.centerX}, ${c.centerY})`);
             await moveMachineSettled('toolsetter:travel', { x: c.centerX, y: c.centerY }, TRAVEL_FEED);
