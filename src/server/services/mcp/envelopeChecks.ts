@@ -9,12 +9,16 @@
 //
 // No machine or server imports: unit-testable with ts-node.
 
+import { ClearanceBasis } from './landmarkClearance';
+
 export interface ObstacleBox {
     name: string;
     /** Machine-coordinate XY extent. */
     machine: { x0: number; y0: number; x1: number; y1: number };
-    /** Minimum safe TOOLHEAD machine Z over the box (operator-set, tool length included). */
+    /** The clearance height, meaning whatever `clearanceBasis` says it is measured to. */
     clearanceZ: number;
+    /** Defaults to the legacy 'toolhead' basis when absent. */
+    clearanceBasis?: ClearanceBasis;
     /**
      * What the box forbids below its clearance:
      *  - 'crossing': entering or leaving the box on a low horizontal path
