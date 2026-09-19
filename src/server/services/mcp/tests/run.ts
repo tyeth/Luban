@@ -17,6 +17,7 @@ import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
+import { tests as toolProtrusionTests } from './toolProtrusion.test';
 import { tests as traversePlanTests } from './traversePlan.test';
 import { tests as validatorTests } from './validator.test';
 
@@ -27,6 +28,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['machinePosition', machinePositionTests],
     ['envelopeChecks', envelopeChecksTests],
     ['frameRecovery', frameRecoveryTests],
+    ['toolProtrusion', toolProtrusionTests],
     ['traversePlan', traversePlanTests],
     ['jobEnding', jobEndingTests],
     ['landmarkClearance', landmarkClearanceTests],

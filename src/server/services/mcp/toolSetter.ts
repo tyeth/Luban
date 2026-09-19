@@ -73,7 +73,14 @@ export interface ToolSetterConfig {
 /** One completed tool setter measurement, kept for tool-change offsets. */
 export interface ToolMeasurement {
     measuredTriggerZ: number;
+    /** The length DECLARED to plan the descent. */
     bitLengthMm: number;
+    /**
+     * What the tool actually protrudes, derived from the trigger against the
+     * stored reference. Clearance checks read this (toolProtrusion.ts);
+     * absent on measurements recorded before it was kept.
+     */
+    derivedBitLengthMm?: number;
     spreadMm: number;
     at: number;
 }
@@ -99,6 +106,7 @@ function parseMeasurement(raw: unknown): ToolMeasurement | null {
     return {
         measuredTriggerZ: Number(m.measuredTriggerZ),
         bitLengthMm: Number(m.bitLengthMm),
+        derivedBitLengthMm: Number.isFinite(Number(m.derivedBitLengthMm)) ? Number(m.derivedBitLengthMm) : undefined,
         spreadMm: Number(m.spreadMm) || 0,
         at: Number(m.at),
     };
@@ -560,6 +568,9 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         recordMeasurement({
             measuredTriggerZ: measuredZ,
             bitLengthMm: plan.bitLengthMm,
+            // What the tool ACTUALLY protrudes, as opposed to the length that
+            // was declared to plan the descent. Clearance checks read this.
+            derivedBitLengthMm: Number(derivedBitLengthMm.toFixed(3)),
             spreadMm,
             at: Date.now(),
         });
