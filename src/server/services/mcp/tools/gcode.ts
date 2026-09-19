@@ -13,7 +13,7 @@ import { probeFeedService } from '../probeFeed';
 import { clearProcedureStop, procedureStopRequested, requestProcedureStop } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
 import { planTraverseXy } from '../traversePlan';
-import { JobFrame, resolveJobFrame, validateGcode } from '../validator';
+import { JobFrame, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
 import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 
@@ -277,6 +277,19 @@ function watchFileJobCompletion(job: McpJob): void {
     }
 }
 
+/**
+ * Append a corrected draft to a staging refusal when the fix is mechanical.
+ * The submitted file is never edited - this is the program the agent should
+ * have written, handed over so a refusal costs one re-submit instead of a
+ * round trip through prose.
+ */
+function describeSuggestion(suggestion: { gcode: string; changes: string[] } | null): string {
+    if (!suggestion) {
+        return '';
+    }
+    return `\n\nRe-submit this instead (${suggestion.changes.join('; ')}):\n${suggestion.gcode}`;
+}
+
 export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
         name: 'validate_gcode',
@@ -294,7 +307,15 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (typeof args.gcode !== 'string' || !args.gcode.trim()) {
                 throw new McpToolError('gcode must be a non-empty string.');
             }
-            return validateGcode(args.gcode) as unknown as object;
+            const report = validateGcode(args.gcode);
+            const suggestion = suggestGcode(args.gcode, report);
+            return {
+                ...report,
+                // Present only when the fix is mechanical and the corrected
+                // draft re-validates clean; your file is never edited.
+                suggested_gcode: suggestion ? suggestion.gcode : null,
+                suggested_changes: suggestion ? suggestion.changes : [],
+            } as unknown as object;
         },
     });
 
@@ -343,7 +364,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             // confirm page. The gcode itself is never edited to add a declaration.
             const resolved = resolveJobFrame(validateGcode(args.gcode), stagingFrameContext(frameArgument));
             if (resolved.refusal) {
-                throw new McpToolError(resolved.refusal);
+                throw new McpToolError(resolved.refusal + describeSuggestion(suggestGcode(args.gcode, resolved.report)));
             }
             const validation = resolved.report;
             const job = jobManager.submit(args.gcode, args.name, headType, validation);

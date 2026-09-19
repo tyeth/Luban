@@ -1,6 +1,13 @@
 import { strict as assert } from 'assert';
 
-import { FRAME_REFUSAL_NO_RESTORE, FRAME_REFUSAL_UNDECLARED, FrameResolutionContext, resolveJobFrame, validateGcode } from '../validator';
+import {
+    FRAME_REFUSAL_NO_RESTORE,
+    FRAME_REFUSAL_UNDECLARED,
+    FrameResolutionContext,
+    resolveJobFrame,
+    suggestGcode,
+    validateGcode,
+} from '../validator';
 
 const A350 = { machineZMax: 330 };
 
@@ -168,5 +175,55 @@ export const tests: Array<[string, () => void]> = [
         const bad = resolveJobFrame(validateGcode('G90\nG54;\nG0 X5;\nG53;\nG0 X160;\n'), ctx());
         assert.equal(bad.report.frame.endsInFrame, 'machine');
         assert.equal(bad.refusal, FRAME_REFUSAL_NO_RESTORE);
+    }],
+
+    // A6: a refusal whose fix is mechanical hands back the corrected program.
+    ['the inline-G53 refusal comes with G53 on its own line - and the draft re-validates clean', () => {
+        const gcode = 'G90\nG53 G0 X160 Y175\n';
+        const suggestion = suggestGcode(gcode, validateGcode(gcode));
+        assert.ok(suggestion, 'a suggestion is offered');
+        const fixed = (suggestion as NonNullable<typeof suggestion>).gcode;
+        assert.equal(fixed, 'G90\nG53;\nG0 X160 Y175\nG54;');
+        const after = validateGcode(fixed);
+        assert.deepEqual(after.frame.inlineG53Lines, []);
+        assert.equal(after.frame.declared, 'machine');
+        assert.equal(after.frame.endsInFrame, 'work');
+        assert.equal(resolveJobFrame(after, ctx()).refusal, null, 'the draft would stage');
+    }],
+
+    ['a file that moves before stating its distance mode gets G90 first', () => {
+        const gcode = 'G53;\nG0 X160 Y175;\nG54;';
+        const suggestion = suggestGcode(gcode, validateGcode(gcode));
+        assert.ok(suggestion);
+        const fixed = (suggestion as NonNullable<typeof suggestion>).gcode;
+        assert.ok(fixed.startsWith('G90\n'), fixed);
+        assert.equal(validateGcode(fixed).assumesDistanceMode, false);
+        assert.ok((suggestion as NonNullable<typeof suggestion>).changes.some((c) => /G90 added first/.test(c)));
+    }],
+
+    ['a file that ends in the machine frame gets G54 last', () => {
+        const gcode = 'G90\nG53;\nG0 X160 Y175;\n';
+        const suggestion = suggestGcode(gcode, validateGcode(gcode));
+        assert.ok(suggestion);
+        const fixed = (suggestion as NonNullable<typeof suggestion>).gcode;
+        assert.equal(fixed, 'G90\nG53;\nG0 X160 Y175;\nG54;');
+        assert.equal(validateGcode(fixed).frame.endsInFrame, 'work');
+    }],
+
+    ['the live 2026-09-19 centre move, corrected in one pass', () => {
+        // What the agent actually submitted, twice, before getting it right.
+        const gcode = 'G53 G0 X160 Y175 F3000\n';
+        const suggestion = suggestGcode(gcode, validateGcode(gcode));
+        assert.ok(suggestion);
+        const fixed = (suggestion as NonNullable<typeof suggestion>).gcode;
+        assert.equal(fixed, 'G90\nG53;\nG0 X160 Y175 F3000\nG54;');
+        assert.equal(resolveJobFrame(validateGcode(fixed), ctx()).refusal, null);
+        assert.equal((suggestion as NonNullable<typeof suggestion>).changes.length, 3);
+    }],
+
+    ['a clean file gets no suggestion, and nothing is invented', () => {
+        assert.equal(suggestGcode(MOVE_Z_MACHINE, validateGcode(MOVE_Z_MACHINE)), null);
+        assert.equal(suggestGcode(LUBAN_EXPORT, validateGcode(LUBAN_EXPORT)), null,
+            'an undeclared file needs a DECISION about its frame - no draft is offered');
     }],
 ];

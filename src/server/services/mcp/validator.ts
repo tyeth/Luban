@@ -319,6 +319,82 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     };
 }
 
+const NEWLINE = '\n';
+
+export interface GcodeSuggestion {
+    /** The corrected program, ready to re-submit unchanged. */
+    gcode: string;
+    /** One line per edit, in the order they were made. */
+    changes: string[];
+}
+
+/**
+ * A corrected draft for the refusals whose fix is mechanical.
+ *
+ * The MCP never edits a submitted file - that law stands, and this does not
+ * touch the job. It hands the agent the program it should have written, so a
+ * refusal costs one re-submit instead of a round trip through prose. Live
+ * 2026-09-19 two of six operator approvals were spent re-deriving "put G53 on
+ * its own line" and "declare G90" from refusal text.
+ *
+ * Only three edits are made, all of them mechanical:
+ *   - an inline `G53 G0 ...` is split, because this controller runs the move
+ *     in the selected workspace instead of honouring a one-shot G53;
+ *   - a missing distance mode gets `G90` first, because a file that assumes
+ *     one runs in whatever mode the controller happens to be in;
+ *   - a file that ends with G53 selected gets `G54;` last, because the
+ *     controller keeps that workspace after the job.
+ *
+ * Anything needing a DECISION - which frame an undeclared file meant, whether
+ * a G92 was intended - returns null. A suggestion is only offered when it is
+ * certain, and it is verified by re-validating before it is returned.
+ */
+export function suggestGcode(gcode: string, report: GcodeValidationReport): GcodeSuggestion | null {
+    const changes: string[] = [];
+    const lines = gcode.split(/\r?\n/);
+    const out: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (report.frame.inlineG53Lines.includes(i + 1)) {
+            const indent = (/^\s*/.exec(line) as RegExpExecArray)[0];
+            // Drop the G53 token (with any leading 0s) and keep the rest of the line byte-for-byte.
+            const stripped = line.replace(/\bG0*53\b\s*/i, '');
+            out.push(`${indent}G53;`);
+            out.push(stripped);
+            changes.push(`line ${i + 1}: G53 moved onto its own line before the move (this controller does not honour a one-shot G53)`);
+        } else {
+            out.push(line);
+        }
+    }
+
+    if (report.assumesDistanceMode) {
+        out.unshift('G90');
+        changes.push('G90 added first: the file moved before stating its distance mode');
+    }
+    // Judge the epilogue on the SPLIT program, not the original: an inline
+    // `G53 G0 ...` selects nothing (which is the bug), so only after the split
+    // does the file actually leave the machine workspace selected.
+    if (validateGcode(out.join(NEWLINE)).frame.endsInFrame === 'machine') {
+        while (out.length && out[out.length - 1].trim() === '') {
+            out.pop();
+        }
+        out.push('G54;');
+        changes.push('G54 added last: the file ended with G53 still selected, which leaves the controller reporting machine coordinates');
+    }
+
+    if (!changes.length) {
+        return null;
+    }
+    const suggestion = out.join('\n');
+    // Never hand back a draft that is not itself clean.
+    const after = validateGcode(suggestion);
+    if (after.assumesDistanceMode || after.frame.inlineG53Lines.length || after.frame.endsInFrame === 'machine') {
+        return null;
+    }
+    return { gcode: suggestion, changes };
+}
+
 export interface FrameResolutionContext {
     /** The submit call's `frame` argument, if any. */
     frameArgument?: JobFrame | null;
