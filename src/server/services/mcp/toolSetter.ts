@@ -59,6 +59,13 @@ export interface ToolSetterConfig {
     centerY: number;
     triggerZ: number; // machine Z at trigger with the reference bit fitted
     referenceBitLengthMm: number;
+    /**
+     * Diameter of the setter's contact disc, when the operator has measured
+     * it. Nothing in the tool setter needs it; the camera bootstrap does - a
+     * circle of known size in a frame is an absolute scale constraint that
+     * does not depend on the pose solution.
+     */
+    discDiameterMm?: number;
     longestBitLengthMm: number;
     floorMarginMm: number; // how far below the expected trigger Z to allow
     // Tool-change park position (machine coords), operator preference: on
@@ -123,6 +130,9 @@ export function getToolSetterConfig(): ToolSetterConfig | null {
         centerY: Number(cfg.centerY),
         triggerZ: Number(cfg.triggerZ),
         referenceBitLengthMm: Number(cfg.referenceBitLengthMm),
+        discDiameterMm: Number.isFinite(Number(cfg.discDiameterMm)) && Number(cfg.discDiameterMm) > 0
+            ? Number(cfg.discDiameterMm)
+            : undefined,
         longestBitLengthMm: Number(cfg.longestBitLengthMm),
         floorMarginMm: Number.isFinite(Number(cfg.floorMarginMm)) ? Number(cfg.floorMarginMm) : 3,
         changeX: numberOrNull(cfg.changeX),

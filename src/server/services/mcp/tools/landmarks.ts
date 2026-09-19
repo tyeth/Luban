@@ -150,6 +150,16 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
             properties: {
                 rotary_axis_x: { type: ['number', 'null'], description: 'Machine X of the rotary axis line.' },
                 rotary_axis_z_physical: { type: ['number', 'null'], description: 'Physical machine Z of the axis (not a contact Z).' },
+                rotary_tailstock_y: {
+                    type: ['number', 'null'],
+                    description: 'Machine Y of the tailstock centre. With the axis line this is a fully known 3D '
+                        + 'point, which the camera bootstrap solves against.',
+                },
+                rotary_chuck_face_y: {
+                    type: ['number', 'null'],
+                    description: 'Machine Y of the chuck face. Also settles which end is which - "the non-chuck end" '
+                        + 'stops being a guess.',
+                },
                 probe_effective_length: { type: ['number', 'null'], description: 'Probe effective length in mm (this fitting).' },
                 probe_tip_diameter: { type: ['number', 'null'], description: 'Probe tip diameter in mm.' },
                 reason: { type: 'string', description: 'How the values were obtained (which job / measurement / operator statement).' },
