@@ -9,12 +9,16 @@
 //
 // No machine or server imports: unit-testable with ts-node.
 
+import { CLEARANCE_MARGIN_MM, ClearanceBasis, normaliseClearanceBasis, requiredToolheadZ } from './landmarkClearance';
+
 export interface ObstacleBox {
     name: string;
     /** Machine-coordinate XY extent. */
     machine: { x0: number; y0: number; x1: number; y1: number };
-    /** Minimum safe TOOLHEAD machine Z over the box (operator-set, tool length included). */
+    /** The clearance height, meaning whatever `clearanceBasis` says it is measured to. */
     clearanceZ: number;
+    /** Defaults to the legacy 'toolhead' basis when absent. */
+    clearanceBasis?: ClearanceBasis;
     /**
      * What the box forbids below its clearance:
      *  - 'crossing': entering or leaving the box on a low horizontal path
@@ -48,8 +52,28 @@ export interface Violation {
     obstacle: string;
     /** Lowest toolhead Z the segment reaches while over the (inflated) box. */
     z: number;
+    /** The stored clearance, as stored. */
     clearanceZ: number;
+    /** What that number is measured to. */
+    basis: ClearanceBasis;
+    /**
+     * The toolhead Z actually demanded: the stored number for a 'toolhead'
+     * clearance, obstacle top + tool + margin for a 'physical' one. null when
+     * a physical clearance could not be judged because no tool length is
+     * known - which is itself the violation.
+     */
+    requiredZ: number | null;
 }
+
+/**
+ * The heartbeat's float noise, shared by every comparison of a machine Z
+ * against a stated height. Home reports machine Z 327.9989959716797 for a 328
+ * home (live 2026-09-14): an exact compare refused a traverse from home, and
+ * an exact compare here refused an XY move over a landmark whose clearance is
+ * the traverse height because the live Z read 327.999994 (live 2026-09-19).
+ * `TRAVERSE_Z_TOLERANCE_MM` in traversePlan.ts is this same number.
+ */
+export const POSITION_EPSILON_MM = 0.05;
 
 export const OBSTACLE_MARGIN_MM = 5;
 
@@ -104,14 +128,30 @@ export function pointInBox2D(x: number, y: number, box: { x0: number; y0: number
 export function checkMotion(
     segments: MotionSegment[],
     obstacles: ObstacleBox[],
-    options: { margin?: number; /** informational: the planner's hop height */ traverseZ?: number } = {}
+    options: {
+        margin?: number;
+        /** informational: the planner's hop height */
+        traverseZ?: number;
+        /**
+         * How far the fitted tool hangs below the toolhead (toolProtrusion.ts).
+         * Only a 'physical' clearance needs it; a legacy 'toolhead' one already
+         * has a tool baked in. null/absent makes every physical obstacle
+         * impassable rather than passable.
+         */
+        toolProtrusionMm?: number | null;
+        clearanceMarginMm?: number;
+    } = {}
 ): Violation[] {
     const margin = options.margin === undefined ? OBSTACLE_MARGIN_MM : options.margin;
+    const protrusion = options.toolProtrusionMm === undefined ? null : options.toolProtrusionMm;
+    const clearanceMargin = options.clearanceMarginMm === undefined ? CLEARANCE_MARGIN_MM : options.clearanceMarginMm;
     const out: Violation[] = [];
     for (const seg of segments) {
         const lowZ = Math.min(seg.from.z, seg.to.z);
         for (const ob of obstacles) {
-            if (lowZ >= ob.clearanceZ - 1e-9) {
+            const basis = normaliseClearanceBasis(ob.clearanceBasis);
+            const requiredZ = requiredToolheadZ(ob.clearanceZ, basis, protrusion, clearanceMargin);
+            if (requiredZ !== null && lowZ >= requiredZ - POSITION_EPSILON_MM) {
                 continue;
             }
             // No traverse-height exemption (removed 2026-09-14). The safe
@@ -131,7 +171,14 @@ export function checkMotion(
                 && pointInBox2D(seg.to.x, seg.to.y, ob.machine, margin)) {
                 continue; // wholly inside: the approved procedure works here
             }
-            out.push({ what: seg.what, obstacle: ob.name, z: Number(lowZ.toFixed(3)), clearanceZ: ob.clearanceZ });
+            out.push({
+                what: seg.what,
+                obstacle: ob.name,
+                z: Number(lowZ.toFixed(3)),
+                clearanceZ: ob.clearanceZ,
+                basis,
+                requiredZ,
+            });
         }
     }
     return out;
@@ -139,7 +186,18 @@ export function checkMotion(
 
 export function describeViolations(violations: Violation[]): string {
     return violations
-        .map((v) => `${v.what} reaches toolhead Z ${v.z} over / into "${v.obstacle}" (clearance Z ${v.clearanceZ})`)
+        .map((v) => {
+            if (v.requiredZ === null) {
+                return `${v.what} crosses "${v.obstacle}", whose top is machine Z ${v.clearanceZ}, but no tool length is `
+                    + 'known - so the toolhead Z this needs cannot be computed. State one (set_tool_setter_config '
+                    + 'longest_bit_length_mm, or set_probe_geometry probe_effective_length) and retry';
+            }
+            if (v.basis === 'physical') {
+                return `${v.what} reaches toolhead Z ${v.z} over / into "${v.obstacle}" (top Z ${v.clearanceZ}, `
+                    + `so the toolhead needs Z ${v.requiredZ} with the tool and margin above it)`;
+            }
+            return `${v.what} reaches toolhead Z ${v.z} over / into "${v.obstacle}" (clearance Z ${v.clearanceZ})`;
+        })
         .join('; ');
 }
 

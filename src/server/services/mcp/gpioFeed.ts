@@ -5,6 +5,8 @@ import logger from '../../lib/logger';
 import config from '../configstore';
 import { recordSensorLatency } from './diagnostics';
 import { PROBE_CHANNELS, ProbeChannel, ProbeTransport } from './probeTransport';
+import { EMPTY_PROGRESS, MonitorProgress, describeReadyTimeout } from './probeFeedHealth';
+import { BridgeResetResult, describeBridgeReset, resetStrandedBridges } from './usbBridgeReset';
 
 const log = logger('service:mcp:gpio-feed');
 
@@ -201,6 +203,7 @@ def main():
         emit({'t': 'fatal', 'error': 'Blinka import failed (pip install adafruit-blinka): %s' % err})
         return 1
     board_id = getattr(board, 'board_id', 'unknown')
+    emit({'t': 'progress', 'stage': 'imported', 'board': board_id})
     lines = {}
     for channel, spec in cfg['pins'].items():
         name = spec['pin']
@@ -220,6 +223,7 @@ def main():
             emit({'t': 'fatal', 'error': 'configuring %s (%s) failed: %s' % (name, channel, err)})
             return 1
         lines[channel] = line
+        emit({'t': 'progress', 'stage': 'pin', 'channel': channel, 'pin': name})
     emit({'t': 'ready', 'board': board_id})
     poll_s = cfg['poll_ms'] / 1000.0
     hb_s = cfg['heartbeat_ms'] / 1000.0
@@ -263,6 +267,12 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
     private child: ChildProcess | null = null;
 
     private lineBuffer = '';
+
+    /** How far the current monitor got before it went quiet (describeReadyTimeout). */
+    private progress: MonitorProgress = { ...EMPTY_PROGRESS };
+
+    /** What the last automatic USB reset did, for the status. */
+    private lastBridgeReset: BridgeResetResult | null = null;
 
     private stderrTail = '';
 
@@ -330,8 +340,24 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
             }
             this.child = child;
 
-            const readyTimer = setTimeout(() => {
-                const err = new Error(`GPIO monitor produced no ready line within ${READY_TIMEOUT_MS} ms${this.detailSuffix()}`);
+            this.progress = { ...EMPTY_PROGRESS };
+            const readyTimer = setTimeout(async () => {
+                let detail = describeReadyTimeout(
+                    this.progress,
+                    READY_TIMEOUT_MS,
+                    this.cfg.python,
+                    this.cfg.blinkaEnvText
+                );
+                // A monitor that got as far as loading the board and then
+                // stalled on its first pin is the leaked-claim signature. Clear
+                // it here rather than asking a human to walk over and replug
+                // the board: USBDEVFS_RESET rebinds the kernel driver and needs
+                // no root (the device node carries a plugdev ACL).
+                if (this.progress.stage === 'imported' && !this.progress.pinsDone.length) {
+                    this.lastBridgeReset = await resetStrandedBridges(this.cfg.python);
+                    detail += describeBridgeReset(this.lastBridgeReset);
+                }
+                const err = new Error(detail);
                 settle(err);
                 this.fail(err);
             }, READY_TIMEOUT_MS);
@@ -418,14 +444,46 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
             python: this.cfg.python,
             blinkaEnv: this.cfg.blinkaEnvText,
             pollMs: this.cfg.pollMs,
-            board: this.boardId,
+            board: this.boardId || this.progress.board,
             bridge: this.bridgeState(),
+            monitorProgress: this.ready ? null : this.progress,
+            lastBridgeReset: this.lastBridgeReset,
             monitorPid: this.child ? this.child.pid : null,
             configSources: this.cfg.sources,
         };
     }
 
+    /** Channels with a pin configured, in the order the monitor walks them. */
+    private pinChannels(): string[] {
+        return PROBE_CHANNELS.filter((channel) => this.cfg.pins[channel]);
+    }
+
+    private firstPinChannel(): string | null {
+        return this.pinChannels()[0] || null;
+    }
+
+    private nextPinChannel(done: string[]): string | null {
+        return this.pinChannels().find((channel) => !done.includes(channel)) || null;
+    }
+
     private onMonitorMessage(message: { t?: string; [key: string]: unknown }, onReady: () => void): void {
+        if (message.t === 'progress') {
+            // How far the monitor got. Only read when it never reaches ready,
+            // and then it is the difference between "install Blinka" and
+            // "replug the board".
+            if (message.stage === 'imported') {
+                this.progress = { stage: 'imported', board: String(message.board || 'unknown'), pinsDone: [], stuckOn: this.firstPinChannel() };
+            } else if (message.stage === 'pin') {
+                const done = [...this.progress.pinsDone, String(message.channel)];
+                this.progress = {
+                    stage: 'pin',
+                    board: this.progress.board,
+                    pinsDone: done,
+                    stuckOn: this.nextPinChannel(done),
+                };
+            }
+            return;
+        }
         if (message.t === 'ready') {
             this.ready = true;
             this.boardId = String(message.board || 'unknown');

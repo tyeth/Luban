@@ -1,4 +1,4 @@
-# Luban MCP tool surface (48 tools)
+# Luban MCP tool surface (54 tools)
 
 Terse per-tool reference. Machines: A350 = CNC, F350 = printer. Motion tools stage a job and
 need one operator click on the confirm page; nothing moves on an agent's word alone. Results
@@ -28,9 +28,11 @@ session.
 - `home` — machine home (`G53;G28;G54`; also homes B). Default first step after (re)connecting; raises Z first and clears the NOT-HOMED state. It is not a remedy for a `get_position` reliability of `awaiting-resync` or `stale` — a rejected or aged beat is a reporting fault, not a position fault, and motion is refused until the record recovers on its own (next coherent beat, ~2 s).
 - `goto_work_origin` — move to work X0 Y0. Distinct from `home`.
 - `move_z {z | z_targets[], coordinate_system: "machine"|"work", feed_rate?, reason}` — single Z target or a batch; one approval covers the list, one `start_gcode_job` per step. Only on the operator's explicit request.
-- `traverse_xy {x?, y? | targets: [{x?, y?}], coordinate_system?: "machine" (default) | "work", feed_rate?, reason}` — law-2 TRANSPORT: an absolute XY target or an ordered `targets` series at the traverse height (machine Z328), one approval, one `start_gcode_job` per leg, like `move_z`. Refused unless the head is already at/above `mcpSafeTraverseZ` (no override); every leg checked against landmarks and the travel; Z never written; default frame machine (`G53` per step). Use this, never a hand-written file job, to move the head.
+- `traverse_xy {x?, y? | targets: [{x?, y?}], coordinate_system?: "machine" (default) | "work", feed_rate?, reason}` — law-2 TRANSPORT: an absolute XY target or an ordered `targets` series at the height the head is already at (>= the motion floor), one approval, one `start_gcode_job` per leg, like `move_z`. Refused unless the head is already at/above `mcpMotionFloorZ` (default 320; no override); every leg checked against landmarks and the travel; Z never written; default frame machine (`G53` per step). Use this, never a hand-written file job, to move the head.
 - `move_and_capture` — one guarded XY move followed by a position-stamped frame; the unit of visual alignment.
 - `goto_tool_change_position` — two approved steps: Z up, then XY to the operator-set park spot.
+
+- `restore_work_frame {reason?}` — `G90` + `G54` on their own lines, NO MOTION. The cure for a controller left in the machine workspace by a job that declared `G53` and never handed the frame back: every beat then carries machine coordinates with the work-origin offset still populated, `raw − offset` is impossible, and the position of record refuses everything - including this, which is why it is explicitly allowed while `awaiting-resync` or `stale`. Reports the position before and after. A re-home is not the remedy.
 
 ## Camera and vision
 
@@ -41,8 +43,18 @@ session.
 - `set_camera_calibration` — Y/Z-keyed pixel-to-mm calibration, optional `surface` depth tag and `jacobian`. Sign-flipped matrices are rejected.
 - `get_camera_calibration` / `delete_camera_calibration` — read or remove a stored calibration.
 - `visual_servo` — one clamped step toward a seen target per call. Trips when the error stops shrinking or the response diverges from the calibration prediction (parallax signature).
-- `survey_bed` — approved serpentine XY camera grid at gantry height; whole-bed mosaic for finding stock and fixtures.
+- `survey_bed` — approved serpentine XY camera grid at gantry height; whole-bed mosaic for finding stock and fixtures. New: `overlap_fraction` + `plane_z` derive the pitch from the camera model's real field of view ("seamless" is a relationship between pitch and field of view, and a picked pitch is not one); `z_levels` runs the grid at several heights under ONE approval, each entered with XY stationary; with a verified model each pass is composed into `mosaic_z<Z>.jpg` indexed in machine coordinates, and the seams double as a drift check that marks the model unverified when overlapping frames disagree.
 - *(not a tool)* Live view for humans: `GET /camera` on the MCP port (`stream_url` above) — MJPEG at `/camera/stream.mjpeg`, one JPEG at `/camera/snapshot.jpg`, `/camera/status.json`. Same LAN gate as `/mcp`; off (Settings → MCP Server → Camera) = 404.
+
+### The camera model (the camera is SESSION STATE, not a rig constant)
+
+It can sit differently after every power cycle, be knocked, be re-aimed, or be a different camera. Nothing converts a pixel into a machine coordinate, or a machine coordinate into a pose, until a model is solved AND verified on this connection. Plain captures never need one.
+
+- `get_camera_model {history?}` — the model, its state (verified | unverified | superseded), why it is not usable, and which tool fixes it. Read-only.
+- `verify_camera_model {target, pixel_u, pixel_v, tolerance_px?}` — predict where a target of known machine coordinates should appear at the CURRENT toolhead position, compare with where it does, record the residual in px and mm. **The first camera call of any session.** Beyond tolerance the model stays unverified and says the camera has probably moved. No motion - position with `traverse_xy` first.
+- `camera_bootstrap {stage, reason, ...}` — solve the geometry FROM NOTHING, two staged procedures, one approval each. `stage: "search"`: a grid at the park height bracketing the tool setter, whose machine XY is known exactly - which frames contain it gives the camera offset INCLUDING ITS SIGN with no prior assumption, and it is the only step meaningful without a calibration. `stage: "poses"`: the poses that implies, each sweeping Z from the park height to the motion floor with XY stationary. A pose the TOOLHEAD cannot reach is dropped with a reason, never quietly adjusted.
+- `set_camera_model {offset, rotation, intrinsics, valid_band_z, central_region, residuals, ...}` — store a solve from `scripts/camera_bootstrap.py`. Always stored UNVERIFIED; the previous model is kept superseded, never overwritten.
+- `plan_view_pose {target, toolhead_z?}` — where must the TOOLHEAD go to see this machine point? Returns the pose, the standoff and the field of view, from the model. Use it instead of computing a pose; never carry one between sessions.
 
 ## Landmarks and scene
 

@@ -5,7 +5,8 @@ import * as fs from 'fs-extra';
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpJob, TERMINAL_JOB_STATES, approvalHandoff, jobManager } from '../jobs';
-import { classifyProcedureEnding, countMeasured } from '../jobEnding';
+import { clearanceOptions } from '../clearanceContext';
+import { classifyProcedureEnding, countMeasured, planJobStop } from '../jobEnding';
 import { summarizeJobTiming } from '../jobTiming';
 import { landmarkStore } from '../landmarks';
 import { matchFrame } from '../positionOfRecord';
@@ -13,9 +14,16 @@ import { probeFeedService } from '../probeFeed';
 import { clearProcedureStop, procedureStopRequested, requestProcedureStop } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
 import { planTraverseXy } from '../traversePlan';
-import { JobFrame, resolveJobFrame, validateGcode } from '../validator';
+import { JobFrame, TRANSPORT_REFUSAL, isPureTransport, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
-import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import {
+    PositionSnapshot,
+    assertFreshHeartbeat,
+    getMachineSizeByIdentifier,
+    getPositionSnapshot,
+    motionFloorZ,
+    safeTraverseZ,
+} from './machine';
 
 // Motion policy (#23): compound motion leaves this process only as a G-code
 // file submitted through the same prepare/start path as "Start on Luban",
@@ -277,6 +285,19 @@ function watchFileJobCompletion(job: McpJob): void {
     }
 }
 
+/**
+ * Append a corrected draft to a staging refusal when the fix is mechanical.
+ * The submitted file is never edited - this is the program the agent should
+ * have written, handed over so a refusal costs one re-submit instead of a
+ * round trip through prose.
+ */
+function describeSuggestion(suggestion: { gcode: string; changes: string[] } | null): string {
+    if (!suggestion) {
+        return '';
+    }
+    return `\n\nRe-submit this instead (${suggestion.changes.join('; ')}):\n${suggestion.gcode}`;
+}
+
 export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
         name: 'validate_gcode',
@@ -294,7 +315,15 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (typeof args.gcode !== 'string' || !args.gcode.trim()) {
                 throw new McpToolError('gcode must be a non-empty string.');
             }
-            return validateGcode(args.gcode) as unknown as object;
+            const report = validateGcode(args.gcode);
+            const suggestion = suggestGcode(args.gcode, report);
+            return {
+                ...report,
+                // Present only when the fix is mechanical and the corrected
+                // draft re-validates clean; your file is never edited.
+                suggested_gcode: suggestion ? suggestion.gcode : null,
+                suggested_changes: suggestion ? suggestion.changes : [],
+            } as unknown as object;
         },
     });
 
@@ -341,9 +370,16 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             // The frame handshake (operator law 2026-09-14): an agent-authored job
             // must say which coordinate frame it runs in, or it does not reach the
             // confirm page. The gcode itself is never edited to add a declaration.
-            const resolved = resolveJobFrame(validateGcode(args.gcode), stagingFrameContext(frameArgument));
+            const inspected = validateGcode(args.gcode);
+            // Transport has tools. A hand-written transit is the path that
+            // produced both the undeclared-frame job of 2026-09-12 and the
+            // G53-stranded controller of 2026-09-19.
+            if (headType === 'cnc' && isPureTransport(inspected)) {
+                throw new McpToolError(TRANSPORT_REFUSAL);
+            }
+            const resolved = resolveJobFrame(inspected, stagingFrameContext(frameArgument));
             if (resolved.refusal) {
-                throw new McpToolError(resolved.refusal);
+                throw new McpToolError(resolved.refusal + describeSuggestion(suggestGcode(args.gcode, resolved.report)));
             }
             const validation = resolved.report;
             const job = jobManager.submit(args.gcode, args.name, headType, validation);
@@ -931,8 +967,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     originOffset: position.originOffset,
                     bounds: size ? { min: { x: 0, y: 0, z: 0 }, max: { x: size.x, y: size.y, z: size.z } } : null,
                     traverseZ: safeTraverseZ(),
+                    motionFloorZ: motionFloorZ(),
                     feedRate,
                     obstacles: landmarkStore.obstacleBoxes(),
+                    ...clearanceOptions(),
                     reason,
                 });
             } catch (err) {
@@ -1065,7 +1103,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             + 'run_tool_setter, survey) is a server-driven loop, so it stops at the next step boundary (within one '
             + '<= 1 mm step or sensor window), raises the head to the traverse height and keeps every completed '
             + 'station / contact / op on the job record (result, state "stopped"); this call waits up to wait_ms for '
-            + 'that. A FILE job is stopped on the machine (firmware stop_print). Result: {ok, stopped, stopping, job}.',
+            + 'that. A job that never reached the machine (any kind, awaiting confirmation or approved but not '
+            + 'started) is WITHDRAWN: it is marked stopped here and its confirm link dies, so an approval cannot '
+            + 'start it later. A file/direct job already handed over is stopped on the machine (firmware '
+            + 'stop_print). Result: {ok, stopped, stopping, withdrawn, note, job}.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1080,18 +1121,25 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
             }
-            if (job.kind === 'procedure') {
-                if (TERMINAL_JOB_STATES.includes(job.state)) {
-                    return { ok: true, stopped: true, stopping: false, note: `Procedure already ${job.state}.`, job: jobManager.describe(job) };
+            const plan = planJobStop(job.kind, job.state);
+            if (plan.action === 'already-ended') {
+                return { ok: true, stopped: true, stopping: false, withdrawn: false, note: plan.note, job: jobManager.describe(job) };
+            }
+            if (plan.action === 'withdraw') {
+                // Never handed to the machine: withdraw it here so the operator's
+                // confirm link cannot start it later. Before this only procedures
+                // were withdrawn and a staged file/direct job stayed approvable.
+                job.state = 'stopped';
+                job.endedAt = Date.now();
+                job.ending = { kind: 'withdrawn', reason: 'withdrawn by the agent before it started', at: job.endedAt };
+                job.confirmToken = null;
+                jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
+                if (jobManager.getActive() === job) {
+                    jobManager.setActive(null);
                 }
-                if (job.state !== 'started') {
-                    // Not running yet: withdraw it so the approval cannot start it later.
-                    job.state = 'stopped';
-                    job.endedAt = Date.now();
-                    job.ending = { kind: 'withdrawn', reason: 'withdrawn by the agent before it started', at: job.endedAt };
-                    jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
-                    return { ok: true, stopped: true, stopping: false, note: 'Procedure withdrawn before it started.', job: jobManager.describe(job) };
-                }
+                return { ok: true, stopped: true, stopping: false, withdrawn: true, note: plan.note, job: jobManager.describe(job) };
+            }
+            if (plan.action === 'request-procedure-stop') {
                 const request = requestProcedureStop('stop_gcode_job by the agent');
                 jobManager.appendEvent(job, 'stop-requested', { note: 'stop requested by the agent; the runner stops at the next step boundary and raises' });
                 const waitMs = Math.min(Math.max(Number(args.wait_ms) || 20000, 0), 120000);
@@ -1104,6 +1152,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     ok: true,
                     stopped,
                     stopping: !stopped,
+                    withdrawn: false,
                     requestedAt: request.requestedAt,
                     note: stopped
                         ? `Procedure ${job.state} (${job.ending ? job.ending.kind : 'ending unknown'}${job.ending && job.ending.measured !== undefined ? `, ${job.ending.measured} measured` : ''}); `
@@ -1128,7 +1177,11 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             }
             return {
                 ok: stopped.ok,
+                stopped: stopped.ok,
+                stopping: false,
+                withdrawn: false,
                 text: stopped.text || null,
+                note: plan.note,
                 job: jobManager.describe(job),
             };
         },

@@ -24,7 +24,7 @@ import {
     RaiseToTopPhases,
 } from './probing';
 import { McpToolError } from './registry';
-import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
+import { getPositionSnapshot, motionFloorZ, safeTraverseZ } from './tools/machine';
 
 const log = logger('service:mcp:tool-setter');
 
@@ -59,6 +59,13 @@ export interface ToolSetterConfig {
     centerY: number;
     triggerZ: number; // machine Z at trigger with the reference bit fitted
     referenceBitLengthMm: number;
+    /**
+     * Diameter of the setter's contact disc, when the operator has measured
+     * it. Nothing in the tool setter needs it; the camera bootstrap does - a
+     * circle of known size in a frame is an absolute scale constraint that
+     * does not depend on the pose solution.
+     */
+    discDiameterMm?: number;
     longestBitLengthMm: number;
     floorMarginMm: number; // how far below the expected trigger Z to allow
     // Tool-change park position (machine coords), operator preference: on
@@ -73,7 +80,14 @@ export interface ToolSetterConfig {
 /** One completed tool setter measurement, kept for tool-change offsets. */
 export interface ToolMeasurement {
     measuredTriggerZ: number;
+    /** The length DECLARED to plan the descent. */
     bitLengthMm: number;
+    /**
+     * What the tool actually protrudes, derived from the trigger against the
+     * stored reference. Clearance checks read this (toolProtrusion.ts);
+     * absent on measurements recorded before it was kept.
+     */
+    derivedBitLengthMm?: number;
     spreadMm: number;
     at: number;
 }
@@ -99,6 +113,7 @@ function parseMeasurement(raw: unknown): ToolMeasurement | null {
     return {
         measuredTriggerZ: Number(m.measuredTriggerZ),
         bitLengthMm: Number(m.bitLengthMm),
+        derivedBitLengthMm: Number.isFinite(Number(m.derivedBitLengthMm)) ? Number(m.derivedBitLengthMm) : undefined,
         spreadMm: Number(m.spreadMm) || 0,
         at: Number(m.at),
     };
@@ -115,6 +130,9 @@ export function getToolSetterConfig(): ToolSetterConfig | null {
         centerY: Number(cfg.centerY),
         triggerZ: Number(cfg.triggerZ),
         referenceBitLengthMm: Number(cfg.referenceBitLengthMm),
+        discDiameterMm: Number.isFinite(Number(cfg.discDiameterMm)) && Number(cfg.discDiameterMm) > 0
+            ? Number(cfg.discDiameterMm)
+            : undefined,
         longestBitLengthMm: Number(cfg.longestBitLengthMm),
         floorMarginMm: Number.isFinite(Number(cfg.floorMarginMm)) ? Number(cfg.floorMarginMm) : 3,
         changeX: numberOrNull(cfg.changeX),
@@ -397,9 +415,9 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             // after the 2026-09-01 probe crash) - the bit never sweeps across
             // the bed below the safe traverse Z.
             const z = position.machine.z;
-            if (z === null || z < safeTraverseZ() - TRAVERSE_Z_TOLERANCE_MM) {
+            if (z === null || z < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM) {
                 throw new ProcedureAbort(`XY travel to the setter refused at machine Z ${z === null ? 'unknown' : z.toFixed(1)} - `
-                    + `below the safe traverse height ${safeTraverseZ()}. Raise Z first (move_z, operator-confirmed).`);
+                    + `below the motion floor ${motionFloorZ()}. Raise Z first (move_z, operator-confirmed).`);
             }
             announce('travel-xy', z, `XY to (${c.centerX}, ${c.centerY})`);
             await moveMachineSettled('toolsetter:travel', { x: c.centerX, y: c.centerY }, TRAVEL_FEED);
@@ -560,6 +578,9 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         recordMeasurement({
             measuredTriggerZ: measuredZ,
             bitLengthMm: plan.bitLengthMm,
+            // What the tool ACTUALLY protrudes, as opposed to the length that
+            // was declared to plan the descent. Clearance checks read this.
+            derivedBitLengthMm: Number(derivedBitLengthMm.toFixed(3)),
             spreadMm,
             at: Date.now(),
         });

@@ -7,6 +7,7 @@ import { connectionManager } from '../machine/ConnectionManager';
 import { GpioProbeTransport, describePin, resolveGpioFeedConfig } from './gpioFeed';
 import { mcpBroadcast } from './index';
 import { MqttClient } from './mqtt';
+import { describeFeedHealth } from './probeFeedHealth';
 import { PROBE_CHANNELS, ProbeChannel, ProbeTransport, ProbeTransportKind, ReadingMeta } from './probeTransport';
 import { McpToolError } from './registry';
 
@@ -512,6 +513,9 @@ export class ProbeFeedService {
 
     private lastError: string | null = null;
 
+    /** When the feed first failed on this run; null while it is healthy. */
+    private downSince: number | null = null;
+
     /**
      * Start (or keep) the feed connection. Idempotent; reconnection with
      * backoff is automatic until disconnect() is called. Resolves once the
@@ -669,6 +673,18 @@ export class ProbeFeedService {
             safetyTrip: this.trip,
             reconnectAttempts: this.reconnectAttempts,
             lastError: this.lastError,
+            downForMs: this.downSince === null ? null : Date.now() - this.downSince,
+            // The sentence that was missing on 2026-09-19: a dead bridge
+            // should not be something you discover by trying to probe.
+            ...describeFeedHealth({
+                configured: cfg.configured,
+                connected: this.isConnected(),
+                connecting: this.connecting,
+                disabledSensors: cfg.disabled,
+                downForMs: this.downSince === null ? null : Date.now() - this.downSince,
+                reconnectAttempts: this.reconnectAttempts,
+                lastError: this.lastError,
+            }),
         };
     }
 
@@ -709,6 +725,7 @@ export class ProbeFeedService {
             this.connecting = false;
             this.reconnectAttempts = 0;
             this.lastError = null;
+            this.downSince = null;
             mcpBroadcast('mcp:activity', { tool: 'probe_feed', phase: 'connected', transport: cfg.kind });
         } catch (err) {
             this.connecting = false;
@@ -725,6 +742,9 @@ export class ProbeFeedService {
             return;
         }
         this.reconnectAttempts += 1;
+        if (this.downSince === null) {
+            this.downSince = Date.now();
+        }
         const delay = Math.min(RECONNECT_BASE_MS * (2 ** Math.min(this.reconnectAttempts - 1, 4)), RECONNECT_MAX_MS);
         if (this.reconnectAttempts <= 3 || this.reconnectAttempts % 10 === 0) {
             const why = this.lastError ? ` (last error: ${this.lastError})` : '';

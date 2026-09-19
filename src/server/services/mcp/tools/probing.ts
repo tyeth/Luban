@@ -25,7 +25,18 @@ import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
-import { getMachineSizeByIdentifier, getPositionSnapshot, requireReliableMachine, safeTraverseZ } from './machine';
+import { fovAt } from '../cameraGeometry';
+import { judgeSeams, pitchForOverlap } from '../surveyMosaic';
+import { modelContext, requireCameraModel } from './cameraModel';
+import { judgeCameraModel } from '../cameraModel';
+import { cameraModelStore } from '../cameraModelStore';
+import { renderMosaic } from '../surveyRender';
+import {
+    getMachineSizeByIdentifier,
+    getPositionSnapshot,
+    motionFloorZ,
+    requireReliableMachine,
+} from './machine';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -533,7 +544,28 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             type: 'object',
             properties: {
                 pitch_mm: { type: 'number', description: 'MAXIMUM grid spacing, default 80 (20-160). Each axis span is divided into equal steps no larger than this, so rows and columns are uniform and both edges are covered - no fixed-pitch stub at the far end.' },
+                overlap_fraction: {
+                    type: 'number',
+                    description: 'Fraction of each frame that must be shared with its neighbour, 0-0.9. Given this, '
+                        + 'the pitch is DERIVED from the camera model\'s field of view on plane_z instead of guessed - '
+                        + '"seamless" is a relationship between pitch and field of view, and a picked number is not '
+                        + 'one. Needs a verified camera model (camera_bootstrap); pitch_mm then just caps the result.',
+                },
+                plane_z: {
+                    type: 'number',
+                    description: 'Machine Z of the surface being surveyed, for the field of view and the mosaic '
+                        + 'index. Default 0 (the bed). A frame cannot tell how far away what it sees is, so this is '
+                        + 'stated, never inferred.',
+                },
                 margin_mm: { type: 'number', description: 'Inset from the default bounds, default 10.' },
+                z_levels: {
+                    type: 'array',
+                    description: 'Machine Z heights to run the whole grid at, highest first; one approval covers the '
+                        + 'series. Every level must be at or above the motion floor. Each level is entered with XY '
+                        + 'STATIONARY, so the grid is a stack of flat passes and never a diagonal. Default: the '
+                        + 'current Z alone.',
+                    items: { type: 'number' },
+                },
                 x_min: { type: 'number', description: 'Machine-coord grid bounds. Defaults: margin..(size-margin).' },
                 x_max: { type: 'number', description: 'Set beyond the nominal size to cover reachable overtravel (e.g. the far-X column the camera angle otherwise misses - setup-specific, so state it explicitly).' },
                 y_min: { type: 'number' },
@@ -550,7 +582,10 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
         },
         handler: async (args: {
             pitch_mm?: number;
+            overlap_fraction?: number;
+            plane_z?: number;
             margin_mm?: number;
+            z_levels?: number[];
             x_min?: number;
             x_max?: number;
             y_min?: number;
@@ -565,9 +600,9 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             if (x === null || y === null || z === null) {
                 throw new McpToolError('Current machine position unknown.');
             }
-            if (z < safeTraverseZ() - TRAVERSE_Z_TOLERANCE_MM && args.operator_confirmed_clearance !== true) {
-                throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the safe traverse height `
-                    + `${safeTraverseZ()} (top gantry - operator law for all X/Y motion) - raise Z `
+            if (z < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM && args.operator_confirmed_clearance !== true) {
+                throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the motion floor `
+                    + `${motionFloorZ()} (law 2 - the lowest Z any X/Y move may happen at) - raise Z `
                     + '(move_z), or pass operator_confirmed_clearance: true only on the operator\'s '
                     + 'explicit word that this Z clears everything on the bed.');
             }
@@ -575,7 +610,41 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             if (!size) {
                 throw new McpToolError('Unknown machine size; cannot plan the grid.');
             }
-            const pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
+            // Levels: highest first, deduplicated, and every one of them at or
+            // above the motion floor unless the operator has said otherwise.
+            const rawLevels = Array.isArray(args.z_levels) && args.z_levels.length ? args.z_levels.map(Number) : [z];
+            if (rawLevels.some((level) => !Number.isFinite(level))) {
+                throw new McpToolError('z_levels must be finite machine Z heights.');
+            }
+            if (rawLevels.length > 6) {
+                throw new McpToolError('At most 6 z_levels: each one is a full pass of the grid.');
+            }
+            const levels = [...new Set(rawLevels.map((level) => Number(level.toFixed(3))))].sort((a, b) => b - a);
+            const belowFloor = levels.filter((level) => level < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM);
+            if (belowFloor.length && args.operator_confirmed_clearance !== true) {
+                throw new McpToolError(`z_levels ${belowFloor.join(', ')} are below the motion floor ${motionFloorZ()} `
+                    + '(law 2 - the lowest Z any X/Y move may happen at). Raise them, or pass '
+                    + 'operator_confirmed_clearance: true only on the operator\'s explicit word that these heights '
+                    + 'clear everything on the bed.');
+            }
+            let pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
+            let pitchNote = `pitch ${pitch} mm (stated)`;
+            const planeZ = Number.isFinite(Number(args.plane_z)) ? Number(args.plane_z) : 0;
+            if (args.overlap_fraction !== undefined) {
+                const overlap = Number(args.overlap_fraction);
+                if (!Number.isFinite(overlap) || overlap < 0 || overlap > 0.9) {
+                    throw new McpToolError('overlap_fraction must be between 0 and 0.9.');
+                }
+                // A verified model, or nothing: the field of view is the whole
+                // basis of the number, and guessing it is what this replaces.
+                const model = requireCameraModel('an overlap-derived survey pitch');
+                const fov = fovAt(model, { x, y, z }, planeZ);
+                const derived = pitchForOverlap(fov.widthMm, fov.heightMm, overlap);
+                pitch = Math.min(derived.x, derived.y, pitch);
+                pitchNote = `pitch ${pitch} mm, derived from a ${fov.widthMm.toFixed(0)}x${fov.heightMm.toFixed(0)} mm `
+                    + `field of view on plane Z ${planeZ} at ${(overlap * 100).toFixed(0)}% overlap`
+                    + `${fov.extrapolated ? ' (EXTRAPOLATED: this Z is outside the band the model was solved over)' : ''}`;
+            }
             const margin = Math.min(Math.max(Number(args.margin_mm) || 10, 0), 50);
 
             // Serpentine at the current Z. Bounds are explicit (clamped to the
@@ -615,12 +684,17 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             });
 
             const envelope = [
-                `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch}) at CURRENT machine Z ${z.toFixed(1)}`,
+                `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch})`,
+                `; ${levels.length} pass(es) at machine Z ${levels.join(', ')} - each entered with XY stationary`,
+                `; ${pitchNote}`,
                 '; one frame captured per waypoint after the move settles; frames saved to disk with a',
                 '; machine-position index. Each line is sent individually. Aborts on the first capture failure.',
                 'G90',
                 'G53;',
-                ...waypoints.map((w, i) => `G0 X${w.x.toFixed(1)} Y${w.y.toFixed(1)}; waypoint ${i + 1} + capture`),
+                ...levels.flatMap((level) => [
+                    `G1 Z${level.toFixed(3)}; enter the pass at this height, XY stationary`,
+                    ...waypoints.map((w, i) => `G0 X${w.x.toFixed(1)} Y${w.y.toFixed(1)}; Z${level} waypoint ${i + 1} + capture`),
+                ]),
                 'G54;',
             ].join('\n');
             const validation = validateGcode(envelope);
@@ -637,26 +711,85 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 const dir = path.join(DataStorage.userDataDir, 'mcp-surveys', surveyId);
                 fs.ensureDirSync(dir);
                 const frames: object[] = [];
-                for (let i = 0; i < waypoints.length; i++) {
-                    const w = waypoints[i];
-                    await moveMachineSettled('survey:move', { x: w.x, y: w.y }, TRAVEL_FEED * 4);
-                    let frame;
-                    try {
-                        frame = await captureFrame();
-                    } catch (err) {
-                        throw new McpToolError(`Capture failed at waypoint ${i + 1}/${waypoints.length} `
-                            + `(machine ${w.x}, ${w.y}): ${err.message}. Survey aborted; `
-                            + `${frames.length} frames saved in ${dir}.`);
+                for (const level of levels) {
+                    // Enter the pass with XY stationary: the grid is a stack of
+                    // flat passes, never a diagonal through unknown space.
+                    if (Math.abs(level - (getPositionSnapshot().machine.z ?? level)) > TRAVERSE_Z_TOLERANCE_MM) {
+                        await moveMachineSettled('survey:level', { z: level }, TRAVEL_FEED);
                     }
-                    const file = path.join(dir, `wp${String(i + 1).padStart(3, '0')}_x${w.x}_y${w.y}.jpg`);
-                    fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
-                    frames.push({ file, machine: { x: w.x, y: w.y, z }, capturedAt: frame.capturedAt });
+                    for (let i = 0; i < waypoints.length; i++) {
+                        const w = waypoints[i];
+                        await moveMachineSettled('survey:move', { x: w.x, y: w.y }, TRAVEL_FEED * 4);
+                        let frame;
+                        try {
+                            frame = await captureFrame();
+                        } catch (err) {
+                            throw new McpToolError(`Capture failed at waypoint ${i + 1}/${waypoints.length} of the `
+                                + `Z ${level} pass (machine ${w.x}, ${w.y}): ${err.message}. Survey aborted; `
+                                + `${frames.length} frames saved in ${dir}.`);
+                        }
+                        const file = path.join(dir, `z${level}_wp${String(i + 1).padStart(3, '0')}_x${w.x}_y${w.y}.jpg`);
+                        fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
+                        frames.push({ file, machine: { x: w.x, y: w.y, z: level }, capturedAt: frame.capturedAt });
+                    }
                 }
-                const index = { surveyId, machineZ: z, pitchMm: pitch, frames };
+                // One mosaic per pass, indexed in machine coordinates: with a
+                // verified model, "the feature is at mosaic pixel (u, v)"
+                // becomes a lookup through the affine instead of an inference
+                // from one frame and a remembered scale.
+                const mosaics: object[] = [];
+                const model = cameraModelStore.current();
+                if (model && judgeCameraModel(model, modelContext(null)).usable) {
+                    for (const level of levels) {
+                        const levelFrames = (frames as Array<{ file: string; machine: { x: number; y: number; z: number } }>)
+                            .filter((f) => Math.abs(f.machine.z - level) < 1e-6);
+                        const out = path.join(dir, `mosaic_z${level}.jpg`);
+                        try {
+                            const rendered = renderMosaic(model, levelFrames, planeZ, out);
+                            if (rendered) {
+                                const seams = judgeSeams(rendered.seams);
+                                if (seams.drifted) {
+                                    cameraModelStore.invalidate(model.id, `survey ${surveyId} seam mismatch`);
+                                }
+                                mosaics.push({
+                                    seams: { ...rendered.seams, ...seams },
+                                    file: out,
+                                    passZ: level,
+                                    planeZ,
+                                    bounds: rendered.layout.bounds,
+                                    widthPx: rendered.layout.widthPx,
+                                    heightPx: rendered.layout.heightPx,
+                                    mmPerPixel: rendered.layout.mmPerPixel,
+                                    // mosaic pixel -> machine XY on planeZ.
+                                    affine: rendered.layout.affine,
+                                    uncoveredFraction: rendered.uncoveredFraction,
+                                    modelId: model.id,
+                                });
+                            }
+                        } catch (err) {
+                            mosaics.push({ passZ: level, error: (err as Error).message });
+                        }
+                    }
+                }
+                const index = {
+                    surveyId,
+                    machineZ: levels[0],
+                    zLevels: levels,
+                    planeZ,
+                    pitchMm: pitch,
+                    frames,
+                    mosaics,
+                    mosaicNote: mosaics.length
+                        ? 'Each mosaic carries the affine that turns its pixels into machine XY on planeZ. Read a '
+                            + 'feature\'s position off it rather than estimating one from a single frame.'
+                        : 'No mosaic: a verified camera model is needed to place frames in machine coordinates '
+                            + '(camera_bootstrap, then verify_camera_model). The frames themselves are all here.',
+                };
                 fs.writeJsonSync(path.join(dir, 'index.json'), index, { spaces: 2 });
                 return {
                     surveyId,
                     directory: dir,
+                    mosaics,
                     frameCount: frames.length,
                     index_file: path.join(dir, 'index.json'),
                     frames,

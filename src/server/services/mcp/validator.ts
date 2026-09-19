@@ -30,6 +30,14 @@ export interface FrameDeclaration {
     workspaceSelects: string[];
     /** Lines carrying G53 together with a motion word - this controller does not honour inline G53. */
     inlineG53Lines: number[];
+    /**
+     * Frame still selected when the file ENDS. The controller keeps the last
+     * workspace selected after a job finishes, so a file that ends in 'machine'
+     * leaves every later heartbeat reporting machine coordinates (live
+     * 2026-09-19: the position of record then rejected every beat until a
+     * re-home). null = the file selected no workspace at all.
+     */
+    endsInFrame: JobFrame | null;
 }
 
 export interface GcodeValidationReport {
@@ -51,6 +59,10 @@ export interface GcodeValidationReport {
     assumesDistanceMode: boolean; // motion before any G90/G91
     endsInRelativeMode: boolean; // G91 still active at end of file
     usesArcs: boolean; // G2/G3 present (extents are approximated from endpoints)
+    /** Any G38.x probing cycle. This firmware has none - probing programs go through run_probing_gcode. */
+    usesProbing: boolean;
+    /** Motion lines carrying an X or Y word, a Z word, and both at once. */
+    motionAxes: { xy: number; z: number; both: number };
     fourAxis: boolean; // any B-axis word
     minZWithSpindleOn: number | null;
     /** G92 rewrites the work origin; the only sanctioned path is apply_tool_length_offset. */
@@ -131,6 +143,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     let motionLineCount = 0;
     let usesRelativeMotion = false;
     let usesArcs = false;
+    let usesProbing = false;
+    const motionAxes = { xy: 0, z: 0, both: 0 };
     let relativeMode = false;
     let distanceModeSet = false;
     let motionBeforeDistanceMode = false;
@@ -187,6 +201,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
                 relativeMode = true;
                 usesRelativeMotion = true;
                 distanceModeSet = true;
+            } else if (code.startsWith('G38')) {
+                usesProbing = true;
             } else if (code === 'G92') {
                 setsWorkOrigin = true;
             } else if (code === 'M3' || code === 'M4') {
@@ -223,6 +239,15 @@ export function validateGcode(gcode: string): GcodeValidationReport {
                 // even under G91.)
                 return;
             }
+            const movesXy = words.X !== undefined || words.Y !== undefined;
+            const movesZ = words.Z !== undefined;
+            if (movesXy && movesZ) {
+                motionAxes.both += 1;
+            } else if (movesXy) {
+                motionAxes.xy += 1;
+            } else if (movesZ) {
+                motionAxes.z += 1;
+            }
             if (words.X !== undefined) x = extend(x, words.X);
             if (words.Y !== undefined) y = extend(y, words.Y);
             if (words.Z !== undefined) {
@@ -238,6 +263,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     });
 
     const frame: FrameDeclaration = {
+        endsInFrame: frameModal,
         declared: declaredAtFirstMotion,
         source: declaredAtFirstMotion ? 'gcode' : null,
         line: declaredAtFirstMotion ? declarationLine : null,
@@ -300,6 +326,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         assumesDistanceMode: motionBeforeDistanceMode,
         endsInRelativeMode: relativeMode,
         usesArcs,
+        usesProbing,
+        motionAxes,
         fourAxis: b !== null,
         minZWithSpindleOn,
         setsWorkOrigin,
@@ -308,6 +336,118 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         originOffsetZAtStaging: null,
         warnings,
     };
+}
+
+const NEWLINE = '\n';
+
+/** The most motion lines a hand-authored TRANSIT plausibly has; beyond it, the file is doing something. */
+export const MAX_TRANSPORT_MOTION_LINES = 8;
+
+export const TRANSPORT_REFUSAL = 'Refused: this file is pure transport - a few rapids with no spindle, no probing, '
+    + 'no arcs and no rotation - and transport has its own tools. Use `traverse_xy` for XY (it plans the move at the '
+    + 'traverse height, checks every leg against the stored landmarks, and stages the series for one approval) or '
+    + '`move_z` for Z. They emit the declared, frame-restoring file for you, which is the file a hand-written transit '
+    + 'keeps getting wrong: on 2026-09-19 one was rejected for an undeclared distance mode, restaged, and then left '
+    + 'the controller in the machine workspace for the rest of the session. If this really is not transport - it '
+    + 'cuts, probes, rotates, or moves in XY and Z together - it will not be refused; only a file that is purely one or the other is.';
+
+/**
+ * Whether a staged file is nothing but getting the toolhead from A to B.
+ *
+ * Deliberately narrow: a file is only transport when EVERY signal agrees, so
+ * a real toolpath is never refused for lacking a spindle command. A laser or
+ * printing job is excluded by head type at the call site, not here.
+ */
+export function isPureTransport(report: GcodeValidationReport): boolean {
+    // Exactly what traverse_xy and move_z can express between them: an XY
+    // series at a constant Z, or a Z series at a constant XY. A file that
+    // moves in both - a toolpath, a slicer export, a plunge-and-cut - is
+    // never one of ours, which is what keeps this from refusing real work.
+    const xyOnly = report.motionAxes.xy > 0 && report.motionAxes.z === 0 && report.motionAxes.both === 0;
+    const zOnly = report.motionAxes.z > 0 && report.motionAxes.xy === 0 && report.motionAxes.both === 0;
+    return (xyOnly || zOnly)
+        && report.motionLineCount > 0
+        && report.motionLineCount <= MAX_TRANSPORT_MOTION_LINES
+        && report.spindle.onCommands === 0
+        && !report.usesArcs
+        && !report.usesProbing
+        && !report.fourAxis
+        && !report.setsWorkOrigin
+        && !report.usesRelativeMotion;
+}
+
+export interface GcodeSuggestion {
+    /** The corrected program, ready to re-submit unchanged. */
+    gcode: string;
+    /** One line per edit, in the order they were made. */
+    changes: string[];
+}
+
+/**
+ * A corrected draft for the refusals whose fix is mechanical.
+ *
+ * The MCP never edits a submitted file - that law stands, and this does not
+ * touch the job. It hands the agent the program it should have written, so a
+ * refusal costs one re-submit instead of a round trip through prose. Live
+ * 2026-09-19 two of six operator approvals were spent re-deriving "put G53 on
+ * its own line" and "declare G90" from refusal text.
+ *
+ * Only three edits are made, all of them mechanical:
+ *   - an inline `G53 G0 ...` is split, because this controller runs the move
+ *     in the selected workspace instead of honouring a one-shot G53;
+ *   - a missing distance mode gets `G90` first, because a file that assumes
+ *     one runs in whatever mode the controller happens to be in;
+ *   - a file that ends with G53 selected gets `G54;` last, because the
+ *     controller keeps that workspace after the job.
+ *
+ * Anything needing a DECISION - which frame an undeclared file meant, whether
+ * a G92 was intended - returns null. A suggestion is only offered when it is
+ * certain, and it is verified by re-validating before it is returned.
+ */
+export function suggestGcode(gcode: string, report: GcodeValidationReport): GcodeSuggestion | null {
+    const changes: string[] = [];
+    const lines = gcode.split(/\r?\n/);
+    const out: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (report.frame.inlineG53Lines.includes(i + 1)) {
+            const indent = (/^\s*/.exec(line) as RegExpExecArray)[0];
+            // Drop the G53 token (with any leading 0s) and keep the rest of the line byte-for-byte.
+            const stripped = line.replace(/\bG0*53\b\s*/i, '');
+            out.push(`${indent}G53;`);
+            out.push(stripped);
+            changes.push(`line ${i + 1}: G53 moved onto its own line before the move (this controller does not honour a one-shot G53)`);
+        } else {
+            out.push(line);
+        }
+    }
+
+    if (report.assumesDistanceMode) {
+        out.unshift('G90');
+        changes.push('G90 added first: the file moved before stating its distance mode');
+    }
+    // Judge the epilogue on the SPLIT program, not the original: an inline
+    // `G53 G0 ...` selects nothing (which is the bug), so only after the split
+    // does the file actually leave the machine workspace selected.
+    if (validateGcode(out.join(NEWLINE)).frame.endsInFrame === 'machine') {
+        while (out.length && out[out.length - 1].trim() === '') {
+            out.pop();
+        }
+        out.push('G54;');
+        changes.push('G54 added last: the file ended with G53 still selected, which leaves the controller reporting machine coordinates');
+    }
+
+    if (!changes.length) {
+        return null;
+    }
+    const suggestion = out.join('\n');
+    // Never hand back a draft that is not itself clean.
+    const after = validateGcode(suggestion);
+    if (after.assumesDistanceMode || after.frame.inlineG53Lines.length || after.frame.endsInFrame === 'machine') {
+        return null;
+    }
+    return { gcode: suggestion, changes };
 }
 
 export interface FrameResolutionContext {
@@ -326,6 +466,12 @@ export interface FrameResolution {
     /** Non-null = the job must be REFUSED at staging with this message. */
     refusal: string | null;
 }
+
+export const FRAME_REFUSAL_NO_RESTORE = 'Refused: this job never hands the coordinate frame back - it ends with G53 '
+    + 'still selected. The controller keeps that workspace after the job finishes, so every later status '
+    + 'report carries machine coordinates while the work-origin offset is still populated, the position of record '
+    + 'rejects them, and motion and staging refuse (live 2026-09-19: a re-home was the only way out). Put `G54;` on its '
+    + 'own line at the end of the file. The MCP never edits your gcode to add it.';
 
 export const FRAME_REFUSAL_UNDECLARED = 'Refused: the job never declares its coordinate frame, so its moves would run in '
     + 'whatever workspace the controller happens to have selected. Declare it: put `G53` on its own line before the '
@@ -367,6 +513,13 @@ export function resolveJobFrame(input: GcodeValidationReport, ctx: FrameResoluti
         } else {
             return { report, refusal: FRAME_REFUSAL_UNDECLARED };
         }
+    }
+
+    // A machine-frame job must hand the frame back. Every MCP emitter already
+    // ends `G54;` - only a hand-authored file can leave the controller in the
+    // machine workspace, and that is exactly what happened on 2026-09-19.
+    if (report.frame.endsInFrame === 'machine') {
+        return { report, refusal: FRAME_REFUSAL_NO_RESTORE };
     }
 
     const zMax = ctx.machineZMax;

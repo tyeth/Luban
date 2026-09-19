@@ -1,6 +1,6 @@
 ---
 name: cnc-visual-alignment
-description: "Measure CNC stock and position a toolhead from webcam frames — via the Luban MCP tool surface (capture, guarded moves, Y-keyed calibration, visual servo) with single-frame metric rectification and parallax handling as the vision core. Use whenever the user wants to locate stock, find a datum, set or verify a work origin visually, drive the toolhead to something seen on camera, or measure a part on the bed."
+description: "Measure CNC stock and position a toolhead from webcam frames — via the Luban MCP tool surface (capture, guarded moves, the solved camera model, visual servo, overlapping surveys) with single-frame metric rectification and parallax handling as the vision core. The camera is session state, not a rig constant: verify or re-solve its geometry before any pose arithmetic. Use whenever the user wants to locate stock, find a datum, set or verify a work origin visually, drive the toolhead to something seen on camera, or measure a part on the bed."
 ---
 
 # CNC visual alignment from a toolhead camera
@@ -34,8 +34,10 @@ better frames.
 | Machine home | `home` | `G53;G28;G54`; also homes B (rotary stock rotates) — `cnc-motion-rules` §5. |
 | Work origin | `goto_work_origin` | XY only, at the current Z. Distinct from homing — never conflate the two. |
 | Single guarded move | `move_and_capture` | ONE bounded XY move at current Z, settle, capture. No Z parameter by design. |
-| Servo step | `visual_servo` | One clamped correction per call; the loop lives in you, not the tool. |
-| Calibration store | `set_/get_/delete_camera_calibration` | 2×2 pixel-delta→mm matrix, keyed by the machine Y and Z it was derived at. |
+| Camera model | `get_camera_model`, `verify_camera_model`, `camera_bootstrap`, `set_camera_model` | Where the camera is and whether that may still be believed. `verify_camera_model` FIRST, every session. |
+| Pose arithmetic | `plan_view_pose` | "Where must the toolhead go to see this machine point?" - from the model, never from memory. |
+| Servo step | `visual_servo` | One clamped correction per call; the loop lives in you, not the tool. Pass `plane_z` and it derives the matrix from the camera model at this pose. |
+| Calibration store | `set_/get_/delete_camera_calibration` | The legacy 2×2 pixel-delta→mm matrix, keyed by the machine Y and Z it was derived at. Superseded by the camera model, which can also say whether it is still about the camera that is plugged in. |
 | Z / XY transport / programs | `move_z`, `traverse_xy`, `submit_gcode_job` | Canonical calls and rules: `cnc-motion-rules` §7–§8. |
 | Anything compound (sequences, cutting) | `validate_gcode`, `submit_gcode_job` → human confirm page → `start_gcode_job`, `get_gcode_job_status`, `stop_gcode_job` | Jobs run through the controller's own state machine and door interlock. Only the operator's click on the confirm page authorises motion — call `start_gcode_job` with `wait_for_approval_ms` to start on that click, or pass the one-time code they relay as `confirm_token`. |
 
@@ -54,29 +56,89 @@ better frames.
   operator's to set, never yours.
 - "Home"/"homing" ALWAYS means machine home. Going to work X0 Y0 is "goto work origin".
 - The camera is **toolhead-mounted**: it rides X and Z; the **platform moves under it in Y**.
-  So a pixel→machine mapping is valid only at the machine Y (scale also changes with Z) at
-  which it was captured — which is exactly how the calibration store is keyed.
+  The camera model works in MACHINE coordinates, where that is just a fixed offset from the
+  toolhead — which is why one rigid transform covers every pose, and why the old 2x2 matrix had
+  to be keyed by Y: it was this model linearised at one Y and one Z.
 - The repeatable *board-viewing* camera pose is the pre-home park (machine X0 Y0), not
   machine home — at home the work area is out of frame entirely.
 
-## Choosing a viewing pose (do this before any metric work)
+## The camera is session state — start here, every session
 
-The camera rides the toolhead and looks **−X**, seeing roughly **90–150 mm to the toolhead's
-−X side**, and Y is the platform axis, so the arithmetic is: **toolhead X ≈ feature X + 90…150,
-toolhead Y ≈ feature Y**, at the traverse height Z328. The offset is a rig constant — read it
-from the stored landmark notes (`get_stored_state`) or ask; do not estimate it from a frame. A
-viewing pose is ONE `traverse_xy` at 328 (one approval), never a chain of `move_and_capture`
-calls; `move_and_capture` is for ≤ 100 mm nudges once the feature is in frame. Then
-`capture_frame`, describe what IS in the frame by evidence, and put the frame in front of the
-operator if identities are in doubt — a frame FINDS things, it clears nothing (law 3).
+**The camera is not a rig constant.** It can sit differently after every power cycle, be
+knocked, be re-aimed, or be a different camera entirely. Nothing you remember about where it
+points survives that, and no number in this file is one.
 
-## Whole-bed survey (`survey_bed`)
+So the first camera call of any session is **`verify_camera_model`**: position the toolhead
+over a target whose machine coordinates are known (the tool setter is the obvious one), capture,
+say where it appears in the frame, and read the residual. It passes, or it does not:
 
-At the traverse height: a serpentine grid, one settled frame per waypoint, saved to disk with a
-machine-position index; `pitch_mm` is a MAXIMUM (each axis divided evenly into steps no larger
-than it, min 20). Cover the full reachable envelope — on this rig the far-X column is the only
-view of the bed centre-right. Read the frames from disk; landmarks near each position are the
-identities the operator already stated.
+| State | What it means | What to do |
+|---|---|---|
+| verified | The model predicts a known target to within a few pixels, on this connection | use it |
+| unverified after a reconnect | The machine has power-cycled since the solve | `verify_camera_model` |
+| unverified after a residual | The camera has most likely moved | `camera_bootstrap` |
+| a different camera or resolution | It is a different camera | `camera_bootstrap` |
+| no model | Nothing has ever been solved here | `camera_bootstrap` |
+
+Until a model is verified, **nothing converts a pixel into a machine coordinate or a machine
+coordinate into a pose** — the tools refuse, and so should you. Plain captures are always
+allowed: a frame FINDS things, it clears nothing (law 3).
+
+### `camera_bootstrap`: solving it from nothing
+
+Two staged procedures, one approval each.
+
+1. **`stage: "search"`** — a grid at the park height across the X band the camera could be
+   looking from, bracketing the tool setter. Which frames contain that unmistakable gold disc,
+   against the toolhead XY of those frames, gives the camera's offset **including its sign**
+   while assuming nothing at all. This is the only step that means anything without a
+   calibration, which is why it is first.
+2. **`stage: "poses"`** — the poses that coarse offset implies, each sweeping Z from the park
+   height to the motion floor with XY stationary, capturing at every stop. Targets at different
+   heights over that baseline are what make perspective observable.
+
+Then `scripts/camera_bootstrap.py <directory>` (hand-mark pixels with `--marks` when detection
+fails), `set_camera_model`, and `verify_camera_model` against a pose that was **not** in the
+fit. A model that has only agreed with its own fit has demonstrated nothing.
+
+### Choosing a viewing pose
+
+**`plan_view_pose {target: {x, y, z}}`.** It returns the toolhead XY, the standoff and the
+field of view, from the measured model. Then ONE `traverse_xy` (one approval);
+`move_and_capture` is for ≤ 100 mm nudges once the feature is in frame.
+
+Never compute a pose yourself, and never carry one in your head between sessions. An earlier
+version of this file stated the offset as fact — "the camera looks −X, seeing roughly 90–150 mm
+to the toolhead's −X side" — and on 2026-09-19 an agent followed it, went to toolhead X 290 for
+a feature at X≈170, moved +30 mm to check, watched the workpiece slide further out of frame,
+and was corrected by the operator to "260 is about the max". Three operator approvals to
+establish a sign that one measurement settles.
+
+The sanity check on a solved model is still evidence: a commanded +X moves the *camera* over
+the scene; a commanded +Y moves the *scene* under the camera (platform axis). If a verified
+model disagrees with what you see, the camera has been knocked — re-verify, do not re-derive by
+hand.
+
+## Survey first, single poses second (`survey_bed`)
+
+A serpentine grid, one settled frame per waypoint, saved to disk with a machine-position index.
+**Reach for this before a chain of single poses.** The 2026-09-19 session spent forty minutes
+and five approvals on single poses, then found what it was looking for in the first grid it
+ran.
+
+- `overlap_fraction` (with a verified model) derives the pitch from the real field of view on
+  `plane_z`. "Seamless" is a relationship between pitch and field of view; a picked `pitch_mm`
+  is not one.
+- `z_levels` runs the whole grid at several heights under ONE approval, each entered with XY
+  stationary.
+- With a verified model each pass is composed into `mosaic_z<Z>.jpg`, indexed in machine
+  coordinates. Read a feature's position off the mosaic through the index's affine — that is a
+  lookup, not an inference from one frame and a remembered scale.
+- The seams double as the drift check: overlapping frames that disagree mean the camera moved,
+  and the survey marks the model unverified rather than handing you a skewed mosaic.
+
+Cover the full reachable envelope — on this rig the far-X column is the only view of the bed
+centre-right. Landmarks near each position are the identities the operator already stated.
 
 ## Measuring: the pipeline
 

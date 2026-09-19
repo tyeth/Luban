@@ -3,6 +3,7 @@
 // the probe_sequence arguments verbatim).
 import { ObstacleBox, checkMotion, describeViolations, sequenceMotion } from './envelopeChecks';
 import { mcpBroadcast } from './index';
+import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import { probeFeedService } from './probeFeed';
 import {
@@ -198,7 +199,11 @@ export function planProbeSequence(args: {
     // Law 4 (mcp/48): every hop, descend column and march is checked against
     // the obstacle landmarks and the program's transient keep-out boxes at
     // staging - refused, not left for the operator to spot on the page.
-    const violations = checkMotion(sequenceMotion({ hopZ, staged, steps }), [...landmarkStore.obstacleBoxes(), ...extraObstacles], { traverseZ: hopZ });
+    const violations = checkMotion(
+        sequenceMotion({ hopZ, staged, steps }),
+        [...landmarkStore.obstacleBoxes(), ...extraObstacles],
+        { traverseZ: hopZ, ...clearanceOptions() }
+    );
     if (violations.length) {
         throw new McpToolError(`Sequence refused (law 4, landmarks are obstacles): ${describeViolations(violations)}. `
             + 'Raise the descend / march Z above the clearance, move the step, or have the operator adjust the landmark.');

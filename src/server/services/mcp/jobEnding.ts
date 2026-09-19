@@ -3,6 +3,25 @@
 // finished, stopped by the agent, door/pause, alarm, failure in operation).
 // Pure: unit-tested in tests/jobEnding.test.ts.
 
+/**
+ * Job lifecycle state. Lives here rather than in jobs.ts so the pure stop
+ * planner below can reason about it without importing the server-bound job
+ * manager; jobs.ts re-exports both names.
+ */
+export type McpJobState =
+    | 'awaiting_confirmation'
+    | 'approved'
+    | 'rejected'
+    | 'starting'
+    | 'started'
+    | 'start_failed'
+    | 'stopped'
+    | 'completed';
+
+export type McpJobKind = 'file' | 'direct' | 'procedure';
+
+export const TERMINAL_JOB_STATES: McpJobState[] = ['rejected', 'start_failed', 'stopped', 'completed'];
+
 export type JobEndingKind =
     | 'completed'
     | 'stopped-by-agent'
@@ -81,4 +100,56 @@ export function countMeasured(result: unknown): number | undefined {
         }
         return it.z !== undefined || it.contactMachine !== undefined;
     }).length;
+}
+
+/**
+ * What stopping a job should actually DO, given its kind and state.
+ *
+ * Before this, only an un-started PROCEDURE was withdrawn; a staged `file` or
+ * `direct` job fell through to the firmware stop, which stops nothing when
+ * nothing is running - so the job kept its `approved` state and its confirm
+ * link, and an operator could still start it later. Live 2026-09-19 the agent
+ * had to tell its operator in prose "do not approve job 245869890315".
+ *
+ *  - 'already-ended': terminal, nothing to do.
+ *  - 'withdraw': never handed to the machine, so mark it stopped here. The
+ *    confirm page answers 409 for any non-`awaiting_confirmation` state, so
+ *    this genuinely kills the link.
+ *  - 'request-procedure-stop': a running server-driven runner stops at its
+ *    next step boundary and raises.
+ *  - 'machine-stop': a file/direct job already handed over - firmware stop.
+ */
+export type JobStopAction = 'already-ended' | 'withdraw' | 'request-procedure-stop' | 'machine-stop';
+
+export interface JobStopPlan {
+    action: JobStopAction;
+    /** Shown to the agent; says in words whether the confirm link is now dead. */
+    note: string;
+}
+
+export function planJobStop(kind: McpJobKind, state: McpJobState): JobStopPlan {
+    if (TERMINAL_JOB_STATES.includes(state)) {
+        return { action: 'already-ended', note: `Job already ${state}.` };
+    }
+    if (kind === 'procedure') {
+        if (state === 'started') {
+            return {
+                action: 'request-procedure-stop',
+                note: 'Procedure stopping at the next step boundary; it raises to the traverse height and keeps every '
+                    + 'completed measurement.',
+            };
+        }
+        return {
+            action: 'withdraw',
+            note: 'Procedure withdrawn before it started. Its confirm link is dead - approving it now does nothing.',
+        };
+    }
+    if (state === 'awaiting_confirmation' || state === 'approved') {
+        return {
+            action: 'withdraw',
+            note: `Job withdrawn before it reached the machine (it was ${state}). Its confirm link is dead - approving `
+                + 'it now does nothing, and no one needs to be told to leave it alone.',
+        };
+    }
+    return { action: 'machine-stop', note: 'Job already handed to the machine; sending the firmware stop.' };
 }

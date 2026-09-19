@@ -1,6 +1,10 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
 import { CalibrationEntry, calibrationStore } from '../calibration';
+import { jacobianAt } from '../cameraGeometry';
+import { judgeCameraModel } from '../cameraModel';
+import { cameraModelStore } from '../cameraModelStore';
+import { modelContext } from './cameraModel';
 import { McpToolError, ToolRegistry } from '../registry';
 import { executeBoundedMoveAndCapture } from './camera';
 import { getPositionSnapshot } from './machine';
@@ -208,6 +212,13 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                     required: ['u', 'v'],
                     description: 'Where the feature should image.',
                 },
+                plane_z: {
+                    type: 'number',
+                    description: 'Machine Z of the plane the tracked feature sits ON. Given this, and a verified '
+                        + 'camera model, the pixel-to-machine matrix is derived from the model at this exact pose '
+                        + 'instead of read from a stored calibration - which is both more accurate and able to say '
+                        + 'whether it is still about the camera that is plugged in. Omit to use a stored matrix.',
+                },
                 calibration_id: { type: 'string', description: 'Omit to auto-select nearest to the current machine Y.' },
                 max_step_mm: { type: 'number' },
                 feed_rate: { type: 'number' },
@@ -224,6 +235,7 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
             feature_pixel?: { u?: number; v?: number };
             target_pixel?: { u?: number; v?: number };
             calibration_id?: string;
+            plane_z?: number;
             max_step_mm?: number;
             feed_rate?: number;
             operator_confirmed_clearance?: boolean;
@@ -239,9 +251,35 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                 throw new McpToolError('Current machine position unknown.');
             }
 
+            // The camera model, when there is a verified one and a depth plane
+            // to solve on, is the better answer: the stored 2x2 IS that model
+            // linearised at one Y and one Z, and unlike the model it cannot say
+            // whether it is still about the camera that is plugged in. Derived
+            // here as an entry so everything downstream - the sign check, the
+            // depth-plane cross-check, the series memory - is untouched.
+            const model = cameraModelStore.current();
             let entry: CalibrationEntry | null = null;
             let entryDistance: number | null = null;
-            if (args.calibration_id) {
+            let derivedFromModel = false;
+            if (model && judgeCameraModel(model, modelContext(null)).usable && Number.isFinite(Number(args.plane_z))) {
+                const planeZ = Number(args.plane_z);
+                const toolhead = {
+                    x: position.machine.x as number,
+                    y: position.machine.y as number,
+                    z: position.machine.z as number,
+                };
+                entry = {
+                    id: model.id,
+                    validAtY: toolhead.y,
+                    z: toolhead.z,
+                    matrix: jacobianAt(model, toolhead, planeZ),
+                    surface: `plane machine Z ${planeZ}`,
+                    notes: `derived from camera model ${model.id} at this pose - not a stored calibration`,
+                    createdAt: model.solvedAt,
+                };
+                entryDistance = 0;
+                derivedFromModel = true;
+            } else if (args.calibration_id) {
                 entry = calibrationStore.get(String(args.calibration_id));
                 if (!entry) {
                     throw new McpToolError('Unknown calibration id.');
@@ -251,13 +289,15 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                 const match = calibrationStore.findNearest(position.machine.y, MAX_Y_DISTANCE_MM);
                 if (!match) {
                     throw new McpToolError(`No calibration within ${MAX_Y_DISTANCE_MM} mm of machine Y `
-                        + `${position.machine.y.toFixed(1)}. Store one with set_camera_calibration, or pass calibration_id.`);
+                        + `${position.machine.y.toFixed(1)}, and no verified camera model to derive one from. `
+                        + 'Either run camera_bootstrap and pass plane_z (preferred - it says which camera it is '
+                        + 'about and survives a change of pose), or store a matrix with set_camera_calibration.');
                 }
                 entry = match.entry;
                 entryDistance = match.distance;
             }
 
-            const [[m00, m01], [m10, m11]] = entry.matrix;
+            const [[m00, m01], [m10, m11]] = (entry as CalibrationEntry).matrix;
             let dx = m00 * du + m01 * dv;
             let dy = m10 * du + m11 * dv;
 
@@ -308,6 +348,11 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
                             + 'Re-derive on the working surface before iterating.');
                     }
                 }
+            }
+            if (derivedFromModel) {
+                warnings.push(`The 2x2 was derived from camera model ${(entry as CalibrationEntry).id} at this pose `
+                    + `on the plane machine Z ${args.plane_z}, not read from a stored calibration. If the feature is `
+                    + 'not on that plane, say so with the right plane_z rather than iterating.');
             }
             if (entryDistance !== null && entryDistance > DEFAULT_Y_TOLERANCE_MM) {
                 warnings.push(`Calibration ${entry.id} is ${entryDistance.toFixed(1)} mm from the current Y; scale may be off.`);

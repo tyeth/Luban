@@ -3,6 +3,7 @@
 // probe_surface_path / probe_surface_grid arguments verbatim).
 import { ObstacleBox, checkMotion, describeViolations, surfaceMotion } from './envelopeChecks';
 import { mcpBroadcast } from './index';
+import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import { steppedTraverseZ } from './march';
 import { probeFeedService } from './probeFeed';
@@ -294,7 +295,7 @@ function finishPlan(
     const violations = checkMotion(
         surfaceMotion({ hopZ, absoluteFloorZ: floorZ, zSafeDeltaMm: hopMode === 'stepped' ? hopLiftMm : env.zSafeDeltaMm, hopMode, stations }),
         [...landmarkStore.obstacleBoxes(), ...extraObstacles],
-        { traverseZ: hopZ }
+        { traverseZ: hopZ, ...clearanceOptions() }
     );
     if (violations.length) {
         throw new McpToolError(`Scan refused (law 4, landmarks are obstacles): ${describeViolations(violations)}. `

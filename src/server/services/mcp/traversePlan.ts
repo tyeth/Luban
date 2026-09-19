@@ -3,7 +3,7 @@
 // call, like move_z - the twin the 100 mm move_and_capture cap kept forcing
 // into hand-written file jobs (which is how a frameless `G0 Z0` got staged on
 // 2026-09-12). Pure: no server imports, unit-tested in tests/traversePlan.test.ts.
-import { MotionSegment, ObstacleBox, checkMotion, describeViolations } from './envelopeChecks';
+import { MotionSegment, ObstacleBox, POSITION_EPSILON_MM, checkMotion, describeViolations } from './envelopeChecks';
 
 export interface Xyz {
     x: number;
@@ -31,6 +31,14 @@ export interface TraversePlanInput {
     feedRate: number;
     /** Stored landmarks (+ any program keep-outs) as obstacle boxes. */
     obstacles: ObstacleBox[];
+    /**
+     * Lowest machine Z this transport may happen at (law 2). Defaults to
+     * traverseZ, which is what it was until the two were told apart.
+     */
+    motionFloorZ?: number;
+    /** clearanceContext.currentToolProtrusion().mm - a physically stated obstacle needs it. */
+    toolProtrusionMm?: number | null;
+    clearanceMarginMm?: number;
     reason: string;
 }
 
@@ -70,7 +78,7 @@ export const MAX_TRAVERSE_TARGETS = 20;
  * machine Z 327.9989959716797 for a 328 home (seen live 2026-09-14), and an
  * exact >= 328 refused every traverse from home.
  */
-export const TRAVERSE_Z_TOLERANCE_MM = 0.05;
+export const TRAVERSE_Z_TOLERANCE_MM = POSITION_EPSILON_MM;
 /** The direct-batch separator start_gcode_job and the confirm page know. */
 export const STEP_SEPARATOR = '\n; --- next approved step ---\n';
 
@@ -100,12 +108,13 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
     if (!Array.isArray(targets) || targets.length < 1 || targets.length > MAX_TRAVERSE_TARGETS) {
         throw new TraversePlanError(`Provide 1-${MAX_TRAVERSE_TARGETS} targets.`);
     }
-    // Law 2: every XY move over 1 mm happens at the traverse height. There is
-    // deliberately no override here - transport that cannot happen at the
-    // traverse height is not transport, it is a procedure with its own envelope.
-    if (currentMachine.z < traverseZ - TRAVERSE_Z_TOLERANCE_MM) {
-        throw new TraversePlanError(`Refused: the toolhead is at machine Z ${f3(currentMachine.z)}, below the traverse height `
-            + `${traverseZ} (law 2: all XY over 1 mm at top gantry height). Raise Z with move_z (coordinate_system "machine") first.`);
+    // Law 2: every XY move over 1 mm happens at or above the motion floor.
+    // There is deliberately no override here - transport that cannot happen up
+    // there is not transport, it is a procedure with its own envelope.
+    const floorZ = input.motionFloorZ === undefined ? traverseZ : input.motionFloorZ;
+    if (currentMachine.z < floorZ - TRAVERSE_Z_TOLERANCE_MM) {
+        throw new TraversePlanError(`Refused: the toolhead is at machine Z ${f3(currentMachine.z)}, below the motion floor `
+            + `${floorZ} (law 2: all XY over 1 mm at or above it). Raise Z with move_z (coordinate_system "machine") first.`);
     }
 
     const toMachine = (t: { x: number; y: number }) => (frame === 'machine'
@@ -117,9 +126,12 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
 
     const steps: TraverseStep[] = [];
     const segments: MotionSegment[] = [];
-    // Within tolerance of the traverse height the head IS at the traverse height:
-    // plan the segments there so the landmark check does not fail on 1 um.
-    const planZ = Math.max(currentMachine.z, traverseZ);
+    // Plan the segments at the height the head is ACTUALLY at, snapped up only
+    // by the heartbeat's float noise so the landmark check does not fail on
+    // 1 um. Planning them at the park height instead would check a corridor
+    // the toolhead is not in - harmless while the floor WAS the park height,
+    // wrong the moment transport is allowed lower.
+    const planZ = Math.max(currentMachine.z, floorZ);
     let fromMachine: Xyz = { ...currentMachine, z: planZ };
     let total = 0;
     targets.forEach((raw, i) => {
@@ -156,10 +168,14 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
         fromMachine = to;
     });
 
-    // Landmarks are obstacles (law 4) - at 328 every stored clearance passes on
-    // its own merits; a configured lower traverse height or a taller landmark
-    // refuses here, naming the step and the landmark.
-    const violations = checkMotion(segments, obstacles, { traverseZ });
+    // Landmarks are obstacles (law 4). There is no exemption for height: a hop
+    // at the motion floor is checked against every stored box exactly like a
+    // low segment, which is what makes a floor below the park height safe.
+    const violations = checkMotion(segments, obstacles, {
+        traverseZ,
+        toolProtrusionMm: input.toolProtrusionMm === undefined ? null : input.toolProtrusionMm,
+        clearanceMarginMm: input.clearanceMarginMm,
+    });
     if (violations.length) {
         throw new TraversePlanError(`Refused - the path crosses a landmark below its clearance: ${describeViolations(violations)}. `
             + 'Raise the traverse height only if the operator says so; never shrink or delete the landmark.');
