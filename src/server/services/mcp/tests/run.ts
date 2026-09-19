@@ -20,6 +20,7 @@ import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
+import { tests as probeFeedHealthTests } from './probeFeedHealth.test';
 import { tests as surveyMosaicTests } from './surveyMosaic.test';
 import { tests as toolProtrusionTests } from './toolProtrusion.test';
 import { tests as traversePlanTests } from './traversePlan.test';
@@ -35,6 +36,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['cameraGeometry', cameraGeometryTests],
     ['bootstrapPlan', bootstrapPlanTests],
     ['frameRecovery', frameRecoveryTests],
+    ['probeFeedHealth', probeFeedHealthTests],
     ['surveyMosaic', surveyMosaicTests],
     ['toolProtrusion', toolProtrusionTests],
     ['traversePlan', traversePlanTests],
