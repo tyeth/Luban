@@ -11,6 +11,7 @@
  * legacy JS, and these modules must stay importable without the Luban
  * server (config/settings.base is ESM-only and breaks ts-node).
  */
+import { tests as cameraGeometryTests } from './cameraGeometry.test';
 import { tests as cameraModelTests } from './cameraModel.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as frameRecoveryTests } from './frameRecovery.test';
@@ -29,6 +30,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['machinePosition', machinePositionTests],
     ['envelopeChecks', envelopeChecksTests],
     ['cameraModel', cameraModelTests],
+    ['cameraGeometry', cameraGeometryTests],
     ['frameRecovery', frameRecoveryTests],
     ['toolProtrusion', toolProtrusionTests],
     ['traversePlan', traversePlanTests],
