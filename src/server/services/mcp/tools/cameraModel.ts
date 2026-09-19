@@ -12,10 +12,24 @@ import {
     judgeCameraModel,
 } from '../cameraModel';
 import { machineToPixel, viewPose } from '../cameraGeometry';
+import {
+    PosePlanArgs,
+    SearchPlanArgs,
+    bootstrapTargets,
+    describeBootstrapGcode,
+    planPoseStage,
+    planSearchStage,
+    runPoseStage,
+    runSearchStage,
+} from '../cameraBootstrap';
+import { jobManager } from '../jobs';
+import { probeFeedService } from '../probeFeed';
+import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
+import { validateGcode } from '../validator';
 import { cameraModelStore } from '../cameraModelStore';
 import { decodeToGray } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
-import { connectionEpoch, getPositionSnapshot, requireReliableMachine } from './machine';
+import { connectionEpoch, getPositionSnapshot, motionFloorZ, requireReliableMachine } from './machine';
 import { connectionManager } from '../../machine/ConnectionManager';
 
 /**
@@ -240,6 +254,132 @@ export function registerCameraModelTools(registry: ToolRegistry): void {
                 model: stored,
                 next_step: 'The model is UNVERIFIED and converts nothing yet. Run verify_camera_model against a target '
                     + 'at a pose that was NOT in the fit, and report the residual it returns.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'camera_bootstrap',
+        description: 'Stage the camera pre-configuration for human approval. The camera is session state - it can sit '
+            + 'differently after a power cycle, be knocked, be re-aimed, or be a different camera - so this solves the '
+            + 'geometry FROM NOTHING: no assumed direction, offset, field of view or lens. Two stages, one approval '
+            + 'each, because the second cannot be planned until someone has looked at the first.\n'
+            + 'stage "search" (start here): a serpentine grid at the park height across the X band the camera could be '
+            + 'looking from, bracketing the tool setter, whose machine XY is known exactly. Which frames contain it, '
+            + 'against the toolhead XY of those frames, gives the camera offset INCLUDING ITS SIGN with no prior '
+            + 'assumption at all - the only step that means anything without a calibration.\n'
+            + 'stage "poses": visit the poses that coarse offset implies and sweep Z from the park height down to the '
+            + 'motion floor with XY STATIONARY, capturing at every stop. Targets at different heights over that '
+            + 'baseline are what turn a flat pixels-per-mm figure into perspective. A pose the TOOLHEAD cannot reach '
+            + 'is dropped with a reason and never quietly adjusted, even though the camera looks into keep-outs on '
+            + 'purpose.\n'
+            + 'Frames are written with a machine-position index; solve them with scripts/camera_bootstrap.py, store '
+            + 'with set_camera_model, then prove it with verify_camera_model.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                stage: { type: 'string', enum: ['search', 'poses'], description: 'Default "search".' },
+                reason: { type: 'string', description: 'Shown to the operator.' },
+                reach_mm: { type: 'number', description: 'search: how far either side of the setter to look, default 200 (40-400).' },
+                pitch_mm: { type: 'number', description: 'search: grid pitch, default 40 (10-120). Smaller pitch, tighter offset.' },
+                y_span_mm: { type: 'number', description: 'search: Y band around the setter, default 0 (one row).' },
+                poses: {
+                    type: 'array',
+                    description: 'poses: 1-12 TOOLHEAD positions to view the targets from.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            label: { type: 'string' },
+                            x: { type: 'number' },
+                            y: { type: 'number' },
+                        },
+                        required: ['x', 'y'],
+                    },
+                },
+                step_mm: { type: 'number', description: 'poses: Z step of the sweep, default 2 (minimum 1).' },
+                floor_z: { type: 'number', description: 'poses: lowest Z of the sweep; never below the motion floor.' },
+            },
+            required: ['reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required: it is shown to the operator on the confirm page.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const position = getPositionSnapshot();
+            requireReliableMachine(position, 'a camera bootstrap');
+            const z = position.machine.z;
+            if (z === null || z < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM) {
+                throw new McpToolError(`Machine Z ${z === null ? 'unknown' : z.toFixed(1)} is below the motion floor `
+                    + `${motionFloorZ()} - raise Z first (move_z, coordinate_system "machine").`);
+            }
+            const targets = bootstrapTargets();
+            if (!targets.length) {
+                throw new McpToolError('Nothing to solve against: no tool setter is configured and no rotary axis end '
+                    + 'is stated. A bootstrap with no target of known machine coordinates measures nothing. Set one '
+                    + 'with set_tool_setter_config or set_probe_geometry.');
+            }
+
+            const stage = args.stage === 'poses' ? 'poses' : 'search';
+            if (stage === 'search') {
+                const plan = planSearchStage(args as SearchPlanArgs);
+                const envelope = describeBootstrapGcode([
+                    `; CAMERA BOOTSTRAP (search): ${plan.waypoints.length} waypoints at machine Z ${plan.parkZ}, one frame each`,
+                    `; bracketing the tool setter at (${plan.target.machine.x}, ${plan.target.machine.y})`,
+                    ...plan.waypoints.map((w, i) => `G0 X${w.x.toFixed(1)} Y${w.y.toFixed(1)}; waypoint ${i + 1} + capture`),
+                ]);
+                const job = jobManager.submit(
+                    envelope,
+                    `camera-bootstrap search ${plan.waypoints.length}pts - ${reason.slice(0, 40)}`,
+                    'cnc',
+                    validateGcode(envelope),
+                    'procedure'
+                );
+                job.runner = async () => runSearchStage(plan, (phase, note) => {
+                    jobManager.appendEvent(job, phase, { note });
+                });
+                return {
+                    job: jobManager.describe(job),
+                    stage,
+                    waypoints: plan.waypoints.length,
+                    bounds: plan.bounds,
+                    targets,
+                    next_step: 'Ask the operator to approve, then start_gcode_job. Nothing about where the camera '
+                        + 'points is assumed by this stage.',
+                };
+            }
+
+            const planned = planPoseStage(args as PosePlanArgs);
+            const envelope = describeBootstrapGcode([
+                `; CAMERA BOOTSTRAP (poses): ${planned.plan.poses.length} poses, Z ${planned.parkZ} -> ${planned.floorZ}`,
+                `; ${planned.plan.captureCount} frames; every XY at Z ${planned.parkZ}, every sweep with XY stationary`,
+                ...planned.plan.poses.flatMap((pose) => [
+                    `G0 X${pose.x.toFixed(1)} Y${pose.y.toFixed(1)}; ${pose.label}`,
+                    ...pose.stops.map((stop) => `G1 Z${stop.z.toFixed(3)}; ${pose.label} capture`),
+                    `G1 Z${planned.parkZ.toFixed(3)}; back to the park height`,
+                ]),
+            ]);
+            const job = jobManager.submit(
+                envelope,
+                `camera-bootstrap poses ${planned.plan.captureCount}frames - ${reason.slice(0, 40)}`,
+                'cnc',
+                validateGcode(envelope),
+                'procedure'
+            );
+            job.runner = async () => runPoseStage(planned, (phase, note) => {
+                jobManager.appendEvent(job, phase, { note });
+            });
+            return {
+                job: jobManager.describe(job),
+                stage,
+                poses: planned.plan.poses,
+                dropped: planned.plan.dropped,
+                captures: planned.plan.captureCount,
+                targets,
+                next_step: 'Ask the operator to approve, then start_gcode_job. Solve the frames with '
+                    + 'scripts/camera_bootstrap.py, store with set_camera_model, prove with verify_camera_model.',
             };
         },
     });
