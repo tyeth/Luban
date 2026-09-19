@@ -22,15 +22,20 @@ item, quoting the tool result — not an essay):
    rotates — say so before staging it.
 2. **Frame.** Every number you plan with is MACHINE frame, or the job declares the WORK frame
    and the MCP resolves it (§2). Never convert a file's coordinates by hand. No bare `Z`.
-3. **Height.** Any XY move over 1 mm runs at the traverse height — machine Z328 (home). If the
-   head is below 328, the retreat is its own `move_z` step and needs its own word from the
-   operator: ask "may I raise Z to machine 328 first?" — a transit request is not authority to
-   move Z.
+3. **Height.** Any XY move over 1 mm runs at or above the MOTION FLOOR — machine **Z320**
+   (`mcpMotionFloorZ`; a head reading 319.96 is at it). That is not the same number as the PARK
+   height, machine Z328 = home, which is where procedures hop between stations, retreat to on an
+   abort, and end. If the head is below the floor, the retreat is its own `move_z` step and needs
+   its own word from the operator: ask "may I raise Z first?" — a transit request is not
+   authority to move Z.
 4. **Obstacles.** The same `get_stored_state` call: does the path — the whole SEGMENT from
-   where the toolhead is to where it is going, not the destination point — cross a landmark box below
-   its `clearanceZ`? `clearanceZ == 328` passes (the test is at-or-above). A box the operator
-   states in chat is a planning obstacle immediately; write it with `set_landmark` only when
-   they ask; if chat and the store disagree, stop and ask which is current.
+   where the toolhead is to where it is going, not the destination point — cross a landmark box
+   below the toolhead Z it demands? Read `requiredToolheadZ` on the landmark rather than working
+   it out: for a box stated with `obstacle_top_z` it is the top plus the fitted tool plus a 5 mm
+   margin, and for a legacy `clearance_z` it is that number as it stands. The test is
+   at-or-above, so equal passes. A box the operator states in chat is a planning obstacle
+   immediately; write it with `set_landmark` only when they ask; if chat and the store disagree,
+   stop and ask which is current.
 5. **Tool.** A tool or the probe is ALWAYS in the spindle. Where is its tip at the Z you plan?
 6. **Authority.** An explicit imperative in the operator's LATEST message is necessary — not
    sufficient. It authorises STAGING; the click on the confirm page authorises the motion. An
@@ -61,25 +66,44 @@ item, quoting the tool result — not an essay):
    tailstock", "probe along X from 164 to 176") authorises STAGING that procedure; the confirm
    page is its decision point. A staged program or procedure is ONE decision point for every
    move inside its approved envelope — that is the efficient lawful form, not a violation.
-2. **X/Y traverses happen at top gantry height — ALL of them.** Any XY move over 1 mm is
-   planned at the traverse height (`mcpSafeTraverseZ`, default **machine Z328** = home Z; a
-   head reading 327.999 is at it). No "local hops" above a measured top, no other "measured
-   safe" height (operator, 2026-09-02: "x/y motion over 1mm is never below gantry height").
-   Retreat Z FIRST, traverse, then descend at the destination. The only sub-gantry XY motion is
-   fine positioning of ≤ 1 mm and the in-procedure envelopes in §4, which the operator approves
-   on the confirm page as part of that one tool call — the NEXT motion starts from a full
-   retreat again. Enforced: `traverse_xy` and direct XY moves below `mcpSafeTraverseZ` are
-   refused; `operator_confirmed_clearance` exists for emergencies on the operator's explicit
-   words, never for planning.
+2. **X/Y traverses happen at or above the motion floor — ALL of them.** Any XY move over 1 mm
+   is planned at or above `mcpMotionFloorZ`, default **machine Z320** (a head reading 319.96 is
+   at it). No "local hops" above a measured top, no other "measured safe" height (operator,
+   2026-09-02: "x/y motion over 1mm is never below gantry height"; revised 2026-09-19 from a
+   single height to a floor). Retreat Z FIRST, traverse, then descend at the destination. The
+   only sub-floor XY motion is fine positioning of ≤ 1 mm and the in-procedure envelopes in §4,
+   which the operator approves on the confirm page as part of that one tool call — the NEXT
+   motion starts from a full retreat again. Enforced: `traverse_xy` and direct XY moves below
+   the floor are refused; `operator_confirmed_clearance` exists for emergencies on the
+   operator's explicit words, never for planning.
+
+   **The floor is not the park height.** `mcpSafeTraverseZ` (machine Z328 = home) is where
+   procedures hop between stations, retreat to on an abort, and finish; that is unchanged, and
+   `planRaiseToTop` still targets it. The floor could only drop below it once clearances stopped
+   carrying tool length (law 4): a hop at the floor is checked against every stored landmark
+   exactly like any low segment, and there is still **no exemption for being high**. What it
+   costs is 8 mm less blind protection for anything on the bed with no landmark — which is why
+   an unmapped object taller than the floor minus the tool is the operator's problem to state,
+   not the guard's to catch.
 3. **Never fabricate clearance.** Only measured numbers or operator-stated numbers count for
    heights. A photo FINDS things, it clears nothing (incident 1). An unknown height is measured
    from a proven-safe height by a sensor-gated −Z march (§8 example), never assumed — and never
    fed as `start_z_machine` from an operator's rough guess when a march can measure it first.
-4. **Landmarks are obstacles.** Stored landmarks are CROSSING obstacles: an XY segment that
-   enters or leaves their box below `clearanceZ` is refused — at staging for procedures, at
-   call time for direct moves. A hop at 328 passes because 328 is at or above every clearance
-   (equal passes), not because it is exempt; an in-procedure hop below 328 is checked like any
-   low segment; marches are exempt because they stop on contact. A program's `keep_out` is a
+4. **Landmarks are obstacles, and a clearance is the OBSTACLE's height.** Stored landmarks are
+   CROSSING obstacles: an XY segment that enters or leaves their box below the toolhead Z it
+   demands is refused — at staging for procedures, at call time for direct moves. State a new
+   one with `obstacle_top_z`: the top of the obstacle ITSELF, nothing about the tool. The server
+   adds how far the fitted tool hangs below the toolhead (the longest of the last tool-setter
+   measurement, `probe_effective_length` and `longest_bit_length_mm` — a measurement only ever
+   lengthens the requirement) plus a 5 mm margin. With the touch probe fitted, a 250 mm-high
+   obstacle still demands 328; with a 2 mm engraving bit it demands 257, and that is where the
+   machine gets its working room back. If NOTHING is known about the tool, a physically stated
+   obstacle is impassable rather than passable — state a tool length. Legacy `clearance_z`
+   records are toolhead heights with a tool already baked in and are enforced exactly as before;
+   `get_stored_state.landmarkClearances` lists which ones still want re-stating. A hop passes
+   because it is at or above the requirement (equal passes), never because it is exempt; an
+   in-procedure hop below it is checked like any low segment; marches are exempt because they
+   stop on contact. A program's `keep_out` is a
    VOLUME: nothing enters, not even a descent column. Never delete or shrink a landmark to make
    a plan pass. Measuring INSIDE an unmeasured region is allowed and is how a keep-out is
    retired: one sensor-gated march, then `set_landmark` with the measured clearance.
@@ -180,15 +204,32 @@ The MCP keeps ONE judged machine position. Read it; never compute your own from 
 | `heartbeat` | Latest beat coherent, offset reported by the controller | allowed |
 | `cached-offset` | Beat carried a missing/zero offset; the last complete offset was reused | allowed; re-read once before a position CHECK |
 | `awaiting-resync` | The beat was REJECTED (out of bounds, frame-flip signature, or no offset yet) and the record is held at the last accepted position with its age | **refused** by every motion tool |
+| `heartbeat` + `frame: machine-frame` | Three consecutive beats read as a legal MACHINE position while the work reading was impossible: the controller is stuck in the machine workspace. The raw fields ARE the position | allowed — but the work coordinates and the offset are not to be trusted until `restore_work_frame` |
 | `stale` | No report for > 10 s (period 2 s) — the connection has likely dropped unnoticed | **refused** — reconnect and re-verify |
 
-**Nothing you do performs the resync.** The server clears `awaiting-resync` when a coherent
-beat arrives (normally the next one, 2 s). Homing does not clear it, reconnecting does not
-clear it, re-reading only lets you see that it cleared. Re-read `get_position` once after ~3 s;
-still rejected after ~3 re-reads (~10 s): stop polling, call `query_firmware_position` (proves
-the controller is alive — it reports WORK coordinates, not an independent machine frame) and
-`get_mcp_diagnostics → machinePosition` (rejected-beat counters by reason), and tell the
-operator — that is a connection or controller fault, not a wait. `frame: undetermined` means
+**Nothing you do performs the resync, with one exception.** The server clears
+`awaiting-resync` when a coherent beat arrives (normally the next one, 2 s). Homing does not
+clear it, reconnecting does not clear it, re-reading only lets you see that it cleared. Re-read
+`get_position` once after ~3 s.
+
+The exception is the one that cost a whole session on 2026-09-19: if the controller was left in
+the MACHINE workspace — a job declared `G53` and never selected a work workspace again — then
+every beat carries machine coordinates with the work-origin offset still populated, `raw −
+offset` is impossible, and no amount of waiting fixes it. The server recognises that after
+three such beats and says so in `reasons`, reporting `frame: machine-frame` and using the raw
+fields as the machine position. **The remedy is `restore_work_frame`**: `G90` and `G54`, no
+axis word, permitted precisely because the position is incoherent. A re-home is NOT the remedy,
+though it happens to work — it emits a `G54` on the way.
+
+**Frame hygiene stops it happening.** Every machine-frame job hands the frame back: `G53` on its
+own line before the moves, `G54` on its own line after the last one. `traverse_xy` and `move_z`
+already emit exactly that, which is the real reason to use them instead of writing the file
+yourself; a hand-authored transit that is pure transport is refused and told so.
+
+Still rejected after ~3 re-reads (~10 s) and not a frame problem: stop polling, call
+`query_firmware_position` (proves the controller is alive — it reports WORK coordinates, not an
+independent machine frame) and `get_mcp_diagnostics → machinePosition` (rejected-beat counters
+by reason), and tell the operator — that is a connection or controller fault, not a wait. `frame: undetermined` means
 the judgement rests on no clean reading: treat it as `awaiting-resync`. During a direct move,
 beats sampled inside the `G53…G54` window are rejected by design and the record holds the
 start position — expect it, do not act on it.
@@ -214,7 +255,9 @@ start position — expect it, do not act on it.
 - **Home / homing** = machine home, `G53;G28;G54` like Luban's button — ALWAYS. Also homes B.
   It clears the NOT-HOMED state; it is not a remedy for `awaiting-resync` or `stale`.
 - **Goto work origin** = XY to work (0, 0) at the current Z. Never called "home".
-- **Traverse height** = `mcpSafeTraverseZ` = machine Z328.
+- **Motion floor** = `mcpMotionFloorZ` = machine Z320: the lowest Z any XY move may happen at.
+- **Park height** (a.k.a. traverse height) = `mcpSafeTraverseZ` = machine Z328: where procedures
+  hop, retreat on abort, and end. `get_stored_state.limits` reports both.
 - **Toolhead Z** = the Z the heartbeat reports for the head; **physical / surface height** =
   toolhead Z at contact minus the probe (or tool) length.
 - **`bit_length_mm`** (tool setter) = the fitted tool's PROTRUSION from the collet in mm — a
