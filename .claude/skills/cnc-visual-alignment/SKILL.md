@@ -1,6 +1,6 @@
 ---
 name: cnc-visual-alignment
-description: "Measure CNC stock and position a toolhead from webcam frames — via the Luban MCP tool surface (capture, guarded moves, Y-keyed calibration, visual servo) with single-frame metric rectification and parallax handling as the vision core. Use whenever the user wants to locate stock, find a datum, set or verify a work origin visually, drive the toolhead to something seen on camera, or measure a part on the bed."
+description: "Measure CNC stock and position a toolhead from webcam frames — via the Luban MCP tool surface (capture, guarded moves, the solved camera model, visual servo, overlapping surveys) with single-frame metric rectification and parallax handling as the vision core. The camera is session state, not a rig constant: verify or re-solve its geometry before any pose arithmetic. Use whenever the user wants to locate stock, find a datum, set or verify a work origin visually, drive the toolhead to something seen on camera, or measure a part on the bed."
 ---
 
 # CNC visual alignment from a toolhead camera
