@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 
-import { FRAME_REFUSAL_UNDECLARED, FrameResolutionContext, resolveJobFrame, validateGcode } from '../validator';
+import { FRAME_REFUSAL_NO_RESTORE, FRAME_REFUSAL_UNDECLARED, FrameResolutionContext, resolveJobFrame, validateGcode } from '../validator';
 
 const A350 = { machineZMax: 330 };
 
@@ -100,7 +100,7 @@ export const tests: Array<[string, () => void]> = [
     }],
 
     ['machine-frame Z outside the travel is warned, not refused', () => {
-        const r = resolveJobFrame(validateGcode('G90\nG53\nG1 Z400\n'), ctx());
+        const r = resolveJobFrame(validateGcode('G90\nG53\nG1 Z400\nG54\n'), ctx());
         assert.equal(r.refusal, null);
         assert.ok(r.report.warnings.some((w) => w.includes('outside the 0 .. 330 travel')));
     }],
@@ -128,5 +128,45 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(report.spindle.maxS, 8000);
         assert.equal(report.minZWithSpindleOn, -3);
         assert.equal(report.motionLineCount, 2);
+    }],
+
+    // A5: a machine-frame job must hand the frame back. Live 2026-09-19 a
+    // hand-authored centre move ended in G53, the controller stayed in the
+    // machine workspace, and every later beat was rejected until a re-home.
+    ['a machine-frame job that never selects a work workspace again is refused', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG53\nG0 X160 Y175\n'), ctx());
+        assert.equal(r.refusal, FRAME_REFUSAL_NO_RESTORE);
+        assert.ok(/G54/.test(r.refusal as string), 'the refusal states the epilogue it wants');
+        assert.equal(r.report.frame.endsInFrame, 'machine');
+    }],
+
+    ['the same job with a trailing G54 stages cleanly', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG53;\nG0 X160 Y175;\nG54;\n'), ctx());
+        assert.equal(r.refusal, null);
+        assert.equal(r.report.frame.declared, 'machine');
+        assert.equal(r.report.frame.endsInFrame, 'work');
+    }],
+
+    ['every MCP emitter already ends in the work frame (regression)', () => {
+        assert.equal(validateGcode(MOVE_Z_MACHINE).frame.endsInFrame, 'work');
+    }],
+
+    ['a work-frame job is unaffected - it never left the work workspace', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG54\nG0 X10 Y10\n'), ctx());
+        assert.equal(r.refusal, null);
+        assert.equal(r.report.frame.endsInFrame, 'work');
+    }],
+
+    ['a no-motion file is never asked for an epilogue', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG53;\n'), ctx());
+        assert.equal(r.refusal, null, 'nothing ran, so nothing needs handing back');
+    }],
+
+    ['mixed frames: ending in work stages, ending in machine does not', () => {
+        const ok = resolveJobFrame(validateGcode('G90\nG53;\nG0 X160;\nG54;\nG0 X5;\n'), ctx());
+        assert.equal(ok.refusal, null);
+        const bad = resolveJobFrame(validateGcode('G90\nG54;\nG0 X5;\nG53;\nG0 X160;\n'), ctx());
+        assert.equal(bad.report.frame.endsInFrame, 'machine');
+        assert.equal(bad.refusal, FRAME_REFUSAL_NO_RESTORE);
     }],
 ];

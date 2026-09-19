@@ -30,6 +30,14 @@ export interface FrameDeclaration {
     workspaceSelects: string[];
     /** Lines carrying G53 together with a motion word - this controller does not honour inline G53. */
     inlineG53Lines: number[];
+    /**
+     * Frame still selected when the file ENDS. The controller keeps the last
+     * workspace selected after a job finishes, so a file that ends in 'machine'
+     * leaves every later heartbeat reporting machine coordinates (live
+     * 2026-09-19: the position of record then rejected every beat until a
+     * re-home). null = the file selected no workspace at all.
+     */
+    endsInFrame: JobFrame | null;
 }
 
 export interface GcodeValidationReport {
@@ -238,6 +246,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     });
 
     const frame: FrameDeclaration = {
+        endsInFrame: frameModal,
         declared: declaredAtFirstMotion,
         source: declaredAtFirstMotion ? 'gcode' : null,
         line: declaredAtFirstMotion ? declarationLine : null,
@@ -327,6 +336,12 @@ export interface FrameResolution {
     refusal: string | null;
 }
 
+export const FRAME_REFUSAL_NO_RESTORE = 'Refused: this job never hands the coordinate frame back - it ends with G53 '
+    + 'still selected. The controller keeps that workspace after the job finishes, so every later status '
+    + 'report carries machine coordinates while the work-origin offset is still populated, the position of record '
+    + 'rejects them, and motion and staging refuse (live 2026-09-19: a re-home was the only way out). Put `G54;` on its '
+    + 'own line at the end of the file. The MCP never edits your gcode to add it.';
+
 export const FRAME_REFUSAL_UNDECLARED = 'Refused: the job never declares its coordinate frame, so its moves would run in '
     + 'whatever workspace the controller happens to have selected. Declare it: put `G53` on its own line before the '
     + 'first move (and `G54` after the last) for MACHINE coordinates, or pass frame: "work" for a Luban/slicer file '
@@ -367,6 +382,13 @@ export function resolveJobFrame(input: GcodeValidationReport, ctx: FrameResoluti
         } else {
             return { report, refusal: FRAME_REFUSAL_UNDECLARED };
         }
+    }
+
+    // A machine-frame job must hand the frame back. Every MCP emitter already
+    // ends `G54;` - only a hand-authored file can leave the controller in the
+    // machine workspace, and that is exactly what happened on 2026-09-19.
+    if (report.frame.endsInFrame === 'machine') {
+        return { report, refusal: FRAME_REFUSAL_NO_RESTORE };
     }
 
     const zMax = ctx.machineZMax;
