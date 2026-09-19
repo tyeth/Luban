@@ -31,6 +31,9 @@ export interface TraversePlanInput {
     feedRate: number;
     /** Stored landmarks (+ any program keep-outs) as obstacle boxes. */
     obstacles: ObstacleBox[];
+    /** clearanceContext.currentToolProtrusion().mm - a physically stated obstacle needs it. */
+    toolProtrusionMm?: number | null;
+    clearanceMarginMm?: number;
     reason: string;
 }
 
@@ -159,7 +162,11 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
     // Landmarks are obstacles (law 4) - at 328 every stored clearance passes on
     // its own merits; a configured lower traverse height or a taller landmark
     // refuses here, naming the step and the landmark.
-    const violations = checkMotion(segments, obstacles, { traverseZ });
+    const violations = checkMotion(segments, obstacles, {
+        traverseZ,
+        toolProtrusionMm: input.toolProtrusionMm === undefined ? null : input.toolProtrusionMm,
+        clearanceMarginMm: input.clearanceMarginMm,
+    });
     if (violations.length) {
         throw new TraversePlanError(`Refused - the path crosses a landmark below its clearance: ${describeViolations(violations)}. `
             + 'Raise the traverse height only if the operator says so; never shrink or delete the landmark.');

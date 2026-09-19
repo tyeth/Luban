@@ -55,3 +55,40 @@ export function restatementAdvice(name: string, clearanceZ: number): string {
         + 'already baked in. Re-state it with set_landmark obstacle_top_z = the height of the OBSTACLE ITSELF, and the '
         + 'live tool protrusion is added at check time instead. Until then it is still enforced exactly as before.';
 }
+
+/**
+ * Head-room added above the obstacle on top of the tool, for a physically
+ * stated clearance. The obstacle's top is measured, the tool's protrusion is
+ * the longest candidate known (toolProtrusion.ts), and this is the slack for
+ * everything neither of them covers: an unmeasured collet nut, a workpiece
+ * standing proud of what was measured, a fixture that moved.
+ */
+export const CLEARANCE_MARGIN_MM = 5;
+
+/**
+ * The minimum toolhead machine Z a path may reach over this obstacle.
+ *
+ *  - 'toolhead': the stored number already IS that height - the tool was
+ *    accounted for when it was set, so nothing is added (adding to it would
+ *    double-count and refuse every traverse on the machine).
+ *  - 'physical': obstacle top + how far the tool hangs below the toolhead +
+ *    the margin.
+ *
+ * null when a physical clearance cannot be judged because nothing is known
+ * about the tool. A null is a REFUSAL, never a pass: the caller treats the
+ * obstacle as impassable until someone states a tool length.
+ */
+export function requiredToolheadZ(
+    clearanceZ: number,
+    basis: ClearanceBasis,
+    toolProtrusionMm: number | null,
+    marginMm: number = CLEARANCE_MARGIN_MM
+): number | null {
+    if (basis === 'toolhead') {
+        return clearanceZ;
+    }
+    if (toolProtrusionMm === null || !Number.isFinite(toolProtrusionMm)) {
+        return null;
+    }
+    return Number((clearanceZ + toolProtrusionMm + marginMm).toFixed(3));
+}

@@ -5,6 +5,7 @@ import * as fs from 'fs-extra';
 import logger from '../../../lib/logger';
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpJob, TERMINAL_JOB_STATES, approvalHandoff, jobManager } from '../jobs';
+import { clearanceOptions } from '../clearanceContext';
 import { classifyProcedureEnding, countMeasured, planJobStop } from '../jobEnding';
 import { summarizeJobTiming } from '../jobTiming';
 import { landmarkStore } from '../landmarks';
@@ -961,6 +962,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     traverseZ: safeTraverseZ(),
                     feedRate,
                     obstacles: landmarkStore.obstacleBoxes(),
+                    ...clearanceOptions(),
                     reason,
                 });
             } catch (err) {

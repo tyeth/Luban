@@ -12,6 +12,7 @@ import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
+import { clearanceOptions } from '../clearanceContext';
 import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
@@ -259,6 +260,19 @@ const recentDirectMoves: number[] = [];
 const PACING_WINDOW_MS = 15000;
 const PACING_REFUSE_AT = 4; // the 4th move inside the window is refused
 
+/** One obstacle, with the toolhead Z it demands and where that number came from. */
+function describeObstacleRequirement(l: { name: string; clearanceZ: number | null; clearanceBasis: string; requiredZ: number | null }): string {
+    if (l.requiredZ === null) {
+        return `"${l.name}" (top Z ${l.clearanceZ}, but no tool length is known so the toolhead Z it needs cannot be `
+            + 'computed - state one with set_tool_setter_config longest_bit_length_mm or set_probe_geometry '
+            + 'probe_effective_length)';
+    }
+    if (l.clearanceBasis === 'physical') {
+        return `"${l.name}" (top Z ${l.clearanceZ}, needs toolhead Z ${l.requiredZ} with the tool and margin above it)`;
+    }
+    return `"${l.name}" (clearance Z ${l.clearanceZ})`;
+}
+
 /**
  * The single bounded XY move + settle + capture behind move_and_capture,
  * shared with visual_servo. Enforces every guard.
@@ -326,13 +340,15 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         }
         const machineFrom = { x: before.machine.x, y: before.machine.y };
         if (machineFrom.x !== null && machineFrom.y !== null) {
+            const clearance = clearanceOptions();
             const obstacles = landmarkStore.obstaclesOnPath(
-                machineFrom.x, machineFrom.y, machineTarget.x, machineTarget.y, machineZ
+                machineFrom.x, machineFrom.y, machineTarget.x, machineTarget.y, machineZ,
+                undefined, clearance.toolProtrusionMm, clearance.clearanceMarginMm
             );
             if (obstacles.length) {
                 throw new McpToolError('XY move refused: the path crosses obstacle landmark(s) '
-                    + `${obstacles.map((l) => `"${l.name}" (clearance Z ${l.clearanceZ})`).join(', ')} `
-                    + `while at machine Z ${machineZ.toFixed(1)}. Raise Z above the clearance, or get the `
+                    + `${obstacles.map((l) => describeObstacleRequirement(l)).join(', ')} `
+                    + `while at machine Z ${machineZ.toFixed(3)}. Raise Z above the requirement, or get the `
                     + 'operator\'s explicit confirmation for this corridor.');
             }
         }

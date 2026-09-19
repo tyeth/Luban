@@ -2,9 +2,11 @@ import { strict as assert } from 'assert';
 
 import {
     CLEARANCE_BASES,
+    CLEARANCE_MARGIN_MM,
     LEGACY_CLEARANCE_BASIS,
     needsRestatement,
     normaliseClearanceBasis,
+    requiredToolheadZ,
     restatementAdvice,
 } from '../landmarkClearance';
 
@@ -45,5 +47,23 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(/328/.test(advice));
         assert.ok(/obstacle_top_z/.test(advice), 'names the argument to use');
         assert.ok(/enforced exactly as before/.test(advice), 'says the old number is still in force');
+    }],
+
+    // B3: what toolhead Z an obstacle actually demands.
+    ['a legacy clearance IS the toolhead height - nothing is added to it', () => {
+        // The rotary-axis landmark as stored: 328, with a probe already in it.
+        assert.equal(requiredToolheadZ(328, 'toolhead', 73, 5), 328);
+        assert.equal(requiredToolheadZ(328, 'toolhead', null, 5), 328, 'and it needs no tool length to be judged');
+    }],
+
+    ['a physical clearance adds the tool and the margin', () => {
+        assert.equal(requiredToolheadZ(250, 'physical', 73, 5), 328, 'the probe reproduces the old ceiling');
+        assert.equal(requiredToolheadZ(250, 'physical', 2, 5), 257, 'an engraving bit does not');
+        assert.equal(requiredToolheadZ(250, 'physical', 73), 250 + 73 + CLEARANCE_MARGIN_MM, 'default margin');
+    }],
+
+    ['a physical clearance with no tool length known is null - impassable, not passable', () => {
+        assert.equal(requiredToolheadZ(250, 'physical', null, 5), null);
+        assert.equal(requiredToolheadZ(250, 'physical', Number.NaN, 5), null);
     }],
 ];
