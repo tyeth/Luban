@@ -3,6 +3,7 @@ import http from 'http';
 import pkg from '../../../package.json';
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { cameraStreamService } from './cameraStream';
 import { diagnosticsSnapshot, startDiagnostics } from './diagnostics';
 import { McpServer, isTrustedAddress, isTrustedOrigin, localSubnets } from './McpServer';
 import { OAuthShim } from './oauth';
@@ -157,6 +158,16 @@ export function getMcpStatus() {
         // Timing evidence (event-loop stalls, heartbeat cadence, gcode
         // pacing, sensor pipe latency) - diagnostics.ts.
         diagnostics: diagnosticsSnapshot(),
+        // Live MJPEG view of the camera (/camera on this same server) -
+        // cameraStream.ts. URLs follow the LAN setting like confirm pages.
+        cameraStream: {
+            ...cameraStreamService.status(),
+            ...(httpServer ? {} : {
+                pageUrl: `${publicBaseUrl(settings.port, settings.allowLan)}/camera`,
+                streamUrl: `${publicBaseUrl(settings.port, settings.allowLan)}/camera/stream.mjpeg`,
+                snapshotUrl: `${publicBaseUrl(settings.port, settings.allowLan)}/camera/snapshot.jpg`,
+            }),
+        },
     };
 }
 
@@ -188,6 +199,10 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     registerProbingTools(registry, baseUrl);
     registerCamTools(registry, baseUrl);
     registeredToolCount = registry.list().length;
+
+    // Operator-facing live camera view; also the single frame source for
+    // every MCP capture while it runs (camera.ts LiveFrameSource).
+    cameraStreamService.start(baseUrl);
 
     broadcaster = socketServer || null;
 
@@ -224,6 +239,11 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
             jobManager.handleConfirmRequest(req, res, url.pathname);
             return;
         }
+        if (url.pathname === '/camera' || url.pathname.startsWith('/camera/')) {
+            // Live MJPEG camera view (cameraStream.ts); off = 404
+            cameraStreamService.handleRequest(req, res, url);
+            return;
+        }
         if (oauth.handleRequest(req, res, url)) {
             return;
         }
@@ -256,6 +276,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
 }
 
 export function stopMcpService(): void {
+    cameraStreamService.shutdown();
     if (httpServer) {
         httpServer.close();
         httpServer = null;

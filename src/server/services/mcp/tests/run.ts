@@ -14,10 +14,11 @@
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as machinePositionTests } from './machinePosition.test';
+import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as traversePlanTests } from './traversePlan.test';
 import { tests as validatorTests } from './validator.test';
 
-type TestCase = [string, () => void];
+type TestCase = [string, () => void | Promise<void>];
 
 const suites: Array<[string, TestCase[]]> = [
     ['validator', validatorTests],
@@ -25,22 +26,28 @@ const suites: Array<[string, TestCase[]]> = [
     ['envelopeChecks', envelopeChecksTests],
     ['traversePlan', traversePlanTests],
     ['jobEnding', jobEndingTests],
+    ['mjpegFanout', mjpegFanoutTests],
 ];
 
-let passed = 0;
-let failed = 0;
-for (const [suite, cases] of suites) {
-    for (const [name, fn] of cases) {
-        try {
-            fn();
-            passed += 1;
-            console.log(`  ok    ${suite} :: ${name}`);
-        } catch (err) {
-            failed += 1;
-            console.log(`  FAIL  ${suite} :: ${name}`);
-            console.log(`        ${(err as Error).message.split('\n').join('\n        ')}`);
+async function main(): Promise<void> {
+    let passed = 0;
+    let failed = 0;
+    for (const [suite, cases] of suites) {
+        for (const [name, fn] of cases) {
+            try {
+                // eslint-disable-next-line no-await-in-loop
+                await fn();
+                passed += 1;
+                console.log(`  ok    ${suite} :: ${name}`);
+            } catch (err) {
+                failed += 1;
+                console.log(`  FAIL  ${suite} :: ${name}`);
+                console.log(`        ${(err as Error).message.split('\n').join('\n        ')}`);
+            }
         }
     }
+    console.log(`\n${passed} passed, ${failed} failed`);
+    process.exit(failed ? 1 : 0);
 }
-console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed ? 1 : 0);
+
+main();

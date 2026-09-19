@@ -20,6 +20,7 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 | `mcpToolSetterEnabled`, `mcpProbeToolEnabled` | Default on. Off = that sensor's channel is never bound on any transport (overtravel follows the tool setter): no pill, no readings, and procedures needing it refuse with a clear message. Use when the sensor or the USB bridge is not fitted. Env `LUBAN_MCP_TOOLSETTER_ENABLED` / `LUBAN_MCP_PROBE_ENABLED` override. |
 | `mcpCameraUrl` | HTTP(S) snapshot URL; takes precedence over ffmpeg. |
 | `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg capture — DirectShow on Windows (device = friendly name), v4l2 on Linux (device = a `list_cameras` entry, preferably the stable `/dev/v4l/by-id/… (Name)` form; a bare `/dev/videoN` works but renumbers on replug). Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. |
+| `mcpCameraStreamEnabled`, `mcpCameraStreamFps`, `mcpCameraStreamMaxClients` | Live MJPEG view of the camera at `/camera` on the MCP port (see "Live camera stream"). Enabled: unset = on once a camera is configured (URL, pinned or last-good device), else the stored switch; env `LUBAN_MCP_CAMERA_STREAM_ENABLED` overrides. Fps 1–15 (default 5), clients 1–16 (default 4). Settings → MCP Server → Camera edits these; the switch applies immediately (off disconnects every viewer), fps/clients at the next loop start. |
 | `mcpMaxJogDistance` | Per-call XY travel cap for direct moves, default 100 mm. `goto_work_origin` is exempt (fixed operator-set destination). |
 | `mcpToolRegion` | Fractional box where the endmill images (fixed camera-to-spindle geometry); returned with every frame; settable via the `set_tool_region` tool. |
 | *(machine, toolheads, modules)* | **Not MCP keys.** `get_machine_profile` / `get_stored_state` read the machine, toolheads and installed add-on modules (bracing kit, quick-swap) from Luban's own **Machine Settings** (`userData/machine.json`, `state.machine`) on every call — change them in the app (it returns to its home page) and the MCP follows. `mcpInstalledModules` is gone (2026-09-05). |
@@ -68,6 +69,45 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
   ffmpeg input wired up. `mcpCameraUrl` (HTTP snapshot, e.g. Android IP Webcam) remains
   platform-independent and takes precedence everywhere.
 
+## Live camera stream (2026-09-16)
+
+The MCP http server also serves the camera to a **browser**, so the operator can watch the
+job without pasting frames — same port, same LAN gate as `/mcp` and `/confirm` (loopback
+only unless `mcpAllowLan`; `stream_url` follows the LAN address exactly like `confirm_url`):
+
+| Route | What |
+|---|---|
+| `GET /camera` | Tiny dark page showing the stream plus a live status line. This is the URL handed out as `stream_url`. |
+| `GET /camera/stream.mjpeg` | `multipart/x-mixed-replace` MJPEG, capped at `mcpCameraStreamFps`. |
+| `GET /camera/snapshot.jpg` | One JPEG through the very same path the tools take (`captureFrame`); headers `X-Frame-Captured-At`, `X-Frame-Source`, `X-Frame-Id`, and `X-Frame-Stale: true` when only an old frame is available. |
+| `GET /camera/status.json` | Loop state: running, clients, provider/device, frame age, stale, last error, fan-out stats. |
+
+On the Ubuntu box: `http://192.168.1.153:40889/camera` (LAN mode on); on the machine itself
+`http://127.0.0.1:40889/camera`. With the switch off every `/camera*` route answers **404**
+with a one-line pointer to the setting, and the capture loop never starts for streaming.
+
+**One device, one owner.** A v4l2 / DirectShow camera opens for one process at a time, so
+the stream and the tools cannot both open it. `cameraStream.ts` runs ONE long-lived ffmpeg
+(`-f mjpeg pipe:1`, or a poller of `mcpCameraUrl`) only while a browser is attached, splits
+the pipe into JPEGs (`mjpegFanout.ts` walks the marker segments; a naive `FFD9` search
+would end a frame at an EXIF thumbnail) and publishes each into a `FrameHub`. While that
+loop runs, `captureFrame()` in `camera.ts` is served FROM the hub through the
+`LiveFrameSource` hook — `capture_frame`, `move_and_capture`, `visual_servo`, `survey_bed`
+all keep working, position-stamped and cached (`frameId`) exactly as before, with
+`camera.source = "stream"` — waiting for a frame no older than one frame interval (so a
+post-settle capture never gets a pre-settle frame). When the last viewer leaves the loop
+lingers 5 s, then ends ffmpeg and the tools go back to opening the device themselves
+(`source = "one-shot"`); a one-shot capture in flight is awaited before the loop opens the
+device. The loop is a child process plus a cheap marker walk, so it never blocks the
+heartbeat or motion; if ffmpeg dies it is restarted with 1→30 s backoff while viewers
+remain, the last frame stays available and `stale` is flagged. Slow viewers skip frames
+(socket backpressure), never queue them; the client cap answers 503. Pure parts
+(splitter, hub fan-out/backpressure/rate cap/client cap/stale/awaitFrame, backoff, the
+enabled default) are unit-tested in `tests/mjpegFanout.test.ts`.
+
+Not hardware-tested at merge time: the only camera lives on the Ubuntu box; the ffmpeg
+command line is the one-shot capture's input arguments plus `-vf fps=N -f mjpeg`.
+
 ## Architecture
 
 Own `http.Server` bound to loopback by default (`mcpAllowLan` widens it to this machine's own IPv4
@@ -97,14 +137,16 @@ loopback, so LAN clients the outer gate admitted still got `403 loopback only` o
 
 ```
 mcp/
-  index.ts       start/stop, config resolution, routing (/mcp, /confirm, oauth), mcpBroadcast
+  index.ts       start/stop, config resolution, routing (/mcp, /confirm, /camera, oauth), mcpBroadcast
   McpServer.ts   JSON-RPC transport, per-call logging + mcp:activity broadcast
   oauth.ts       OAuth 2.1 / DCR shim for clients that insist on it; grants all, labels logs
   registry.ts    tool registration/dispatch; McpToolError = tool-level failure
   jobs.ts        JobManager + human confirm pages (/confirm/<id>); job kinds file|direct
   validator.ts   static gcode inspection (extents, spindle, distance-mode hazards) + the FRAME
                  handshake (G53/G54 tracking, resolveJobFrame refuses undeclared jobs)
-  camera.ts      capture providers, frame cache (last 12, frameId), sticky device
+  camera.ts      capture providers, frame cache (last 12, frameId), sticky device, LiveFrameSource hook
+  cameraStream.ts  live MJPEG view (/camera*): one ffmpeg loop while viewers exist, serves the tools too
+  mjpegFanout.ts pure: JPEG stream splitter, FrameHub fan-out (backpressure, fps/client caps, stale, awaitFrame)
   tracking.ts    zero-mean NCC template matching between cached frames
   calibration.ts Y/Z-keyed pixel->mm calibration store (userDataDir, persists)
   mqtt.ts        minimal MQTT 3.1.1 client over net/tls (hand-rolled, no deps)
@@ -791,8 +833,9 @@ the fixtures).
 stored result; long-poll with `wait_ms`/`since_event`) / `stop_gcode_job` (procedures: cooperative
 stop at the next step boundary, raise, state `stopped`, partial `result` kept; file jobs: firmware
 stop) · `move_z` (single or
-`z_targets` batch) · `home` · `goto_work_origin` · `move_and_capture` · `list_cameras` ·
-`capture_frame` (position-stamped, `frameId`, `expectedToolRegion`) · `set_tool_region` ·
+`z_targets` batch) · `home` · `goto_work_origin` · `move_and_capture` · `list_cameras` (devices +
+`stream.stream_url`, the operator's live view) ·
+`capture_frame` (position-stamped, `frameId`, `expectedToolRegion`, `source` stream|one-shot) · `set_tool_region` ·
 `track_feature` (NCC between cached frames — use instead of eyeballing pixels) ·
 `set_/get_/delete_camera_calibration` (Y/Z-keyed; optional `surface` depth-plane tag;
 optional `jacobian` REJECTS sign-flipped matrices, M·J ≈ −I) · `visual_servo` (one clamped

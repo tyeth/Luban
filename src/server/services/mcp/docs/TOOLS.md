@@ -7,7 +7,7 @@ session.
 
 ## Orientation and status (read-only)
 
-- `get_stored_state` — everything known in one call: calibrations, landmarks, tool region, limits, camera, connection, probe feed. Start here.
+- `get_stored_state` — everything known in one call: calibrations, landmarks, tool region, limits, camera (incl. `camera.stream.stream_url`, the operator's live view), connection, probe feed. Start here.
 - `get_connection_status` — is Luban connected to a machine, over what channel.
 - `get_machine_profile` — kinematics, work envelope, toolhead module offsets.
 - `get_position` — the machine POSITION OF RECORD: judged machine coordinates with `reliability` (verified | heartbeat | cached-offset | awaiting-resync | stale), the frame it rests on and `reasons`, plus the raw work report and originOffset. Motion refuses unless verified/heartbeat/cached-offset; never derive machine = work − offset yourself.
@@ -34,14 +34,15 @@ session.
 
 ## Camera and vision
 
-- `list_cameras` — enumerate capture devices (DirectShow names on Windows, `/dev/v4l/by-id` on Linux).
-- `capture_frame` — position-stamped frame with a `frameId`, the expected tool region, and nearby landmarks. Cached (last 12).
+- `list_cameras` — enumerate capture devices (DirectShow names on Windows, `/dev/v4l/by-id` on Linux), plus `stream` — `enabled`, `stream_url` (`/camera` page for the OPERATOR's browser; not for the agent to fetch), `running`, `clients`, `fps`.
+- `capture_frame` — position-stamped frame with a `frameId`, the expected tool region, nearby landmarks, `source` (`stream` = served by the live MJPEG loop someone is watching, `one-shot` = this call opened the device) and `stream_url`. Cached (last 12). Works the same whether or not the stream is running.
 - `set_tool_region` — tell the server where the tool appears in frame so captures can flag it.
 - `track_feature` — normalised cross-correlation of a template between two cached frames. Use instead of eyeballing pixels.
 - `set_camera_calibration` — Y/Z-keyed pixel-to-mm calibration, optional `surface` depth tag and `jacobian`. Sign-flipped matrices are rejected.
 - `get_camera_calibration` / `delete_camera_calibration` — read or remove a stored calibration.
 - `visual_servo` — one clamped step toward a seen target per call. Trips when the error stops shrinking or the response diverges from the calibration prediction (parallax signature).
 - `survey_bed` — approved serpentine XY camera grid at gantry height; whole-bed mosaic for finding stock and fixtures.
+- *(not a tool)* Live view for humans: `GET /camera` on the MCP port (`stream_url` above) — MJPEG at `/camera/stream.mjpeg`, one JPEG at `/camera/snapshot.jpg`, `/camera/status.json`. Same LAN gate as `/mcp`; off (Settings → MCP Server → Camera) = 404.
 
 ## Landmarks and scene
 
