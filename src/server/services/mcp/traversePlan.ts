@@ -3,7 +3,7 @@
 // call, like move_z - the twin the 100 mm move_and_capture cap kept forcing
 // into hand-written file jobs (which is how a frameless `G0 Z0` got staged on
 // 2026-09-12). Pure: no server imports, unit-tested in tests/traversePlan.test.ts.
-import { MotionSegment, ObstacleBox, checkMotion, describeViolations } from './envelopeChecks';
+import { MotionSegment, ObstacleBox, POSITION_EPSILON_MM, checkMotion, describeViolations } from './envelopeChecks';
 
 export interface Xyz {
     x: number;
@@ -70,7 +70,7 @@ export const MAX_TRAVERSE_TARGETS = 20;
  * machine Z 327.9989959716797 for a 328 home (seen live 2026-09-14), and an
  * exact >= 328 refused every traverse from home.
  */
-export const TRAVERSE_Z_TOLERANCE_MM = 0.05;
+export const TRAVERSE_Z_TOLERANCE_MM = POSITION_EPSILON_MM;
 /** The direct-batch separator start_gcode_job and the confirm page know. */
 export const STEP_SEPARATOR = '\n; --- next approved step ---\n';
 

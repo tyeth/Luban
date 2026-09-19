@@ -51,6 +51,16 @@ export interface Violation {
     clearanceZ: number;
 }
 
+/**
+ * The heartbeat's float noise, shared by every comparison of a machine Z
+ * against a stated height. Home reports machine Z 327.9989959716797 for a 328
+ * home (live 2026-09-14): an exact compare refused a traverse from home, and
+ * an exact compare here refused an XY move over a landmark whose clearance is
+ * the traverse height because the live Z read 327.999994 (live 2026-09-19).
+ * `TRAVERSE_Z_TOLERANCE_MM` in traversePlan.ts is this same number.
+ */
+export const POSITION_EPSILON_MM = 0.05;
+
 export const OBSTACLE_MARGIN_MM = 5;
 
 /** 2D segment-vs-AABB slab test; the box is inflated by `margin` on every side. */
@@ -111,7 +121,7 @@ export function checkMotion(
     for (const seg of segments) {
         const lowZ = Math.min(seg.from.z, seg.to.z);
         for (const ob of obstacles) {
-            if (lowZ >= ob.clearanceZ - 1e-9) {
+            if (lowZ >= ob.clearanceZ - POSITION_EPSILON_MM) {
                 continue;
             }
             // No traverse-height exemption (removed 2026-09-14). The safe

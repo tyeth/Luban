@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 
-import { MotionSegment, ObstacleBox, checkMotion } from '../envelopeChecks';
+import { MotionSegment, ObstacleBox, POSITION_EPSILON_MM, checkMotion } from '../envelopeChecks';
 
 // The rotary-axis landmark as stored on the A350: X140-200 x Y0-350, clearance 328
 // (the box includes the tailstock, whose height is unmeasured).
@@ -50,5 +50,28 @@ export const tests: Array<[string, () => void]> = [
         const low = checkMotion([hop(240, 100, 250, 290)], [JAWS], { traverseZ: 328 });
         assert.equal(low.length, 1);
         assert.deepEqual(checkMotion([hop(328, 100, 250, 290)], [JAWS], { traverseZ: 328 }), [], 'above the volume clearance is fine');
+    }],
+
+    // A1: the heartbeat's float noise is not a clearance violation. Live
+    // 2026-09-19: an XY move was refused because machine Z read 327.999994
+    // against the rotary landmark's clearance of 328 - 6 nanometres.
+    ['a hop a float-noise hair below the clearance is allowed', () => {
+        assert.deepEqual(checkMotion([hop(327.999994, 20, 290)], [ROTARY]), []);
+    }],
+
+    ['a hop exactly at the clearance is allowed', () => {
+        assert.deepEqual(checkMotion([hop(328, 20, 290)], [ROTARY]), []);
+    }],
+
+    ['a hop at the epsilon boundary is allowed; one hair below it is refused', () => {
+        assert.deepEqual(checkMotion([hop(328 - POSITION_EPSILON_MM, 20, 290)], [ROTARY]), [],
+            'exactly one epsilon below the clearance still clears');
+        const v = checkMotion([hop(328 - POSITION_EPSILON_MM - 0.001, 20, 290)], [ROTARY]);
+        assert.equal(v.length, 1, 'beyond the epsilon it is a real violation');
+        assert.equal(v[0].clearanceZ, 328);
+    }],
+
+    ['a tenth of a millimetre low is still a violation - the epsilon is noise, not slack', () => {
+        assert.equal(checkMotion([hop(327.9, 20, 290)], [ROTARY]).length, 1);
     }],
 ];
