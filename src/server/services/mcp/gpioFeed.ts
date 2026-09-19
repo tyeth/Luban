@@ -6,6 +6,7 @@ import config from '../configstore';
 import { recordSensorLatency } from './diagnostics';
 import { PROBE_CHANNELS, ProbeChannel, ProbeTransport } from './probeTransport';
 import { EMPTY_PROGRESS, MonitorProgress, describeReadyTimeout } from './probeFeedHealth';
+import { BridgeResetResult, describeBridgeReset, resetStrandedBridges } from './usbBridgeReset';
 
 const log = logger('service:mcp:gpio-feed');
 
@@ -270,6 +271,9 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
     /** How far the current monitor got before it went quiet (describeReadyTimeout). */
     private progress: MonitorProgress = { ...EMPTY_PROGRESS };
 
+    /** What the last automatic USB reset did, for the status. */
+    private lastBridgeReset: BridgeResetResult | null = null;
+
     private stderrTail = '';
 
     private lastFatal: string | null = null;
@@ -337,13 +341,23 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
             this.child = child;
 
             this.progress = { ...EMPTY_PROGRESS };
-            const readyTimer = setTimeout(() => {
-                const err = new Error(describeReadyTimeout(
+            const readyTimer = setTimeout(async () => {
+                let detail = describeReadyTimeout(
                     this.progress,
                     READY_TIMEOUT_MS,
                     this.cfg.python,
                     this.cfg.blinkaEnvText
-                ));
+                );
+                // A monitor that got as far as loading the board and then
+                // stalled on its first pin is the leaked-claim signature. Clear
+                // it here rather than asking a human to walk over and replug
+                // the board: USBDEVFS_RESET rebinds the kernel driver and needs
+                // no root (the device node carries a plugdev ACL).
+                if (this.progress.stage === 'imported' && !this.progress.pinsDone.length) {
+                    this.lastBridgeReset = await resetStrandedBridges(this.cfg.python);
+                    detail += describeBridgeReset(this.lastBridgeReset);
+                }
+                const err = new Error(detail);
                 settle(err);
                 this.fail(err);
             }, READY_TIMEOUT_MS);
@@ -433,6 +447,7 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
             board: this.boardId || this.progress.board,
             bridge: this.bridgeState(),
             monitorProgress: this.ready ? null : this.progress,
+            lastBridgeReset: this.lastBridgeReset,
             monitorPid: this.child ? this.child.pid : null,
             configSources: this.cfg.sources,
         };

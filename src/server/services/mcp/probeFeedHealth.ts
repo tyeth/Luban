@@ -54,9 +54,11 @@ export function describeReadyTimeout(progress: MonitorProgress, timeoutMs: numbe
     const board = progress.board || 'an unknown board';
     if (progress.stage === 'imported' && !progress.pinsDone.length) {
         return `Blinka loaded and the bridge answered as ${board}, but configuring the first pin`
-            + `${progress.stuckOn ? ` (${progress.stuckOn})` : ''} never returned in ${waited}. The board is `
-            + 'enumerated on USB but not servicing requests - a wedged U2IF bridge. UNPLUG AND REPLUG the board '
-            + '(a reboot also clears it); nothing in software can reset it.';
+            + `${progress.stuckOn ? ` (${progress.stuckOn})` : ''} never returned in ${waited}. That is a LEAKED `
+            + 'CLAIM: a previous monitor died holding the libusb claim without reattaching the kernel driver, so '
+            + 'the board still enumerates and still reports its id while the first pin blocks for ever. `lsusb -t` '
+            + 'shows its HID interface as Driver=[none] instead of Driver=usbhid. The transport resets the bridge '
+            + 'on the USB bus and retries by itself; only if that keeps failing is replugging the board the answer.';
     }
     return `Blinka loaded on ${board} and configured ${progress.pinsDone.join(', ')}, then stopped while setting up `
         + `${progress.stuckOn || 'the next pin'} - it did not finish within ${waited}. That pin is most likely `
