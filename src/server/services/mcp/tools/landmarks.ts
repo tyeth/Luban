@@ -17,7 +17,7 @@ import {
     requiredToolheadZ,
     restatementAdvice,
 } from '../landmarkClearance';
-import { readAppMachineSettings, safeTraverseZ } from './machine';
+import { motionFloorZ, readAppMachineSettings, safeTraverseZ } from './machine';
 
 // Named scene landmarks (#50) and the stored-state overview (#53): operator
 // knowledge captured once, surfaced every session, so no agent spends moves
@@ -238,8 +238,15 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 expectedToolRegion: toolRegion,
                 limits: {
                     maxJogDistanceMm: Number(config.get('mcpMaxJogDistance')) || 100,
-                    /** Machine Z every XY move over 1 mm happens at (law 2); 328 = home Z. */
+                    /** The PARK height: where procedures hop, retreat on abort, and end. 328 = home Z. */
                     safeTraverseZMm: safeTraverseZ(),
+                    /**
+                     * The MOTION FLOOR (law 2): the lowest machine Z an XY move
+                     * over 1 mm may happen at. Lower than the park height since
+                     * 2026-09-19 - landmarks are checked at the real height, so
+                     * the registry does the work a blanket ceiling used to.
+                     */
+                    motionFloorZMm: motionFloorZ(),
                 },
                 camera: {
                     url: config.get('mcpCameraUrl') || null,
