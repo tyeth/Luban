@@ -11,7 +11,7 @@ import {
     Vec3,
     judgeCameraModel,
 } from '../cameraModel';
-import { machineToPixel, viewPose } from '../cameraGeometry';
+import { fovAt, machineToPixel, viewPose } from '../cameraGeometry';
 import {
     PosePlanArgs,
     SearchPlanArgs,
@@ -29,7 +29,13 @@ import { validateGcode } from '../validator';
 import { cameraModelStore } from '../cameraModelStore';
 import { decodeToGray } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
-import { connectionEpoch, getPositionSnapshot, motionFloorZ, requireReliableMachine } from './machine';
+import {
+    connectionEpoch,
+    getPositionSnapshot,
+    motionFloorZ,
+    requireReliableMachine,
+    safeTraverseZ,
+} from './machine';
 import { connectionManager } from '../../machine/ConnectionManager';
 
 /**
@@ -254,6 +260,57 @@ export function registerCameraModelTools(registry: ToolRegistry): void {
                 model: stored,
                 next_step: 'The model is UNVERIFIED and converts nothing yet. Run verify_camera_model against a target '
                     + 'at a pose that was NOT in the fit, and report the residual it returns.',
+            };
+        },
+    });
+
+    registry.register({
+        name: 'plan_view_pose',
+        description: 'Where must the TOOLHEAD go to see this machine point? Read-only, no motion, no capture: it '
+            + 'answers from the verified camera model, so the direction the camera looks and the SIGN of its offset '
+            + 'are measured facts rather than anything remembered. Use it instead of estimating a pose - on '
+            + '2026-09-19 an assumed "the camera looks -X, 90-150 mm" pointed the wrong way and cost three operator '
+            + 'approvals to discover. Returns the toolhead XY, the standoff, the field of view at the plane you name, '
+            + 'and whether the toolhead Z asked for is outside the band the model was solved over. Move there with '
+            + 'traverse_xy.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                target: {
+                    type: 'object',
+                    description: 'The machine point to centre in the frame. z matters: it is the depth plane the view is solved on.',
+                    properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } },
+                    required: ['x', 'y', 'z'],
+                },
+                toolhead_z: { type: 'number', description: 'Machine Z to view from. Defaults to the park height.' },
+            },
+            required: ['target'],
+            additionalProperties: false,
+        },
+        handler: async (args: { target?: unknown; toolhead_z?: number }) => {
+            const model = requireCameraModel('a viewing pose');
+            const target = parseVec3(args.target, 'target');
+            const toolheadZ = Number.isFinite(Number(args.toolhead_z)) ? Number(args.toolhead_z) : safeTraverseZ();
+            const pose = viewPose(model, target, toolheadZ);
+            const fov = fovAt(model, pose.toolhead, target.z);
+            return {
+                toolhead: {
+                    x: Number(pose.toolhead.x.toFixed(3)),
+                    y: Number(pose.toolhead.y.toFixed(3)),
+                    z: Number(pose.toolhead.z.toFixed(3)),
+                },
+                standoff_mm: Number(pose.standoffMm.toFixed(2)),
+                field_of_view: {
+                    width_mm: Number(fov.widthMm.toFixed(2)),
+                    height_mm: Number(fov.heightMm.toFixed(2)),
+                    mm_per_pixel: Number(fov.mmPerPixel.toFixed(5)),
+                },
+                extrapolated: pose.extrapolated,
+                model_id: model.id,
+                note: pose.extrapolated
+                    ? `Toolhead Z ${toolheadZ} is outside the ${model.validBandZ[0]}-${model.validBandZ[1]} band the `
+                        + 'model was solved over, so this pose is extrapolated - treat it as approximate and verify by eye.'
+                    : 'Move there with traverse_xy (machine frame), then capture.',
             };
         },
     });
