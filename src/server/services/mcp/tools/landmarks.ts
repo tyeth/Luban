@@ -9,15 +9,44 @@ import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 import { GEOMETRY_FIELDS, geometrySettings, setGeometryValues } from '../rotaryGeometry';
 import { getToolSetterConfig } from '../toolSetter';
-import { ClearanceBasis } from '../landmarkClearance';
+import { currentToolProtrusion } from '../clearanceContext';
+import {
+    CLEARANCE_MARGIN_MM,
+    ClearanceBasis,
+    needsRestatement,
+    requiredToolheadZ,
+    restatementAdvice,
+} from '../landmarkClearance';
 import { readAppMachineSettings, safeTraverseZ } from './machine';
 
 // Named scene landmarks (#50) and the stored-state overview (#53): operator
 // knowledge captured once, surfaced every session, so no agent spends moves
 // re-deriving what the operator already said.
 
+/**
+ * A landmark plus what its clearance actually demands of the toolhead right
+ * now, and - for a record still on the legacy basis - what to do about it.
+ * An agent reading get_stored_state should not have to work out that a
+ * clearance of 328 is a toolhead height with a probe baked into it.
+ */
 function describeLandmark(landmark: Landmark): object {
-    return landmark;
+    if (landmark.clearanceZ === null) {
+        return { ...landmark, requiredToolheadZ: null };
+    }
+    const protrusion = currentToolProtrusion();
+    const required = requiredToolheadZ(landmark.clearanceZ, landmark.clearanceBasis, protrusion.mm);
+    return {
+        ...landmark,
+        requiredToolheadZ: required,
+        clearanceNote: required === null
+            ? `No tool length is known, so the toolhead Z this obstacle needs cannot be computed. ${protrusion.note}`
+            : `Needs toolhead machine Z ${required}${landmark.clearanceBasis === 'physical'
+                ? ` (top ${landmark.clearanceZ} + ${protrusion.mm} mm tool + ${CLEARANCE_MARGIN_MM} mm margin)`
+                : ' (stated as a toolhead height, tool length already included)'}.`,
+        restatement: needsRestatement(landmark.clearanceZ, landmark.clearanceBasis)
+            ? restatementAdvice(landmark.name, landmark.clearanceZ)
+            : null,
+    };
 }
 
 export function registerLandmarkTools(registry: ToolRegistry): void {
@@ -97,7 +126,12 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 clearanceBasis,
                 notes: args.notes ? String(args.notes) : null,
             });
-            return { landmark: describeLandmark(landmark) };
+            return {
+                landmark: describeLandmark(landmark),
+                note: clearanceBasis === 'toolhead' && clearanceZ !== null
+                    ? restatementAdvice(name, clearanceZ)
+                    : null,
+            };
         },
     });
 
@@ -184,6 +218,23 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 connection: connectionManager.getConnectionStatus(),
                 calibrations: calibrationStore.list(),
                 landmarks: landmarkStore.list().map(describeLandmark),
+                landmarkClearances: (() => {
+                    const legacy = landmarkStore.list().filter((l) => needsRestatement(l.clearanceZ, l.clearanceBasis));
+                    const protrusion = currentToolProtrusion();
+                    return {
+                        toolProtrusionMm: protrusion.mm,
+                        toolProtrusionSource: protrusion.source,
+                        toolProtrusionNote: protrusion.note,
+                        clearanceMarginMm: CLEARANCE_MARGIN_MM,
+                        onLegacyBasis: legacy.map((l) => l.name),
+                        note: legacy.length
+                            ? `${legacy.length} obstacle(s) still state a TOOLHEAD height with some tool length baked `
+                                + 'in, so they are pinned wherever they were set. Re-state each with set_landmark '
+                                + 'obstacle_top_z (the top of the obstacle itself) and the live tool is added at check '
+                                + 'time instead. They are enforced exactly as before meanwhile.'
+                            : 'Every obstacle states its own physical height; the live tool and margin are added when a path is checked.',
+                    };
+                })(),
                 expectedToolRegion: toolRegion,
                 limits: {
                     maxJogDistanceMm: Number(config.get('mcpMaxJogDistance')) || 100,
