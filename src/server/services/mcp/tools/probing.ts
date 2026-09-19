@@ -27,7 +27,10 @@ import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
 import { fovAt } from '../cameraGeometry';
 import { pitchForOverlap } from '../surveyMosaic';
-import { requireCameraModel } from './cameraModel';
+import { modelContext, requireCameraModel } from './cameraModel';
+import { judgeCameraModel } from '../cameraModel';
+import { cameraModelStore } from '../cameraModelStore';
+import { renderMosaic } from '../surveyRender';
 import {
     getMachineSizeByIdentifier,
     getPositionSnapshot,
@@ -730,11 +733,58 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         frames.push({ file, machine: { x: w.x, y: w.y, z: level }, capturedAt: frame.capturedAt });
                     }
                 }
-                const index = { surveyId, machineZ: levels[0], zLevels: levels, planeZ, pitchMm: pitch, frames };
+                // One mosaic per pass, indexed in machine coordinates: with a
+                // verified model, "the feature is at mosaic pixel (u, v)"
+                // becomes a lookup through the affine instead of an inference
+                // from one frame and a remembered scale.
+                const mosaics: object[] = [];
+                const model = cameraModelStore.current();
+                if (model && judgeCameraModel(model, modelContext(null)).usable) {
+                    for (const level of levels) {
+                        const levelFrames = (frames as Array<{ file: string; machine: { x: number; y: number; z: number } }>)
+                            .filter((f) => Math.abs(f.machine.z - level) < 1e-6);
+                        const out = path.join(dir, `mosaic_z${level}.jpg`);
+                        try {
+                            const rendered = renderMosaic(model, levelFrames, planeZ, out);
+                            if (rendered) {
+                                mosaics.push({
+                                    file: out,
+                                    passZ: level,
+                                    planeZ,
+                                    bounds: rendered.layout.bounds,
+                                    widthPx: rendered.layout.widthPx,
+                                    heightPx: rendered.layout.heightPx,
+                                    mmPerPixel: rendered.layout.mmPerPixel,
+                                    // mosaic pixel -> machine XY on planeZ.
+                                    affine: rendered.layout.affine,
+                                    uncoveredFraction: rendered.uncoveredFraction,
+                                    modelId: model.id,
+                                });
+                            }
+                        } catch (err) {
+                            mosaics.push({ passZ: level, error: (err as Error).message });
+                        }
+                    }
+                }
+                const index = {
+                    surveyId,
+                    machineZ: levels[0],
+                    zLevels: levels,
+                    planeZ,
+                    pitchMm: pitch,
+                    frames,
+                    mosaics,
+                    mosaicNote: mosaics.length
+                        ? 'Each mosaic carries the affine that turns its pixels into machine XY on planeZ. Read a '
+                            + 'feature\'s position off it rather than estimating one from a single frame.'
+                        : 'No mosaic: a verified camera model is needed to place frames in machine coordinates '
+                            + '(camera_bootstrap, then verify_camera_model). The frames themselves are all here.',
+                };
                 fs.writeJsonSync(path.join(dir, 'index.json'), index, { spaces: 2 });
                 return {
                     surveyId,
                     directory: dir,
+                    mosaics,
                     frameCount: frames.length,
                     index_file: path.join(dir, 'index.json'),
                     frames,
