@@ -59,6 +59,10 @@ export interface GcodeValidationReport {
     assumesDistanceMode: boolean; // motion before any G90/G91
     endsInRelativeMode: boolean; // G91 still active at end of file
     usesArcs: boolean; // G2/G3 present (extents are approximated from endpoints)
+    /** Any G38.x probing cycle. This firmware has none - probing programs go through run_probing_gcode. */
+    usesProbing: boolean;
+    /** Motion lines carrying an X or Y word, a Z word, and both at once. */
+    motionAxes: { xy: number; z: number; both: number };
     fourAxis: boolean; // any B-axis word
     minZWithSpindleOn: number | null;
     /** G92 rewrites the work origin; the only sanctioned path is apply_tool_length_offset. */
@@ -139,6 +143,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     let motionLineCount = 0;
     let usesRelativeMotion = false;
     let usesArcs = false;
+    let usesProbing = false;
+    const motionAxes = { xy: 0, z: 0, both: 0 };
     let relativeMode = false;
     let distanceModeSet = false;
     let motionBeforeDistanceMode = false;
@@ -195,6 +201,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
                 relativeMode = true;
                 usesRelativeMotion = true;
                 distanceModeSet = true;
+            } else if (code.startsWith('G38')) {
+                usesProbing = true;
             } else if (code === 'G92') {
                 setsWorkOrigin = true;
             } else if (code === 'M3' || code === 'M4') {
@@ -230,6 +238,15 @@ export function validateGcode(gcode: string): GcodeValidationReport {
                 // fact instead of accumulating wrong numbers. (G53 is absolute
                 // even under G91.)
                 return;
+            }
+            const movesXy = words.X !== undefined || words.Y !== undefined;
+            const movesZ = words.Z !== undefined;
+            if (movesXy && movesZ) {
+                motionAxes.both += 1;
+            } else if (movesXy) {
+                motionAxes.xy += 1;
+            } else if (movesZ) {
+                motionAxes.z += 1;
             }
             if (words.X !== undefined) x = extend(x, words.X);
             if (words.Y !== undefined) y = extend(y, words.Y);
@@ -309,6 +326,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         assumesDistanceMode: motionBeforeDistanceMode,
         endsInRelativeMode: relativeMode,
         usesArcs,
+        usesProbing,
+        motionAxes,
         fourAxis: b !== null,
         minZWithSpindleOn,
         setsWorkOrigin,
@@ -320,6 +339,42 @@ export function validateGcode(gcode: string): GcodeValidationReport {
 }
 
 const NEWLINE = '\n';
+
+/** The most motion lines a hand-authored TRANSIT plausibly has; beyond it, the file is doing something. */
+export const MAX_TRANSPORT_MOTION_LINES = 8;
+
+export const TRANSPORT_REFUSAL = 'Refused: this file is pure transport - a few rapids with no spindle, no probing, '
+    + 'no arcs and no rotation - and transport has its own tools. Use `traverse_xy` for XY (it plans the move at the '
+    + 'traverse height, checks every leg against the stored landmarks, and stages the series for one approval) or '
+    + '`move_z` for Z. They emit the declared, frame-restoring file for you, which is the file a hand-written transit '
+    + 'keeps getting wrong: on 2026-09-19 one was rejected for an undeclared distance mode, restaged, and then left '
+    + 'the controller in the machine workspace for the rest of the session. If this really is not transport - it '
+    + 'cuts, probes, rotates, or moves in XY and Z together - it will not be refused; only a file that is purely one or the other is.';
+
+/**
+ * Whether a staged file is nothing but getting the toolhead from A to B.
+ *
+ * Deliberately narrow: a file is only transport when EVERY signal agrees, so
+ * a real toolpath is never refused for lacking a spindle command. A laser or
+ * printing job is excluded by head type at the call site, not here.
+ */
+export function isPureTransport(report: GcodeValidationReport): boolean {
+    // Exactly what traverse_xy and move_z can express between them: an XY
+    // series at a constant Z, or a Z series at a constant XY. A file that
+    // moves in both - a toolpath, a slicer export, a plunge-and-cut - is
+    // never one of ours, which is what keeps this from refusing real work.
+    const xyOnly = report.motionAxes.xy > 0 && report.motionAxes.z === 0 && report.motionAxes.both === 0;
+    const zOnly = report.motionAxes.z > 0 && report.motionAxes.xy === 0 && report.motionAxes.both === 0;
+    return (xyOnly || zOnly)
+        && report.motionLineCount > 0
+        && report.motionLineCount <= MAX_TRANSPORT_MOTION_LINES
+        && report.spindle.onCommands === 0
+        && !report.usesArcs
+        && !report.usesProbing
+        && !report.fourAxis
+        && !report.setsWorkOrigin
+        && !report.usesRelativeMotion;
+}
 
 export interface GcodeSuggestion {
     /** The corrected program, ready to re-submit unchanged. */

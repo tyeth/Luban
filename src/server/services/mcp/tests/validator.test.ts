@@ -4,6 +4,8 @@ import {
     FRAME_REFUSAL_NO_RESTORE,
     FRAME_REFUSAL_UNDECLARED,
     FrameResolutionContext,
+    MAX_TRANSPORT_MOTION_LINES,
+    isPureTransport,
     resolveJobFrame,
     suggestGcode,
     validateGcode,
@@ -225,5 +227,49 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(suggestGcode(MOVE_Z_MACHINE, validateGcode(MOVE_Z_MACHINE)), null);
         assert.equal(suggestGcode(LUBAN_EXPORT, validateGcode(LUBAN_EXPORT)), null,
             'an undeclared file needs a DECISION about its frame - no draft is offered');
+    }],
+
+    // A7: transport has tools. A hand-written transit is the path that
+    // produced the undeclared 2026-09-12 job and the G53-stranded controller
+    // of 2026-09-19.
+    ['the hand-written transit job of 2026-09-19 is pure transport', () => {
+        assert.equal(isPureTransport(validateGcode('G90\nG53;\nG0 X160 Y175;\nG54;')), true);
+        assert.equal(isPureTransport(validateGcode(MOVE_Z_MACHINE)), true, 'what move_z itself emits');
+    }],
+
+    ['a toolpath is never transport, even between its cuts', () => {
+        assert.equal(isPureTransport(validateGcode(LUBAN_EXPORT)), false, 'a slicer export moves in XY and Z');
+        assert.equal(isPureTransport(validateGcode(TRANSIT_2026_09_12)), false,
+            'XY and Z in one file is not what traverse_xy or move_z emit - it is refused for its frame instead');
+        assert.equal(isPureTransport(validateGcode('G90\nG54\nM3 S8000\nG1 X10 F600\nM5')), false, 'spindle on');
+        assert.equal(isPureTransport(validateGcode('G90\nG54\nG2 X10 Y10 I5 J0 F600')), false, 'an arc is a cut');
+        assert.equal(isPureTransport(validateGcode('G90\nG54\nG38.2 Z-10 F50')), false, 'probing');
+        assert.equal(isPureTransport(validateGcode('G90\nG53;\nG0 B90;\nG54;')), false, 'a rotation is not transport');
+        assert.equal(isPureTransport(validateGcode('G90\nG53;\nG92 Z0\nG0 Z10;\nG54;')), false, 'it rewrites the origin');
+        assert.equal(isPureTransport(validateGcode('G91\nG0 X1\nG90')), false, 'relative inching is not a staged transit');
+    }],
+
+    ['a file with no motion is not transport either', () => {
+        assert.equal(isPureTransport(validateGcode('G90\nG54;')), false);
+    }],
+
+    ['a long spindle-off program is left alone - only a handful of rapids is a transit', () => {
+        const short = ['G90', 'G53;'];
+        for (let i = 0; i < MAX_TRANSPORT_MOTION_LINES; i++) {
+            short.push(`G0 X${10 + i} Y10;`);
+        }
+        short.push('G54;');
+        assert.equal(isPureTransport(validateGcode(short.join('\n'))), true, 'at the limit it is still a transit');
+        const long = ['G90', 'G53;'];
+        for (let i = 0; i <= MAX_TRANSPORT_MOTION_LINES; i++) {
+            long.push(`G0 X${10 + i} Y10;`);
+        }
+        long.push('G54;');
+        assert.equal(isPureTransport(validateGcode(long.join('\n'))), false, 'beyond it, the file is doing something');
+    }],
+
+    ['G38 is recorded so a probing program is never mistaken for a transit', () => {
+        assert.equal(validateGcode('G90\nG54\nG38.2 Z-10 F50').usesProbing, true);
+        assert.equal(validateGcode(MOVE_Z_MACHINE).usesProbing, false);
     }],
 ];

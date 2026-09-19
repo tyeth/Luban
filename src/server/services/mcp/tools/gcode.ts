@@ -13,7 +13,7 @@ import { probeFeedService } from '../probeFeed';
 import { clearProcedureStop, procedureStopRequested, requestProcedureStop } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
 import { planTraverseXy } from '../traversePlan';
-import { JobFrame, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
+import { JobFrame, TRANSPORT_REFUSAL, isPureTransport, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
 import { PositionSnapshot, assertFreshHeartbeat, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 
@@ -362,7 +362,14 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             // The frame handshake (operator law 2026-09-14): an agent-authored job
             // must say which coordinate frame it runs in, or it does not reach the
             // confirm page. The gcode itself is never edited to add a declaration.
-            const resolved = resolveJobFrame(validateGcode(args.gcode), stagingFrameContext(frameArgument));
+            const inspected = validateGcode(args.gcode);
+            // Transport has tools. A hand-written transit is the path that
+            // produced both the undeclared-frame job of 2026-09-12 and the
+            // G53-stranded controller of 2026-09-19.
+            if (headType === 'cnc' && isPureTransport(inspected)) {
+                throw new McpToolError(TRANSPORT_REFUSAL);
+            }
+            const resolved = resolveJobFrame(inspected, stagingFrameContext(frameArgument));
             if (resolved.refusal) {
                 throw new McpToolError(resolved.refusal + describeSuggestion(suggestGcode(args.gcode, resolved.report)));
             }
