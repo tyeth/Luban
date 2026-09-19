@@ -12,9 +12,11 @@ import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
+import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
 import { assertFreshHeartbeat, PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import { reliableForMotion } from '../machinePosition';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
 // action only. move_and_capture performs ONE bounded XY move at the current
@@ -29,6 +31,8 @@ const SETTLE_TIMEOUT_MS = 30000;
 const SETTLE_POLL_MS = 250;
 const POST_SETTLE_DWELL_MS = 300;
 const HOME_TIMEOUT_MS = 120000;
+// Two status periods: the judgement needs a beat taken after the workspace change.
+const FRAME_RESTORE_SETTLE_MS = 4500;
 const HOME_POLL_MS = 1000;
 
 export interface GcodeChannel {
@@ -608,6 +612,56 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 patch_size: patch,
                 search_radius: radius,
                 warnings: result.warnings,
+            };
+        },
+    });
+
+    registry.register({
+        name: 'restore_work_frame',
+        description: 'Put the controller back in the WORK workspace (`G90` then `G54` on its own line). NO MOTION: '
+            + 'the program carries no axis word, so it is permitted even when the machine position is '
+            + 'awaiting-resync or stale - it is the remedy for exactly that state. Use it when get_position '
+            + 'reports an incoherent or machine-frame position after a job that declared G53 and never selected a '
+            + 'work workspace again: the controller keeps reporting machine coordinates while the heartbeat still '
+            + 'carries a work-origin offset, so every derived position is rejected until the frame is handed back. '
+            + 'Returns the position of record before and after, re-read two beats later. A re-home is not the remedy.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                reason: { type: 'string', description: 'Why the frame is being restored; logged and shown on the console.' },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { reason?: string }) => {
+            const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+            if (!channel || typeof channel.executeGcode !== 'function') {
+                throw new McpToolError('No machine connected, or the channel does not support direct commands.');
+            }
+            const before = getPositionSnapshot();
+            const reason = String(args.reason || '').trim();
+            const executed = await sendGcodeVisible(
+                channel,
+                `restore_work_frame${reason ? ` - ${reason.slice(0, 60)}` : ''}`,
+                WORK_FRAME_RESTORE_GCODE
+            );
+            // Two status periods: the judgement needs a beat taken AFTER the
+            // workspace change, and the poll runs on its own ~2 s cadence.
+            await new Promise((resolve) => setTimeout(resolve, FRAME_RESTORE_SETTLE_MS));
+            const after = getPositionSnapshot();
+            const recovered = reliableForMotion(after.reliability) && !reliableForMotion(before.reliability);
+            return {
+                sent: WORK_FRAME_RESTORE_GCODE,
+                result: executed.result,
+                text: executed.text || null,
+                before: { reliability: before.reliability, frame: before.frame, machine: before.machine },
+                after: { reliability: after.reliability, frame: after.frame, machine: after.machine },
+                recovered,
+                warnings: after.warnings,
+                note: recovered
+                    ? 'The controller is back in the work workspace and the position of record is usable again.'
+                    : `The position of record is ${after.reliability} after the restore. `
+                        + 'Read get_position again in a couple of seconds; if it has not cleared, call '
+                        + 'query_firmware_position to see which frame the controller is actually in and tell the operator.',
             };
         },
     });

@@ -12,6 +12,7 @@
  * server (config/settings.base is ESM-only and breaks ts-node).
  */
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
+import { tests as frameRecoveryTests } from './frameRecovery.test';
 import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
@@ -24,6 +25,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['validator', validatorTests],
     ['machinePosition', machinePositionTests],
     ['envelopeChecks', envelopeChecksTests],
+    ['frameRecovery', frameRecoveryTests],
     ['traversePlan', traversePlanTests],
     ['jobEnding', jobEndingTests],
     ['mjpegFanout', mjpegFanoutTests],

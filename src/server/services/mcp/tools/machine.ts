@@ -30,6 +30,7 @@ import {
     directGcodeQuiet,
     getPositionOfRecord,
 } from '../positionOfRecord';
+import { resyncHint } from '../frameRecovery';
 import { McpToolError, ToolRegistry } from '../registry';
 
 const MACHINES = [
@@ -317,10 +318,7 @@ export function requireReliableMachine(position: PositionSnapshot, what: string)
         return;
     }
     const why = position.reasons.length ? ` ${position.reasons.join(' ')}` : '';
-    const hint = position.reliability === 'awaiting-resync'
-        ? ' Wait for the next status report (2 s) and read get_position again; if it persists, query_firmware_position for liveness and tell the operator.'
-        : ' Reconnect the machine and re-verify get_position before any motion.';
-    throw new McpToolError(`Refusing ${what}: the machine position is ${position.reliability}.${why}${hint}`);
+    throw new McpToolError(`Refusing ${what}: the machine position is ${position.reliability}.${why}${resyncHint(position.reliability)}`);
 }
 
 /**
