@@ -25,6 +25,9 @@ import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
+import { fovAt } from '../cameraGeometry';
+import { pitchForOverlap } from '../surveyMosaic';
+import { requireCameraModel } from './cameraModel';
 import {
     getMachineSizeByIdentifier,
     getPositionSnapshot,
@@ -538,6 +541,19 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             type: 'object',
             properties: {
                 pitch_mm: { type: 'number', description: 'MAXIMUM grid spacing, default 80 (20-160). Each axis span is divided into equal steps no larger than this, so rows and columns are uniform and both edges are covered - no fixed-pitch stub at the far end.' },
+                overlap_fraction: {
+                    type: 'number',
+                    description: 'Fraction of each frame that must be shared with its neighbour, 0-0.9. Given this, '
+                        + 'the pitch is DERIVED from the camera model\'s field of view on plane_z instead of guessed - '
+                        + '"seamless" is a relationship between pitch and field of view, and a picked number is not '
+                        + 'one. Needs a verified camera model (camera_bootstrap); pitch_mm then just caps the result.',
+                },
+                plane_z: {
+                    type: 'number',
+                    description: 'Machine Z of the surface being surveyed, for the field of view and the mosaic '
+                        + 'index. Default 0 (the bed). A frame cannot tell how far away what it sees is, so this is '
+                        + 'stated, never inferred.',
+                },
                 margin_mm: { type: 'number', description: 'Inset from the default bounds, default 10.' },
                 x_min: { type: 'number', description: 'Machine-coord grid bounds. Defaults: margin..(size-margin).' },
                 x_max: { type: 'number', description: 'Set beyond the nominal size to cover reachable overtravel (e.g. the far-X column the camera angle otherwise misses - setup-specific, so state it explicitly).' },
@@ -555,6 +571,8 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
         },
         handler: async (args: {
             pitch_mm?: number;
+            overlap_fraction?: number;
+            plane_z?: number;
             margin_mm?: number;
             x_min?: number;
             x_max?: number;
@@ -580,7 +598,24 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             if (!size) {
                 throw new McpToolError('Unknown machine size; cannot plan the grid.');
             }
-            const pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
+            let pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
+            let pitchNote = `pitch ${pitch} mm (stated)`;
+            const planeZ = Number.isFinite(Number(args.plane_z)) ? Number(args.plane_z) : 0;
+            if (args.overlap_fraction !== undefined) {
+                const overlap = Number(args.overlap_fraction);
+                if (!Number.isFinite(overlap) || overlap < 0 || overlap > 0.9) {
+                    throw new McpToolError('overlap_fraction must be between 0 and 0.9.');
+                }
+                // A verified model, or nothing: the field of view is the whole
+                // basis of the number, and guessing it is what this replaces.
+                const model = requireCameraModel('an overlap-derived survey pitch');
+                const fov = fovAt(model, { x, y, z }, planeZ);
+                const derived = pitchForOverlap(fov.widthMm, fov.heightMm, overlap);
+                pitch = Math.min(derived.x, derived.y, pitch);
+                pitchNote = `pitch ${pitch} mm, derived from a ${fov.widthMm.toFixed(0)}x${fov.heightMm.toFixed(0)} mm `
+                    + `field of view on plane Z ${planeZ} at ${(overlap * 100).toFixed(0)}% overlap`
+                    + `${fov.extrapolated ? ' (EXTRAPOLATED: this Z is outside the band the model was solved over)' : ''}`;
+            }
             const margin = Math.min(Math.max(Number(args.margin_mm) || 10, 0), 50);
 
             // Serpentine at the current Z. Bounds are explicit (clamped to the
@@ -621,6 +656,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
 
             const envelope = [
                 `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch}) at CURRENT machine Z ${z.toFixed(1)}`,
+                `; ${pitchNote}`,
                 '; one frame captured per waypoint after the move settles; frames saved to disk with a',
                 '; machine-position index. Each line is sent individually. Aborts on the first capture failure.',
                 'G90',
