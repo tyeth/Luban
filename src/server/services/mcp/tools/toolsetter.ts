@@ -30,6 +30,11 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 center_y: { type: 'number', description: 'Machine Y of the setter centre.' },
                 trigger_z: { type: 'number', description: 'Machine Z at trigger with the reference bit.' },
                 reference_bit_length_mm: { type: 'number', description: 'Protrusion of the reference bit, mm.' },
+                disc_diameter_mm: {
+                    type: 'number',
+                    description: 'Diameter of the setter\'s contact disc, if measured. Nothing here needs it; the '
+                        + 'camera bootstrap uses it as an absolute scale reference in a frame.',
+                },
                 longest_bit_length_mm: { type: 'number', description: 'Longest bit in use, mm - sets the safe start height.' },
                 floor_margin_mm: { type: 'number', description: 'Allowed descent below the expected trigger Z, default 3.' },
                 tool_change_x: { type: 'number', description: 'Machine X of the tool-change park position (operator preference).' },
@@ -45,6 +50,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             center_y?: number;
             trigger_z?: number;
             reference_bit_length_mm?: number;
+            disc_diameter_mm?: number;
             longest_bit_length_mm?: number;
             floor_margin_mm?: number;
             tool_change_x?: number;
@@ -58,6 +64,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 triggerZ: Number(args.trigger_z),
                 referenceBitLengthMm: Number(args.reference_bit_length_mm),
                 longestBitLengthMm: Number(args.longest_bit_length_mm),
+                discDiameterMm: args.disc_diameter_mm === undefined ? undefined : Number(args.disc_diameter_mm),
             };
             if (Object.values(numbers).some((v) => !Number.isFinite(v))) {
                 throw new McpToolError('All coordinates and lengths must be finite numbers.');

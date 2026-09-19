@@ -12,6 +12,7 @@ import { probeFeedService, resolveActiveProbeConfig } from './probeFeed';
 import { ToolRegistry } from './registry';
 import { registerCalibrationTools } from './tools/calibration';
 import { registerCameraTools } from './tools/camera';
+import { registerCameraModelTools } from './tools/cameraModel';
 import { registerCamTools } from './tools/cam';
 import { registerGcodeTools } from './tools/gcode';
 import { registerLandmarkTools } from './tools/landmarks';
@@ -192,6 +193,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     const baseUrl = () => publicBaseUrl(port, settings.allowLan);
     registerGcodeTools(registry, baseUrl);
     registerCameraTools(registry);
+    registerCameraModelTools(registry);
     registerCalibrationTools(registry);
     registerLandmarkTools(registry);
     registerProbeTools(registry);

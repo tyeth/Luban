@@ -48,12 +48,12 @@ export const tests: Array<[string, () => void]> = [
     ['home reports 327.9989959716797 for Z328: that IS the traverse height (live refusal 2026-09-14)', () => {
         const plan = planTraverseXy(input({ currentMachine: { x: -19, y: 342, z: 327.9989959716797 } }));
         assert.equal(plan.steps.length, 1, 'the rotary landmark (clearance 328) must not refuse a 1 um shortfall either');
-        assert.equal(plan.steps[0].to.z, 328, 'segments are planned at the traverse height');
-        refuses(() => planTraverseXy(input({ currentMachine: { x: -19, y: 342, z: 327.9 } })), 'below the traverse height');
+        assert.equal(plan.steps[0].to.z, 328, 'segments are planned at the height the head is at');
+        refuses(() => planTraverseXy(input({ currentMachine: { x: -19, y: 342, z: 327.9 } })), 'below the motion floor');
     }],
 
-    ['refused below the traverse height, with no override', () => {
-        refuses(() => planTraverseXy(input({ currentMachine: { x: 100, y: 100, z: 320 } })), 'below the traverse height 328');
+    ['refused below the motion floor, with no override', () => {
+        refuses(() => planTraverseXy(input({ currentMachine: { x: 100, y: 100, z: 320 } })), 'below the motion floor 328');
     }],
 
     ['a series fills omitted axes from the previous target and reports every leg', () => {
@@ -156,5 +156,60 @@ export const tests: Array<[string, () => void]> = [
         refuses(() => planTraverseXy(input({ targets: [] })), 'Provide 1-20');
         refuses(() => planTraverseXy(input({ targets: new Array(21).fill({ x: 1 }) })), 'Provide 1-20');
         refuses(() => planTraverseXy(input({ targets: [{}] })), 'names neither x nor y');
+    }],
+
+    // C1: transport is allowed at the motion floor, not only at the park
+    // height. The two were one number until 2026-09-19, which is why the park
+    // height sat at the ceiling.
+    ['transport is allowed at the motion floor and refused below it', () => {
+        // A target clear of the rotary box: the floor is about law 2, and the
+        // landmark check is exercised separately below.
+        const at = (z: number) => planTraverseXy({
+            ...input(),
+            targets: [{ x: 100, y: 105 }],
+            currentMachine: { x: 20, y: 105, z },
+            traverseZ: 328,
+            motionFloorZ: 320,
+        });
+        assert.ok(at(328), 'at the park height');
+        assert.ok(at(320), 'at the floor');
+        assert.ok(at(319.96), 'and a float-noise hair below it');
+        assert.throws(() => at(319.9), /below the motion floor 320/);
+    }],
+
+    ['the segments are planned where the head actually is, not at the park height', () => {
+        const plan = planTraverseXy({
+            ...input(),
+            targets: [{ x: 100, y: 105 }],
+            currentMachine: { x: 20, y: 105, z: 321 },
+            traverseZ: 328,
+            motionFloorZ: 320,
+        });
+        assert.equal(plan.steps[0].from.z, 321, 'a corridor the toolhead is actually in');
+        assert.equal(plan.steps[0].to.z, 321);
+    }],
+
+    ['a landmark is checked at the real height - no exemption for being high', () => {
+        // The rotary landmark's clearance is the park height, so transport at
+        // the floor across it is refused. That is the point of the floor being
+        // safe: the registry does the work the blanket height used to.
+        assert.throws(
+            () => planTraverseXy({
+                ...input(),
+                targets: [{ x: 290, y: 105 }],
+                currentMachine: { x: 20, y: 105, z: 320 },
+                traverseZ: 328,
+                motionFloorZ: 320,
+                obstacles: [ROTARY],
+            }),
+            /crosses a landmark/
+        );
+    }],
+
+    ['omitting the floor keeps the old behaviour exactly', () => {
+        assert.throws(
+            () => planTraverseXy({ ...input(), currentMachine: { x: 20, y: 105, z: 321 }, traverseZ: 328 }),
+            /below the motion floor 328/
+        );
     }],
 ];

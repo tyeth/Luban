@@ -248,17 +248,33 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    run one at a time. Only an explicit imperative in the operator's latest message
    authorizes a motion; a motion mentioned in passing ("before homing", "then we'll…",
    a previously approved plan) is context, not a command — announce and wait.
-2. **X/Y traverses at top gantry height — ALL of them** (operator, 2026-09-02: "x/y motion
-   over 1mm is never below gantry height"). Any XY move over 1 mm is planned at the safe
-   traverse height — no local hops above a measured feature, no other "measured safe"
-   heights. Retreat, traverse, descend — in that order. Sub-gantry XY is only fine
-   positioning <= 1 mm (touch nudges, probe march steps). Enforced: direct XY below
-   `mcpSafeTraverseZ` (default 328 = home Z since 2026-09-14) refused without `operator_confirmed_clearance`, which
-   is for emergencies on the operator's explicit words, not a planning device.
+2. **X/Y traverses at or above the motion floor — ALL of them** (operator, 2026-09-02:
+   "x/y motion over 1mm is never below gantry height"; revised 2026-09-19 to a floor rather
+   than a single height). Any XY move over 1 mm happens at or above `mcpMotionFloorZ`
+   (default **320**, with the heartbeat's 0.05 mm float noise tolerated, so 319.95 up) — no
+   local hops above a measured feature, no other "measured safe" heights. Retreat, traverse,
+   descend — in that order. Sub-gantry XY is only fine positioning <= 1 mm (touch nudges,
+   probe march steps). Enforced: direct XY below the floor refused without
+   `operator_confirmed_clearance`, which is for emergencies on the operator's explicit
+   words, not a planning device.
+
+   The floor is NOT the park height. `mcpSafeTraverseZ` (328 = home Z) is where procedures
+   hop between stations, retreat to on an abort, and end; that is unchanged. The floor could
+   only drop below it once clearances stopped carrying tool length (law 4), because a hop at
+   the floor is checked against every stored landmark exactly like any low segment — there
+   is still no exemption for being high. What the floor costs is 8 mm less blind protection
+   for anything on the bed with no landmark; `mcpMotionFloorZ` reverts it.
 3. **No fabricated clearances** — only measured or operator-stated heights count. Visual
    inference finds things; it never clears them.
-4. **Landmarks are obstacles** — `clearance_z` on a landmark refuses XY paths crossing its
-   box below that height.
+4. **Landmarks are obstacles** — a landmark's clearance refuses XY paths crossing its box
+   below the toolhead Z it demands. State it with `obstacle_top_z`: the height of the
+   OBSTACLE ITSELF, to which the fitted tool's protrusion and a 5 mm margin are added when a
+   path is checked. The tool is the longest candidate known (last tool-setter measurement,
+   `probe_effective_length`, `longest_bit_length_mm`), so a measurement only ever lengthens
+   the requirement; with none of them known a physically stated obstacle is impassable, not
+   passable. Records set with the legacy `clearance_z` are toolhead heights with a tool
+   already baked in and are enforced exactly as before until re-stated —
+   `get_stored_state.landmarkClearances` lists which ones those are.
 5. **Contact sensors are crash sensors** — a probe/toolsetter trigger during motion that no
    procedure declared as expected trips a CRASH alarm (stop + force-close + latch), the
    same machinery as overtravel; `clear_overtravel_alarm` (or the Workspace pill's Clear

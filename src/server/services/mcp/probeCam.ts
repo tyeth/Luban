@@ -12,6 +12,7 @@ import {
     renderReport,
     reportExtension,
 } from './inspectionReport';
+import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import {
     MarchParams,
@@ -257,7 +258,7 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
         warnings,
     };
 
-    const violations = checkMotion(camMotion(plan), landmarkStore.obstacleBoxes(), { traverseZ: hopZ });
+    const violations = checkMotion(camMotion(plan), landmarkStore.obstacleBoxes(), { traverseZ: hopZ, ...clearanceOptions() });
     if (violations.length) {
         throw new McpToolError(`Probing program refused (law 4, landmarks are obstacles): ${describeViolations(violations)}.`);
     }

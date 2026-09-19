@@ -18,6 +18,10 @@ export interface RotaryGeometry {
     axisX: number;
     /** PHYSICAL machine Z of the axis (not a toolhead-contact Z). */
     axisZ: number;
+    /** Machine Y of the tailstock centre, when stated: a known point ON the axis line. */
+    tailstockY: number | null;
+    /** Machine Y of the chuck face, when stated. Which end is the chuck stops being a guess. */
+    chuckFaceY: number | null;
 }
 
 export interface ProbeGeometry {
@@ -30,6 +34,8 @@ export interface ProbeGeometry {
 export const GEOMETRY_FIELDS = [
     { field: 'rotary_axis_x', key: 'mcpRotaryAxisX', env: 'LUBAN_MCP_ROTARY_AXIS_X', min: -50, max: 400 },
     { field: 'rotary_axis_z_physical', key: 'mcpRotaryAxisZ', env: 'LUBAN_MCP_ROTARY_AXIS_Z', min: 0, max: 400 },
+    { field: 'rotary_tailstock_y', key: 'mcpRotaryTailstockY', env: 'LUBAN_MCP_ROTARY_TAILSTOCK_Y', min: -50, max: 400 },
+    { field: 'rotary_chuck_face_y', key: 'mcpRotaryChuckFaceY', env: 'LUBAN_MCP_ROTARY_CHUCK_FACE_Y', min: -50, max: 400 },
     { field: 'probe_effective_length', key: 'mcpProbeEffectiveLength', env: 'LUBAN_MCP_PROBE_LENGTH', min: 1, max: 300 },
     { field: 'probe_tip_diameter', key: 'mcpProbeTipDiameter', env: 'LUBAN_MCP_PROBE_TIP_DIAMETER', min: 0.1, max: 30 },
 ] as const;
@@ -70,7 +76,12 @@ export function rotaryGeometry(): RotaryGeometry | null {
     if (axisX === null || axisZ === null) {
         return null;
     }
-    return { axisX, axisZ };
+    return {
+        axisX,
+        axisZ,
+        tailstockY: geometryValue('rotary_tailstock_y'),
+        chuckFaceY: geometryValue('rotary_chuck_face_y'),
+    };
 }
 
 export function probeGeometry(): ProbeGeometry | null {
@@ -184,4 +195,25 @@ export function missingGeometryNote(): string {
         ? `The "axis" namespace needs ${missing.join(', ')}: measure them and store with set_probe_geometry `
             + '(or drop the axis.* reference - a program that references only its own earlier ops needs no geometry).'
         : '';
+}
+
+/**
+ * Points on the rotary axis whose machine coordinates are fully known, for
+ * anything that needs to solve against the scene rather than probe it - the
+ * camera bootstrap above all. The axis line fixes X and Z; naming an end
+ * fixes Y as well, which is what turns it into a point.
+ */
+export function rotaryAxisPoints(): Array<{ name: string; x: number; y: number; z: number }> {
+    const g = rotaryGeometry();
+    if (!g) {
+        return [];
+    }
+    const points: Array<{ name: string; x: number; y: number; z: number }> = [];
+    if (g.tailstockY !== null) {
+        points.push({ name: 'rotary-tailstock', x: g.axisX, y: g.tailstockY, z: g.axisZ });
+    }
+    if (g.chuckFaceY !== null) {
+        points.push({ name: 'rotary-chuck-face', x: g.axisX, y: g.chuckFaceY, z: g.axisZ });
+    }
+    return points;
 }

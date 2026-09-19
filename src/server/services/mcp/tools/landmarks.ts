@@ -9,14 +9,44 @@ import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
 import { GEOMETRY_FIELDS, geometrySettings, setGeometryValues } from '../rotaryGeometry';
 import { getToolSetterConfig } from '../toolSetter';
-import { readAppMachineSettings, safeTraverseZ } from './machine';
+import { currentToolProtrusion } from '../clearanceContext';
+import {
+    CLEARANCE_MARGIN_MM,
+    ClearanceBasis,
+    needsRestatement,
+    requiredToolheadZ,
+    restatementAdvice,
+} from '../landmarkClearance';
+import { motionFloorZ, readAppMachineSettings, safeTraverseZ } from './machine';
 
 // Named scene landmarks (#50) and the stored-state overview (#53): operator
 // knowledge captured once, surfaced every session, so no agent spends moves
 // re-deriving what the operator already said.
 
+/**
+ * A landmark plus what its clearance actually demands of the toolhead right
+ * now, and - for a record still on the legacy basis - what to do about it.
+ * An agent reading get_stored_state should not have to work out that a
+ * clearance of 328 is a toolhead height with a probe baked into it.
+ */
 function describeLandmark(landmark: Landmark): object {
-    return landmark;
+    if (landmark.clearanceZ === null) {
+        return { ...landmark, requiredToolheadZ: null };
+    }
+    const protrusion = currentToolProtrusion();
+    const required = requiredToolheadZ(landmark.clearanceZ, landmark.clearanceBasis, protrusion.mm);
+    return {
+        ...landmark,
+        requiredToolheadZ: required,
+        clearanceNote: required === null
+            ? `No tool length is known, so the toolhead Z this obstacle needs cannot be computed. ${protrusion.note}`
+            : `Needs toolhead machine Z ${required}${landmark.clearanceBasis === 'physical'
+                ? ` (top ${landmark.clearanceZ} + ${protrusion.mm} mm tool + ${CLEARANCE_MARGIN_MM} mm margin)`
+                : ' (stated as a toolhead height, tool length already included)'}.`,
+        restatement: needsRestatement(landmark.clearanceZ, landmark.clearanceBasis)
+            ? restatementAdvice(landmark.name, landmark.clearanceZ)
+            : null,
+    };
 }
 
 export function registerLandmarkTools(registry: ToolRegistry): void {
@@ -36,11 +66,20 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 y0: { type: 'number' },
                 x1: { type: 'number' },
                 y1: { type: 'number' },
+                obstacle_top_z: {
+                    type: 'number',
+                    description: 'PREFERRED. Marks this landmark as an OBSTACLE by stating the machine Z of the '
+                        + 'top of the OBSTACLE ITSELF - nothing about the tool. The live tool protrusion and a '
+                        + 'safety margin are added when a path is checked, so the number stays true across tool '
+                        + 'changes instead of having to be set for the longest bit ever fitted. Omit for '
+                        + 'non-obstacles.',
+                },
                 clearance_z: {
                     type: 'number',
-                    description: 'Marks this landmark as an OBSTACLE: minimum safe toolhead machine Z '
-                        + 'when an XY path crosses its box (operator accounts for tool length). Direct '
-                        + 'XY moves below it across the box are refused. Omit for non-obstacles.',
+                    description: 'LEGACY form of the same thing: the minimum safe TOOLHEAD machine Z when an XY '
+                        + 'path crosses this box, with tool length already included by whoever set it. Still '
+                        + 'honoured exactly as before, but prefer obstacle_top_z - a toolhead height has to be '
+                        + 're-stated on every tool change and in practice ends up pinned at the machine ceiling.',
                 },
                 notes: { type: 'string' },
             },
@@ -55,6 +94,7 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
             x1?: number;
             y1?: number;
             clearance_z?: number;
+            obstacle_top_z?: number;
             notes?: string;
         }) => {
             const name = String(args.name || '').trim();
@@ -66,18 +106,32 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
             if (box.some((v) => !Number.isFinite(v)) || box[0] >= box[2] || box[1] >= box[3]) {
                 throw new McpToolError('Require finite machine coordinates with x0 < x1 and y0 < y1.');
             }
-            const clearanceZ = args.clearance_z !== undefined ? Number(args.clearance_z) : null;
-            if (clearanceZ !== null && !Number.isFinite(clearanceZ)) {
-                throw new McpToolError('clearance_z must be a finite machine Z when given.');
+            if (args.obstacle_top_z !== undefined && args.clearance_z !== undefined) {
+                throw new McpToolError('Give obstacle_top_z (the top of the obstacle itself - preferred) or '
+                    + 'clearance_z (the legacy toolhead height), not both: they are the same number measured to '
+                    + 'different things.');
             }
+            const physical = args.obstacle_top_z !== undefined;
+            const raw = physical ? args.obstacle_top_z : args.clearance_z;
+            const clearanceZ = raw !== undefined ? Number(raw) : null;
+            if (clearanceZ !== null && !Number.isFinite(clearanceZ)) {
+                throw new McpToolError(`${physical ? 'obstacle_top_z' : 'clearance_z'} must be a finite machine Z when given.`);
+            }
+            const clearanceBasis: ClearanceBasis = physical ? 'physical' : 'toolhead';
             const landmark = landmarkStore.add({
                 name,
                 description,
                 machine: { x0: box[0], y0: box[1], x1: box[2], y1: box[3] },
                 clearanceZ,
+                clearanceBasis,
                 notes: args.notes ? String(args.notes) : null,
             });
-            return { landmark: describeLandmark(landmark) };
+            return {
+                landmark: describeLandmark(landmark),
+                note: clearanceBasis === 'toolhead' && clearanceZ !== null
+                    ? restatementAdvice(name, clearanceZ)
+                    : null,
+            };
         },
     });
 
@@ -96,6 +150,16 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
             properties: {
                 rotary_axis_x: { type: ['number', 'null'], description: 'Machine X of the rotary axis line.' },
                 rotary_axis_z_physical: { type: ['number', 'null'], description: 'Physical machine Z of the axis (not a contact Z).' },
+                rotary_tailstock_y: {
+                    type: ['number', 'null'],
+                    description: 'Machine Y of the tailstock centre. With the axis line this is a fully known 3D '
+                        + 'point, which the camera bootstrap solves against.',
+                },
+                rotary_chuck_face_y: {
+                    type: ['number', 'null'],
+                    description: 'Machine Y of the chuck face. Also settles which end is which - "the non-chuck end" '
+                        + 'stops being a guess.',
+                },
                 probe_effective_length: { type: ['number', 'null'], description: 'Probe effective length in mm (this fitting).' },
                 probe_tip_diameter: { type: ['number', 'null'], description: 'Probe tip diameter in mm.' },
                 reason: { type: 'string', description: 'How the values were obtained (which job / measurement / operator statement).' },
@@ -164,11 +228,35 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 connection: connectionManager.getConnectionStatus(),
                 calibrations: calibrationStore.list(),
                 landmarks: landmarkStore.list().map(describeLandmark),
+                landmarkClearances: (() => {
+                    const legacy = landmarkStore.list().filter((l) => needsRestatement(l.clearanceZ, l.clearanceBasis));
+                    const protrusion = currentToolProtrusion();
+                    return {
+                        toolProtrusionMm: protrusion.mm,
+                        toolProtrusionSource: protrusion.source,
+                        toolProtrusionNote: protrusion.note,
+                        clearanceMarginMm: CLEARANCE_MARGIN_MM,
+                        onLegacyBasis: legacy.map((l) => l.name),
+                        note: legacy.length
+                            ? `${legacy.length} obstacle(s) still state a TOOLHEAD height with some tool length baked `
+                                + 'in, so they are pinned wherever they were set. Re-state each with set_landmark '
+                                + 'obstacle_top_z (the top of the obstacle itself) and the live tool is added at check '
+                                + 'time instead. They are enforced exactly as before meanwhile.'
+                            : 'Every obstacle states its own physical height; the live tool and margin are added when a path is checked.',
+                    };
+                })(),
                 expectedToolRegion: toolRegion,
                 limits: {
                     maxJogDistanceMm: Number(config.get('mcpMaxJogDistance')) || 100,
-                    /** Machine Z every XY move over 1 mm happens at (law 2); 328 = home Z. */
+                    /** The PARK height: where procedures hop, retreat on abort, and end. 328 = home Z. */
                     safeTraverseZMm: safeTraverseZ(),
+                    /**
+                     * The MOTION FLOOR (law 2): the lowest machine Z an XY move
+                     * over 1 mm may happen at. Lower than the park height since
+                     * 2026-09-19 - landmarks are checked at the real height, so
+                     * the registry does the work a blanket ceiling used to.
+                     */
+                    motionFloorZMm: motionFloorZ(),
                 },
                 camera: {
                     url: config.get('mcpCameraUrl') || null,

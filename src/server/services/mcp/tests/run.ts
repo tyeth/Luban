@@ -11,10 +11,17 @@
  * legacy JS, and these modules must stay importable without the Luban
  * server (config/settings.base is ESM-only and breaks ts-node).
  */
+import { tests as bootstrapPlanTests } from './bootstrapPlan.test';
+import { tests as cameraGeometryTests } from './cameraGeometry.test';
+import { tests as cameraModelTests } from './cameraModel.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
+import { tests as frameRecoveryTests } from './frameRecovery.test';
 import { tests as jobEndingTests } from './jobEnding.test';
+import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
+import { tests as surveyMosaicTests } from './surveyMosaic.test';
+import { tests as toolProtrusionTests } from './toolProtrusion.test';
 import { tests as traversePlanTests } from './traversePlan.test';
 import { tests as validatorTests } from './validator.test';
 
@@ -24,8 +31,15 @@ const suites: Array<[string, TestCase[]]> = [
     ['validator', validatorTests],
     ['machinePosition', machinePositionTests],
     ['envelopeChecks', envelopeChecksTests],
+    ['cameraModel', cameraModelTests],
+    ['cameraGeometry', cameraGeometryTests],
+    ['bootstrapPlan', bootstrapPlanTests],
+    ['frameRecovery', frameRecoveryTests],
+    ['surveyMosaic', surveyMosaicTests],
+    ['toolProtrusion', toolProtrusionTests],
     ['traversePlan', traversePlanTests],
     ['jobEnding', jobEndingTests],
+    ['landmarkClearance', landmarkClearanceTests],
     ['mjpegFanout', mjpegFanoutTests],
 ];
 

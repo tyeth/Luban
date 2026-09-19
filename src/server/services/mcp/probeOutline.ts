@@ -1,6 +1,7 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
 import { MotionSegment, ObstacleBox, checkMotion, describeViolations } from './envelopeChecks';
+import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import {
     MarchParams,
@@ -323,7 +324,7 @@ export function planProbeOutline(args: OutlineArgs, extraObstacles: ObstacleBox[
 
     // Law 4: keep-out. Side marches enter the stock's region deliberately
     // (kind 'march' - exempt from crossing landmarks, checked against volumes).
-    const violations = checkMotion(outlineMotion(plan), [...landmarkStore.obstacleBoxes(), ...extraObstacles], { traverseZ: hopZ });
+    const violations = checkMotion(outlineMotion(plan), [...landmarkStore.obstacleBoxes(), ...extraObstacles], { traverseZ: hopZ, ...clearanceOptions() });
     if (violations.length) {
         throw new McpToolError(`Outline refused (law 4, landmarks are obstacles): ${describeViolations(violations)}. `
             + 'Move the estimate, shrink overextend_mm / side points, or have the operator adjust the landmark.');

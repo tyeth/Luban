@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 
-import { MotionSegment, ObstacleBox, checkMotion } from '../envelopeChecks';
+import { MotionSegment, ObstacleBox, POSITION_EPSILON_MM, checkMotion, describeViolations } from '../envelopeChecks';
 
 // The rotary-axis landmark as stored on the A350: X140-200 x Y0-350, clearance 328
 // (the box includes the tailstock, whose height is unmeasured).
@@ -50,5 +50,82 @@ export const tests: Array<[string, () => void]> = [
         const low = checkMotion([hop(240, 100, 250, 290)], [JAWS], { traverseZ: 328 });
         assert.equal(low.length, 1);
         assert.deepEqual(checkMotion([hop(328, 100, 250, 290)], [JAWS], { traverseZ: 328 }), [], 'above the volume clearance is fine');
+    }],
+
+    // A1: the heartbeat's float noise is not a clearance violation. Live
+    // 2026-09-19: an XY move was refused because machine Z read 327.999994
+    // against the rotary landmark's clearance of 328 - 6 nanometres.
+    ['a hop a float-noise hair below the clearance is allowed', () => {
+        assert.deepEqual(checkMotion([hop(327.999994, 20, 290)], [ROTARY]), []);
+    }],
+
+    ['a hop exactly at the clearance is allowed', () => {
+        assert.deepEqual(checkMotion([hop(328, 20, 290)], [ROTARY]), []);
+    }],
+
+    ['a hop at the epsilon boundary is allowed; one hair below it is refused', () => {
+        assert.deepEqual(checkMotion([hop(328 - POSITION_EPSILON_MM, 20, 290)], [ROTARY]), [],
+            'exactly one epsilon below the clearance still clears');
+        const v = checkMotion([hop(328 - POSITION_EPSILON_MM - 0.001, 20, 290)], [ROTARY]);
+        assert.equal(v.length, 1, 'beyond the epsilon it is a real violation');
+        assert.equal(v[0].clearanceZ, 328);
+    }],
+
+    ['a tenth of a millimetre low is still a violation - the epsilon is noise, not slack', () => {
+        assert.equal(checkMotion([hop(327.9, 20, 290)], [ROTARY]).length, 1);
+    }],
+
+    // B3: an obstacle stated physically is judged against the live tool.
+    ['a physically stated obstacle is cleared by a short tool and not by a long one', () => {
+        const ROTARY_PHYSICAL: ObstacleBox = {
+            name: 'rotary-axis',
+            machine: { x0: 140, y0: 0, x1: 200, y1: 350 },
+            clearanceZ: 250,
+            clearanceBasis: 'physical',
+            mode: 'crossing',
+        };
+        // 73 mm touch probe + 5 mm margin: the old blanket 328 falls out of it.
+        assert.equal(checkMotion([hop(328, 20, 290)], [ROTARY_PHYSICAL], { toolProtrusionMm: 73 }).length, 0);
+        assert.equal(checkMotion([hop(327, 20, 290)], [ROTARY_PHYSICAL], { toolProtrusionMm: 73 }).length, 1);
+        // 2 mm engraving bit: 257 is enough, and the machine gets its room back.
+        assert.equal(checkMotion([hop(320, 20, 290)], [ROTARY_PHYSICAL], { toolProtrusionMm: 2 }).length, 0);
+        assert.equal(checkMotion([hop(256, 20, 290)], [ROTARY_PHYSICAL], { toolProtrusionMm: 2 }).length, 1);
+    }],
+
+    ['a physically stated obstacle with no tool length known is impassable', () => {
+        const PHYSICAL: ObstacleBox = {
+            name: 'tailstock',
+            machine: { x0: 140, y0: 0, x1: 200, y1: 350 },
+            clearanceZ: 250,
+            clearanceBasis: 'physical',
+            mode: 'crossing',
+        };
+        const v = checkMotion([hop(328, 20, 290)], [PHYSICAL], { toolProtrusionMm: null });
+        assert.equal(v.length, 1, 'unknown is refused, never waved through');
+        assert.equal(v[0].requiredZ, null);
+        assert.ok(/no tool length is known/.test(describeViolations(v)), describeViolations(v));
+        assert.ok(/longest_bit_length_mm/.test(describeViolations(v)), 'names how to fix it');
+    }],
+
+    ['a legacy obstacle is enforced exactly as before, tool length or not', () => {
+        assert.equal(checkMotion([hop(328, 20, 290)], [ROTARY], { toolProtrusionMm: null }).length, 0);
+        assert.equal(checkMotion([hop(320, 20, 290)], [ROTARY], { toolProtrusionMm: 73 }).length, 1,
+            'the stored number is not inflated by the tool a second time');
+        const v = checkMotion([hop(320, 20, 290)], [ROTARY]);
+        assert.equal(v[0].basis, 'toolhead');
+        assert.equal(v[0].requiredZ, 328);
+    }],
+
+    ['the refusal says which number it wants and why', () => {
+        const PHYSICAL: ObstacleBox = {
+            name: 'rotary-axis',
+            machine: { x0: 140, y0: 0, x1: 200, y1: 350 },
+            clearanceZ: 250,
+            clearanceBasis: 'physical',
+            mode: 'crossing',
+        };
+        const text = describeViolations(checkMotion([hop(300, 20, 290)], [PHYSICAL], { toolProtrusionMm: 73 }));
+        assert.ok(/top Z 250/.test(text), text);
+        assert.ok(/needs Z 328/.test(text) || /toolhead needs Z 328/.test(text), text);
     }],
 ];

@@ -12,9 +12,18 @@ import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
+import { clearanceOptions } from '../clearanceContext';
+import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
-import { assertFreshHeartbeat, PositionSnapshot, getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
+import {
+    assertFreshHeartbeat,
+    PositionSnapshot,
+    getMachineSizeByIdentifier,
+    getPositionSnapshot,
+    motionFloorZ,
+} from './machine';
+import { reliableForMotion } from '../machinePosition';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
 // action only. move_and_capture performs ONE bounded XY move at the current
@@ -29,6 +38,8 @@ const SETTLE_TIMEOUT_MS = 30000;
 const SETTLE_POLL_MS = 250;
 const POST_SETTLE_DWELL_MS = 300;
 const HOME_TIMEOUT_MS = 120000;
+// Two status periods: the judgement needs a beat taken after the workspace change.
+const FRAME_RESTORE_SETTLE_MS = 4500;
 const HOME_POLL_MS = 1000;
 
 export interface GcodeChannel {
@@ -255,6 +266,19 @@ const recentDirectMoves: number[] = [];
 const PACING_WINDOW_MS = 15000;
 const PACING_REFUSE_AT = 4; // the 4th move inside the window is refused
 
+/** One obstacle, with the toolhead Z it demands and where that number came from. */
+function describeObstacleRequirement(l: { name: string; clearanceZ: number | null; clearanceBasis: string; requiredZ: number | null }): string {
+    if (l.requiredZ === null) {
+        return `"${l.name}" (top Z ${l.clearanceZ}, but no tool length is known so the toolhead Z it needs cannot be `
+            + 'computed - state one with set_tool_setter_config longest_bit_length_mm or set_probe_geometry '
+            + 'probe_effective_length)';
+    }
+    if (l.clearanceBasis === 'physical') {
+        return `"${l.name}" (top Z ${l.clearanceZ}, needs toolhead Z ${l.requiredZ} with the tool and margin above it)`;
+    }
+    return `"${l.name}" (clearance Z ${l.clearanceZ})`;
+}
+
 /**
  * The single bounded XY move + settle + capture behind move_and_capture,
  * shared with visual_servo. Enforces every guard.
@@ -312,23 +336,25 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     // about what is on the bed.
     const machineZ = before.machine.z;
     if (args.operator_confirmed_clearance !== true && machineZ !== null) {
-        const traverseFloor = safeTraverseZ();
+        const traverseFloor = motionFloorZ();
         // Tolerance: home reports 327.999 for Z328 (heartbeat float noise).
         if (machineZ < traverseFloor - TRAVERSE_Z_TOLERANCE_MM) {
-            throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the safe `
-                + `traverse height ${traverseFloor} (top gantry). Retreat Z first (move_z, operator-`
+            throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the motion `
+                + `floor ${traverseFloor} (law 2). Retreat Z first (move_z, operator-`
                 + 'confirmed), then traverse, then descend at the destination. Only the operator\'s '
                 + 'explicit word (operator_confirmed_clearance: true) authorises a lower corridor.');
         }
         const machineFrom = { x: before.machine.x, y: before.machine.y };
         if (machineFrom.x !== null && machineFrom.y !== null) {
+            const clearance = clearanceOptions();
             const obstacles = landmarkStore.obstaclesOnPath(
-                machineFrom.x, machineFrom.y, machineTarget.x, machineTarget.y, machineZ
+                machineFrom.x, machineFrom.y, machineTarget.x, machineTarget.y, machineZ,
+                undefined, clearance.toolProtrusionMm, clearance.clearanceMarginMm
             );
             if (obstacles.length) {
                 throw new McpToolError('XY move refused: the path crosses obstacle landmark(s) '
-                    + `${obstacles.map((l) => `"${l.name}" (clearance Z ${l.clearanceZ})`).join(', ')} `
-                    + `while at machine Z ${machineZ.toFixed(1)}. Raise Z above the clearance, or get the `
+                    + `${obstacles.map((l) => describeObstacleRequirement(l)).join(', ')} `
+                    + `while at machine Z ${machineZ.toFixed(3)}. Raise Z above the requirement, or get the `
                     + 'operator\'s explicit confirmation for this corridor.');
             }
         }
@@ -608,6 +634,56 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 patch_size: patch,
                 search_radius: radius,
                 warnings: result.warnings,
+            };
+        },
+    });
+
+    registry.register({
+        name: 'restore_work_frame',
+        description: 'Put the controller back in the WORK workspace (`G90` then `G54` on its own line). NO MOTION: '
+            + 'the program carries no axis word, so it is permitted even when the machine position is '
+            + 'awaiting-resync or stale - it is the remedy for exactly that state. Use it when get_position '
+            + 'reports an incoherent or machine-frame position after a job that declared G53 and never selected a '
+            + 'work workspace again: the controller keeps reporting machine coordinates while the heartbeat still '
+            + 'carries a work-origin offset, so every derived position is rejected until the frame is handed back. '
+            + 'Returns the position of record before and after, re-read two beats later. A re-home is not the remedy.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                reason: { type: 'string', description: 'Why the frame is being restored; logged and shown on the console.' },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { reason?: string }) => {
+            const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+            if (!channel || typeof channel.executeGcode !== 'function') {
+                throw new McpToolError('No machine connected, or the channel does not support direct commands.');
+            }
+            const before = getPositionSnapshot();
+            const reason = String(args.reason || '').trim();
+            const executed = await sendGcodeVisible(
+                channel,
+                `restore_work_frame${reason ? ` - ${reason.slice(0, 60)}` : ''}`,
+                WORK_FRAME_RESTORE_GCODE
+            );
+            // Two status periods: the judgement needs a beat taken AFTER the
+            // workspace change, and the poll runs on its own ~2 s cadence.
+            await new Promise((resolve) => setTimeout(resolve, FRAME_RESTORE_SETTLE_MS));
+            const after = getPositionSnapshot();
+            const recovered = reliableForMotion(after.reliability) && !reliableForMotion(before.reliability);
+            return {
+                sent: WORK_FRAME_RESTORE_GCODE,
+                result: executed.result,
+                text: executed.text || null,
+                before: { reliability: before.reliability, frame: before.frame, machine: before.machine },
+                after: { reliability: after.reliability, frame: after.frame, machine: after.machine },
+                recovered,
+                warnings: after.warnings,
+                note: recovered
+                    ? 'The controller is back in the work workspace and the position of record is usable again.'
+                    : `The position of record is ${after.reliability} after the restore. `
+                        + 'Read get_position again in a couple of seconds; if it has not cleared, call '
+                        + 'query_firmware_position to see which frame the controller is actually in and tell the operator.',
             };
         },
     });

@@ -4,7 +4,8 @@ import path from 'path';
 
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
-import { ObstacleBox, segmentHitsBox2D } from './envelopeChecks';
+import { ObstacleBox, POSITION_EPSILON_MM, segmentHitsBox2D } from './envelopeChecks';
+import { ClearanceBasis, normaliseClearanceBasis, requiredToolheadZ } from './landmarkClearance';
 
 const log = logger('service:mcp:landmarks');
 
@@ -27,6 +28,13 @@ export interface Landmark {
     // fabricated "clearance" height crossed the rotary and destroyed the
     // fitted touch probe.
     clearanceZ: number | null;
+    /**
+     * What clearanceZ is measured to. 'toolhead' (the legacy meaning, and the
+     * default for every record written before this existed) is a minimum safe
+     * toolhead Z with tool length already baked in; 'physical' is the top of
+     * the obstacle itself, and the live tool is added at check time.
+     */
+    clearanceBasis: ClearanceBasis;
     notes: string | null;
     createdAt: number;
 }
@@ -54,7 +62,11 @@ export class LandmarkStore {
         try {
             const raw = fs.readJsonSync(this.file());
             const landmarks = (Array.isArray(raw?.landmarks) ? raw.landmarks : [])
-                .map((l: Landmark) => ({ ...l, clearanceZ: Number.isFinite(Number(l.clearanceZ)) ? Number(l.clearanceZ) : null }));
+                .map((l: Landmark) => ({
+                    ...l,
+                    clearanceZ: Number.isFinite(Number(l.clearanceZ)) ? Number(l.clearanceZ) : null,
+                    clearanceBasis: normaliseClearanceBasis(l.clearanceBasis),
+                }));
             this.cache = { landmarks };
         } catch (err) {
             this.cache = { landmarks: [] };
@@ -106,16 +118,40 @@ export class LandmarkStore {
      * clearanceZ the given toolhead machine Z is BELOW. These are collisions
      * waiting to happen; the direct XY guard refuses them.
      */
+    /**
+     * Obstacles a direct XY move at `toolheadZ` would cross. Same requirement
+     * as the procedure planners' checkMotion: the stored height for a legacy
+     * 'toolhead' clearance, obstacle top + tool + margin for a 'physical' one,
+     * and an obstacle whose requirement cannot be computed (physical, no tool
+     * length known) is impassable rather than passable.
+     *
+     * `toolProtrusionMm` is clearanceContext.currentToolProtrusion().mm.
+     */
     public obstaclesOnPath(
         x0: number, y0: number, x1: number, y1: number,
-        toolheadZ: number, marginMm = 5
-    ): Landmark[] {
-        return this.load().landmarks.filter((l) => {
-            if (l.clearanceZ === null || toolheadZ >= l.clearanceZ) {
-                return false;
-            }
-            return segmentHitsBox2D(x0, y0, x1, y1, l.machine, marginMm);
-        });
+        toolheadZ: number, marginMm = 5,
+        toolProtrusionMm: number | null = null,
+        clearanceMarginMm?: number
+    ): Array<Landmark & { requiredZ: number | null }> {
+        return this.load().landmarks
+            .map((l) => ({
+                ...l,
+                requiredZ: l.clearanceZ === null
+                    ? null
+                    : requiredToolheadZ(l.clearanceZ, l.clearanceBasis, toolProtrusionMm, clearanceMarginMm),
+            }))
+            .filter((l) => {
+                if (l.clearanceZ === null) {
+                    return false;
+                }
+                // POSITION_EPSILON_MM: home reports 327.999994 for a 328 home,
+                // and an exact compare refused the move over a landmark whose
+                // clearance IS the traverse height (live 2026-09-19).
+                if (l.requiredZ !== null && toolheadZ >= l.requiredZ - POSITION_EPSILON_MM) {
+                    return false;
+                }
+                return segmentHitsBox2D(x0, y0, x1, y1, l.machine, marginMm);
+            });
     }
 
     /**
@@ -127,7 +163,13 @@ export class LandmarkStore {
     public obstacleBoxes(): ObstacleBox[] {
         return this.load().landmarks
             .filter((l) => l.clearanceZ !== null)
-            .map((l) => ({ name: l.name, machine: { ...l.machine }, clearanceZ: l.clearanceZ as number, mode: 'crossing' as const }));
+            .map((l) => ({
+                name: l.name,
+                machine: { ...l.machine },
+                clearanceZ: l.clearanceZ as number,
+                clearanceBasis: l.clearanceBasis,
+                mode: 'crossing' as const,
+            }));
     }
 
     /**
