@@ -220,6 +220,16 @@ const machinePosition = createMachinePositionState();
 // idle and is believed after 3 quiet beats (~6 s).
 const ZERO_OFFSET_QUIET_MS = 3000;
 
+/**
+ * Which connection we are on. The position-of-record state is forgotten on
+ * every (re)connection, so its reset stamp IS the epoch: anything bound to a
+ * connection - a work origin, a camera model - stops being believable when
+ * this changes.
+ */
+export function connectionEpoch(): number {
+    return machinePosition.resetAt === null ? 0 : machinePosition.resetAt;
+}
+
 /** Diagnostics: how the machine position is currently being judged. */
 export function machinePositionDiagnostics() {
     const last = machinePosition.lastJudgement;
