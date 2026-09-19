@@ -2,6 +2,7 @@ import { strict as assert } from 'assert';
 
 import {
     BOUNDS_MARGIN_MM,
+    SUSTAINED_MACHINE_FRAME_BEATS,
     JudgeContext,
     RawBeat,
     createMachinePositionState,
@@ -186,5 +187,101 @@ export const tests: Array<[string, () => void]> = [
         );
         assert.equal(j.reliability, 'heartbeat');
         assert.deepEqual(j.machine, { x: 100, y: 100, z: 300 });
+    }],
+
+    // A4: a controller left in the machine workspace. Live 2026-09-19 a job
+    // declared G53 and never selected a work workspace again, so every beat
+    // was rejected for ever and only a re-home cleared it.
+    ['a run of machine-frame beats is believed AS machine coordinates, but not before the third', () => {
+        const state = createMachinePositionState();
+        judgeBeatStateful(state, workBeat(T0), ctx(T0 + 100));
+        const stuck = (at: number, machine = { x: 170, y: 207.571, z: 227.7 }): RawBeat => ({
+            raw: { ...machine }, offsetReported: { ...OFFSET }, reportedAt: at,
+        });
+        for (let beat = 1; beat < SUSTAINED_MACHINE_FRAME_BEATS; beat++) {
+            const j = judgeBeatStateful(state, stuck(T0 + (2000 * beat)), ctx(T0 + (2000 * beat) + 100));
+            assert.equal(j.reliability, 'awaiting-resync', `beat ${beat} is still a transient`);
+            assert.equal(j.machineFrameSuspect, true);
+            assert.deepEqual(j.machine, { x: 170, y: 199, z: 240 }, 'the last accepted position is held');
+        }
+        const j = judgeBeatStateful(
+            state,
+            stuck(T0 + (2000 * SUSTAINED_MACHINE_FRAME_BEATS)),
+            ctx(T0 + (2000 * SUSTAINED_MACHINE_FRAME_BEATS) + 100)
+        );
+        assert.equal(j.reliability, 'heartbeat');
+        assert.equal(j.frame, 'machine-frame');
+        assert.ok(reliableForMotion(j.reliability), 'the position is usable again - the FRAME is what is broken');
+        assert.deepEqual(j.machine, { x: 170, y: 207.571, z: 227.7 }, 'the raw fields ARE the machine position');
+        assert.deepEqual(j.nextAccepted && j.nextAccepted.machine, { x: 170, y: 207.571, z: 227.7 },
+            'the held position follows the machine, not where it was before the frame broke');
+    }],
+
+    ['the sustained judgement names the remedy and rules out a re-home', () => {
+        const state = createMachinePositionState();
+        judgeBeatStateful(state, workBeat(T0), ctx(T0 + 100));
+        let j = null as ReturnType<typeof judgeBeatStateful> | null;
+        for (let beat = 1; beat <= SUSTAINED_MACHINE_FRAME_BEATS; beat++) {
+            j = judgeBeatStateful(
+                state,
+                { raw: { x: 170, y: 207.571, z: 227.7 }, offsetReported: { ...OFFSET }, reportedAt: T0 + (2000 * beat) },
+                ctx(T0 + (2000 * beat) + 100)
+            );
+        }
+        const reasons = (j as NonNullable<typeof j>).reasons.join(' ');
+        assert.ok(/MACHINE workspace/.test(reasons));
+        assert.ok(/restore_work_frame/.test(reasons), 'names the remedy');
+        assert.ok(/re-home is not the remedy/.test(reasons));
+    }],
+
+    ['a position that is impossible in BOTH frames is never believed, however long it persists', () => {
+        const state = createMachinePositionState();
+        judgeBeatStateful(state, workBeat(T0), ctx(T0 + 100));
+        for (let beat = 1; beat <= SUSTAINED_MACHINE_FRAME_BEATS + 2; beat++) {
+            // raw Z 900 is off the machine read either way - a bug, not a frame.
+            const j = judgeBeatStateful(
+                state,
+                { raw: { x: 170, y: 207.571, z: 900 }, offsetReported: { ...OFFSET }, reportedAt: T0 + (2000 * beat) },
+                ctx(T0 + (2000 * beat) + 100)
+            );
+            assert.equal(j.machineFrameSuspect, false, `beat ${beat}`);
+            assert.equal(j.reliability, 'awaiting-resync', `beat ${beat}`);
+        }
+    }],
+
+    ['one coherent beat in the middle resets the streak - only an unbroken run counts', () => {
+        const state = createMachinePositionState();
+        judgeBeatStateful(state, workBeat(T0), ctx(T0 + 100));
+        const stuck = (at: number): RawBeat => ({ raw: { x: 170, y: 207.571, z: 227.7 }, offsetReported: { ...OFFSET }, reportedAt: at });
+        judgeBeatStateful(state, stuck(T0 + 2000), ctx(T0 + 2100));
+        judgeBeatStateful(state, stuck(T0 + 4000), ctx(T0 + 4100));
+        const good = judgeBeatStateful(state, workBeat(T0 + 6000), ctx(T0 + 6100));
+        assert.equal(good.reliability, 'heartbeat');
+        assert.equal(good.frame, 'work-frame');
+        assert.equal(state.machineFrameStreak, 0);
+        const j = judgeBeatStateful(state, stuck(T0 + 8000), ctx(T0 + 8100));
+        assert.equal(j.reliability, 'awaiting-resync', 'the count starts again from this beat');
+    }],
+
+    ['restoring the frame hands the record back to work-frame beats', () => {
+        const state = createMachinePositionState();
+        judgeBeatStateful(state, workBeat(T0), ctx(T0 + 100));
+        for (let beat = 1; beat <= SUSTAINED_MACHINE_FRAME_BEATS; beat++) {
+            judgeBeatStateful(
+                state,
+                { raw: { x: 170, y: 207.571, z: 227.7 }, offsetReported: { ...OFFSET }, reportedAt: T0 + (2000 * beat) },
+                ctx(T0 + (2000 * beat) + 100)
+            );
+        }
+        // restore_work_frame runs; the controller answers in the work workspace again.
+        const at = T0 + (2000 * (SUSTAINED_MACHINE_FRAME_BEATS + 1));
+        let j = judgeBeatStateful(state, workBeat(at, { x: 170, y: 207.571, z: 227.7 }), ctx(at + 100));
+        if (!reliableForMotion(j.reliability)) {
+            // At most one beat is spent on the flip signature (the return from the window).
+            j = judgeBeatStateful(state, workBeat(at + 2000, { x: 170, y: 207.571, z: 227.7 }), ctx(at + 2100));
+        }
+        assert.equal(j.reliability, 'heartbeat');
+        assert.equal(j.frame, 'work-frame');
+        assert.deepEqual(j.machine, { x: 170, y: 207.571, z: 227.7 });
     }],
 ];

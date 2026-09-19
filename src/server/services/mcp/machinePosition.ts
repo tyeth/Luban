@@ -30,6 +30,26 @@ export type RejectReason = 'out-of-bounds' | 'frame-flip' | 'no-offset-yet';
 /** A derived machine coordinate this far outside the travel is a bug, not a position (operator, 2026-09-14). */
 export const BOUNDS_MARGIN_MM = 50;
 
+/**
+ * Consecutive beats carrying the machine-frame signature before the report is
+ * believed AS machine coordinates rather than ignored.
+ *
+ * One such beat is the ordinary G53-window artefact: the HTTP channel sends a
+ * move as four requests and the poll lands inside them, so the next beat
+ * rectifies. But a job that declares G53 and never selects a work workspace
+ * again leaves the controller there PERMANENTLY, and then every beat is
+ * rejected for ever - the position of record never recovers, motion and
+ * staging refuse indefinitely, and the no-motion G54 that would fix it is
+ * refused too. Live 2026-09-19 the only way out was a re-home.
+ *
+ * Three beats (~6 s at the 2 s poll) is far longer than any send window and
+ * still well short of a wait anyone would notice.
+ */
+export const SUSTAINED_MACHINE_FRAME_BEATS = 3;
+
+/** An offset smaller than this on every axis cannot tell the two frames apart. */
+export const MACHINE_FRAME_OFFSET_TOLERANCE_MM = 0.5;
+
 export interface MachineBounds {
     min: Xyz;
     max: Xyz;
@@ -58,6 +78,8 @@ export interface BeatInput {
     lastAccepted: AcceptedPosition | null;
     /** Controller-echo position of record still valid for the current gcode sequence, if any. */
     verified: Xyz | null;
+    /** Consecutive PRIOR beats that carried the machine-frame signature (judgeBeatStateful keeps it). */
+    machineFrameStreak: number;
 }
 
 export interface BeatJudgement {
@@ -77,6 +99,12 @@ export interface BeatJudgement {
     reasons: string[];
     /** What the caller should hold as lastAccepted after this beat. */
     nextAccepted: AcceptedPosition | null;
+    /**
+     * This beat reads as a legal MACHINE position while its work-frame reading
+     * is impossible - the signature of a controller left in the machine
+     * workspace. The caller counts these to decide when it is not a transient.
+     */
+    machineFrameSuspect: boolean;
 }
 
 function complete(v: NullableXyz): v is Xyz {
@@ -109,6 +137,35 @@ export function isFrameFlip(raw: Xyz, previousRaw: Xyz, offset: Xyz, toleranceMm
         || axes.every((axis) => Math.abs(delta[axis] - offset[axis]) <= toleranceMm);
 }
 
+function machineBeatsText(beats: number): string {
+    return `${beats} consecutive beat${beats === 1 ? '' : 's'}`;
+}
+
+/**
+ * What the caller holds as the last accepted position. A sustained
+ * machine-frame beat updates it too: its raw fields are the machine position,
+ * and holding a position from before the frame broke would strand the record
+ * wherever the machine happened to be minutes ago.
+ */
+function nextAcceptedFrom(
+    input: BeatInput,
+    derived: NullableXyz,
+    accepted: boolean,
+    stale: boolean,
+    sustainedMachineFrame: boolean
+): AcceptedPosition | null {
+    if (stale) {
+        return input.lastAccepted;
+    }
+    if (accepted && complete(derived)) {
+        return { machine: { x: derived.x, y: derived.y, z: derived.z }, reportedAt: input.reportedAt };
+    }
+    if (sustainedMachineFrame && complete(input.raw)) {
+        return { machine: { ...input.raw }, reportedAt: input.reportedAt };
+    }
+    return input.lastAccepted;
+}
+
 const NULLS: NullableXyz = { x: null, y: null, z: null };
 
 /** Judge one status report. Pure. */
@@ -134,7 +191,8 @@ export function judgeBeat(input: BeatInput): BeatJudgement {
             + `(${input.previousRaw.x}, ${input.previousRaw.y}, ${input.previousRaw.z}) with offset (${input.offsetReported.x}, `
             + `${input.offsetReported.y}, ${input.offsetReported.z}) - a poll inside a G53 window, or the return from one. Ignored.`);
     }
-    const outsideAxes = rejectedReason ? [] : outsideBounds(derived, input.bounds);
+    const derivedOutside = outsideBounds(derived, input.bounds);
+    const outsideAxes = rejectedReason ? [] : derivedOutside;
     if (!rejectedReason && outsideAxes.length) {
         rejectedReason = 'out-of-bounds';
         reasons.push(`Derived machine ${outsideAxes.join('/')} (${outsideAxes.map((a) => `${a}=${(derived[a] as number).toFixed(1)}`).join(', ')}) `
@@ -152,6 +210,21 @@ export function judgeBeat(input: BeatInput): BeatJudgement {
 
     const stale = input.now - input.reportedAt > input.staleMs;
     const accepted = rejectedReason === null && complete(derived);
+
+    // The machine-frame signature: the raw fields read as a legal machine
+    // position while the work-frame reading (raw - offset) is impossible, and
+    // the offset is big enough to tell the two apart. One such beat is the
+    // ordinary G53-window artefact; a run of them means the controller was
+    // left in the machine workspace and no amount of waiting will rectify it.
+    const offsetDistinguishable = AXES.some((axis) => Math.abs(offset.offset[axis]) > MACHINE_FRAME_OFFSET_TOLERANCE_MM);
+    const machineFrameSuspect = rejectedReason !== null
+        && rejectedReason !== 'no-offset-yet'
+        && complete(input.raw)
+        && derivedOutside.length > 0
+        && outsideBounds(input.raw, input.bounds).length === 0
+        && offsetDistinguishable;
+    const machineFrameBeats = machineFrameSuspect ? input.machineFrameStreak + 1 : 0;
+    const sustainedMachineFrame = machineFrameBeats >= SUSTAINED_MACHINE_FRAME_BEATS;
 
     let reliability: Reliability;
     let machine: NullableXyz;
@@ -171,6 +244,19 @@ export function judgeBeat(input: BeatInput): BeatJudgement {
         machineReportedAt = input.reportedAt;
         frame = 'work-frame';
         reliability = offset.source === 'heartbeat' ? 'heartbeat' : 'cached-offset';
+    } else if (sustainedMachineFrame) {
+        // Believed AS machine coordinates: that reading is legal, the work
+        // reading is impossible, and it has held for long enough not to be a
+        // send window. The position is usable - the FRAME is what is broken.
+        machine = { ...(input.raw as Xyz) };
+        machineReportedAt = input.reportedAt;
+        frame = 'machine-frame';
+        reliability = 'heartbeat';
+        reasons.push(`The controller has reported in the MACHINE workspace for ${machineBeatsText(machineFrameBeats)} - a job `
+            + 'declared G53 and never selected a work workspace again, so the heartbeat carries machine coordinates while the '
+            + 'work-origin offset is still populated. These raw fields ARE the machine position and are used as such; the '
+            + 'work coordinates and the offset are not to be trusted until the frame is handed back. Call restore_work_frame '
+            + '(no motion) to fix it - a re-home is not the remedy.');
     } else {
         machine = input.lastAccepted ? { ...input.lastAccepted.machine } : { ...NULLS };
         machineReportedAt = input.lastAccepted ? input.lastAccepted.reportedAt : null;
@@ -200,11 +286,11 @@ export function judgeBeat(input: BeatInput): BeatJudgement {
         derived,
         outsideAxes,
         reasons,
-        nextAccepted: accepted && !stale && complete(derived)
-            ? { machine: { x: derived.x, y: derived.y, z: derived.z }, reportedAt: input.reportedAt }
-            : input.lastAccepted,
+        machineFrameSuspect,
+        nextAccepted: nextAcceptedFrom(input, derived, accepted, stale, sustainedMachineFrame),
     };
 }
+
 
 /** True when the judgement allows motion to be staged or started on its machine position. */
 export function reliableForMotion(reliability: Reliability): boolean {
@@ -237,6 +323,8 @@ export interface MachinePositionState {
     previousRaw: Xyz | null;
     lastAccepted: AcceptedPosition | null;
     lastBeatAt: number | null;
+    /** Consecutive beats carrying the machine-frame signature (judgeBeat's machineFrameSuspect). */
+    machineFrameStreak: number;
     /** Inputs of the last distinct beat, so repeated reads of the same beat re-judge (staleness moves) without mutating. */
     lastInput: Omit<BeatInput, 'now' | 'verified'> | null;
     lastJudgement: BeatJudgement | null;
@@ -254,6 +342,7 @@ export function createMachinePositionState(): MachinePositionState {
         zeroSeenAt: null,
         zeroTransients: 0,
         previousRaw: null,
+        machineFrameStreak: 0,
         lastAccepted: null,
         lastBeatAt: null,
         lastInput: null,
@@ -302,6 +391,7 @@ export function judgeBeatStateful(state: MachinePositionState, beat: RawBeat, ct
             offsetReported: beat.offsetReported,
             cachedOffset: state.cachedOffset ? { x: state.cachedOffset.x, y: state.cachedOffset.y, z: state.cachedOffset.z } : null,
             zeroStreak: state.zeroStreak,
+            machineFrameStreak: state.machineFrameStreak,
             previousRaw: state.previousRaw,
             bounds: ctx.bounds,
             reportedAt: beat.reportedAt,
@@ -332,6 +422,7 @@ export function judgeBeatStateful(state: MachinePositionState, beat: RawBeat, ct
         if (judgement.accepted && complete(beat.raw)) {
             state.previousRaw = { x: beat.raw.x, y: beat.raw.y, z: beat.raw.z };
         }
+        state.machineFrameStreak = judgement.machineFrameSuspect ? state.machineFrameStreak + 1 : 0;
         state.lastAccepted = judgement.nextAccepted;
         state.lastBeatAt = beat.reportedAt;
         state.lastJudgement = judgement;
