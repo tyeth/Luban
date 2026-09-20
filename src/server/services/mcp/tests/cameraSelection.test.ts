@@ -1,6 +1,12 @@
 import { strict as assert } from 'assert';
 
-import { CameraCandidate, isSnapshotUrl, matchCameraDevice, selectionInvalidatesModel } from '../cameraSelection';
+import {
+    CameraCandidate,
+    describeCaptureFailure,
+    isSnapshotUrl,
+    matchCameraDevice,
+    selectionInvalidatesModel,
+} from '../cameraSelection';
 
 // The Ubuntu box as it actually is: the toolhead camera and a second one,
 // both listed under stable by-id symlinks, both perfectly capable of
@@ -106,6 +112,50 @@ export const tests: Array<[string, () => void]> = [
         const match = matchCameraDevice('http://192.168.1.153:8080/shot.jpg', [url, TOOLHEAD]);
         assert.equal(match.ok, true);
         assert.equal(match.entry, url.entry);
+    }],
+
+    // The box really was pinned to a camera that had been swapped out
+    // (2026-09-20): every capture died with ffmpeg's "No such file or
+    // directory" and nothing said which cameras were actually there.
+    ['a capture failure from a camera that is gone names the attached ones and the cure', () => {
+        // Exactly what the box looked like: pinned to the Sonix, which had
+        // been swapped for these two.
+        const attachedNow = [
+            '/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0 (USB Camera: USB Camera)',
+            '/dev/v4l/by-id/usb-icSpring_icspring_camera-video-index0 (icspring camera: icspring camer)',
+        ];
+        const message = describeCaptureFailure(
+            TOOLHEAD.entry,
+            attachedNow,
+            'Error opening input file ... No such file or directory'
+        );
+        assert.match(message, /is not attached any more/);
+        assert.match(message, /Sonix/);
+        assert.match(message, /Generic_USB_Camera/);
+        assert.match(message, /icspring/);
+        assert.match(message, /select_camera/);
+        // The ffmpeg text is kept: it is still the proximate evidence.
+        assert.match(message, /No such file or directory/);
+    }],
+
+    ['a capture failure from a camera that IS attached stays the plain failure', () => {
+        const message = describeCaptureFailure(TOOLHEAD.entry, [TOOLHEAD.entry, SECOND.entry], 'Device busy');
+        assert.match(message, /failed after retry/);
+        assert.match(message, /Device busy/);
+        assert.doesNotMatch(message, /not attached any more/);
+    }],
+
+    ['enumeration finding nothing is not evidence the camera vanished', () => {
+        // An empty list means the listing failed, not that the camera is gone;
+        // claiming otherwise would send someone hunting the wrong fault.
+        const message = describeCaptureFailure(TOOLHEAD.entry, [], 'Cannot open video device');
+        assert.match(message, /failed after retry/);
+        assert.doesNotMatch(message, /not attached any more/);
+    }],
+
+    ['a failure with no ffmpeg output still reads as a sentence', () => {
+        const message = describeCaptureFailure(TOOLHEAD.entry, [TOOLHEAD.entry], '');
+        assert.match(message, /no output from ffmpeg/);
     }],
 
     ['changing camera invalidates the solved model; re-pinning the same one does not', () => {

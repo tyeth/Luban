@@ -112,3 +112,27 @@ export function matchCameraDevice(query: string, candidates: CameraCandidate[]):
 export function selectionInvalidatesModel(previous: string | null, next: string): boolean {
     return !!previous && previous !== next;
 }
+
+/**
+ * Why a capture from `device` failed, in words that name the cure.
+ *
+ * Live 2026-09-20: the box was pinned to a Sonix camera that had since been
+ * swapped for two others, and every capture died with ffmpeg's own "No such
+ * file or directory". True, and useless: it does not say which cameras ARE
+ * attached, and it reads like a broken camera rather than a stale choice.
+ * A pinned device is deliberately not checked against the device list on the
+ * happy path - enumeration costs an ffmpeg spawn on Windows - so this runs
+ * only once a capture has already failed.
+ *
+ * `attached` empty means enumeration itself failed or found nothing; that is
+ * not evidence the camera vanished, so the plain failure stands.
+ */
+export function describeCaptureFailure(device: string, attached: string[], ffmpegTail: string): string {
+    const detail = ffmpegTail ? ` (ffmpeg: ${ffmpegTail})` : '';
+    if (attached.length && !attached.includes(device)) {
+        return `The selected camera "${device}" is not attached any more. Attached now: ${listFor(attached.map((entry) => ({ entry, aliases: [] })))}. `
+            + 'Run preview_cameras to see what each one is looking at, then select_camera to choose one - '
+            + `refusing to silently substitute a different camera.${detail}`;
+    }
+    return `ffmpeg capture from "${device}" failed after retry:${detail || ' no output from ffmpeg.'}`;
+}
