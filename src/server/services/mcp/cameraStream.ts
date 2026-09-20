@@ -195,6 +195,23 @@ class CameraStreamService implements LiveFrameSource {
         }
     }
 
+    /**
+     * The selected camera changed (select_camera): the loop is holding the
+     * OLD device and would go on feeding its frames to every capture, so it
+     * is stopped here and started again - on the new device, which startLoop
+     * re-reads from the configstore - for whoever is still watching.
+     */
+    public reselectDevice(reason: string): boolean {
+        const wasRunning = this.loopAlive();
+        this.stopLoop(reason);
+        this.device = null;
+        this.provider = null;
+        if (this.hub && this.hub.hasClients() && this.isEnabled()) {
+            this.ensureLoop();
+        }
+        return wasRunning;
+    }
+
     public urls(): CameraStreamUrls {
         const base = this.baseUrl();
         return { page: `${base}/camera`, stream: `${base}/camera/stream.mjpeg`, snapshot: `${base}/camera/snapshot.jpg` };
@@ -235,12 +252,17 @@ class CameraStreamService implements LiveFrameSource {
         return this.loopAlive() || this.starting;
     }
 
+    /** Which device the loop holds right now (LiveFrameSource): null when it holds none. */
+    public activeDevice(): string | null {
+        return this.loopAlive() ? this.device : null;
+    }
+
     public async awaitFrame(): Promise<CapturedFrame> {
         const hub = this.getHub();
         const frameIntervalMs = Math.round(1000 / this.settings().fps);
         const live = await hub.awaitFrame(frameIntervalMs + 150, CAPTURE_TIMEOUT_MS);
         return {
-            frameId: cacheFrame(live.jpg),
+            frameId: cacheFrame(live.jpg, this.device),
             imageBase64: live.jpg.toString('base64'),
             mimeType: 'image/jpeg',
             provider: this.provider || FFMPEG_PROVIDER,

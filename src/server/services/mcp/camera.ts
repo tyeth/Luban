@@ -8,6 +8,7 @@ import path from 'path';
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { CameraCandidate, isSnapshotUrl } from './cameraSelection';
 import { McpToolError } from './registry';
 
 const log = logger('service:mcp:camera');
@@ -46,6 +47,8 @@ export interface LiveFrameSource {
     isActive(): boolean;
     /** A frame no older than the loop's own frame interval, or the next one. */
     awaitFrame(): Promise<CapturedFrame>;
+    /** The device string the loop currently holds, or null when it holds none. */
+    activeDevice(): string | null;
 }
 
 let liveSource: LiveFrameSource | null = null;
@@ -68,11 +71,15 @@ export async function oneShotCapturePending(): Promise<void> {
 // them by id - the dominant field error source was hand-estimated pixel
 // coordinates, so measurement between cached frames replaces eyeballing.
 const FRAME_CACHE_LIMIT = 12;
-const frameCache = new Map<string, Buffer>();
+// The device each cached frame came from rides with it: select_camera makes a
+// caller point at a frame as its evidence for "this is the right camera", and
+// that evidence is only worth anything if the frame provably came from the
+// camera being selected.
+const frameCache = new Map<string, { jpg: Buffer; device: string | null }>();
 
-export function cacheFrame(jpg: Buffer): string {
+export function cacheFrame(jpg: Buffer, device: string | null = null): string {
     const frameId = crypto.randomBytes(4).toString('hex');
-    frameCache.set(frameId, jpg);
+    frameCache.set(frameId, { jpg, device });
     while (frameCache.size > FRAME_CACHE_LIMIT) {
         frameCache.delete(frameCache.keys().next().value);
     }
@@ -84,7 +91,14 @@ export function getCachedFrameIds(): string[] {
 }
 
 export function getCachedFrame(frameId: string): Buffer | null {
-    return frameCache.get(frameId) || null;
+    const entry = frameCache.get(frameId);
+    return entry ? entry.jpg : null;
+}
+
+/** Which camera a cached frame was taken from; null when it is not cached (or came from an unnamed source). */
+export function getCachedFrameDevice(frameId: string): string | null {
+    const entry = frameCache.get(frameId);
+    return entry ? entry.device : null;
 }
 
 export function ffmpegBinary(): string {
@@ -152,12 +166,12 @@ function listV4l2Devices(): string[] {
     return devices;
 }
 
-export async function listCameras(): Promise<{ provider: string; devices: string[]; note?: string }> {
-    const cameraUrl = config.get('mcpCameraUrl');
-    if (cameraUrl) {
-        return { provider: 'http', devices: [String(cameraUrl)], note: 'mcpCameraUrl is set; it takes precedence.' };
-    }
-
+/**
+ * The cameras physically attached, whatever mcpCameraUrl says. listCameras()
+ * reports the CONFIGURED source and so hides these behind a set snapshot URL;
+ * choosing between cameras needs to see them all.
+ */
+export async function listLocalCameras(): Promise<{ provider: string; devices: string[]; note?: string }> {
     if (process.platform === 'linux') {
         return { provider: 'ffmpeg-v4l2', devices: listV4l2Devices() };
     }
@@ -180,6 +194,48 @@ export async function listCameras(): Promise<{ provider: string; devices: string
         }
     }
     return { provider: 'ffmpeg-dshow', devices };
+}
+
+export async function listCameras(): Promise<{ provider: string; devices: string[]; note?: string }> {
+    const cameraUrl = config.get('mcpCameraUrl');
+    if (cameraUrl) {
+        return { provider: 'http', devices: [String(cameraUrl)], note: 'mcpCameraUrl is set; it takes precedence.' };
+    }
+    return listLocalCameras();
+}
+
+/**
+ * Every camera that could be selected, with the other strings that name it.
+ * A v4l2 entry reads "<path> (<Name>)", so the path and the name are each an
+ * alias; the path is resolved through its symlink as well, because
+ * /dev/v4l/by-id/... and the /dev/videoN it points at are the same camera
+ * under two names and a caller may have either.
+ */
+export async function listCameraCandidates(): Promise<{ provider: string; candidates: CameraCandidate[]; note?: string }> {
+    const { provider, devices, note } = await listLocalCameras();
+    const candidates: CameraCandidate[] = devices.map((entry) => {
+        const aliases = new Set<string>();
+        const parsed = entry.match(/^(\/dev\/\S+)\s+\((.+)\)$/);
+        if (parsed) {
+            aliases.add(parsed[1]);
+            aliases.add(parsed[2]);
+            try {
+                // by-id symlink and the /dev/videoN it points at are the same
+                // camera under two names, and a caller may hold either.
+                aliases.add(fs.realpathSync(parsed[1]));
+            } catch (err) {
+                // the node vanished between listing and resolving; the
+                // literal path stays an alias
+            }
+        }
+        aliases.delete(entry);
+        return { entry, aliases: [...aliases] };
+    });
+    const cameraUrl = config.get('mcpCameraUrl');
+    if (cameraUrl) {
+        candidates.unshift({ entry: String(cameraUrl), aliases: [] });
+    }
+    return { provider, candidates, note };
 }
 
 /** One GET of an HTTP snapshot source; shared by the one-shot capture and the stream's poller. */
@@ -217,7 +273,7 @@ export async function fetchHttpSnapshot(url: string): Promise<{ body: Buffer; mi
 async function captureViaHttp(url: string): Promise<CapturedFrame> {
     const { body, mimeType } = await fetchHttpSnapshot(url);
     return {
-        frameId: cacheFrame(body),
+        frameId: cacheFrame(body, url),
         imageBase64: body.toString('base64'),
         mimeType,
         provider: 'http',
@@ -235,12 +291,15 @@ async function captureViaHttp(url: string): Promise<CapturedFrame> {
  * remembered and preferred; a missing device is an error, never a
  * substitution. Shared by the one-shot capture and the live stream loop.
  */
-export async function resolveFfmpegInput(): Promise<{ device: string; inputArgs: string[] }> {
+export async function resolveFfmpegInput(deviceOverride?: string): Promise<{ device: string; inputArgs: string[] }> {
     if (process.platform !== 'win32' && process.platform !== 'linux') {
         throw new McpToolError(`No ffmpeg camera input is wired up for ${process.platform}. `
             + 'Set mcpCameraUrl to an HTTP snapshot URL instead.');
     }
-    let device = config.get('mcpCameraDevice');
+    // An override names the device for THIS capture only (preview_cameras
+    // looking at a camera that has not been chosen): it neither reads nor
+    // writes the sticky choice.
+    let device: unknown = deviceOverride || config.get('mcpCameraDevice');
     if (!device) {
         const { devices } = await listCameras();
         if (!devices.length) {
@@ -278,8 +337,8 @@ export function noteCameraLastGood(device: string): void {
     config.set('mcpCameraLastGood', device);
 }
 
-async function captureViaFfmpeg(): Promise<CapturedFrame> {
-    const { device, inputArgs } = await resolveFfmpegInput();
+async function captureViaFfmpeg(deviceOverride?: string): Promise<CapturedFrame> {
+    const { device, inputArgs } = await resolveFfmpegInput(deviceOverride);
 
     const outPath = path.join(DataStorage.tmpDir, `mcp-frame-${crypto.randomBytes(4).toString('hex')}.jpg`);
     try {
@@ -301,10 +360,14 @@ async function captureViaFfmpeg(): Promise<CapturedFrame> {
             throw new McpToolError(`ffmpeg capture from "${device}" failed after retry: `
                 + `${stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' ')}`);
         }
-        noteCameraLastGood(device);
+        if (!deviceOverride) {
+            // A preview of an unchosen camera must not become the fallback
+            // the next capture silently lands on.
+            noteCameraLastGood(device);
+        }
         const body = await fs.readFile(outPath);
         return {
-            frameId: cacheFrame(body),
+            frameId: cacheFrame(body, device),
             imageBase64: body.toString('base64'),
             mimeType: 'image/jpeg',
             provider: FFMPEG_PROVIDER,
@@ -332,13 +395,9 @@ async function captureOneShot(): Promise<CapturedFrame> {
     return captureViaFfmpeg();
 }
 
-export async function captureFrame(): Promise<CapturedFrame> {
-    if (liveSource && liveSource.isActive()) {
-        // The stream loop holds the device: its next fresh frame IS the capture.
-        log.debug('Capturing frame from the live stream loop');
-        return liveSource.awaitFrame();
-    }
-    const pending = captureOneShot();
+/** Run a capture as THE one-shot in flight, so the stream loop waits for the device. */
+async function asOneShot(capture: () => Promise<CapturedFrame>): Promise<CapturedFrame> {
+    const pending = capture();
     oneShotInFlight = pending;
     try {
         return await pending;
@@ -347,4 +406,81 @@ export async function captureFrame(): Promise<CapturedFrame> {
             oneShotInFlight = null;
         }
     }
+}
+
+export async function captureFrame(): Promise<CapturedFrame> {
+    if (liveSource && liveSource.isActive()) {
+        // The stream loop holds the device: its next fresh frame IS the capture.
+        log.debug('Capturing frame from the live stream loop');
+        return liveSource.awaitFrame();
+    }
+    return asOneShot(captureOneShot);
+}
+
+/**
+ * One frame from a NAMED camera, chosen or not - what preview_cameras shows
+ * of each candidate before one is selected, and what select_camera takes to
+ * prove the camera it just pinned is the one that was looked at.
+ *
+ * Nothing sticky is read or written: the configured source is bypassed
+ * entirely. When the live stream loop already holds this very device its
+ * frame is used (one process per device), and any other device is opened
+ * here - which is safe alongside the loop precisely because it is a
+ * different device.
+ */
+export async function captureFromDevice(device: string): Promise<CapturedFrame> {
+    if (liveSource && liveSource.isActive() && liveSource.activeDevice() === device) {
+        log.debug(`Capturing frame for "${device}" from the live stream loop that holds it`);
+        return liveSource.awaitFrame();
+    }
+    if (isSnapshotUrl(device)) {
+        return asOneShot(async () => captureViaHttp(device));
+    }
+    return asOneShot(async () => captureViaFfmpeg(device));
+}
+
+export interface CameraSelection {
+    /** The snapshot URL, which takes precedence over any device when set. */
+    url: string | null;
+    /** The pinned ffmpeg device, or null when the choice is left to the sticky fallback. */
+    device: string | null;
+    /** The last device that actually produced a frame; the fallback when nothing is pinned. */
+    lastGood: string | null;
+}
+
+export function cameraSelection(): CameraSelection {
+    return {
+        url: (config.get('mcpCameraUrl') as string) || null,
+        device: (config.get('mcpCameraDevice') as string) || null,
+        lastGood: (config.get('mcpCameraLastGood') as string) || null,
+    };
+}
+
+/**
+ * Pin the camera every capture uses from now on. A URL and a device are the
+ * same choice made two ways and the URL wins wherever both are set, so
+ * choosing one CLEARS the other - a selection that leaves a stale URL in
+ * place would be a selection that did nothing.
+ */
+export function selectCamera(entry: string): CameraSelection {
+    const before = cameraSelection();
+    if (isSnapshotUrl(entry)) {
+        config.set('mcpCameraUrl', entry);
+        config.unset('mcpCameraDevice');
+    } else {
+        config.set('mcpCameraDevice', entry);
+        config.unset('mcpCameraUrl');
+    }
+    config.set('mcpCameraLastGood', entry);
+    log.info(`Camera selected: "${entry}" (was ${before.url || before.device || 'unpinned'})`);
+    return before;
+}
+
+/** Unpin: the next capture falls back to the last-good device, then to the only one attached. */
+export function clearCameraSelection(): CameraSelection {
+    const before = cameraSelection();
+    config.unset('mcpCameraDevice');
+    config.unset('mcpCameraUrl');
+    log.info(`Camera selection cleared (was ${before.url || before.device || 'unpinned'})`);
+    return before;
 }

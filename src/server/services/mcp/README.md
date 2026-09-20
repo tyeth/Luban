@@ -18,8 +18,8 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 | `mcpEnabled`, `mcpPort` | Start the server on 127.0.0.1:port (default 40889). Legacy: `mcpPort` alone enables when `mcpEnabled` was never written. |
 | `mcpAllowLan` | Default off = loopback only. On: bind every interface but accept only clients (and browser origins) on this machine's own IPv4 subnets; confirm-page links use the LAN address. **No authentication exists** — anyone on that subnet can command the machine; the pane warns in red (the OAuth endpoints in `oauth.ts` grant everyone, see Architecture). Env `LUBAN_MCP_ALLOW_LAN` overrides. Applies at the next start. |
 | `mcpToolSetterEnabled`, `mcpProbeToolEnabled` | Default on. Off = that sensor's channel is never bound on any transport (overtravel follows the tool setter): no pill, no readings, and procedures needing it refuse with a clear message. Use when the sensor or the USB bridge is not fitted. Env `LUBAN_MCP_TOOLSETTER_ENABLED` / `LUBAN_MCP_PROBE_ENABLED` override. |
-| `mcpCameraUrl` | HTTP(S) snapshot URL; takes precedence over ffmpeg. |
-| `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg capture — DirectShow on Windows (device = friendly name), v4l2 on Linux (device = a `list_cameras` entry, preferably the stable `/dev/v4l/by-id/… (Name)` form; a bare `/dev/videoN` works but renumbers on replug). Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. |
+| `mcpCameraUrl` | HTTP(S) snapshot URL; takes precedence over ffmpeg. Set by `select_camera` when the chosen camera is a URL (which clears `mcpCameraDevice`). |
+| `mcpFfmpegPath`, `mcpCameraDevice`, `mcpCameraLastGood` | ffmpeg capture — DirectShow on Windows (device = friendly name), v4l2 on Linux (device = a `list_cameras` entry, preferably the stable `/dev/v4l/by-id/… (Name)` form; a bare `/dev/videoN` works but renumbers on replug). Device choice is sticky (last-good preferred); a vanished device is an error, never a silent substitution. `mcpCameraDevice` is what `select_camera` writes — pick the camera from `preview_cameras` frames rather than by editing this by hand. |
 | `mcpCameraStreamEnabled`, `mcpCameraStreamFps`, `mcpCameraStreamMaxClients` | Live MJPEG view of the camera at `/camera` on the MCP port (see "Live camera stream"). Enabled: unset = on once a camera is configured (URL, pinned or last-good device), else the stored switch; env `LUBAN_MCP_CAMERA_STREAM_ENABLED` overrides. Fps 1–15 (default 5), clients 1–16 (default 4). Settings → MCP Server → Camera edits these; the switch applies immediately (off disconnects every viewer), fps/clients at the next loop start. |
 | `mcpMaxJogDistance` | Per-call XY travel cap for direct moves, default 100 mm. `goto_work_origin` is exempt (fixed operator-set destination). |
 | `mcpToolRegion` | Fractional box where the endmill images (fixed camera-to-spindle geometry); returned with every frame; settable via the `set_tool_region` tool. |
@@ -64,8 +64,10 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
   `/sys/class/video4linux` (capture nodes only, listed as
   `/dev/v4l/by-id/usb-…-video-index0 (Name)` — stable across replugs, unlike
   `/dev/videoN`, which renumbers when cameras come and go), and the user must be able to
-  read `/dev/video*` (usually the `video` group). Pin `mcpCameraDevice` to the by-id
-  entry from `list_cameras`, never to a bare `/dev/videoN`. macOS has no
+  read `/dev/video*` (usually the `video` group). Pin the camera with `select_camera`
+  (by-id entry from `list_cameras`, never a bare `/dev/videoN`) after checking
+  `preview_cameras` frames — with two cameras attached, both produce perfectly good
+  frames and only the picture tells you which one is on the toolhead. macOS has no
   ffmpeg input wired up. `mcpCameraUrl` (HTTP snapshot, e.g. Android IP Webcam) remains
   platform-independent and takes precedence everywhere.
 
@@ -850,7 +852,11 @@ stored result; long-poll with `wait_ms`/`since_event`) / `stop_gcode_job` (proce
 stop at the next step boundary, raise, state `stopped`, partial `result` kept; file jobs: firmware
 stop) · `move_z` (single or
 `z_targets` batch) · `home` · `goto_work_origin` · `move_and_capture` · `list_cameras` (devices +
-`stream.stream_url`, the operator's live view) ·
+current `selection` + `stream.stream_url`, the operator's live view) ·
+`preview_cameras` (a frame from EACH attached camera, labelled - two cameras both return
+good-looking frames, so the right one is chosen by looking, not by name) ·
+`select_camera` (pins it; needs the `frame_id` of a frame from THAT camera as evidence,
+restarts the live loop onto it, and marks a model solved for the old camera unverified) ·
 `capture_frame` (position-stamped, `frameId`, `expectedToolRegion`, `source` stream|one-shot) · `set_tool_region` ·
 `track_feature` (NCC between cached frames — use instead of eyeballing pixels) ·
 `set_/get_/delete_camera_calibration` (Y/Z-keyed; optional `surface` depth-plane tag;

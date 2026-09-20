@@ -4,7 +4,21 @@ import logger from '../../../lib/logger';
 import config from '../../configstore';
 import { mcpBroadcast } from '../index';
 import { connectionManager } from '../../machine/ConnectionManager';
-import { CapturedFrame, captureFrame, getCachedFrame, getCachedFrameIds, listCameras } from '../camera';
+import {
+    CapturedFrame,
+    cameraSelection,
+    captureFrame,
+    captureFromDevice,
+    clearCameraSelection,
+    getCachedFrame,
+    getCachedFrameDevice,
+    getCachedFrameIds,
+    listCameraCandidates,
+    listCameras,
+    selectCamera,
+} from '../camera';
+import { CameraCandidate, matchCameraDevice, selectionInvalidatesModel } from '../cameraSelection';
+import { cameraModelStore } from '../cameraModelStore';
 import { cameraStreamService } from '../cameraStream';
 import { recordGcodeTiming } from '../diagnostics';
 import { jobManager } from '../jobs';
@@ -47,6 +61,7 @@ export interface GcodeChannel {
 }
 
 const gcodeLog = logger('service:mcp:gcode');
+const cameraLog = logger('service:mcp:camera');
 
 /**
  * Send gcode on the direct path AND mirror exactly what was sent (plus the
@@ -476,18 +491,59 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     });
 }
 
+/** How many cameras one preview call will open, so a box with a hub full of them stays answerable. */
+const PREVIEW_DEVICE_LIMIT = 4;
+
+/** The device a capture would actually use right now, under the URL-beats-device precedence. */
+function effectiveCamera(): string | null {
+    const selection = cameraSelection();
+    return selection.url || selection.device || selection.lastGood;
+}
+
+function selectionReport(): object {
+    const selection = cameraSelection();
+    return {
+        url: selection.url,
+        device: selection.device,
+        last_good: selection.lastGood,
+        effective: effectiveCamera(),
+        pinned: !!(selection.url || selection.device),
+    };
+}
+
+async function candidatesOrThrow(): Promise<{ provider: string; candidates: CameraCandidate[]; note?: string }> {
+    const listed = await listCameraCandidates();
+    if (!listed.candidates.length) {
+        throw new McpToolError(`No cameras are attached (provider ${listed.provider})`
+            + `${listed.note ? `: ${listed.note}` : '.'} Nothing can be previewed or selected until one appears.`);
+    }
+    return listed;
+}
+
+/** One preview frame, or the reason that camera could not produce one - never a substitute frame. */
+async function previewOne(entry: string): Promise<{ device: string; frame: CapturedFrame | null; error: string | null }> {
+    try {
+        return { device: entry, frame: await captureFromDevice(entry), error: null };
+    } catch (err) {
+        return { device: entry, frame: null, error: (err as Error).message };
+    }
+}
+
 export function registerCameraTools(registry: ToolRegistry): void {
     registry.register({
         name: 'list_cameras',
         description: 'List available capture sources: the configured snapshot URL, or DirectShow '
-            + 'video devices found by ffmpeg. Also reports the live MJPEG stream (stream_url: a page '
-            + 'the OPERATOR opens in a browser to watch the camera; not for the agent to fetch). Read-only.',
+            + 'video devices found by ffmpeg. Reports which one is selected, and the live MJPEG stream '
+            + '(stream_url: a page the OPERATOR opens in a browser to watch the camera; not for the agent '
+            + 'to fetch). To see what each camera is actually looking at, use preview_cameras; to change '
+            + 'the choice, select_camera. Read-only.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         handler: async () => {
             const cameras = await listCameras();
             const stream = cameraStreamService.status();
             return {
                 ...cameras,
+                selection: selectionReport(),
                 stream: {
                     enabled: stream.enabled,
                     stream_url: stream.pageUrl,
@@ -513,6 +569,242 @@ export function registerCameraTools(registry: ToolRegistry): void {
         handler: async () => {
             const frame = await captureFrame();
             return frameContent(frame, { position: positionOrNull() });
+        },
+    });
+
+    registry.register({
+        name: 'preview_cameras',
+        description: 'Show what each attached camera SEES, one frame per camera, so the right one can be '
+            + 'identified before it is selected. Frames come back labelled with the device string and a '
+            + 'frame_id; pass that frame_id to select_camera as the evidence for the choice. With two cameras '
+            + 'attached, both return perfectly good frames and nothing downstream can tell you picked the '
+            + 'wrong one - every measurement is simply wrong - so look first. A camera that cannot be opened '
+            + 'is reported as a failure beside the others, never replaced by a substitute frame. Read-only, '
+            + 'no motion, and the current selection is left exactly as it is.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                device: {
+                    type: 'string',
+                    description: 'Preview just this camera (a list_cameras entry, its /dev path or its name). '
+                        + 'Omit to preview every attached camera.',
+                },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { device?: string }) => {
+            const { provider, candidates, note } = await candidatesOrThrow();
+            let wanted = candidates;
+            if (args.device !== undefined) {
+                const match = matchCameraDevice(String(args.device), candidates);
+                if (!match.ok) {
+                    throw new McpToolError(match.reason);
+                }
+                wanted = candidates.filter((candidate) => candidate.entry === match.entry);
+            }
+            const truncated = wanted.length > PREVIEW_DEVICE_LIMIT;
+            wanted = wanted.slice(0, PREVIEW_DEVICE_LIMIT);
+
+            const results = [];
+            for (const candidate of wanted) {
+                // Sequentially: opening several USB cameras at once is how you
+                // get a bandwidth failure that reads like a broken camera.
+                // eslint-disable-next-line no-await-in-loop
+                results.push(await previewOne(candidate.entry));
+            }
+
+            const selected = effectiveCamera();
+            const content: object[] = [];
+            results.forEach((result, index) => {
+                const label = `camera ${index + 1}/${results.length}: "${result.device}"`
+                    + `${result.device === selected ? ' [currently selected]' : ''}`;
+                if (result.frame) {
+                    content.push({ type: 'text', text: `${label} - frame_id ${result.frame.frameId}` });
+                    content.push({ type: 'image', data: result.frame.imageBase64, mimeType: result.frame.mimeType });
+                } else {
+                    content.push({ type: 'text', text: `${label} - NO FRAME: ${result.error}` });
+                }
+            });
+            content.push({
+                type: 'text',
+                text: JSON.stringify({
+                    provider,
+                    note,
+                    selection: selectionReport(),
+                    position: positionOrNull(),
+                    previews: results.map((result, index) => ({
+                        index: index + 1,
+                        device: result.device,
+                        frame_id: result.frame ? result.frame.frameId : null,
+                        source: result.frame ? result.frame.source : null,
+                        currently_selected: result.device === selected,
+                        error: result.error,
+                    })),
+                    truncated_after: truncated ? PREVIEW_DEVICE_LIMIT : null,
+                    next: 'select_camera with the device string of the frame that shows the right view, and '
+                        + 'that frame\'s frame_id as confirm_frame_id.',
+                }),
+            });
+            return { mcpContent: content };
+        },
+    });
+
+    registry.register({
+        name: 'select_camera',
+        description: 'Choose which camera every capture uses from here on (persists as mcpCameraDevice, or '
+            + 'mcpCameraUrl for a snapshot URL - picking one clears the other, since the URL would otherwise '
+            + 'keep winning). Requires confirm_frame_id: the id of a frame that came from THIS camera, from '
+            + 'preview_cameras - a wrong camera produces good-looking frames and silently wrong millimetres, '
+            + 'so the choice must be made from a picture, not from a device name that reads plausibly. '
+            + 'Selecting a different camera marks the solved camera model unverified: its geometry belonged '
+            + 'to the old one. Returns a fresh frame from the camera it just selected. No motion.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                device: {
+                    type: 'string',
+                    description: 'A list_cameras / preview_cameras entry, its /dev path, its friendly name, or '
+                        + 'an http(s) snapshot URL. Must name exactly one attached camera.',
+                },
+                confirm_frame_id: {
+                    type: 'string',
+                    description: 'frame_id of a frame taken from this same camera (preview_cameras). Not needed '
+                        + 'when only one camera is attached, or when re-selecting the camera already in use.',
+                },
+                operator_confirmed: {
+                    type: 'boolean',
+                    description: 'The OPERATOR - not the model - has confirmed this device is the right camera '
+                        + 'without a frame. Never pass this on your own judgement.',
+                },
+                reason: { type: 'string', description: 'Why this camera; recorded in the log.' },
+                clear: {
+                    type: 'boolean',
+                    description: 'Unpin instead of choosing: captures fall back to the last camera that worked. '
+                        + 'Use with no device.',
+                },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: {
+            device?: string;
+            confirm_frame_id?: string;
+            operator_confirmed?: boolean;
+            reason?: string;
+            clear?: boolean;
+        }) => {
+            if (args.clear) {
+                if (args.device) {
+                    throw new McpToolError('Pass either device or clear: true, not both.');
+                }
+                const before = clearCameraSelection();
+                cameraStreamService.reselectDevice('camera selection cleared');
+                return {
+                    cleared: true,
+                    previous: { url: before.url, device: before.device },
+                    selection: selectionReport(),
+                    note: 'No camera is pinned. Captures now fall back to the last device that produced a frame, '
+                        + 'and a vanished device is still an error rather than a substitution.',
+                } as unknown as object;
+            }
+            if (!args.device) {
+                throw new McpToolError('device is required (or clear: true). Run preview_cameras to see what each '
+                    + 'attached camera looks at.');
+            }
+            const { candidates } = await candidatesOrThrow();
+            const match = matchCameraDevice(String(args.device), candidates);
+            if (!match.ok) {
+                throw new McpToolError(match.reason);
+            }
+            const entry = match.entry;
+            const previous = effectiveCamera();
+            const unchanged = previous === entry;
+
+            // Evidence for the choice. Waived only where there is nothing to
+            // get wrong: one camera attached, or re-pinning the one already
+            // in use. The frame must have come from THIS camera - a frame_id
+            // from the other camera is exactly the mistake being guarded.
+            let confirmedBy = 'operator';
+            if (!args.operator_confirmed && !unchanged && candidates.length > 1) {
+                const frameId = String(args.confirm_frame_id || '');
+                if (!frameId) {
+                    throw new McpToolError(`${candidates.length} cameras are attached, so "${entry}" needs `
+                        + 'evidence: run preview_cameras, look at the frames, and pass the frame_id of the one '
+                        + 'showing the right view as confirm_frame_id (or operator_confirmed: true if the '
+                        + 'OPERATOR has confirmed the device by name).');
+                }
+                if (!getCachedFrame(frameId)) {
+                    throw new McpToolError(`Frame "${frameId}" is not in the frame cache (it holds the last few `
+                        + `frames: ${getCachedFrameIds().join(', ') || 'none'}). Take a fresh preview_cameras frame.`);
+                }
+                const frameDevice = getCachedFrameDevice(frameId);
+                if (frameDevice === null) {
+                    throw new McpToolError(`Frame "${frameId}" is cached but does not name the camera it came from, `
+                        + 'so it is evidence for nothing. Take a fresh preview_cameras frame of this camera.');
+                }
+                if (frameDevice !== entry) {
+                    throw new McpToolError(`Frame "${frameId}" came from "${frameDevice}", not from "${entry}". `
+                        + 'That frame is evidence about a different camera; preview the one being selected.');
+                }
+                confirmedBy = `frame ${frameId}`;
+            } else if (!args.operator_confirmed) {
+                confirmedBy = unchanged ? 'unchanged selection' : 'only camera attached';
+            }
+
+            const before = selectCamera(entry);
+            cameraLog.info(`select_camera -> "${entry}" (confirmed by ${confirmedBy})`
+                + `${args.reason ? `: ${args.reason}` : ''}`);
+
+            // Verify BEFORE the stream loop is moved: it is still holding the
+            // old device, so this open cannot collide with it, and when the
+            // device is unchanged the loop simply serves the frame.
+            let frame: CapturedFrame | null = null;
+            let captureError: string | null = null;
+            try {
+                frame = await captureFromDevice(entry);
+            } catch (err) {
+                captureError = (err as Error).message;
+            }
+            const streamRestarted = cameraStreamService.reselectDevice(`camera selected: ${entry}`);
+
+            // The solved model describes the geometry of the camera it was
+            // solved for. A different camera has a different geometry
+            // entirely, so the model stops being usable on the spot rather
+            // than at the next call that happens to pass a fingerprint.
+            const model = cameraModelStore.current();
+            let modelInvalidated = false;
+            if (model && selectionInvalidatesModel(previous, entry)) {
+                cameraModelStore.invalidate(model.id, `camera changed from "${previous}" to "${entry}"`);
+                modelInvalidated = true;
+            }
+
+            const meta = {
+                position: positionOrNull(),
+                selected: entry,
+                matched_on: match.matchedOn,
+                confirmed_by: confirmedBy,
+                changed: !unchanged,
+                previous: { url: before.url, device: before.device, effective: previous },
+                selection: selectionReport(),
+                stream_restarted: streamRestarted,
+                camera_model: modelInvalidated
+                    ? {
+                        invalidated: true,
+                        id: model ? model.id : null,
+                        note: 'The stored camera model was solved for the previous camera and is now unverified. '
+                            + 'Run camera_bootstrap for this camera before converting any pixel to a machine '
+                            + 'coordinate; verify_camera_model refuses a model solved for a different device.',
+                    }
+                    : { invalidated: false },
+                capture_error: captureError,
+            };
+            if (!frame) {
+                return {
+                    ...meta,
+                    note: `The selection is stored, but "${entry}" produced no frame: ${captureError}. `
+                        + 'Fix the camera or select another one - nothing will fall back to a different device.',
+                } as unknown as object;
+            }
+            return frameContent(frame, meta);
         },
     });
 

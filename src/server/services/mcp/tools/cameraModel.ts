@@ -9,6 +9,8 @@ import {
     CameraModelContext,
     Matrix3,
     Vec3,
+    describeFingerprint,
+    fingerprintMatches,
     judgeCameraModel,
 } from '../cameraModel';
 import { fovAt, machineToPixel, viewPose } from '../cameraGeometry';
@@ -494,8 +496,12 @@ export function registerCameraModelTools(registry: ToolRegistry): void {
             const fov = viewPose(provisional, target, z);
             const mmPerPx = fov.standoffMm / provisional.intrinsics.fx;
             const residualMm = residualPx * mmPerPx;
-            const passed = residualPx <= tolerance
-                && (fingerprint.width === model.fingerprint.width && fingerprint.height === model.fingerprint.height);
+            // The fingerprint must match as well as the residual: since
+            // select_camera can change which camera is captured from, "the
+            // prediction happened to land" is not evidence about a model
+            // solved for a DIFFERENT device at the same resolution.
+            const sameCamera = fingerprintMatches(model.fingerprint, fingerprint);
+            const passed = residualPx <= tolerance && sameCamera;
 
             const updated = cameraModelStore.recordVerification(
                 model.id,
@@ -512,12 +518,22 @@ export function registerCameraModelTools(registry: ToolRegistry): void {
                 toolhead: { x, y, z },
                 frame_id: fingerprint.frameId,
                 model: updated,
-                note: passed
-                    ? `The model predicts this target to within ${residualPx.toFixed(1)} px (${residualMm.toFixed(2)} mm) `
-                        + 'and is marked verified for this connection.'
-                    : `The model is ${residualPx.toFixed(1)} px out (${residualMm.toFixed(2)} mm), beyond the ${tolerance} px `
-                        + 'tolerance, and stays UNVERIFIED. The camera has most likely been moved or re-aimed: run '
-                        + 'camera_bootstrap. Do not convert any pixel through this model meanwhile.',
+                same_camera: sameCamera,
+                note: (() => {
+                    if (passed) {
+                        return `The model predicts this target to within ${residualPx.toFixed(1)} px `
+                            + `(${residualMm.toFixed(2)} mm) and is marked verified for this connection.`;
+                    }
+                    if (!sameCamera) {
+                        return `This model was solved for ${describeFingerprint(model.fingerprint)}, and the live `
+                            + `camera is ${describeFingerprint(fingerprint)}. A different camera - or the same one `
+                            + 'at a different resolution - has a different geometry entirely, so no residual can '
+                            + 'verify it: run camera_bootstrap for the camera now selected.';
+                    }
+                    return `The model is ${residualPx.toFixed(1)} px out (${residualMm.toFixed(2)} mm), beyond the `
+                        + `${tolerance} px tolerance, and stays UNVERIFIED. The camera has most likely been moved `
+                        + 'or re-aimed: run camera_bootstrap. Do not convert any pixel through this model meanwhile.';
+                })(),
             };
         },
     });
