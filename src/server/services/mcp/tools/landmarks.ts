@@ -162,6 +162,16 @@ export function registerLandmarkTools(registry: ToolRegistry): void {
                 },
                 probe_effective_length: { type: ['number', 'null'], description: 'Probe effective length in mm (this fitting).' },
                 probe_tip_diameter: { type: ['number', 'null'], description: 'Probe tip diameter in mm.' },
+                travel_x_min: {
+                    type: ['number', 'null'],
+                    description: 'Machine X the toolhead can reach at the low end, for THIS rig. Unset = the machine '
+                        + 'definition, widened by positions the toolhead has actually been observed at. State it when '
+                        + 'the definition is wrong for the rig (an A350 frame runs X -19...339 against a 320 x 350 '
+                        + 'definition); planners clamp their bands to it.',
+                },
+                travel_x_max: { type: ['number', 'null'], description: 'Machine X reachable at the high end. See travel_x_min.' },
+                travel_y_min: { type: ['number', 'null'], description: 'Machine Y reachable at the low end. See travel_x_min.' },
+                travel_y_max: { type: ['number', 'null'], description: 'Machine Y reachable at the high end. See travel_x_min.' },
                 reason: { type: 'string', description: 'How the values were obtained (which job / measurement / operator statement).' },
             },
             required: ['reason'],

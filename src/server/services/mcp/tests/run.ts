@@ -20,6 +20,7 @@ import { tests as frameRecoveryTests } from './frameRecovery.test';
 import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
+import { tests as machineTravelTests } from './machineTravel.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as probeFeedHealthTests } from './probeFeedHealth.test';
 import { tests as surveyMosaicTests } from './surveyMosaic.test';
@@ -32,6 +33,7 @@ type TestCase = [string, () => void | Promise<void>];
 const suites: Array<[string, TestCase[]]> = [
     ['validator', validatorTests],
     ['machinePosition', machinePositionTests],
+    ['machineTravel', machineTravelTests],
     ['envelopeChecks', envelopeChecksTests],
     ['cameraModel', cameraModelTests],
     ['cameraGeometry', cameraGeometryTests],

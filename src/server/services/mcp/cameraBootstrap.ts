@@ -5,7 +5,6 @@ import * as fs from 'fs-extra';
 import path from 'path';
 
 import DataStorage from '../../DataStorage';
-import { connectionManager } from '../machine/ConnectionManager';
 import { BootstrapPose, planPoseSweep, planSearchGrid, sweepStops } from './bootstrapPlan';
 import { captureFrame } from './camera';
 import { clearanceOptions } from './clearanceContext';
@@ -13,7 +12,8 @@ import { landmarkStore } from './landmarks';
 import { McpToolError } from './registry';
 import { rotaryAxisPoints } from './rotaryGeometry';
 import { getToolSetterConfig } from './toolSetter';
-import { getMachineSizeByIdentifier, getPositionSnapshot, motionFloorZ, safeTraverseZ } from './tools/machine';
+import { ResolvedTravel, TravelLimits, clampBand, describeClipping } from './machineTravel';
+import { getPositionSnapshot, motionFloorZ, planningTravel, safeTraverseZ } from './tools/machine';
 import { assertMachineReadyForProcedure, descendInSegments, moveMachineSettled, TRAVEL_FEED } from './probing';
 import { ProbeChannel } from './probeFeed';
 
@@ -113,12 +113,27 @@ function bootstrapDir(id: string): string {
     return path.join(DataStorage.userDataDir, 'mcp-camera-bootstrap', id);
 }
 
-/** The X band the camera could be looking from, given no knowledge of where it looks. */
-export function searchBand(targetX: number, sizeX: number, reachMm: number): { xMin: number; xMax: number } {
-    return {
-        xMin: Math.max(-25, targetX - reachMm),
-        xMax: Math.min(sizeX + 40, targetX + reachMm),
-    };
+/**
+ * The band the camera could be looking from, given no knowledge of where it
+ * looks - clamped to where the TOOLHEAD can actually go.
+ *
+ * Until 2026-09-20 this used its own slop (`max(-25, ...)`, `min(sizeX + 40,
+ * ...)`), which on an A350 planned a first waypoint at X-25 against a travel
+ * that stops at X-19: an abort on the first move, after an operator approval.
+ * The reach is symmetric but the machine is not - the tool setter sits 98 mm
+ * from the X minimum and 260 mm from the maximum - so what the clamp costs is
+ * reported rather than silently swallowed.
+ */
+export function searchBand(
+    target: { x: number; y: number },
+    travel: TravelLimits,
+    reachMm: number,
+    ySpanMm: number
+): { bounds: { xMin: number; xMax: number; yMin: number; yMax: number }; clipped: string[] } {
+    const x = clampBand(target.x, reachMm, travel.xMin, travel.xMax);
+    const y = clampBand(target.y, ySpanMm / 2, travel.yMin, travel.yMax);
+    const clipped = [describeClipping('X', x), describeClipping('Y', y)].filter(Boolean) as string[];
+    return { bounds: { xMin: x.min, xMax: x.max, yMin: y.min, yMax: y.max }, clipped };
 }
 
 export interface SearchPlanArgs {
@@ -132,6 +147,8 @@ export function planSearchStage(args: SearchPlanArgs): {
     target: BootstrapTarget;
     parkZ: number;
     bounds: { xMin: number; xMax: number; yMin: number; yMax: number };
+    travel: ResolvedTravel;
+    clipped: string[];
 } {
     const targets = bootstrapTargets();
     const setter = targets.find((t) => t.name === 'tool-setter');
@@ -140,24 +157,23 @@ export function planSearchStage(args: SearchPlanArgs): {
             + 'known exactly without any camera knowledge at all - and no setter is configured. Run '
             + 'set_tool_setter_config first, or state another target the same way.');
     }
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-    if (!size) {
-        throw new McpToolError('Unknown machine size; cannot plan the search band.');
+    const travel = planningTravel();
+    if (!travel) {
+        throw new McpToolError('The toolhead travel is unknown for this machine, so a search band cannot be planned '
+            + 'without inventing one. State it with set_probe_geometry (travel_x_min, travel_x_max, travel_y_min, '
+            + 'travel_y_max) - the measured limits for this rig.');
     }
     const reach = Math.min(Math.max(Number(args.reach_mm) || 200, 40), 400);
     const pitch = Math.min(Math.max(Number(args.pitch_mm) || 40, 10), 120);
     const ySpan = Math.min(Math.max(Number(args.y_span_mm) || 0, 0), 300);
-    const band = searchBand(setter.machine.x, size.x, reach);
-    const bounds = {
-        ...band,
-        yMin: Math.max(-25, setter.machine.y - (ySpan / 2)),
-        yMax: Math.min(size.y + 40, setter.machine.y + (ySpan / 2)),
-    };
+    const { bounds, clipped } = searchBand(setter.machine, travel.limits, reach, ySpan);
     return {
         waypoints: planSearchGrid({ ...bounds, pitchMm: pitch }),
         target: setter,
         parkZ: safeTraverseZ(),
         bounds,
+        travel,
+        clipped: [...clipped, ...travel.conflicts],
     };
 }
 
