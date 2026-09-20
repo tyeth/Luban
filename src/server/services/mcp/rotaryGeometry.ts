@@ -38,6 +38,16 @@ export const GEOMETRY_FIELDS = [
     { field: 'rotary_chuck_face_y', key: 'mcpRotaryChuckFaceY', env: 'LUBAN_MCP_ROTARY_CHUCK_FACE_Y', min: -50, max: 400 },
     { field: 'probe_effective_length', key: 'mcpProbeEffectiveLength', env: 'LUBAN_MCP_PROBE_LENGTH', min: 1, max: 300 },
     { field: 'probe_tip_diameter', key: 'mcpProbeTipDiameter', env: 'LUBAN_MCP_PROBE_TIP_DIAMETER', min: 0.1, max: 30 },
+    // Toolhead travel for THIS rig (machineTravel.ts). Unset is the normal
+    // case: travel then falls back to the machine definition's size box,
+    // widened by positions the toolhead has actually been observed at. State
+    // an end when the definition is wrong for the rig - an A350's frame runs
+    // X -19...339 against a 320 x 350 definition, and a bracing kit or a
+    // different machine moves it again.
+    { field: 'travel_x_min', key: 'mcpTravelXMin', env: 'LUBAN_MCP_TRAVEL_X_MIN', min: -500, max: 1000 },
+    { field: 'travel_x_max', key: 'mcpTravelXMax', env: 'LUBAN_MCP_TRAVEL_X_MAX', min: -500, max: 1000 },
+    { field: 'travel_y_min', key: 'mcpTravelYMin', env: 'LUBAN_MCP_TRAVEL_Y_MIN', min: -500, max: 1000 },
+    { field: 'travel_y_max', key: 'mcpTravelYMax', env: 'LUBAN_MCP_TRAVEL_Y_MAX', min: -500, max: 1000 },
 ] as const;
 
 export type GeometryField = typeof GEOMETRY_FIELDS[number]['field'];
@@ -90,6 +100,16 @@ export function probeGeometry(): ProbeGeometry | null {
         return null;
     }
     return { effectiveLength, tipDiameter: geometryValue('probe_tip_diameter') };
+}
+
+/** The travel ends stated for this rig; any of them may be null (= not stated). */
+export function statedTravel(): { xMin: number | null; xMax: number | null; yMin: number | null; yMax: number | null } {
+    return {
+        xMin: geometryValue('travel_x_min'),
+        xMax: geometryValue('travel_x_max'),
+        yMin: geometryValue('travel_y_min'),
+        yMax: geometryValue('travel_y_max'),
+    };
 }
 
 /**

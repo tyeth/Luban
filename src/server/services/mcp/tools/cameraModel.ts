@@ -399,14 +399,29 @@ export function registerCameraModelTools(registry: ToolRegistry): void {
                 job.runner = async () => runSearchStage(plan, (phase, note) => {
                     jobManager.appendEvent(job, phase, { note });
                 });
+                const baseStep = 'Ask the operator to approve, then start_gcode_job. Nothing about where the camera '
+                    + 'points is assumed by this stage.';
+                const nextStep = plan.clipped.length
+                    ? `${baseStep} Reach was clipped: ${plan.clipped.join(' ')}`
+                    : baseStep;
                 return {
                     job: jobManager.describe(job),
                     stage,
                     waypoints: plan.waypoints.length,
                     bounds: plan.bounds,
+                    // What the toolhead can reach and where each limit came
+                    // from, so a band that lost reach says so instead of
+                    // quietly searching less than was asked for.
+                    travel: plan.travel.limits,
+                    travel_sources: {
+                        xMin: plan.travel.ends.xMin.source,
+                        xMax: plan.travel.ends.xMax.source,
+                        yMin: plan.travel.ends.yMin.source,
+                        yMax: plan.travel.ends.yMax.source,
+                    },
+                    clipped: plan.clipped,
                     targets,
-                    next_step: 'Ask the operator to approve, then start_gcode_job. Nothing about where the camera '
-                        + 'points is assumed by this stage.',
+                    next_step: nextStep,
                 };
             }
 

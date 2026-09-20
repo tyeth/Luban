@@ -22,6 +22,8 @@ import {
     noteDisconnected,
     reliableForMotion,
 } from '../machinePosition';
+import { ResolvedTravel, resolveTravel } from '../machineTravel';
+import { statedTravel } from '../rotaryGeometry';
 import {
     ZERO_OFFSET_ACCEPT_BEATS,
     clearPositionOfRecord,
@@ -344,6 +346,35 @@ export function getPositionSnapshot(): PositionSnapshot {
             + 'origin is the operator\'s.',
         warnings: [...judgement.reasons],
     };
+}
+
+/**
+ * The XY travel a planner may sweep, for THIS machine and THIS rig: stated
+ * limits first, then positions the toolhead has been observed at, then the
+ * machine definition (machineTravel.ts). Null when the machine is unknown and
+ * nothing has been stated - there is no honest box to clamp to, and a caller
+ * must refuse rather than invent one.
+ *
+ * Deliberately NOT machineBounds() above: that is a +/-50 mm sanity filter for
+ * garbage heartbeats, far too loose to plan a waypoint against.
+ */
+export function planningTravel(observed?: { x: number | null; y: number | null } | null): ResolvedTravel | null {
+    const identifier = connectionManager.getConnectionStatus().machineIdentifier;
+    let seen = observed;
+    if (seen === undefined) {
+        // The live position is evidence of reach, when there is one to read.
+        try {
+            const snapshot = getPositionSnapshot();
+            seen = { x: snapshot.machine.x, y: snapshot.machine.y };
+        } catch (err) {
+            seen = null;
+        }
+    }
+    return resolveTravel({
+        size: getMachineSizeByIdentifier(identifier),
+        stated: statedTravel(),
+        observed: seen || null,
+    });
 }
 
 /**
