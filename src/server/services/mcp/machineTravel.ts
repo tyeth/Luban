@@ -60,6 +60,21 @@ export interface TravelInput {
     observed: { x: number | null; y: number | null } | null;
 }
 
+/**
+ * The heartbeat does not report round numbers: a machine homed to X-19 reports
+ * X-19.00000610351563, and a 328 park reads 327.9989. Comparing travel ends
+ * exactly makes every one of those a "conflict" or a widening of six microns,
+ * which is how a real warning gets trained into noise. Same epsilon as the
+ * clearance checks (envelopeChecks.POSITION_EPSILON_MM), kept local so this
+ * module stays free of server imports.
+ */
+export const TRAVEL_EPSILON_MM = 0.05;
+
+/** Is `value` beyond `limit` by more than float noise? */
+function beyond(value: number, limit: number, end: 'low' | 'high'): boolean {
+    return end === 'low' ? value < limit - TRAVEL_EPSILON_MM : value > limit + TRAVEL_EPSILON_MM;
+}
+
 function resolveEnd(
     stated: number | null,
     nominal: number,
@@ -68,19 +83,18 @@ function resolveEnd(
     axis: string,
     conflicts: string[]
 ): TravelEnd {
+    const seen = observed !== null && Number.isFinite(observed) ? observed : null;
     if (stated !== null && Number.isFinite(stated)) {
-        if (observed !== null && Number.isFinite(observed)
-            && (widen === 'low' ? observed < stated : observed > stated)) {
-            conflicts.push(`The toolhead has been observed at ${axis} ${observed}, outside the stated `
+        if (seen !== null && beyond(seen, stated, widen)) {
+            conflicts.push(`The toolhead has been observed at ${axis} ${Number(seen.toFixed(3))}, outside the stated `
                 + `${axis} ${widen === 'low' ? 'minimum' : 'maximum'} of ${stated}. One of the two is wrong: `
                 + 're-state the travel limit, or find out how it got there.');
         }
         return { value: stated, source: 'stated' };
     }
-    if (observed !== null && Number.isFinite(observed)
-        && (widen === 'low' ? observed < nominal : observed > nominal)) {
+    if (seen !== null && beyond(seen, nominal, widen)) {
         // Reachability is evidence: the machine went there.
-        return { value: observed, source: 'observed' };
+        return { value: Number(seen.toFixed(3)), source: 'observed' };
     }
     return { value: nominal, source: 'nominal' };
 }

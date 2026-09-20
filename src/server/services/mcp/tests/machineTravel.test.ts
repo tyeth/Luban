@@ -48,6 +48,40 @@ export const tests: Array<[string, () => void]> = [
         assert.match(travel.conflicts[0], /observed at X -19/);
     }],
 
+    // Live 2026-09-20: the first staging on the box reported a "conflict"
+    // because a machine homed to X-19 reports X-19.00000610351563. Six
+    // microns is float noise, not a machine that went somewhere it should
+    // not have, and a warning that cries wolf is a warning nobody reads.
+    ['the heartbeat\'s float noise is not a conflict', () => {
+        const travel = resolveTravel({
+            size: A350,
+            stated: { xMin: -19, xMax: 339, yMin: 0, yMax: 342 },
+            observed: { x: -19.00000610351563, y: 342 },
+        });
+        assert.deepEqual(travel.conflicts, []);
+        assert.equal(travel.limits.xMin, -19);
+    }],
+
+    ['float noise does not widen an unstated end either', () => {
+        const travel = resolveTravel({
+            size: { x: 320, y: 350 },
+            stated: NOTHING_STATED,
+            observed: { x: -0.0000061, y: 0 },
+        });
+        assert.equal(travel.limits.xMin, 0);
+        assert.equal(travel.ends.xMin.source, 'nominal');
+    }],
+
+    ['a real excursion past a stated limit is still a conflict', () => {
+        const travel = resolveTravel({
+            size: A350,
+            stated: { xMin: -19, xMax: null, yMin: null, yMax: null },
+            observed: { x: -24, y: 342 },
+        });
+        assert.equal(travel.conflicts.length, 1);
+        assert.match(travel.conflicts[0], /observed at X -24/);
+    }],
+
     ['an unknown machine with nothing stated has no honest travel at all', () => {
         assert.equal(resolveTravel({ size: null, stated: NOTHING_STATED, observed: AT_HOME }), null);
     }],
