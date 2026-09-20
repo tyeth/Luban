@@ -8,7 +8,7 @@ import path from 'path';
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
 import config from '../configstore';
-import { CameraCandidate, isSnapshotUrl } from './cameraSelection';
+import { CameraCandidate, describeCaptureFailure, isSnapshotUrl } from './cameraSelection';
 import { McpToolError } from './registry';
 
 const log = logger('service:mcp:camera');
@@ -308,15 +308,16 @@ export async function resolveFfmpegInput(deviceOverride?: string): Promise<{ dev
                     + 'and the user can read /dev/video* - video group.)'
                 : '';
             throw new McpToolError(`No ${process.platform === 'win32' ? 'DirectShow' : 'v4l2'} video devices `
-                + `found. Set configstore key mcpCameraDevice, or mcpCameraUrl for an HTTP snapshot source.${linuxHint}`);
+                + 'found. Attach a camera and choose it with select_camera, or set mcpCameraUrl for an HTTP '
+                + `snapshot source.${linuxHint}`);
         }
         const lastGood = config.get('mcpCameraLastGood');
         if (lastGood && devices.includes(String(lastGood))) {
             device = lastGood;
         } else if (lastGood) {
             throw new McpToolError(`The last working camera ("${lastGood}") is not in the current device list `
-                + `(${devices.join(', ')}). Re-plug it and retry, or set mcpCameraDevice explicitly - refusing `
-                + 'to silently substitute a different device.');
+                + `(${devices.join(', ')}). Re-plug it and retry, or run preview_cameras and select_camera to `
+                + 'choose one of these - refusing to silently substitute a different device.');
         } else {
             device = devices[0];
         }
@@ -357,8 +358,20 @@ async function captureViaFfmpeg(deviceOverride?: string): Promise<CapturedFrame>
             ({ code, stderr } = await runFfmpeg(ffmpegArgs));
         }
         if (code !== 0 || !fs.existsSync(outPath)) {
-            throw new McpToolError(`ffmpeg capture from "${device}" failed after retry: `
-                + `${stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' ')}`);
+            // Only now is the device list worth the enumeration: a pinned
+            // camera that has been unplugged reads exactly like a broken one
+            // until someone says which cameras are actually there.
+            let attached: string[] = [];
+            try {
+                ({ devices: attached } = await listLocalCameras());
+            } catch (err) {
+                // enumeration is a courtesy; the capture failure is the message
+            }
+            throw new McpToolError(describeCaptureFailure(
+                device,
+                attached,
+                stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' ')
+            ));
         }
         if (!deviceOverride) {
             // A preview of an unchosen camera must not become the fallback
