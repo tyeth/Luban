@@ -15,6 +15,7 @@ on:
     push:
         branches:
             - main
+            - startup/base
             - release/*
 
 # Repeat dispatches on the same ref supersede the previous run.
