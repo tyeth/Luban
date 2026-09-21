@@ -30,6 +30,12 @@ import {
     runProbeSurfaceProcedure,
 } from './probeSurface';
 import {
+    ProbeWallFollowPlan,
+    describeProbeWallFollowPlanAsGcode,
+    planProbeWallFollow,
+    runProbeWallFollowProcedure,
+} from './probeWallFollow';
+import {
     ProcedureAbort,
     ProcedureStopped,
     ROTATE_FEED,
@@ -97,7 +103,7 @@ import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './too
 export { describeRef, isRef, lookupPath, refOpIds, resolveRef, substituteRefs } from './programRefs';
 export type { RefSpec } from './programRefs';
 
-export type ProgramOpKind = 'rotate_b' | 'surface_path' | 'surface_grid' | 'sequence' | 'stock_outline' | 'capture' | 'home';
+export type ProgramOpKind = 'rotate_b' | 'surface_path' | 'surface_grid' | 'sequence' | 'stock_outline' | 'wall_follow' | 'capture' | 'home';
 
 export interface ProgramOp {
     id: string;
@@ -175,6 +181,10 @@ function eventBudgetFor(sub: SubPlan | { kind: 'rotate_b' }): number {
     if (sub.kind === 'stock_outline') {
         return 60 + sub.plan.topPoints.length * 80 + sub.plan.sidePoints.length * 90;
     }
+    if (sub.kind === 'wall_follow') {
+        // A side march plus an along-step per station, like an outline side point.
+        return 40 + sub.plan.stations.length * 90;
+    }
     return 40 + sub.plan.stations.length * 120;
 }
 const ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
@@ -183,7 +193,8 @@ type SubPlan =
     | { kind: 'surface_path'; plan: ProbeSurfacePlan }
     | { kind: 'surface_grid'; plan: ProbeSurfacePlan }
     | { kind: 'sequence'; plan: ProbeSequencePlan }
-    | { kind: 'stock_outline'; plan: ProbeOutlinePlan };
+    | { kind: 'stock_outline'; plan: ProbeOutlinePlan }
+    | { kind: 'wall_follow'; plan: ProbeWallFollowPlan };
 
 function buildSubPlan(kind: ProgramOpKind, args: { [key: string]: unknown }, keepOut: ObstacleBox[]): SubPlan {
     if (kind === 'surface_path') {
@@ -198,6 +209,9 @@ function buildSubPlan(kind: ProgramOpKind, args: { [key: string]: unknown }, kee
     if (kind === 'stock_outline') {
         return { kind, plan: planProbeOutline(args as Parameters<typeof planProbeOutline>[0], keepOut) };
     }
+    if (kind === 'wall_follow') {
+        return { kind, plan: planProbeWallFollow(args as Parameters<typeof planProbeWallFollow>[0], keepOut) };
+    }
     throw new McpToolError(`Unsupported op kind ${kind}.`);
 }
 
@@ -208,6 +222,9 @@ function describeSubPlan(sub: SubPlan): string {
     if (sub.kind === 'stock_outline') {
         return describeProbeOutlinePlanAsGcode(sub.plan);
     }
+    if (sub.kind === 'wall_follow') {
+        return describeProbeWallFollowPlanAsGcode(sub.plan);
+    }
     return describeProbeSurfacePlanAsGcode(sub.plan);
 }
 
@@ -217,6 +234,9 @@ async function runSubPlan(sub: SubPlan): Promise<object> {
     }
     if (sub.kind === 'stock_outline') {
         return runProbeOutlineProcedure(sub.plan);
+    }
+    if (sub.kind === 'wall_follow') {
+        return runProbeWallFollowProcedure(sub.plan);
     }
     return runProbeSurfaceProcedure(sub.plan);
 }

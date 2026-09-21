@@ -265,6 +265,27 @@ export const SIDE_TRAVEL_BEYOND_ESTIMATE_MM = 10;
 export const SIDE_MIN_REACH_MARGIN_MM = 5;
 
 // ---------------------------------------------------------------------------
+// probe_wall_follow
+// ---------------------------------------------------------------------------
+
+/**
+ * Distance along the wall between stations. Default 5: the operator's own
+ * pocket passes went 1 mm in corners and 10 mm on straight walls, and the
+ * result names where the wall curves so a second, denser pass can follow. The
+ * cap is the surface scans' max_hop_mm (operator law 2026-09-05: the low
+ * traverse between consecutive stations stays within 60 mm).
+ */
+export const WALL_FOLLOW_STEP_MM: Bounded = { default: 5, min: 0.5, max: 60 };
+/** Stations per wall follow: a time / event budget like the grid's, not a safety line. */
+export const WALL_FOLLOW_STATIONS: Bounded = { default: 5, min: 1, max: MAX_GRID_STATIONS };
+/**
+ * Back-off from the last contact before stepping along the wall (operator,
+ * 2026-09-21: "back off ~2 mm"). Same range as HOP_LIFT_MM: it is the same
+ * kind of number - the room a stepped traverse keeps from the surface.
+ */
+export const WALL_STANDOFF_MM: Bounded = { default: 2, min: HOP_LIFT_MM.min, max: HOP_LIFT_MM.max };
+
+// ---------------------------------------------------------------------------
 // probe_circle
 // ---------------------------------------------------------------------------
 

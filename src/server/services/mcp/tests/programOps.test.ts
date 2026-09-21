@@ -19,7 +19,8 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(isProgramOpKind('rotate_b'));
         assert.equal(isProgramOpKind('photo'), false);
         assert.equal(isProgramOpKind(undefined), false);
-        assert.equal(PROGRAM_OP_KINDS.length, 7);
+        assert.ok(isProgramOpKind('wall_follow'));
+        assert.equal(PROGRAM_OP_KINDS.length, 8);
     }],
 
     ['home is the one kind a group may not repeat', () => {

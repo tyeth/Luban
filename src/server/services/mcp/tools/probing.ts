@@ -18,6 +18,7 @@ import {
     runProbeSurfaceProcedure,
 } from '../probeSurface';
 import { describeProbeOutlinePlanAsGcode, planProbeOutline, runProbeOutlineProcedure } from '../probeOutline';
+import { describeProbeWallFollowPlanAsGcode, planProbeWallFollow, runProbeWallFollowProcedure } from '../probeWallFollow';
 import { describeProbeProgramAsGcode, planProbeProgram, runProbeProgramProcedure } from '../probeProgram';
 import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
@@ -960,10 +961,79 @@ ${describeProbeOutlinePlanAsGcode(plan)}`;
     });
 
     registry.register({
+        name: 'probe_wall_follow',
+        description: 'Stage ONE approved procedure that follows a VERTICAL wall (a pocket side, a boss face) at N stations '
+            + 'WITHOUT retreating to the start line between them - probe_surface_path for walls (operator, 2026-09-21). Law 2 '
+            + 'to station 1 (raise, hop to start_x/start_y, guarded segmented descent to z_machine - a MEASURED height, top '
+            + 'minus depth, never a guess; any contact on the way down aborts). Per station: sensor-gated march along dir_x/dir_y '
+            + 'toward the wall up to max_travel_mm; back off standoff_mm (default 2) from the contact; STEP ALONG THE WALL at that '
+            + 'standoff to the next station\'s line (step_mm apart along along_x/along_y, default dir turned +90 deg) as a stepped '
+            + 'touch-probing traverse (1 mm steps, probe expected) whose retreat is AWAY from the face and capped at the approved '
+            + 'start line - the low traverse only ever runs inside the corridor the marches have proven; the next march starts '
+            + 'where the step arrives. A miss records no_contact, retreats to the start line and continues (on_miss default) or '
+            + 'aborts. Result: contacts (tip-centre, machine), bumps (the wall turned toward the probe during a step), fit (line '
+            + 'through the contacts: direction, normal, residuals per point, rms/max, yaw from the step direction - a residual '
+            + 'trend at one end is the wall curving into a corner), surfacePoints (contacts + tip radius along dir, when '
+            + 'set_probe_geometry stored the tip). Ends raised at the traverse height. Also probe_program op kind "wall_follow".',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_x: { type: 'number', description: 'REQUIRED machine X of the first march start, over free space (>= tip radius + margin inside the wall).' },
+                start_y: { type: 'number', description: 'REQUIRED machine Y of the first march start.' },
+                z_machine: { type: 'number', description: 'REQUIRED toolhead machine Z the wall is probed at: a MEASURED top minus the depth (0..traverse height).' },
+                dir_x: { type: 'number', description: 'REQUIRED march direction toward the wall (X component; normalised with dir_y).' },
+                dir_y: { type: 'number', description: 'REQUIRED march direction toward the wall (Y component).' },
+                along_x: { type: 'number', description: 'Step direction along the wall (made perpendicular to dir). Default: dir turned +90 deg.' },
+                along_y: { type: 'number', description: 'Step direction along the wall (Y component).' },
+                step_mm: { type: 'number', description: 'Distance between stations along the wall, default 5 (0.5-60).' },
+                stations: { type: 'number', description: 'Number of stations, default 5 (1-400).' },
+                max_travel_mm: { type: 'number', description: 'REQUIRED march travel from the start line before a station records no_contact (1-150). Generous: a short march silently misses.' },
+                standoff_mm: { type: 'number', description: 'Back-off from each contact before stepping along, and the lift per bump, default 2 (0.5-10).' },
+                on_miss: { type: 'string', enum: ['continue', 'abort'], description: 'A station with no contact: continue (default) or abort.' },
+                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger).' },
+                fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1.' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300, floor 30 (GPIO: 50).' },
+                confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per contact, default 3 (1-10).' },
+                reason: { type: 'string', description: 'Shown to the operator: which wall, and why.' },
+            },
+            required: ['start_x', 'start_y', 'z_machine', 'dir_x', 'dir_y', 'max_travel_mm', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeWallFollow(args as Parameters<typeof planProbeWallFollow>[0]);
+            const envelope = `; reason: ${reason}
+${describeProbeWallFollowPlanAsGcode(plan)}`;
+            const validation = validateStagedEnvelope(envelope, 'probe_wall_follow');
+            const job = jobManager.submit(
+                envelope,
+                `wall-follow ${plan.stations.length}st at Z${plan.zMachine} - ${reason.slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeWallFollowProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan,
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url and review the start line, every march limit and the along-steps, '
+                    + 'then start with start_gcode_job wait_for_approval_ms. The result carries contacts (tip-centre), the line fit '
+                    + 'with residuals, and surfacePoints one tip radius beyond the contacts.',
+            };
+        },
+    });
+
+    registry.register({
         name: 'probe_program',
         description: 'Stage a COMPOSITE probing program for ONE human approval: an ordered list of operations - '
             + 'rotate_b (turn the rotary axis to an absolute B, toolhead at/above the traverse height), '
-            + 'surface_path, surface_grid, sequence and stock_outline (the same arguments as the standalone tools), '
+            + 'surface_path, surface_grid, sequence, stock_outline and wall_follow (the same arguments as the standalone tools), '
             + 'capture (one camera frame, stamped with position and B, saved on the job record - view it afterwards with '
             + 'get_frame; give it x/y and it first hops there at the traverse height like a sequence hop, else no motion) '
             + 'and home (machine home, LAST op only; '
@@ -997,7 +1067,7 @@ ${describeProbeOutlinePlanAsGcode(plan)}`;
                         + 'capture {x?, y?, settle_ms? (default 500, max 5000), label?} - a frame; with x/y (machine) it raises and hops '
                         + 'there first (travel + obstacle checked), without them no motion; '
                         + 'home {} - G53;G28;G54, every axis to its switches AND B to 0, allowed only as the last op; '
-                        + 'surface_path / surface_grid / sequence / stock_outline: the standalone tool arguments, where ANY number (start_z_machine, '
+                        + 'surface_path / surface_grid / sequence / stock_outline / wall_follow: the standalone tool arguments, where ANY number (start_z_machine, '
                         + 'expected_z_machine, floor_z_machine, start_x/end_x, sequence hop x/y and descend z, expected_profile.circle.*) '
                         + 'may be a reference; group {id, for_b: [0, 90, 180, 270], ops: [...]} = the inner ops run once per angle '
                         + `after a rotate_b to it, with the token "${'$'}{b}" in any string replaced by the angle and inner ids without it `

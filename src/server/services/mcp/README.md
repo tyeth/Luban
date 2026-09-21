@@ -164,6 +164,7 @@ mcp/
   surfaceScan.ts pure station planning + flatness statistics (no imports; unit-tested alone)
   probeSurface.ts probe_surface_path / probe_surface_grid plan builders + runner
   probeOutline.ts probe_stock_outline: top points + side marches -> centre/size/yaw
+  probeWallFollow.ts probe_wall_follow: N stations along a vertical wall, step-along at a standoff (wallFollow.ts pure fit)
   probeProgram.ts probe_program: many ops, one approval, references between ops
   programRefs.ts pure reference resolution ({from, plus, mid, ...}) with operator bounds
   probeGcode.ts  CAM probing-program parser (G38.x, links, rotations) - pure

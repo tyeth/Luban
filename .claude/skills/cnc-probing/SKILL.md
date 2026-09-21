@@ -38,6 +38,7 @@ Which second op:
 | a profile along a line, a crown, "is it level along Y" | `surface_path` | crown X = symmetry centre, see "Reading a profile" |
 | "is it flat", a height map, a pocketed box | `surface_grid` | plane residual peak-to-valley + tilt |
 | where a block is and how big | `stock_outline` | needs an estimated centre and size |
+| a VERTICAL wall at N points (pocket side, boss face), a corner's shape | `wall_follow` | march, back off 2 mm, step along, march again — no retreat to the start line |
 | a VERTICAL post/boss/hole diameter and centre | `probe_circle` | vertical-axis features only — a cylinder lying along Y is a `surface_path` across it |
 | edges of stock of estimated size | `sequence` side marches | start outside the largest size; long travel is cheap |
 
@@ -130,7 +131,7 @@ Ops: `rotate_b` (absolute B; refused unless the head is at/above the traverse he
 PHYSICALLY finished - `M400`, the rotation's wall-clock time at F600 = 10 deg/s, then two idle
 heartbeats at the target B - because the controller's "ok" and M114 report the buffered target
 the instant a B move is queued, seen on hardware 2026-09-21), `surface_path`, `surface_grid`,
-`sequence`, `stock_outline`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
+`sequence`, `stock_outline`, `wall_follow`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
 position and B, saved on the job record — read it back with `get_frame {frame_id}` or
 `get_frame {file}`; with `x/y` it first raises and hops there at 328, travel- and
 obstacle-checked like a sequence hop — a hop-only `sequence` is refused as pure motion, so this
@@ -176,6 +177,18 @@ ignored), marches the sides from `overextend_mm` outside at `top − side_depth_
 `centerMachine`, `sizeMm` (centre-to-centre), `sizePhysicalMm` (minus tip), `yawDeg`. Do NOT
 shorten `side_max_travel_mm` (default 25) to save time — a first outline missed a face 13.6 mm
 away with an 11 mm march. Also an op kind in `probe_program`.
+
+**Walls: `probe_wall_follow`** (also op kind `wall_follow`). Give `start_x/start_y` (machine, over
+free space, at least tip radius + margin inside the wall), `z_machine` (a MEASURED top minus the
+depth — never a guess), `dir_x/dir_y` (the march toward the wall), `max_travel_mm` (generous),
+`step_mm` (default 5), `stations`, optional `along_x/along_y` (default `dir` turned +90°) and
+`standoff_mm` (default 2). Law 2 to station 1, then per station: march to the wall, back off the
+standoff, STEP ALONG the wall at that standoff to the next line as a stepped touch-probing
+traverse (retreat away from the face, capped at the start line), march again. Result: tip-centre
+`contacts`, `bumps` (the wall turned toward the probe during a step), `fit` (line through the
+contacts with per-point residuals — a residual trend at one end is the wall curving into a
+corner; densify there), `surfacePoints` (contacts + tip radius along `dir`). This replaces the
+pass-1 pattern of retreating 25 mm to the start line between every two wall stations.
 
 Hardware test order for a new program: B0 half without rotations, then one rotation, then the
 whole program — and compare `derived` with the operator's calipers.
