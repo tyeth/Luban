@@ -41,6 +41,7 @@ import {
     getPositionSnapshot,
     motionFloorZ,
     requirePlanningTravel,
+    motionFloorZ,
     safeTraverseZ,
 } from './machine';
 import { validateStagedEnvelope } from './staging';
@@ -410,12 +411,14 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     // already required a fresh, reliable one). An unknown Z refuses. A head
     // below the height is raised straight up first - the one move that cannot
     // descend (law 8) - and the XY is sent only once that raise has settled.
-    // Until 2026-09-21 this check compared against the motion floor, ran
-    // after the travel cap, and was skipped outright when machine Z was null.
+    // The height is the MOTION FLOOR, not the park height (operator ruling
+    // 2026-09-21): a head already above the floor is legal to traverse at and
+    // is not forced up to Z328 for a nudge. Until 2026-09-21 this check ran
+    // after the travel cap and was skipped outright when machine Z was null.
     // The only escape hatch is operator_confirmed_clearance: the operator's
     // explicit word for the corridor at the CURRENT Z - never the model's own
     // judgment, never derived from assumptions about what is on the bed.
-    const gate = gateDirectXy(before.machine.z, safeTraverseZ(), args.operator_confirmed_clearance === true);
+    const gate = gateDirectXy(before.machine.z, motionFloorZ(), args.operator_confirmed_clearance === true);
     if (gate.action === 'refuse' || gate.planZ === null) {
         throw new McpToolError(`XY move refused: ${gate.reason}`);
     }

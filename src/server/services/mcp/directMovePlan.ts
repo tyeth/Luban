@@ -51,16 +51,17 @@ export interface DirectXyGate {
 /**
  * The Z gate of move_and_capture. `machineZ` is the position of record's
  * machine Z (the caller has already required a fresh, reliable record);
- * `traverseZ` is mcpSafeTraverseZ. `operatorConfirmedClearance` is the one
+ * `floorZ` is the motion floor - the lowest Z a direct XY may run at, and the
+ * height a raise goes to. `operatorConfirmedClearance` is the one
  * escape hatch: the operator's explicit word for a corridor at the CURRENT Z,
  * so no raise - but an unknown Z is refused even then, because nobody can
  * have confirmed a height the record does not hold.
  */
-export function gateDirectXy(machineZ: number | null, traverseZ: number, operatorConfirmedClearance: boolean): DirectXyGate {
+export function gateDirectXy(machineZ: number | null, floorZ: number, operatorConfirmedClearance: boolean): DirectXyGate {
     if (machineZ === null || !Number.isFinite(machineZ)) {
         return {
             action: 'refuse',
-            reason: 'machine Z is unknown - the position of record carries no Z, so the traverse-height precondition '
+            reason: 'machine Z is unknown - the position of record carries no Z, so the motion-floor precondition '
                 + 'cannot be established and no XY is sent. Re-read get_position (reliability verified / heartbeat / '
                 + 'cached-offset, warnings empty) and retry.',
             fromZ: null,
@@ -77,10 +78,10 @@ export function gateDirectXy(machineZ: number | null, traverseZ: number, operato
             planZ: machineZ,
         };
     }
-    if (machineZ >= traverseZ - TRAVERSE_Z_TOLERANCE_MM) {
+    if (machineZ >= floorZ - TRAVERSE_Z_TOLERANCE_MM) {
         return {
             action: 'proceed',
-            reason: `at the traverse height already (machine Z ${f3(machineZ)} >= ${traverseZ})`,
+            reason: `at or above the motion floor already (machine Z ${f3(machineZ)} >= ${floorZ})`,
             fromZ: machineZ,
             toZ: null,
             planZ: machineZ,
@@ -88,11 +89,11 @@ export function gateDirectXy(machineZ: number | null, traverseZ: number, operato
     }
     return {
         action: 'raise',
-        reason: `machine Z ${f3(machineZ)} is below the traverse height ${traverseZ}: raise straight up first (law 2 - retreat Z, `
+        reason: `machine Z ${f3(machineZ)} is below the motion floor ${floorZ}: raise straight up first (law 2 - retreat Z, `
             + 'then traverse), the XY runs only once the raise has settled',
         fromZ: machineZ,
-        toZ: traverseZ,
-        planZ: traverseZ,
+        toZ: floorZ,
+        planZ: floorZ,
     };
 }
 

@@ -41,35 +41,36 @@ function refuses(fn: () => unknown, needle: string): void {
 export const tests: Array<[string, () => void]> = [
     // ---- move_and_capture Z gate ----
     ['an unknown machine Z refuses the XY - even with operator_confirmed_clearance', () => {
-        const gate = gateDirectXy(null, 328, false);
+        const gate = gateDirectXy(null, 320, false);
         assert.equal(gate.action, 'refuse');
         assert.equal(gate.planZ, null);
         assert.ok(gate.reason.includes('cannot be established'), gate.reason);
-        assert.equal(gateDirectXy(null, 328, true).action, 'refuse', 'nobody can confirm a height the record does not hold');
-        assert.equal(gateDirectXy(Number.NaN, 328, false).action, 'refuse');
+        assert.equal(gateDirectXy(null, 320, true).action, 'refuse', 'nobody can confirm a height the record does not hold');
+        assert.equal(gateDirectXy(Number.NaN, 320, false).action, 'refuse');
     }],
 
-    ['at the traverse height (within the heartbeat\'s float noise) the XY proceeds at that Z', () => {
-        const gate = gateDirectXy(327.999, 328, false);
+    ['at the motion floor (within the heartbeat\'s float noise) the XY proceeds at that Z', () => {
+        const gate = gateDirectXy(319.999, 320, false);
         assert.equal(gate.action, 'proceed');
-        assert.equal(gate.planZ, 327.999);
+        assert.equal(gate.planZ, 319.999);
         assert.equal(gate.toZ, null);
-        assert.equal(gateDirectXy(328.5, 328, false).action, 'proceed');
+        assert.equal(gateDirectXy(320.5, 320, false).action, 'proceed');
+        // Operator ruling 2026-09-21: the gate is the MOTION FLOOR, not the park
+        // height - a head at 322 is already legal to traverse at, so no raise.
+        assert.equal(gateDirectXy(322, 320, false).action, 'proceed');
     }],
 
-    ['below the traverse height the head is raised FIRST and the XY is planned at the raised Z', () => {
-        const gate = gateDirectXy(300, 328, false);
+    ['below the motion floor the head is raised FIRST and the XY is planned at the raised Z', () => {
+        const gate = gateDirectXy(300, 320, false);
         assert.equal(gate.action, 'raise');
         assert.equal(gate.fromZ, 300);
-        assert.equal(gate.toZ, 328);
-        assert.equal(gate.planZ, 328, 'path checks use the Z the XY will actually run at');
+        assert.equal(gate.toZ, 320);
+        assert.equal(gate.planZ, 320, 'path checks use the Z the XY will actually run at');
         assert.ok(gate.reason.includes('raise straight up first'), gate.reason);
-        // The floor is not the gate here: 322 is above the motion floor 320 but below the traverse height.
-        assert.equal(gateDirectXy(322, 328, false).action, 'raise');
     }],
 
     ['operator_confirmed_clearance is the one escape hatch: proceed at the CURRENT Z, no raise', () => {
-        const gate = gateDirectXy(300, 328, true);
+        const gate = gateDirectXy(300, 320, true);
         assert.equal(gate.action, 'proceed');
         assert.equal(gate.planZ, 300);
         assert.ok(gate.reason.includes('operator confirmed this corridor'), gate.reason);
