@@ -19,6 +19,7 @@ import {
 } from '../probeSurface';
 import { describeProbeOutlinePlanAsGcode, planProbeOutline, runProbeOutlineProcedure } from '../probeOutline';
 import { describeProbeWallFollowPlanAsGcode, planProbeWallFollow, runProbeWallFollowProcedure } from '../probeWallFollow';
+import { describeProbeCornerPlanAsGcode, planProbeCorner, runProbeCornerProcedure } from '../probeCorner';
 import { describeProbeProgramAsGcode, planProbeProgram, runProbeProgramProcedure } from '../probeProgram';
 import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
@@ -990,6 +991,11 @@ ${describeProbeOutlinePlanAsGcode(plan)}`;
                 max_travel_mm: { type: 'number', description: 'REQUIRED march travel from the start line before a station records no_contact (1-150). Generous: a short march silently misses.' },
                 standoff_mm: { type: 'number', description: 'Back-off from each contact before stepping along, and the lift per bump, default 2 (0.5-10).' },
                 on_miss: { type: 'string', enum: ['continue', 'abort'], description: 'A station with no contact: continue (default) or abort.' },
+                line_tolerance_mm: {
+                    type: 'number',
+                    description: 'Optional (0.02-5): split the contacts into the straight wall at each end and the CORNER between (a contact further '
+                        + 'than this off its wall\'s line is a corner point); the result\'s segments carry the corner\'s arc fit with residuals.',
+                },
                 coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger).' },
                 fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
                 backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1.' },
@@ -1030,10 +1036,84 @@ ${describeProbeWallFollowPlanAsGcode(plan)}`;
     });
 
     registry.register({
+        name: 'probe_corner',
+        description: 'Stage ONE approved procedure that measures the RADIUS of an internal corner between two walls earlier marches have '
+            + 'fitted (operator, 2026-09-21: rounded corners are the normal case - a station in the radius reads a blend). wall_a / wall_b '
+            + 'are the fitted TIP-CENTRE lines ({x, y, nx, ny}: a point and the normal toward the free side, as probe_wall_follow returns in '
+            + 'fit.point / fit.normal); radius_max_mm is the operator\'s bound on the physical radius (law 3). 1) Law 2 to the start on the '
+            + 'corner\'s BISECTOR, placed so a fillet as large as the bound plus approach_clearance_mm still leaves it in free space '
+            + '(guarded descent to z_machine, a MEASURED height). 2) Bisector march toward the apex: where it stops gives the radius '
+            + '(rho = reach / (1/sin(angle/2) - 1)); a contact at the apex = SHARP corner, reported, radial pass skipped. 3) Retreat along '
+            + 'the bisector (the path just proven) to the arc CENTRE and march RADIALLY at `points` azimuths from wall A\'s tangent point '
+            + 'to wall B\'s, retreating to the centre between them - every station and link lies on proven ground, nothing is placed '
+            + 'inside an unmeasured radius. 4) Circle fit: radius (tip-centre and physical = + tip radius), centre, per-point residuals '
+            + '(an irregular round is reported as large residuals, never hidden). Result: geometry (apex, bisector, interior angle), '
+            + 'bisector contact and estimate, centre, radials, fit, radiusTipCentreMm, radiusPhysicalMm. Also probe_program op kind "corner".',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                wall_a: {
+                    type: 'object',
+                    properties: { x: { type: 'number' }, y: { type: 'number' }, nx: { type: 'number' }, ny: { type: 'number' } },
+                    required: ['x', 'y', 'nx', 'ny'],
+                    additionalProperties: false,
+                    description: 'REQUIRED: a point on wall A\'s fitted tip-centre line (machine) and the unit normal toward the free side.',
+                },
+                wall_b: {
+                    type: 'object',
+                    properties: { x: { type: 'number' }, y: { type: 'number' }, nx: { type: 'number' }, ny: { type: 'number' } },
+                    required: ['x', 'y', 'nx', 'ny'],
+                    additionalProperties: false,
+                    description: 'REQUIRED: the same for wall B.',
+                },
+                z_machine: { type: 'number', description: 'REQUIRED toolhead machine Z the walls were probed at (a MEASURED top minus a depth).' },
+                radius_max_mm: { type: 'number', description: 'REQUIRED bound on the corner\'s PHYSICAL radius (law 3); places the bisector start in free space (0-200).' },
+                points: { type: 'number', description: 'Radial stations across the arc, default 5 (3-16).' },
+                approach_clearance_mm: { type: 'number', description: 'Free space kept beyond the largest possible arc at the bisector start and past the radial travel, default 5 (1-20).' },
+                coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger).' },
+                fine_step_mm: { type: 'number', description: 'Fine step, default 0.1 (0.02-0.5).' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1; a radius below it is reported as sharp.' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300, floor 30 (GPIO: 50).' },
+                confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per contact, default 3 (1-10).' },
+                reason: { type: 'string', description: 'Shown to the operator: which corner, and why.' },
+            },
+            required: ['wall_a', 'wall_b', 'z_machine', 'radius_max_mm', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeCorner(args as Parameters<typeof planProbeCorner>[0]);
+            const envelope = `; reason: ${reason}
+${describeProbeCornerPlanAsGcode(plan)}`;
+            const validation = validateStagedEnvelope(envelope, 'probe_corner');
+            const job = jobManager.submit(
+                envelope,
+                `corner ${plan.radials.length}rad r<=${plan.radiusMaxMm} at Z${plan.zMachine} - ${reason.slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeCornerProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan,
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url and review the bisector start, the apex, and the radial limits, then start '
+                    + 'with start_gcode_job wait_for_approval_ms. The result carries the fitted radius (tip-centre and physical), centre and '
+                    + 'per-point residuals - large residuals mean the corner is not a circular arc.',
+            };
+        },
+    });
+
+    registry.register({
         name: 'probe_program',
         description: 'Stage a COMPOSITE probing program for ONE human approval: an ordered list of operations - '
             + 'rotate_b (turn the rotary axis to an absolute B, toolhead at/above the traverse height), '
-            + 'surface_path, surface_grid, sequence, stock_outline and wall_follow (the same arguments as the standalone tools), '
+            + 'surface_path, surface_grid, sequence, stock_outline, wall_follow and corner (the same arguments as the standalone tools), '
             + 'capture (one camera frame, stamped with position and B, saved on the job record - view it afterwards with '
             + 'get_frame; give it x/y and it first hops there at the traverse height like a sequence hop, else no motion) '
             + 'and home (machine home, LAST op only; '
@@ -1067,7 +1147,7 @@ ${describeProbeWallFollowPlanAsGcode(plan)}`;
                         + 'capture {x?, y?, settle_ms? (default 500, max 5000), label?} - a frame; with x/y (machine) it raises and hops '
                         + 'there first (travel + obstacle checked), without them no motion; '
                         + 'home {} - G53;G28;G54, every axis to its switches AND B to 0, allowed only as the last op; '
-                        + 'surface_path / surface_grid / sequence / stock_outline / wall_follow: the standalone tool arguments, where ANY number (start_z_machine, '
+                        + 'surface_path / surface_grid / sequence / stock_outline / wall_follow / corner: the standalone tool arguments, where ANY number (start_z_machine, '
                         + 'expected_z_machine, floor_z_machine, start_x/end_x, sequence hop x/y and descend z, expected_profile.circle.*) '
                         + 'may be a reference; group {id, for_b: [0, 90, 180, 270], ops: [...]} = the inner ops run once per angle '
                         + `after a rotate_b to it, with the token "${'$'}{b}" in any string replaced by the angle and inner ids without it `

@@ -1,6 +1,7 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention (planProbeCircle takes the
 // probe_circle arguments verbatim).
+import { CircleFit, fitCircle as fitCircleKasa } from './cornerFit';
 import { mcpBroadcast } from './index';
 import { probeFeedService } from './probeFeed';
 import {
@@ -263,63 +264,13 @@ export function describeProbeCirclePlanAsGcode(plan: ProbeCirclePlan): string {
     return lines.join('\n');
 }
 
-/** Kasa least-squares circle fit; returns centre, radius and residuals. */
-function fitCircle(contacts: { x: number; y: number }[]): {
-    center: { x: number; y: number };
-    radius: number;
-    residuals: number[];
-    rmsResidual: number;
-    maxResidual: number;
-} {
-    // Linear system: x^2 + y^2 = 2ax + 2by + c, solved by normal equations.
-    let sxx = 0; let sxy = 0; let syy = 0; let sx = 0; let sy = 0;
-    let sxz = 0; let syz = 0; let sz = 0;
-    const n = contacts.length;
-    for (const p of contacts) {
-        const zz = p.x * p.x + p.y * p.y;
-        sxx += p.x * p.x; sxy += p.x * p.y; syy += p.y * p.y;
-        sx += p.x; sy += p.y;
-        sxz += p.x * zz; syz += p.y * zz; sz += zz;
+/** Kasa least-squares circle fit (cornerFit.ts, shared with probe_corner); a degenerate set of contacts aborts the procedure. */
+function fitCircle(contacts: { x: number; y: number }[]): CircleFit {
+    const fit = fitCircleKasa(contacts);
+    if (!fit) {
+        throw new ProcedureAbort('Circle fit is degenerate (contacts nearly collinear).');
     }
-    const m = [
-        [2 * sxx, 2 * sxy, sx, sxz],
-        [2 * sxy, 2 * syy, sy, syz],
-        [2 * sx, 2 * sy, n, sz],
-    ];
-    for (let col = 0; col < 3; col++) {
-        let pivot = col;
-        for (let row = col + 1; row < 3; row++) {
-            if (Math.abs(m[row][col]) > Math.abs(m[pivot][col])) {
-                pivot = row;
-            }
-        }
-        [m[col], m[pivot]] = [m[pivot], m[col]];
-        if (Math.abs(m[col][col]) < 1e-12) {
-            throw new ProcedureAbort('Circle fit is degenerate (contacts nearly collinear).');
-        }
-        for (let row = 0; row < 3; row++) {
-            if (row === col) {
-                continue;
-            }
-            const factor = m[row][col] / m[col][col];
-            for (let k = col; k < 4; k++) {
-                m[row][k] -= factor * m[col][k];
-            }
-        }
-    }
-    const a = m[0][3] / m[0][0];
-    const b = m[1][3] / m[1][1];
-    const c = m[2][3] / m[2][2];
-    const radius = Math.sqrt(Math.max(c + a * a + b * b, 0));
-    const residuals = contacts.map((p) => Number((Math.hypot(p.x - a, p.y - b) - radius).toFixed(4)));
-    const rms = Math.sqrt(residuals.reduce((acc, r) => acc + r * r, 0) / n);
-    return {
-        center: { x: Number(a.toFixed(3)), y: Number(b.toFixed(3)) },
-        radius: Number(radius.toFixed(4)),
-        residuals,
-        rmsResidual: Number(rms.toFixed(4)),
-        maxResidual: Number(Math.max(...residuals.map((r) => Math.abs(r))).toFixed(4)),
-    };
+    return fit;
 }
 
 export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<object> {

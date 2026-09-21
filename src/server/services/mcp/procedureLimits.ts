@@ -285,6 +285,22 @@ export const WALL_FOLLOW_STATIONS: Bounded = { default: 5, min: 1, max: MAX_GRID
  */
 export const WALL_STANDOFF_MM: Bounded = { default: 2, min: HOP_LIFT_MM.min, max: HOP_LIFT_MM.max };
 
+/**
+ * probe_wall_follow line_tolerance_mm: the largest residual a contact may
+ * have and still count as "on the wall" when the run is split into straight
+ * runs and a corner (cornerFit.splitWallRun). Optional - without it the
+ * result carries the fit and its residuals and nothing is classified. The
+ * floor is the fine step at its smallest; above 5 mm nothing is a corner.
+ */
+export const WALL_LINE_TOLERANCE_MM: Range = { min: FINE_STEP_MM.min, max: 5 };
+
+// ---------------------------------------------------------------------------
+// probe_corner
+// ---------------------------------------------------------------------------
+
+/** Radial stations across the corner arc, tangent point to tangent point. Fewer than 3 cannot fit a circle. */
+export const CORNER_POINTS: Bounded = { default: 5, min: 3, max: 16 };
+
 // ---------------------------------------------------------------------------
 // probe_circle
 // ---------------------------------------------------------------------------
