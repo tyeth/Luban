@@ -24,6 +24,7 @@ import { tests as machineTravelTests } from './machineTravel.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as probeFeedHealthTests } from './probeFeedHealth.test';
 import { tests as surveyMosaicTests } from './surveyMosaic.test';
+import { tests as surveyPlanTests } from './surveyPlan.test';
 import { tests as toolProtrusionTests } from './toolProtrusion.test';
 import { tests as traversePlanTests } from './traversePlan.test';
 import { tests as validatorTests } from './validator.test';
@@ -42,6 +43,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['frameRecovery', frameRecoveryTests],
     ['probeFeedHealth', probeFeedHealthTests],
     ['surveyMosaic', surveyMosaicTests],
+    ['surveyPlan', surveyPlanTests],
     ['toolProtrusion', toolProtrusionTests],
     ['traversePlan', traversePlanTests],
     ['jobEnding', jobEndingTests],

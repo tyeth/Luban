@@ -35,8 +35,12 @@ import {
     motionFloorZ,
     requirePlanningTravel,
     requireReliableMachine,
+    safeTraverseZ,
 } from './machine';
 import { clampBand, describeClipping } from '../machineTravel';
+import { clearanceOptions } from '../clearanceContext';
+import { landmarkStore } from '../landmarks';
+import { SurveyLeg, describeSurveyLegs, planSurvey } from '../surveyPlan';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -535,10 +539,13 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
     registry.register({
         name: 'survey_bed',
         description: 'Stage a whole-bed camera survey for human confirmation: a serpentine XY grid at '
-            + 'the CURRENT Z (which must be high - machine Z >= 250 unless the operator has confirmed '
-            + 'clearance), capturing a frame at every waypoint. Frames are saved to disk with a '
-            + 'machine-position index so the scene can be reviewed as a whole (read the files '
-            + 'directly); they do NOT go through the 12-frame cache. Requires a working camera '
+            + 'the CURRENT Z or at stated z_levels (each at or above the motion floor unless the operator '
+            + 'has confirmed clearance), capturing a frame at every waypoint. Stored landmarks are '
+            + 'obstacles (law 4): a waypoint the toolhead cannot stand on at a level is DROPPED from that '
+            + 'pass and reported (result.dropped), and a link between waypoints that would cross a keep-out '
+            + 'at the level is lifted to the park height leg by leg - never planned through. Frames are '
+            + 'saved to disk with a machine-position index so the scene can be reviewed as a whole (read '
+            + 'the files directly); they do NOT go through the 12-frame cache. Requires a working camera '
             + '(mcpCameraUrl or ffmpeg).',
         inputSchema: {
             type: 'object',
@@ -572,8 +579,9 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 y_max: { type: 'number' },
                 operator_confirmed_clearance: {
                     type: 'boolean',
-                    description: 'Set true ONLY on the operator\'s explicit word that the current Z '
-                        + 'clears everything on the bed; required when machine Z < 250.',
+                    description: 'Set true ONLY on the operator\'s explicit word that the current Z and every '
+                        + 'z_level clear everything on the bed; required when one is below the motion floor. '
+                        + 'Stored landmarks are still honoured.',
                 },
                 reason: { type: 'string', description: 'Shown to the operator.' },
             },
@@ -695,27 +703,50 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 ordered.forEach((wx) => waypoints.push({ x: wx, y: wy }));
             });
 
+            // Landmarks are obstacles (law 4, issue #141): every column into a
+            // level and every link between waypoints is checked against the
+            // stored boxes as volumes. A waypoint that cannot be stood on at a
+            // level is dropped from that pass and reported; a link the level
+            // cannot make is lifted to the park height, leg by leg.
+            const parkZ = safeTraverseZ();
+            const plan = planSurvey({
+                levels,
+                waypoints,
+                parkZ,
+                fromMachine: { x, y, z },
+                obstacles: landmarkStore.obstacleBoxes(),
+                ...clearanceOptions(),
+            });
+            if (!plan.captureCount) {
+                throw new McpToolError('Every waypoint of the survey is inside a keep-out at every requested level - nothing to '
+                    + `capture. First reason: ${plan.dropped[0] ? plan.dropped[0].reason : 'unknown'}`);
+            }
+            const droppedLines = plan.dropped.map((d) => `; DROPPED Z${d.z} waypoint ${d.index} (${d.x}, ${d.y}): ${d.reason}`);
+
             const envelope = [
                 `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch})`,
                 `; ${levels.length} pass(es) at machine Z ${levels.join(', ')} - each entered with XY stationary`,
+                `; ${plan.captureCount} captures planned${plan.dropped.length ? `, ${plan.dropped.length} waypoint(s) DROPPED (see below)` : ''}`
+                    + `${plan.liftedLinks ? `, ${plan.liftedLinks} link(s) lifted to park Z${parkZ} over a keep-out` : ''}`,
                 `; ${pitchNote}`,
                 `; bounds X ${bounds.xMin}..${bounds.xMax}, Y ${bounds.yMin}..${bounds.yMax} within the toolhead travel `
                     + `X ${limits.xMin}..${limits.xMax}, Y ${limits.yMin}..${limits.yMax}`,
                 ...clipped.map((line) => `; ${line}`),
+                ...droppedLines,
                 '; one frame captured per waypoint after the move settles; frames saved to disk with a',
                 '; machine-position index. Each line is sent individually. Aborts on the first capture failure.',
                 'G90',
                 'G53;',
-                ...levels.flatMap((level) => [
-                    `G1 Z${level.toFixed(3)}; enter the pass at this height, XY stationary`,
-                    ...waypoints.map((w, i) => `G0 X${w.x.toFixed(1)} Y${w.y.toFixed(1)}; Z${level} waypoint ${i + 1} + capture`),
+                ...plan.levels.flatMap((level) => [
+                    `; ---- Z${level.z} pass: ${level.captures} capture(s)${level.liftedLinks ? `, ${level.liftedLinks} lifted link(s)` : ''}`,
+                    ...describeSurveyLegs(level),
                 ]),
                 'G54;',
             ].join('\n');
             const validation = validateGcode(envelope);
             const job = jobManager.submit(
                 envelope,
-                `bed-survey ${waypoints.length}pts pitch${pitch} - ${String(args.reason).slice(0, 40)}`,
+                `bed-survey ${plan.captureCount}pts pitch${pitch} - ${String(args.reason).slice(0, 40)}`,
                 'cnc',
                 validation,
                 'procedure'
@@ -726,26 +757,33 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 const dir = path.join(DataStorage.userDataDir, 'mcp-surveys', surveyId);
                 fs.ensureDirSync(dir);
                 const frames: object[] = [];
-                for (const level of levels) {
-                    // Enter the pass with XY stationary: the grid is a stack of
-                    // flat passes, never a diagonal through unknown space.
-                    if (Math.abs(level - (getPositionSnapshot().machine.z ?? level)) > TRAVERSE_Z_TOLERANCE_MM) {
-                        await moveMachineSettled('survey:level', { z: level }, TRAVEL_FEED);
-                    }
-                    for (let i = 0; i < waypoints.length; i++) {
-                        const w = waypoints[i];
-                        await moveMachineSettled('survey:move', { x: w.x, y: w.y }, TRAVEL_FEED * 4);
+                for (const level of plan.levels) {
+                    // The legs exactly as approved: Z changes with XY stationary
+                    // (the grid is a stack of flat passes, never a diagonal),
+                    // links at the height the planner checked them at, and a
+                    // capture at every kept waypoint.
+                    for (const leg of level.legs as SurveyLeg[]) {
+                        if (leg.kind === 'raise' || leg.kind === 'descend') {
+                            if (Math.abs(leg.z - (getPositionSnapshot().machine.z ?? leg.z)) > TRAVERSE_Z_TOLERANCE_MM) {
+                                await moveMachineSettled('survey:level', { z: leg.z }, TRAVEL_FEED);
+                            }
+                            continue;
+                        }
+                        if (leg.kind === 'hop') {
+                            await moveMachineSettled(leg.lifted ? 'survey:lifted-link' : 'survey:move', { x: leg.x, y: leg.y }, TRAVEL_FEED * 4);
+                            continue;
+                        }
                         let frame;
                         try {
                             frame = await captureFrame();
                         } catch (err) {
-                            throw new McpToolError(`Capture failed at waypoint ${i + 1}/${waypoints.length} of the `
-                                + `Z ${level} pass (machine ${w.x}, ${w.y}): ${err.message}. Survey aborted; `
+                            throw new McpToolError(`Capture failed at waypoint ${leg.index}/${waypoints.length} of the `
+                                + `Z ${level.z} pass (machine ${leg.x}, ${leg.y}): ${err.message}. Survey aborted; `
                                 + `${frames.length} frames saved in ${dir}.`);
                         }
-                        const file = path.join(dir, `z${level}_wp${String(i + 1).padStart(3, '0')}_x${w.x}_y${w.y}.jpg`);
+                        const file = path.join(dir, `z${level.z}_wp${String(leg.index).padStart(3, '0')}_x${leg.x}_y${leg.y}.jpg`);
                         fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
-                        frames.push({ file, machine: { x: w.x, y: w.y, z: level }, capturedAt: frame.capturedAt });
+                        frames.push({ file, machine: { x: leg.x, y: leg.y, z: level.z }, capturedAt: frame.capturedAt });
                     }
                 }
                 // One mosaic per pass, indexed in machine coordinates: with a
@@ -792,6 +830,8 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     zLevels: levels,
                     planeZ,
                     pitchMm: pitch,
+                    dropped: plan.dropped,
+                    liftedLinks: plan.liftedLinks,
                     frames,
                     mosaics,
                     mosaicNote: mosaics.length
@@ -816,6 +856,10 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             return {
                 job: jobManager.describe(job),
                 waypoints: waypoints.length,
+                captures: plan.captureCount,
+                // Law 4 at staging: what the landmarks cost this survey, and why.
+                dropped: plan.dropped,
+                lifted_links: plan.liftedLinks,
                 grid: { max_pitch_mm: pitch, step_x_mm: xAxis.step, step_y_mm: yAxis.step, xs, ys, machine_z: z, columns: xs.length, rows: ys.length },
                 travel: {
                     ...limits,
@@ -828,9 +872,9 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 },
                 clipped,
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
-                next_step: 'Ask the operator to open confirm_url, check the Z clears everything on the '
-                    + 'bed (rotary included), and approve. start_gcode_job then drives the whole grid '
-                    + 'and returns the frame index.',
+                next_step: `Ask the operator to open confirm_url, check the Z clears everything on the bed that has no landmark${
+                    plan.dropped.length ? `, review the ${plan.dropped.length} DROPPED waypoint(s) and their reasons` : ''}, and approve. `
+                    + 'start_gcode_job then drives the whole grid and returns the frame index.',
             };
         },
     });

@@ -169,6 +169,10 @@ mcp/
   probeGcode.ts  CAM probing-program parser (G38.x, links, rotations) - pure
   inspectionReport.ts  Fusion / Renishaw / csv / grbl / json report renderers - pure
   envelopeChecks.ts  pure keep-out geometry: checkMotion(segments, obstacles) for planners
+  surveyPlan.ts  pure: survey_bed's legs against the landmarks as volumes - drop a column,
+                 lift a link to the park height, report both (issue #141)
+  machineTravel.ts  pure: the toolhead travel (stated -> observed -> nominal), clampBand /
+                 clampRay / outsideTravel with the clipping reported (issues #139, #140)
   positionOfRecord.ts  pure: frame matching, controller-echo record, offset judgement,
                  the gcode sequence counter
   machinePosition.ts  pure: the judged machine position of record + reliability state
@@ -461,7 +465,13 @@ hand is now in the program tooling (work plan and hardware test order in
   program `keep_out` boxes are **volumes** nothing enters, not even a column. A hit refuses
   staging naming the step, the obstacle and the Z; the check re-runs when references resolve at
   run time. `rotate_b` with `swept_radius_mm` additionally refuses if the tip is inside that
-  cylinder (`insideSweptCylinder`).
+  cylinder (`insideSweptCylinder`). **`survey_bed`** (`surveyPlan.ts`, #141) checks every
+  descent column into a level and every link between waypoints, treating every stored box as a
+  **volume** (a camera has no business low over a footprint - it can look from above, as the
+  pose sweep does): a waypoint that cannot be stood on at a level is dropped from that pass and
+  reported (`result.dropped`, the confirm page, `index.json`), a link the level cannot make is
+  lifted to the park height leg by leg (`lifted_links`), and only a grid with nothing left to
+  capture is refused. Until 2026-09-21 the survey called `checkMotion` never.
 - **Discovery**: `summary.highestAt` / `lowestAt` (machine XY) locate a cylinder's crown or a
   face's high edge by reference; `surface_path expected_profile: {circle: {center_x,
   center_z_contact, radius, tip_radius?}}` models a cylinder along machine Y — each station's
@@ -892,7 +902,8 @@ least-squares fit, outside or inside a hole) · `probe_surface_path` (N −Z sta
 line: per-station contact, best-fit line slope, flatness) · `probe_surface_grid` (serpentine
 −Z grid: Z matrix, best-fit plane + residuals, ASCII height map) — the two surface scans hop
 at `last contact + z_safe_delta_mm` (cap 20) within `max_hop_mm` (cap 60), see "Surface
-scans" above · `survey_bed` (camera grid at gantry height).
+scans" above · `survey_bed` (camera grid at the current Z or stated `z_levels`, landmarks
+honoured by dropping / lifting with the reasons reported).
 
 ## Tool change workflows
 
