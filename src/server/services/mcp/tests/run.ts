@@ -16,6 +16,7 @@ import { tests as camLinksTests } from './camLinks.test';
 import { tests as cameraGeometryTests } from './cameraGeometry.test';
 import { tests as cameraModelTests } from './cameraModel.test';
 import { tests as cameraSelectionTests } from './cameraSelection.test';
+import { tests as cornerFitTests } from './cornerFit.test';
 import { tests as directMovePlanTests } from './directMovePlan.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as frameRecoveryTests } from './frameRecovery.test';
@@ -69,6 +70,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['wallClearance', wallClearanceTests],
     ['inspectionReport', inspectionReportTests],
     ['wallFollow', wallFollowTests],
+    ['cornerFit', cornerFitTests],
 ];
 
 async function main(): Promise<void> {

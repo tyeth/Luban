@@ -35,6 +35,7 @@ import {
 import {
     GPIO_SENSOR_DELAY_MS,
     MARCH_TRAVEL_MM,
+    WALL_LINE_TOLERANCE_MM,
     WALL_FOLLOW_STATIONS,
     WALL_FOLLOW_STEP_MM,
     WALL_STANDOFF_MM,
@@ -48,6 +49,7 @@ import { probeGeometry } from './rotaryGeometry';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 import { WallFollowStation, WallLineFit, Xy, alongUnit, fitWallLine, unit2, wallFollowStations } from './wallFollow';
+import { WallRunSplit, splitWallRun } from './cornerFit';
 
 // probe_wall_follow (operator request 2026-09-21, handoff §4 item 1): N
 // stations along a VERTICAL wall - the pocket side, the boss face - under
@@ -91,6 +93,8 @@ export interface ProbeWallFollowPlan {
     standoffMm: number;
     stations: WallFollowStation[];
     onMiss: 'continue' | 'abort';
+    /** Optional: split the run into straight walls and a corner with this residual tolerance (cornerFit.splitWallRun). */
+    lineToleranceMm: number | null;
     march: MarchParams;
     hopZ: number;
     staged: Xyz;
@@ -98,6 +102,7 @@ export interface ProbeWallFollowPlan {
 }
 
 interface WallFollowArgs {
+    line_tolerance_mm?: unknown;
     start_x?: unknown;
     start_y?: unknown;
     z_machine?: unknown;
@@ -177,6 +182,13 @@ export function planProbeWallFollow(args: WallFollowArgs, extraObstacles: Obstac
         throw new McpToolError(`standoff_mm ${standoff} must be less than max_travel_mm ${maxTravel}.`);
     }
     const onMiss = args.on_miss === 'abort' ? 'abort' : 'continue';
+    let lineToleranceMm: number | null = null;
+    if (args.line_tolerance_mm !== undefined && args.line_tolerance_mm !== null && args.line_tolerance_mm !== '') {
+        lineToleranceMm = Number(args.line_tolerance_mm);
+        if (!within(lineToleranceMm, WALL_LINE_TOLERANCE_MM)) {
+            throw new McpToolError(`line_tolerance_mm must be ${WALL_LINE_TOLERANCE_MM.min}..${WALL_LINE_TOLERANCE_MM.max} (largest residual still "on the wall").`);
+        }
+    }
     const stations = wallFollowStations(start, along, stepMm, count);
     const dirR = { x: r3(dir.x), y: r3(dir.y) };
 
@@ -204,6 +216,7 @@ export function planProbeWallFollow(args: WallFollowArgs, extraObstacles: Obstac
         standoffMm: standoff,
         stations,
         onMiss,
+        lineToleranceMm,
         // Operator law 2026-09-05: never 2 mm; GPIO sensor floor (procedureLimits.ts).
         march: resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS }),
         hopZ,
@@ -275,6 +288,13 @@ export interface WallFollowResult {
     /** Bumps during the along-steps: the wall turned toward the probe here (tip centre, machine). */
     bumps: { during: string; x: number; y: number; z: number; retreatMm: number }[];
     fit: WallLineFit | null;
+    /**
+     * With line_tolerance_mm: the run split into the straight wall at each end
+     * and the corner between (indices into `contacts` that made contact), with
+     * the corner's arc fit and residuals - operator rule (a), a contact off
+     * its wall's line is a corner. null when no tolerance was given.
+     */
+    segments: WallRunSplit | null;
     tipDiameterMm: number | null;
     /** Contacts pushed one tip radius along the march: the physical wall. null without a stored tip diameter. */
     surfacePoints: Xy[] | null;
@@ -295,7 +315,9 @@ export async function runProbeWallFollowProcedure(plan: ProbeWallFollowPlan): Pr
 
     const build = (aborted: boolean): WallFollowResult => {
         const hits = contacts.filter((c): c is WallFollowContact & { contactMachine: Xyz } => c.contactMachine !== null);
-        const fit = fitWallLine(hits.map((c) => ({ x: c.contactMachine.x, y: c.contactMachine.y })), plan.dir, plan.along);
+        const hitXy = hits.map((c) => ({ x: c.contactMachine.x, y: c.contactMachine.y }));
+        const fit = fitWallLine(hitXy, plan.dir, plan.along);
+        const segments = plan.lineToleranceMm === null ? null : splitWallRun(hitXy, plan.lineToleranceMm, plan.dir);
         const tipR = plan.tipDiameterMm === null ? null : plan.tipDiameterMm / 2;
         return {
             tool: plan.tool,
@@ -305,6 +327,7 @@ export async function runProbeWallFollowProcedure(plan: ProbeWallFollowPlan): Pr
             contacts,
             bumps,
             fit,
+            segments,
             tipDiameterMm: plan.tipDiameterMm,
             surfacePoints: tipR === null
                 ? null
@@ -313,7 +336,10 @@ export async function runProbeWallFollowProcedure(plan: ProbeWallFollowPlan): Pr
             note: `${aborted ? 'ABORTED. ' : ''}${hits.length}/${plan.stations.length} station(s) made contact at toolhead Z${plan.zMachine}`
                 + `${fit ? `; wall line through (${fit.point.x}, ${fit.point.y}) along (${fit.direction.x}, ${fit.direction.y}), yaw ${fit.yawFromAlongDeg} deg from the step direction, `
                     + `residual rms ${fit.rmsMm} / max ${fit.maxAbsMm} mm` : ''}`
-                + `${bumps.length ? `; ${bumps.length} bump(s) during the along-steps (the wall turned toward the probe)` : ''}. `
+                + `${bumps.length ? `; ${bumps.length} bump(s) during the along-steps (the wall turned toward the probe)` : ''}`
+                + `${segments && segments.corner ? `; ${segments.offLinePoints} contact(s) off the wall line = a CORNER${segments.corner.arc
+                    ? ` (arc r ${segments.corner.arc.radius} tip-centre about (${segments.corner.arc.center.x}, ${segments.corner.arc.center.y}), max residual ${segments.corner.arc.maxResidual})`
+                    : ' (too few points for an arc)'}` : ''}. `
                 + `Contacts are tip-centre; the wall is ${tipR === null ? 'one tip radius (unknown: set_probe_geometry)' : `${r3(tipR)} mm`} beyond them along (${plan.dir.x}, ${plan.dir.y}).`,
             aborted: aborted || undefined,
         };

@@ -39,6 +39,7 @@ Which second op:
 | "is it flat", a height map, a pocketed box | `surface_grid` | plane residual peak-to-valley + tilt |
 | where a block is and how big | `stock_outline` | needs an estimated centre and size |
 | a VERTICAL wall at N points (pocket side, boss face), a corner's shape | `wall_follow` | march, back off 2 mm, step along, march again — no retreat to the start line |
+| the RADIUS of an internal corner between two fitted walls | `corner` | bisector march, then radial marches from the fitted centre; needs `radius_max_mm` |
 | a VERTICAL post/boss/hole diameter and centre | `probe_circle` | vertical-axis features only — a cylinder lying along Y is a `surface_path` across it |
 | edges of stock of estimated size | `sequence` side marches | start outside the largest size; long travel is cheap |
 
@@ -131,7 +132,7 @@ Ops: `rotate_b` (absolute B; refused unless the head is at/above the traverse he
 PHYSICALLY finished - `M400`, the rotation's wall-clock time at F600 = 10 deg/s, then two idle
 heartbeats at the target B - because the controller's "ok" and M114 report the buffered target
 the instant a B move is queued, seen on hardware 2026-09-21), `surface_path`, `surface_grid`,
-`sequence`, `stock_outline`, `wall_follow`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
+`sequence`, `stock_outline`, `wall_follow`, `corner`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
 position and B, saved on the job record — read it back with `get_frame {frame_id}` or
 `get_frame {file}`; with `x/y` it first raises and hops there at 328, travel- and
 obstacle-checked like a sequence hop — a hop-only `sequence` is refused as pure motion, so this
@@ -188,7 +189,22 @@ traverse (retreat away from the face, capped at the start line), march again. Re
 `contacts`, `bumps` (the wall turned toward the probe during a step), `fit` (line through the
 contacts with per-point residuals — a residual trend at one end is the wall curving into a
 corner; densify there), `surfacePoints` (contacts + tip radius along `dir`). This replaces the
-pass-1 pattern of retreating 25 mm to the start line between every two wall stations.
+pass-1 pattern of retreating 25 mm to the start line between every two wall stations. With
+`line_tolerance_mm` the result's `segments` splits the run into the straight wall at each end and
+the corner between, with the corner's arc fit.
+
+**Rounded corners are the normal case** (operator, 2026-09-21). Never place a station or a link
+inside a radius you have not measured; a contact off its wall's fitted line is a corner point, not
+a wall point. **`probe_corner`** (op kind `corner`): give the two walls as their fitted TIP-CENTRE
+lines (`wall_a` / `wall_b` = `{x, y, nx, ny}` straight from a `wall_follow` `fit.point` /
+`fit.normal`), `z_machine`, `radius_max_mm` (the operator's bound on the physical radius — law 3;
+it places the bisector start in free space) and `points`. It marches along the bisector (where it
+stops gives the radius; a contact at the apex = sharp corner), retreats along that proven path to
+the arc centre and marches radially from it, tangent point to tangent point, retreating to the
+centre between — every station and link on proven ground. Result: `fit` (tip-centre radius, centre,
+per-point residuals — plate (6)'s lobes fit with rms ~0.5 mm, which is the honest answer, not a
+fault), `radiusPhysicalMm` (+ tip radius for an internal corner). External (boss) corners are not
+planned yet — measure them as a `wall_follow` around the corner and read `segments`.
 
 Hardware test order for a new program: B0 half without rotations, then one rotation, then the
 whole program — and compare `derived` with the operator's calipers.
