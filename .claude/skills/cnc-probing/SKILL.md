@@ -126,7 +126,10 @@ dominates; on stock known to vary < 5 mm use `z_safe_delta_mm: 5`, `confirm_pass
 ## Whole-stock programs (`probe_program`)
 
 Ops: `rotate_b` (absolute B; refused unless the head is at/above the traverse height;
-`swept_radius_mm` adds the tip-outside-the-cylinder check), `surface_path`, `surface_grid`,
+`swept_radius_mm` adds the tip-outside-the-cylinder check; completes only when the turn has
+PHYSICALLY finished - `M400`, the rotation's wall-clock time at F600 = 10 deg/s, then two idle
+heartbeats at the target B - because the controller's "ok" and M114 report the buffered target
+the instant a B move is queued, seen on hardware 2026-09-21), `surface_path`, `surface_grid`,
 `sequence`, `stock_outline`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
 position and B, saved on the job record — read it back with `get_frame {frame_id}` or
 `get_frame {file}`; with `x/y` it first raises and hops there at 328, travel- and
@@ -134,7 +137,8 @@ obstacle-checked like a sequence hop — a hop-only `sequence` is refused as pur
 is how a program places the camera; without `x/y` it is NO motion), `home {}` (machine home, the LAST op
 only; it also homes B — the page says so), and `group {for_b: [0, 90, 180, 270], ops}` which
 runs its inner ops once per angle (`${b}` in strings; a `capture` may sit inside, a `home` may
-not). Every probing op ends raised at 328; a program that ends with `home` ends AT HOME.
+not). A `capture` first waits for two idle heartbeats at the expected B (a frame is never taken
+mid-move). Every probing op ends raised at 328; a program that ends with `home` ends AT HOME.
 **Look at both sides of a rotary part under one click**: `capture {x, y}` → `rotate_b 180` →
 `capture` → `home`. References (grammar in
 `cnc-motion-rules` §8) may sit in any numeric argument; bounds are mandatory (law 3); order ops

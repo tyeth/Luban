@@ -23,6 +23,8 @@ import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/ca
 import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot, safeTraverseZ } from './tools/machine';
 import { ProcedureAbort, ProcedureStopped } from './procedureAbort';
 import { TRAVERSE_Z_TOLERANCE_MM, planRaiseToTop } from './traversePlan';
+import { ROTATE_FEED, judgeRotation } from './rotaryMotion';
+import { reliableForMotion } from './machinePosition';
 
 // The shared sensor-gated motion engine: settled single moves on the direct
 // path, contact/release sensing against a probe feed channel, and the
@@ -717,22 +719,74 @@ export function assertMachineReadyForProcedure(): void {
     }
 }
 
-/** Rotary B feed for program rotations (deg/min): 600 = 10 deg/s, a 180 deg turn in 18 s. */
-export const ROTATE_FEED = 600;
+// Rotary B feed for program rotations (deg/min): 600 = 10 deg/s, a 180 deg
+// turn in 18 s. Lives in rotaryMotion.ts with the timing rules; re-exported.
+export { ROTATE_FEED } from './rotaryMotion';
 const ROTATE_TOLERANCE_DEG = 0.05;
 const ROTATE_TIMEOUT_MS = 120000;
+const IDLE_POLL_MS = 500;
+const SETTLE_CONSECUTIVE_BEATS = 2;
+
+export interface SettledMachine {
+    snapshot: PositionSnapshot;
+    waitedMs: number;
+    beats: number;
+}
+
+/**
+ * Wait until the machine reads idle on SETTLE_CONSECUTIVE_BEATS consecutive
+ * heartbeats (and, when `b` is given, reports that B within tolerance) - the
+ * gate every no-probe op (capture) passes before it acts on the position, and
+ * the confirmation a rotation ends with. Operator, 2026-09-21: "any camera op
+ * should await the previous op's position confirmation first".
+ */
+export async function awaitMachineSettled(tool: string, opts: { b?: number | null; timeoutMs?: number } = {}): Promise<SettledMachine> {
+    const started = Date.now();
+    const deadline = started + (opts.timeoutMs ?? ROTATE_TIMEOUT_MS);
+    let beats = 0;
+    let last: PositionSnapshot | null = null;
+    while (Date.now() < deadline) {
+        checkProcedureStop();
+        probeFeedService.assertNoOvertravel();
+        const now = getPositionSnapshot();
+        const bOk = opts.b === undefined || opts.b === null || (now.b !== null && Math.abs(now.b - opts.b) <= ROTATE_TOLERANCE_DEG);
+        const idle = now.machineStatus === 'idle' && reliableForMotion(now.reliability);
+        beats = idle && bOk ? beats + 1 : 0;
+        last = now;
+        if (beats >= SETTLE_CONSECUTIVE_BEATS) {
+            return { snapshot: now, waitedMs: Date.now() - started, beats };
+        }
+        await sleep(IDLE_POLL_MS);
+    }
+    throw new ProcedureAbort(`${tool}: the machine did not settle within ${(opts.timeoutMs ?? ROTATE_TIMEOUT_MS) / 1000} s `
+        + `(last: status ${last?.machineStatus}, reliability ${last?.reliability}, B ${last?.b}${opts.b === undefined || opts.b === null ? '' : ` wanted ${opts.b}`}).`);
+}
 
 /**
  * Rotate the rotary axis to an ABSOLUTE B angle on the direct path, inside a
  * probe_program the operator approved with the B schedule enumerated. The
  * toolhead must be at or above `requireZAtLeast` (the safe traverse height:
- * the stock turns under a raised head). The HTTP channel executes the move
- * synchronously and the M114 in the same batch reports B; if that echo is
- * missing the heartbeat's `b` is polled until it agrees. Any probe contact
- * while the stock turns is a collision (crash guard: the motion bracket is
- * armed, no contact is expected).
+ * the stock turns under a raised head).
+ *
+ * Completion is PHYSICAL, never the echo alone (hardware, 2026-09-21: the
+ * controller answered "ok" + "B:180.00" 219 ms into an 18 s turn - the
+ * buffered target - the next op photographed the stock 5 degrees in, and the
+ * op after that homed the machine while B was still turning). So the batch
+ * ends in M400 (wait for the planner to drain) before M114, the wall-clock
+ * time is checked against the rotation's physical duration
+ * (rotaryMotion.judgeRotation), the runner sleeps out any remainder, and the
+ * heartbeat must read the target B and idle on two consecutive beats. Any
+ * probe contact while the stock turns is a collision (crash guard: the
+ * motion bracket is armed, no contact is expected).
  */
-export async function rotateB(tool: string, targetDeg: number, requireZAtLeast: number): Promise<{ from: number | null; to: number; verifiedBy: 'echo' | 'heartbeat' }> {
+export async function rotateB(tool: string, targetDeg: number, requireZAtLeast: number): Promise<{
+    from: number | null;
+    to: number;
+    verifiedBy: 'm400-echo+heartbeat' | 'heartbeat';
+    elapsedMs: number;
+    expectedMs: number;
+    settleWaitMs: number;
+}> {
     checkProcedureStop();
     probeFeedService.assertNoOvertravel();
     const known = knownMachinePosition();
@@ -750,24 +804,30 @@ export async function rotateB(tool: string, targetDeg: number, requireZAtLeast: 
     const channel = getDirectChannel();
     const target = Number(targetDeg.toFixed(3));
     probeFeedService.clearExpectedContact();
-    const executed = await sendGcodeVisible(channel, tool, `G90\nG0 B${target.toFixed(3)} F${ROTATE_FEED}\nM114`);
+    const sentAt = Date.now();
+    const executed = await sendGcodeVisible(channel, tool, `G90\nG0 B${target.toFixed(3)} F${ROTATE_FEED}\nM400\nM114`);
     if (executed.result !== 0) {
         throw new ProcedureAbort(`Controller rejected the rotation: ${executed.text || executed.result}`);
     }
+    const elapsedMs = Date.now() - sentAt;
     const echo = String(executed.text || '').match(/\bB:(-?\d+(?:\.\d+)?)/);
-    if (echo && Math.abs(Number(echo[1]) - target) <= ROTATE_TOLERANCE_DEG) {
-        return { from, to: target, verifiedBy: 'echo' };
+    const echoOk = !!echo && Math.abs(Number(echo[1]) - target) <= ROTATE_TOLERANCE_DEG;
+    const judged = judgeRotation(from, target, elapsedMs);
+    if (!judged.plausible) {
+        // The reply is the buffered target: wait out the physical time before
+        // asking the heartbeat (which reports the same logical value meanwhile).
+        mcpBroadcast('mcp:activity', { tool, phase: 'rotation-in-flight', note: `${judged.note}; waiting ${judged.remainingMs} ms` });
+        await sleep(Math.min(judged.remainingMs, ROTATE_TIMEOUT_MS));
     }
-    const deadline = Date.now() + ROTATE_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-        await sleep(500);
-        probeFeedService.assertNoOvertravel();
-        const now = getPositionSnapshot();
-        if (now.b !== null && Math.abs(now.b - target) <= ROTATE_TOLERANCE_DEG && now.machineStatus === 'idle') {
-            return { from, to: target, verifiedBy: 'heartbeat' };
-        }
-    }
-    throw new ProcedureAbort(`Rotation to B${target} not confirmed within ${ROTATE_TIMEOUT_MS / 1000} s (echo ${echo ? echo[1] : 'none'}).`);
+    const settled = await awaitMachineSettled(tool, { b: target, timeoutMs: ROTATE_TIMEOUT_MS });
+    return {
+        from,
+        to: target,
+        verifiedBy: echoOk && judged.plausible ? 'm400-echo+heartbeat' : 'heartbeat',
+        elapsedMs,
+        expectedMs: Math.round(judged.expectedMs),
+        settleWaitMs: settled.waitedMs,
+    };
 }
 
 /** Longest single Z move toward the work a procedure may issue when NO contact is expected (operator law 2026-09-05). */

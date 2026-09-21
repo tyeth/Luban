@@ -460,6 +460,17 @@ no warnings) and run headless with `FreeCADCmd.exe -c` against the saved documen
 opens the export dialog the GUI post does. Hardware status unchanged: `run_probing_gcode` is
 still untested on metal; first run = three points on a known flat face.
 
+**A rotation is done when the chuck stops, not when the controller says "ok" (2026-09-21,
+`rotaryMotion.ts`).** First hardware run of `rotate_b`: `G0 B180 F600` + `M114` answered in
+219 ms with `B:180.00 Count … B:0` - the buffered target - the next op photographed the stock
+5 degrees into its 18 s turn, and the `home` op then sent `G28` while B was still moving.
+`rotateB` now ends its batch with `M400`, judges the reply against the physical duration
+(`judgeRotation`: 80 % of |dB| / F must have elapsed, an unknown start angle counts as 180 deg),
+sleeps out any remainder, and requires two consecutive idle heartbeats at the target B
+(`awaitMachineSettled`). Every `capture` op passes the same gate before it takes a frame
+(operator: "any camera op should await the previous op's position confirmation first").
+Unit tests replay the 219 ms case.
+
 **`capture` and `home` ops (2026-09-21).** The operator asked for "move over the stock, photo,
 rotate B to 180, photo, home" as ONE approval; every motion in it had a program op or a gated
 tool, the two non-probing steps did not, so it cost three confirm pages. `capture {x?, y?, settle_ms?,
