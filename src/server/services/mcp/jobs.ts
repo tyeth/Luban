@@ -468,11 +468,13 @@ export class JobManager {
                    interlock does not apply. Supervise it.</p>`;
         } else if (job.kind === 'procedure') {
             directBanner = `<p style="background:#fff3cd;border:1px solid #b8860b;padding:10px">
-                   <strong>SERVER-DRIVEN PROCEDURE</strong>: on start the server steps the machine
-                   within the envelope below, gated by live probe-sensor feedback - it stops early on
-                   contact and can never exceed the extents shown. It runs on the realtime path, so
-                   the enclosure door interlock does NOT apply, and the overtravel tripwire must be
-                   armed. Supervise it.</p>`;
+                   <strong>SERVER-DRIVEN PROCEDURE</strong>: the lines below are the runner's simulated
+                   PLAN - every move the server itself will COMMAND, in order, with the numbers it will
+                   send - not a file streamed to the controller. On start the server sends them one
+                   settle-verified move at a time, gated by live probe-sensor feedback: marches stop
+                   early on contact, nothing moves that is not listed, and the table above is computed
+                   from exactly these lines. It runs on the realtime path, so the enclosure door
+                   interlock does NOT apply, and the overtravel tripwire must be armed. Supervise it.</p>`;
         }
 
         return `
@@ -501,7 +503,7 @@ export class JobManager {
             <form method="post" action="/confirm/${job.id}/reject" style="display:inline;margin-left:16px">
                 <button type="submit" style="font-size:1.2em;padding:8px 24px">Reject</button>
             </form>
-            <h3>G-code${lines.length > 80 ? ' (first and last 40 lines)' : ''}</h3>
+            <h3>${job.kind === 'procedure' ? 'Simulated plan - every move the runner will command' : 'G-code'}${lines.length > 80 ? ' (first and last 40 lines)' : ''}</h3>
             <pre style="background:#f6f6f6;padding:12px;overflow:auto;max-height:400px">${escapeHtml(preview)}</pre>`;
     }
 

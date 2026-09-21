@@ -17,7 +17,7 @@ import {
     setTrustedOffset,
 } from './positionOfRecord';
 import { ProbeChannel, probeFeedService, resolveSensorEnabled, sensorLabel } from './probeFeed';
-import { MARCH_SEGMENT_MM, marchSegments } from './procedureLimits';
+import { MARCH_SEGMENT_MM, TRAVEL_FEED, marchSegments } from './procedureLimits';
 import { McpToolError } from './registry';
 import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
 import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -32,9 +32,9 @@ import { reliableForMotion } from './machinePosition';
 // hardware-proven 2026-08-31/09-01) so the CNC touch probe reuses the exact
 // same verified mechanics against its own feed channel.
 
-export const TRAVEL_FEED = 600; // mm/min, matches the move_z cap
-export const COARSE_FEED = 100;
-export const FINE_FEED = 60;
+// The feeds live in procedureLimits (pure) so the confirm-page describers can
+// render the runner's plan without the server; re-exported for the runners.
+export { TRAVEL_FEED, COARSE_FEED, FINE_FEED } from './procedureLimits';
 const SETTLE_TIMEOUT_MS = 30000;
 const SETTLE_POLL_MS = 250;
 export const SETTLE_TOLERANCE_MM = 0.15;

@@ -5,7 +5,7 @@ import { jobManager } from '../jobs';
 import { describeProbeCamPlanAsGcode, planProbeCam, renderStoredReport, runProbeCamProcedure } from '../probeCam';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
-import { validateGcode } from '../validator';
+import { validateStagedEnvelope } from './staging';
 
 export function registerCamTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
@@ -60,7 +60,7 @@ export function registerCamTools(registry: ToolRegistry, getConfirmBaseUrl: () =
             const plan = planProbeCam(args as Parameters<typeof planProbeCam>[0]);
             const envelope = `; reason: ${reason}
 ${describeProbeCamPlanAsGcode(plan)}`;
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'run_probing_gcode');
             const job = jobManager.submit(
                 envelope,
                 `cam-probing ${plan.source} (${plan.parsed.probeCount} cycles) - ${reason.slice(0, 40)}`,

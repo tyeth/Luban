@@ -61,6 +61,12 @@ export interface GcodeValidationReport {
     usesArcs: boolean; // G2/G3 present (extents are approximated from endpoints)
     /** Any G38.x probing cycle. This firmware has none - probing programs go through run_probing_gcode. */
     usesProbing: boolean;
+    /**
+     * Any G28 (machine home). Homing drives every axis to its limit switch -
+     * real travel the X/Y/Z/B extents cannot include, so it is reported
+     * beside them instead of hiding inside a comment.
+     */
+    usesHoming: boolean;
     /** Motion lines carrying an X or Y word, a Z word, and both at once. */
     motionAxes: { xy: number; z: number; both: number };
     fourAxis: boolean; // any B-axis word
@@ -144,6 +150,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     let usesRelativeMotion = false;
     let usesArcs = false;
     let usesProbing = false;
+    let usesHoming = false;
     const motionAxes = { xy: 0, z: 0, both: 0 };
     let relativeMode = false;
     let distanceModeSet = false;
@@ -203,6 +210,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
                 distanceModeSet = true;
             } else if (code.startsWith('G38')) {
                 usesProbing = true;
+            } else if (code === 'G28') {
+                usesHoming = true;
             } else if (code === 'G92') {
                 setsWorkOrigin = true;
             } else if (code === 'M3' || code === 'M4') {
@@ -312,6 +321,10 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         warnings.push('Motion occurs under BOTH frames (G53 machine and G54..G59 work). Extents mix the two; '
             + 'review every Z with its frame.');
     }
+    if (usesHoming) {
+        warnings.push('Contains G28 (machine home): every axis drives to its limit switch, Z first - and B is homed too when '
+            + 'the rotary is fitted, so stock on it turns to B0. The extents above do NOT include the homing travel.');
+    }
     if (motionLineCount === 0) {
         warnings.push('No motion commands found.');
     }
@@ -327,6 +340,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         endsInRelativeMode: relativeMode,
         usesArcs,
         usesProbing,
+        usesHoming,
         motionAxes,
         fourAxis: b !== null,
         minZWithSpindleOn,

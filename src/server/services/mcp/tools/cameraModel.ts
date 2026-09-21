@@ -27,7 +27,7 @@ import {
 import { jobManager } from '../jobs';
 import { probeFeedService } from '../probeFeed';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
-import { validateGcode } from '../validator';
+import { validateStagedEnvelope } from './staging';
 import { cameraModelStore } from '../cameraModelStore';
 import { decodeToGray } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -393,7 +393,7 @@ export function registerCameraModelTools(registry: ToolRegistry): void {
                     envelope,
                     `camera-bootstrap search ${plan.waypoints.length}pts - ${reason.slice(0, 40)}`,
                     'cnc',
-                    validateGcode(envelope),
+                    validateStagedEnvelope(envelope, 'camera_bootstrap'),
                     'procedure'
                 );
                 job.runner = async () => runSearchStage(plan, (phase, note) => {
@@ -439,7 +439,7 @@ export function registerCameraModelTools(registry: ToolRegistry): void {
                 envelope,
                 `camera-bootstrap poses ${planned.plan.captureCount}frames - ${reason.slice(0, 40)}`,
                 'cnc',
-                validateGcode(envelope),
+                validateStagedEnvelope(envelope, 'camera_bootstrap'),
                 'procedure'
             );
             job.runner = async () => runPoseStage(planned, (phase, note) => {
