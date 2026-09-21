@@ -5,7 +5,6 @@ import * as fs from 'fs-extra';
 import path from 'path';
 
 import DataStorage from '../../../DataStorage';
-import { connectionManager } from '../../machine/ConnectionManager';
 import { captureFrame } from '../camera';
 import { jobEventLimit, jobManager } from '../jobs';
 import { describeProbeCirclePlanAsGcode, planProbeCircle, runProbeCircleProcedure } from '../probeCircle';
@@ -32,11 +31,24 @@ import { judgeCameraModel } from '../cameraModel';
 import { cameraModelStore } from '../cameraModelStore';
 import { renderMosaic } from '../surveyRender';
 import {
-    getMachineSizeByIdentifier,
     getPositionSnapshot,
     motionFloorZ,
+    requirePlanningTravel,
     requireReliableMachine,
+    safeTraverseZ,
 } from './machine';
+import { clampBand, describeClipping } from '../machineTravel';
+import { clearanceOptions } from '../clearanceContext';
+import { landmarkStore } from '../landmarks';
+import { SurveyLeg, describeSurveyLegs, planSurvey } from '../surveyPlan';
+import {
+    MAX_OVERLAP_FRACTION,
+    MAX_SURVEY_LEVELS,
+    SURVEY_LINK_FEED_FACTOR,
+    SURVEY_MARGIN_MM,
+    SURVEY_PITCH_MM,
+    clampTo,
+} from '../procedureLimits';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -535,10 +547,13 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
     registry.register({
         name: 'survey_bed',
         description: 'Stage a whole-bed camera survey for human confirmation: a serpentine XY grid at '
-            + 'the CURRENT Z (which must be high - machine Z >= 250 unless the operator has confirmed '
-            + 'clearance), capturing a frame at every waypoint. Frames are saved to disk with a '
-            + 'machine-position index so the scene can be reviewed as a whole (read the files '
-            + 'directly); they do NOT go through the 12-frame cache. Requires a working camera '
+            + 'the CURRENT Z or at stated z_levels (each at or above the motion floor unless the operator '
+            + 'has confirmed clearance), capturing a frame at every waypoint. Stored landmarks are '
+            + 'obstacles (law 4): a waypoint the toolhead cannot stand on at a level is DROPPED from that '
+            + 'pass and reported (result.dropped), and a link between waypoints that would cross a keep-out '
+            + 'at the level is lifted to the park height leg by leg - never planned through. Frames are '
+            + 'saved to disk with a machine-position index so the scene can be reviewed as a whole (read '
+            + 'the files directly); they do NOT go through the 12-frame cache. Requires a working camera '
             + '(mcpCameraUrl or ffmpeg).',
         inputSchema: {
             type: 'object',
@@ -557,7 +572,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         + 'index. Default 0 (the bed). A frame cannot tell how far away what it sees is, so this is '
                         + 'stated, never inferred.',
                 },
-                margin_mm: { type: 'number', description: 'Inset from the default bounds, default 10.' },
+                margin_mm: { type: 'number', description: 'Inset of the default bounds from the toolhead travel, default 10 (0-50).' },
                 z_levels: {
                     type: 'array',
                     description: 'Machine Z heights to run the whole grid at, highest first; one approval covers the '
@@ -566,14 +581,15 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         + 'current Z alone.',
                     items: { type: 'number' },
                 },
-                x_min: { type: 'number', description: 'Machine-coord grid bounds. Defaults: margin..(size-margin).' },
-                x_max: { type: 'number', description: 'Set beyond the nominal size to cover reachable overtravel (e.g. the far-X column the camera angle otherwise misses - setup-specific, so state it explicitly).' },
+                x_min: { type: 'number', description: 'Machine-coord grid bounds. Default: the toolhead travel inset by margin_mm - the travel as stated for this rig (set_probe_geometry travel_*), widened by where the head has been observed, else the machine definition.' },
+                x_max: { type: 'number', description: 'A bound beyond the travel is clipped to it and the clipping REPORTED (result.clipped, and on the confirm page) - never silently planned. To survey reachable overtravel the definition omits (the far-X column the camera angle otherwise misses), state the travel with set_probe_geometry travel_x_max.' },
                 y_min: { type: 'number' },
                 y_max: { type: 'number' },
                 operator_confirmed_clearance: {
                     type: 'boolean',
-                    description: 'Set true ONLY on the operator\'s explicit word that the current Z '
-                        + 'clears everything on the bed; required when machine Z < 250.',
+                    description: 'Set true ONLY on the operator\'s explicit word that the current Z and every '
+                        + 'z_level clear everything on the bed; required when one is below the motion floor. '
+                        + 'Stored landmarks are still honoured.',
                 },
                 reason: { type: 'string', description: 'Shown to the operator.' },
             },
@@ -606,18 +622,15 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     + '(move_z), or pass operator_confirmed_clearance: true only on the operator\'s '
                     + 'explicit word that this Z clears everything on the bed.');
             }
-            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-            if (!size) {
-                throw new McpToolError('Unknown machine size; cannot plan the grid.');
-            }
+            const travel = requirePlanningTravel('a bed survey', { x, y });
             // Levels: highest first, deduplicated, and every one of them at or
             // above the motion floor unless the operator has said otherwise.
             const rawLevels = Array.isArray(args.z_levels) && args.z_levels.length ? args.z_levels.map(Number) : [z];
             if (rawLevels.some((level) => !Number.isFinite(level))) {
                 throw new McpToolError('z_levels must be finite machine Z heights.');
             }
-            if (rawLevels.length > 6) {
-                throw new McpToolError('At most 6 z_levels: each one is a full pass of the grid.');
+            if (rawLevels.length > MAX_SURVEY_LEVELS) {
+                throw new McpToolError(`At most ${MAX_SURVEY_LEVELS} z_levels: each one is a full pass of the grid.`);
             }
             const levels = [...new Set(rawLevels.map((level) => Number(level.toFixed(3))))].sort((a, b) => b - a);
             const belowFloor = levels.filter((level) => level < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM);
@@ -627,13 +640,13 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     + 'operator_confirmed_clearance: true only on the operator\'s explicit word that these heights '
                     + 'clear everything on the bed.');
             }
-            let pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
+            let pitch = clampTo(args.pitch_mm, SURVEY_PITCH_MM);
             let pitchNote = `pitch ${pitch} mm (stated)`;
             const planeZ = Number.isFinite(Number(args.plane_z)) ? Number(args.plane_z) : 0;
             if (args.overlap_fraction !== undefined) {
                 const overlap = Number(args.overlap_fraction);
-                if (!Number.isFinite(overlap) || overlap < 0 || overlap > 0.9) {
-                    throw new McpToolError('overlap_fraction must be between 0 and 0.9.');
+                if (!Number.isFinite(overlap) || overlap < 0 || overlap > MAX_OVERLAP_FRACTION) {
+                    throw new McpToolError(`overlap_fraction must be between 0 and ${MAX_OVERLAP_FRACTION}.`);
                 }
                 // A verified model, or nothing: the field of view is the whole
                 // basis of the number, and guessing it is what this replaces.
@@ -645,23 +658,38 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     + `field of view on plane Z ${planeZ} at ${(overlap * 100).toFixed(0)}% overlap`
                     + `${fov.extrapolated ? ' (EXTRAPOLATED: this Z is outside the band the model was solved over)' : ''}`;
             }
-            const margin = Math.min(Math.max(Number(args.margin_mm) || 10, 0), 50);
+            const margin = clampTo(args.margin_mm, SURVEY_MARGIN_MM);
 
-            // Serpentine at the current Z. Bounds are explicit (clamped to the
-            // direct-move envelope) and BOTH endpoints are always covered.
-            // Each axis is divided EVENLY into steps no larger than the pitch
-            // (operator, 2026-09-05: the old fixed pitch gave 80 mm jumps and
-            // then a 9-10 mm stub at the far edge - uneven coverage on both
-            // axes); the far reach is often the only view of its region.
-            const clampAxis = (value: number, max: number) => Math.min(Math.max(value, -25), max + 40);
-            const bounds = {
-                xMin: clampAxis(args.x_min !== undefined ? Number(args.x_min) : margin, size.x),
-                xMax: clampAxis(args.x_max !== undefined ? Number(args.x_max) : size.x - margin, size.x),
-                yMin: clampAxis(args.y_min !== undefined ? Number(args.y_min) : margin, size.y),
-                yMax: clampAxis(args.y_max !== undefined ? Number(args.y_max) : size.y - margin, size.y),
+            // Serpentine grid. The bounds default to the toolhead's travel
+            // inset by the margin, and stated bounds are clamped INTO that
+            // travel with the clipping reported - not to the garbage-beat
+            // filter's -25..size+40 (until 2026-09-21), which on the A350
+            // planned a first column at X-25 against a travel that stops at
+            // X-19 and would have aborted the approved job on its first move.
+            // BOTH endpoints are always covered: each axis is divided EVENLY
+            // into steps no larger than the pitch (operator, 2026-09-05: the
+            // old fixed pitch gave 80 mm jumps and then a 9-10 mm stub at the
+            // far edge); the far reach is often the only view of its region.
+            const limits = travel.limits;
+            const wanted = {
+                xMin: args.x_min !== undefined ? Number(args.x_min) : limits.xMin + margin,
+                xMax: args.x_max !== undefined ? Number(args.x_max) : limits.xMax - margin,
+                yMin: args.y_min !== undefined ? Number(args.y_min) : limits.yMin + margin,
+                yMax: args.y_max !== undefined ? Number(args.y_max) : limits.yMax - margin,
             };
+            if (Object.values(wanted).some((v) => !Number.isFinite(v))) {
+                throw new McpToolError('x_min / x_max / y_min / y_max must be finite machine coordinates.');
+            }
+            if (!(wanted.xMax > wanted.xMin) || !(wanted.yMax > wanted.yMin)) {
+                throw new McpToolError(`Survey bounds are empty: X ${wanted.xMin}..${wanted.xMax}, Y ${wanted.yMin}..${wanted.yMax}.`);
+            }
+            const xBand = clampBand((wanted.xMin + wanted.xMax) / 2, (wanted.xMax - wanted.xMin) / 2, limits.xMin, limits.xMax);
+            const yBand = clampBand((wanted.yMin + wanted.yMax) / 2, (wanted.yMax - wanted.yMin) / 2, limits.yMin, limits.yMax);
+            const clipped = [describeClipping('X', xBand), describeClipping('Y', yBand), ...travel.conflicts].filter(Boolean) as string[];
+            const bounds = { xMin: xBand.min, xMax: xBand.max, yMin: yBand.min, yMax: yBand.max };
             if (!(bounds.xMax > bounds.xMin) || !(bounds.yMax > bounds.yMin)) {
-                throw new McpToolError('Survey bounds are empty after clamping; check x/y min/max.');
+                throw new McpToolError(`Survey bounds lie entirely outside the toolhead travel (X ${limits.xMin}..${limits.xMax}, `
+                    + `Y ${limits.yMin}..${limits.yMax}): ${clipped.join(' ')}`);
             }
             const axisPoints = (min: number, max: number): { points: number[]; step: number } => {
                 const span = max - min;
@@ -683,24 +711,50 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 ordered.forEach((wx) => waypoints.push({ x: wx, y: wy }));
             });
 
+            // Landmarks are obstacles (law 4, issue #141): every column into a
+            // level and every link between waypoints is checked against the
+            // stored boxes as volumes. A waypoint that cannot be stood on at a
+            // level is dropped from that pass and reported; a link the level
+            // cannot make is lifted to the park height, leg by leg.
+            const parkZ = safeTraverseZ();
+            const plan = planSurvey({
+                levels,
+                waypoints,
+                parkZ,
+                fromMachine: { x, y, z },
+                obstacles: landmarkStore.obstacleBoxes(),
+                ...clearanceOptions(),
+            });
+            if (!plan.captureCount) {
+                throw new McpToolError('Every waypoint of the survey is inside a keep-out at every requested level - nothing to '
+                    + `capture. First reason: ${plan.dropped[0] ? plan.dropped[0].reason : 'unknown'}`);
+            }
+            const droppedLines = plan.dropped.map((d) => `; DROPPED Z${d.z} waypoint ${d.index} (${d.x}, ${d.y}): ${d.reason}`);
+
             const envelope = [
                 `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch})`,
                 `; ${levels.length} pass(es) at machine Z ${levels.join(', ')} - each entered with XY stationary`,
+                `; ${plan.captureCount} captures planned${plan.dropped.length ? `, ${plan.dropped.length} waypoint(s) DROPPED (see below)` : ''}`
+                    + `${plan.liftedLinks ? `, ${plan.liftedLinks} link(s) lifted to park Z${parkZ} over a keep-out` : ''}`,
                 `; ${pitchNote}`,
+                `; bounds X ${bounds.xMin}..${bounds.xMax}, Y ${bounds.yMin}..${bounds.yMax} within the toolhead travel `
+                    + `X ${limits.xMin}..${limits.xMax}, Y ${limits.yMin}..${limits.yMax}`,
+                ...clipped.map((line) => `; ${line}`),
+                ...droppedLines,
                 '; one frame captured per waypoint after the move settles; frames saved to disk with a',
                 '; machine-position index. Each line is sent individually. Aborts on the first capture failure.',
                 'G90',
                 'G53;',
-                ...levels.flatMap((level) => [
-                    `G1 Z${level.toFixed(3)}; enter the pass at this height, XY stationary`,
-                    ...waypoints.map((w, i) => `G0 X${w.x.toFixed(1)} Y${w.y.toFixed(1)}; Z${level} waypoint ${i + 1} + capture`),
+                ...plan.levels.flatMap((level) => [
+                    `; ---- Z${level.z} pass: ${level.captures} capture(s)${level.liftedLinks ? `, ${level.liftedLinks} lifted link(s)` : ''}`,
+                    ...describeSurveyLegs(level),
                 ]),
                 'G54;',
             ].join('\n');
             const validation = validateGcode(envelope);
             const job = jobManager.submit(
                 envelope,
-                `bed-survey ${waypoints.length}pts pitch${pitch} - ${String(args.reason).slice(0, 40)}`,
+                `bed-survey ${plan.captureCount}pts pitch${pitch} - ${String(args.reason).slice(0, 40)}`,
                 'cnc',
                 validation,
                 'procedure'
@@ -711,26 +765,33 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 const dir = path.join(DataStorage.userDataDir, 'mcp-surveys', surveyId);
                 fs.ensureDirSync(dir);
                 const frames: object[] = [];
-                for (const level of levels) {
-                    // Enter the pass with XY stationary: the grid is a stack of
-                    // flat passes, never a diagonal through unknown space.
-                    if (Math.abs(level - (getPositionSnapshot().machine.z ?? level)) > TRAVERSE_Z_TOLERANCE_MM) {
-                        await moveMachineSettled('survey:level', { z: level }, TRAVEL_FEED);
-                    }
-                    for (let i = 0; i < waypoints.length; i++) {
-                        const w = waypoints[i];
-                        await moveMachineSettled('survey:move', { x: w.x, y: w.y }, TRAVEL_FEED * 4);
+                for (const level of plan.levels) {
+                    // The legs exactly as approved: Z changes with XY stationary
+                    // (the grid is a stack of flat passes, never a diagonal),
+                    // links at the height the planner checked them at, and a
+                    // capture at every kept waypoint.
+                    for (const leg of level.legs as SurveyLeg[]) {
+                        if (leg.kind === 'raise' || leg.kind === 'descend') {
+                            if (Math.abs(leg.z - (getPositionSnapshot().machine.z ?? leg.z)) > TRAVERSE_Z_TOLERANCE_MM) {
+                                await moveMachineSettled('survey:level', { z: leg.z }, TRAVEL_FEED);
+                            }
+                            continue;
+                        }
+                        if (leg.kind === 'hop') {
+                            await moveMachineSettled(leg.lifted ? 'survey:lifted-link' : 'survey:move', { x: leg.x, y: leg.y }, TRAVEL_FEED * SURVEY_LINK_FEED_FACTOR);
+                            continue;
+                        }
                         let frame;
                         try {
                             frame = await captureFrame();
                         } catch (err) {
-                            throw new McpToolError(`Capture failed at waypoint ${i + 1}/${waypoints.length} of the `
-                                + `Z ${level} pass (machine ${w.x}, ${w.y}): ${err.message}. Survey aborted; `
+                            throw new McpToolError(`Capture failed at waypoint ${leg.index}/${waypoints.length} of the `
+                                + `Z ${level.z} pass (machine ${leg.x}, ${leg.y}): ${err.message}. Survey aborted; `
                                 + `${frames.length} frames saved in ${dir}.`);
                         }
-                        const file = path.join(dir, `z${level}_wp${String(i + 1).padStart(3, '0')}_x${w.x}_y${w.y}.jpg`);
+                        const file = path.join(dir, `z${level.z}_wp${String(leg.index).padStart(3, '0')}_x${leg.x}_y${leg.y}.jpg`);
                         fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
-                        frames.push({ file, machine: { x: w.x, y: w.y, z: level }, capturedAt: frame.capturedAt });
+                        frames.push({ file, machine: { x: leg.x, y: leg.y, z: level.z }, capturedAt: frame.capturedAt });
                     }
                 }
                 // One mosaic per pass, indexed in machine coordinates: with a
@@ -777,6 +838,8 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     zLevels: levels,
                     planeZ,
                     pitchMm: pitch,
+                    dropped: plan.dropped,
+                    liftedLinks: plan.liftedLinks,
                     frames,
                     mosaics,
                     mosaicNote: mosaics.length
@@ -801,11 +864,25 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             return {
                 job: jobManager.describe(job),
                 waypoints: waypoints.length,
+                captures: plan.captureCount,
+                // Law 4 at staging: what the landmarks cost this survey, and why.
+                dropped: plan.dropped,
+                lifted_links: plan.liftedLinks,
                 grid: { max_pitch_mm: pitch, step_x_mm: xAxis.step, step_y_mm: yAxis.step, xs, ys, machine_z: z, columns: xs.length, rows: ys.length },
+                travel: {
+                    ...limits,
+                    source: {
+                        x_min: travel.ends.xMin.source,
+                        x_max: travel.ends.xMax.source,
+                        y_min: travel.ends.yMin.source,
+                        y_max: travel.ends.yMax.source,
+                    },
+                },
+                clipped,
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
-                next_step: 'Ask the operator to open confirm_url, check the Z clears everything on the '
-                    + 'bed (rotary included), and approve. start_gcode_job then drives the whole grid '
-                    + 'and returns the frame index.',
+                next_step: `Ask the operator to open confirm_url, check the Z clears everything on the bed that has no landmark${
+                    plan.dropped.length ? `, review the ${plan.dropped.length} DROPPED waypoint(s) and their reasons` : ''}, and approve. `
+                    + 'start_gcode_job then drives the whole grid and returns the frame index.',
             };
         },
     });

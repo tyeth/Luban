@@ -10,6 +10,7 @@
 // No machine or server imports: unit-testable with ts-node.
 
 import { CLEARANCE_MARGIN_MM, ClearanceBasis, normaliseClearanceBasis, requiredToolheadZ } from './landmarkClearance';
+import { MAX_KEEP_OUT_BOXES, MAX_STATED_MACHINE_Z_MM } from './procedureLimits';
 
 export interface ObstacleBox {
     name: string;
@@ -276,8 +277,8 @@ export function normalizeKeepOut(raw: unknown, where: string = 'keep_out'): Obst
     if (raw === undefined || raw === null) {
         return [];
     }
-    if (!Array.isArray(raw) || raw.length > 20) {
-        throw new KeepOutError(`${where}: must be an array of up to 20 {name, machine: {x0, y0, x1, y1}, clearance_z}.`);
+    if (!Array.isArray(raw) || raw.length > MAX_KEEP_OUT_BOXES) {
+        throw new KeepOutError(`${where}: must be an array of up to ${MAX_KEEP_OUT_BOXES} {name, machine: {x0, y0, x1, y1}, clearance_z}.`);
     }
     return raw.map((item, index) => {
         const at = `${where}[${index}]`;
@@ -295,8 +296,8 @@ export function normalizeKeepOut(raw: unknown, where: string = 'keep_out'): Obst
             throw new KeepOutError(`${at}: machine {x0, y0, x1, y1} must be finite machine coordinates.`);
         }
         const clearanceZ = Number(o.clearance_z);
-        if (!Number.isFinite(clearanceZ) || clearanceZ < 0 || clearanceZ > 400) {
-            throw new KeepOutError(`${at}: clearance_z (minimum safe TOOLHEAD machine Z over the box) is required, 0-400.`);
+        if (!Number.isFinite(clearanceZ) || clearanceZ < 0 || clearanceZ > MAX_STATED_MACHINE_Z_MM) {
+            throw new KeepOutError(`${at}: clearance_z (minimum safe TOOLHEAD machine Z over the box) is required, 0-${MAX_STATED_MACHINE_Z_MM}.`);
         }
         return {
             name,

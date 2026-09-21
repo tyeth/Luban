@@ -22,7 +22,7 @@ import {
     noteDisconnected,
     reliableForMotion,
 } from '../machinePosition';
-import { ResolvedTravel, resolveTravel } from '../machineTravel';
+import { ResolvedTravel, outsideTravel, resolveTravel } from '../machineTravel';
 import { statedTravel } from '../rotaryGeometry';
 import {
     ZERO_OFFSET_ACCEPT_BEATS,
@@ -375,6 +375,48 @@ export function planningTravel(observed?: { x: number | null; y: number | null }
         stated: statedTravel(),
         observed: seen || null,
     });
+}
+
+/**
+ * planningTravel(), or a refusal that says how to state the travel. Every
+ * planner that puts a waypoint, a station or a march limit somewhere in XY
+ * asks this: there is no honest box to check against when the machine is
+ * unknown and nothing has been stated, and until 2026-09-21 each planner
+ * answered that by inventing one (machine -25..size+40, from the garbage-beat
+ * filter), which on an A350 admits X-25 against a travel that stops at X-19.
+ */
+export function requirePlanningTravel(what: string, observed?: { x: number | null; y: number | null } | null): ResolvedTravel {
+    const travel = planningTravel(observed);
+    if (!travel) {
+        throw new McpToolError(`The toolhead travel is unknown for this machine, so ${what} cannot be planned without `
+            + 'inventing an envelope. State it with set_probe_geometry (travel_x_min, travel_x_max, travel_y_min, '
+            + 'travel_y_max) - the measured limits for this rig.');
+    }
+    return travel;
+}
+
+/**
+ * Refuse a plan whose named XY points lie outside the travel (heartbeat float
+ * noise tolerated). The message names the point, the axis and the distance,
+ * and which layer the limit came from, so an operator whose rig really does
+ * reach further knows to state it rather than argue with the definition.
+ */
+export function assertWithinTravel(points: Array<{ label: string; x: number; y: number }>, travel: ResolvedTravel): void {
+    for (const p of points) {
+        const outside = outsideTravel(p, travel.limits);
+        if (outside) {
+            const sources = [travel.ends.xMin, travel.ends.xMax, travel.ends.yMin, travel.ends.yMax].map((e) => e.source);
+            let basis = 'the travel observed so far';
+            if (sources.some((s) => s === 'stated')) {
+                basis = 'the stated travel';
+            } else if (sources.every((s) => s === 'nominal')) {
+                basis = 'the machine definition';
+            }
+            throw new McpToolError(`${p.label} (machine ${Number(p.x.toFixed(3))}, ${Number(p.y.toFixed(3))}) is outside the `
+                + `toolhead travel: ${outside} (from ${basis}). Move the plan inside it, or state a wider limit with `
+                + 'set_probe_geometry travel_* if this rig genuinely reaches there.');
+        }
+    }
 }
 
 /**

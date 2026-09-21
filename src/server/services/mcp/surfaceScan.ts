@@ -1,16 +1,25 @@
-/** Path stations above this only WARN on the confirm page (duration, event budget); the ceiling is the grid's. */
-export const MANY_STATIONS = 60;
-export const MAX_PATH_STATIONS = 400;
-
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention (the planners take the
 // probe_surface_path / probe_surface_grid arguments verbatim).
 //
 // Pure planning and statistics for the top-surface scans (probe_surface_path
-// / probe_surface_grid). NO imports on purpose: this module has no machine,
-// feed or config dependency so it can be compiled alone and unit-tested under
-// plain node (see the development workflow in README.md). The machine-facing
+// / probe_surface_grid). NO server imports on purpose: this module has no
+// machine, feed or config dependency so it can be compiled alone and
+// unit-tested under plain node (see the development workflow in README.md);
+// its only import is the equally pure procedureLimits.ts. The machine-facing
 // plan builders and the runner live in probeSurface.ts.
+import {
+    MAX_GRID_LINES_PER_AXIS,
+    MAX_GRID_STATIONS,
+    MAX_PATH_LENGTH_MM,
+    MIN_DROP_MM,
+    MIN_HOP_MM,
+    MIN_PATH_LENGTH_MM,
+} from './procedureLimits';
+
+/** Path stations above this only WARN on the confirm page (duration, event budget); the ceiling is the grid's. */
+export const MANY_STATIONS = 60;
+export const MAX_PATH_STATIONS = MAX_GRID_STATIONS;
 //
 // The safety envelope these helpers enforce is the operator's, verbatim
 // (2026-09-05): "with the grid we need the point to point variation to not
@@ -82,15 +91,15 @@ export function resolveEnvelope(args: {
         throw new SurfacePlanError(`max_hop_mm ${maxHop} exceeds the operator-authorised maximum of `
             + `${MAX_HOP_CAP_MM} mm between consecutive stations.`);
     }
-    if (maxHop < 1) {
-        throw new SurfacePlanError('max_hop_mm must be at least 1 mm.');
+    if (maxHop < MIN_HOP_MM) {
+        throw new SurfacePlanError(`max_hop_mm must be at least ${MIN_HOP_MM} mm.`);
     }
     const maxDrop = args.max_drop_mm === undefined ? MAX_DROP_DEFAULT_MM : requireFinite(args.max_drop_mm, 'max_drop_mm');
     if (maxDrop > MAX_DROP_CAP_MM + 1e-9) {
         throw new SurfacePlanError(`max_drop_mm ${maxDrop} exceeds the cap of ${MAX_DROP_CAP_MM} mm below the previous contact.`);
     }
-    if (maxDrop < 1) {
-        throw new SurfacePlanError('max_drop_mm must be at least 1 mm.');
+    if (maxDrop < MIN_DROP_MM) {
+        throw new SurfacePlanError(`max_drop_mm must be at least ${MIN_DROP_MM} mm.`);
     }
     return { zSafeDeltaMm: zSafe, maxHopMm: maxHop, maxDropMm: maxDrop };
 }
@@ -154,11 +163,11 @@ export function planPathStations(args: {
         ey = sy + (dy / norm) * length;
     }
     const lengthMm = Math.hypot(ex - sx, ey - sy);
-    if (lengthMm < 1) {
-        throw new SurfacePlanError('The path is under 1 mm long.');
+    if (lengthMm < MIN_PATH_LENGTH_MM) {
+        throw new SurfacePlanError(`The path is under ${MIN_PATH_LENGTH_MM} mm long.`);
     }
-    if (lengthMm > 400) {
-        throw new SurfacePlanError('The path is over 400 mm long - longer than the bed.');
+    if (lengthMm > MAX_PATH_LENGTH_MM) {
+        throw new SurfacePlanError(`The path is over ${MAX_PATH_LENGTH_MM} mm long - longer than the bed.`);
     }
     const unit = { x: (ex - sx) / lengthMm, y: (ey - sy) / lengthMm };
 
@@ -215,8 +224,8 @@ function axisLines(min: number, max: number, pitch: unknown, count: unknown, axi
     let intervals: number;
     if (count !== undefined) {
         const n = Math.round(requireFinite(count, `${axis}_count`));
-        if (n < 2 || n > 40) {
-            throw new SurfacePlanError(`${axis}_count must be 2-40.`);
+        if (n < 2 || n > MAX_GRID_LINES_PER_AXIS) {
+            throw new SurfacePlanError(`${axis}_count must be 2-${MAX_GRID_LINES_PER_AXIS}.`);
         }
         intervals = n - 1;
     } else if (pitch !== undefined) {
@@ -226,8 +235,8 @@ function axisLines(min: number, max: number, pitch: unknown, count: unknown, axi
         }
         // Pitch is a MAXIMUM: even division, both edges covered.
         intervals = Math.max(1, Math.ceil(span / p - 1e-9));
-        if (intervals + 1 > 40) {
-            throw new SurfacePlanError(`pitch_mm ${p} over the ${axis} extent ${span.toFixed(1)} mm gives ${intervals + 1} lines (max 40).`);
+        if (intervals + 1 > MAX_GRID_LINES_PER_AXIS) {
+            throw new SurfacePlanError(`pitch_mm ${p} over the ${axis} extent ${span.toFixed(1)} mm gives ${intervals + 1} lines (max ${MAX_GRID_LINES_PER_AXIS}).`);
         }
     } else {
         throw new SurfacePlanError(`Give pitch_mm or ${axis}_count.`);
@@ -296,8 +305,8 @@ export function planGridStations(args: {
     }
     const xAxis = axisLines(xMin, xMax, args.pitch_mm, args.x_count, 'x');
     const yAxis = axisLines(yMin, yMax, args.pitch_mm, args.y_count, 'y');
-    if (xAxis.values.length * yAxis.values.length > 400) {
-        throw new SurfacePlanError(`${xAxis.values.length} x ${yAxis.values.length} = ${xAxis.values.length * yAxis.values.length} stations (max 400).`);
+    if (xAxis.values.length * yAxis.values.length > MAX_GRID_STATIONS) {
+        throw new SurfacePlanError(`${xAxis.values.length} x ${yAxis.values.length} = ${xAxis.values.length * yAxis.values.length} stations (max ${MAX_GRID_STATIONS}).`);
     }
     const stations: SurfaceStation[] = [];
     let previous: { x: number; y: number } | null = null;

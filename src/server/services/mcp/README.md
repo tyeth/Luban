@@ -169,6 +169,13 @@ mcp/
   probeGcode.ts  CAM probing-program parser (G38.x, links, rotations) - pure
   inspectionReport.ts  Fusion / Renishaw / csv / grbl / json report renderers - pure
   envelopeChecks.ts  pure keep-out geometry: checkMotion(segments, obstacles) for planners
+  surveyPlan.ts  pure: survey_bed's legs against the landmarks as volumes - drop a column,
+                 lift a link to the park height, report both (issue #141)
+  machineTravel.ts  pure: the toolhead travel (stated -> observed -> nominal), clampBand /
+                 clampRay / outsideTravel with the clipping reported (issues #139, #140)
+  procedureLimits.ts  pure: every cap a planner applies to its ARGUMENTS, named once with its
+                 reason (march steps, delays, passes, survey pitch, feeds, waits) - caps on what
+                 may be asked for, never statements about the machine
   positionOfRecord.ts  pure: frame matching, controller-echo record, offset judgement,
                  the gcode sequence counter
   machinePosition.ts  pure: the judged machine position of record + reliability state
@@ -363,11 +370,25 @@ the descent, so a setter hit above the start height is a collision, not a measur
 1 mm guarded final approach and the coarse/fine ladders (which do sense serially, because
 contact there is the measurement) are unchanged. Upward moves stay single.
 
-**Coarse press and the slow zone (operator, 2026-09-05, job d8f6ec1b5c11).** A coarse step is
-executed whole by the controller before the runner sees the probe, so wherever the surface
-is found by a coarse step the probe is pressed past contact by up to a FULL coarse step
-(0.4 mm at station 1 with 2 mm steps; worst case the whole step). `coarse_step_mm` is
-therefore also the worst-case press. From station 2 the runner knows the expected contact
+**The coarse step is a logical advance; the physical move is a segment (2026-09-21, after
+#146).** Until then every planner sent its whole coarse step as one `G1` and read the probe
+once after it, so the worst-case press was a full coarse step. Now `probing.marchInSegments`
+issues every move TOWARD the work as settle-verified segments of **≤ `MARCH_SEGMENT_MM`
+(1 mm)**, each followed by its own `senseAfter` window, and contact ends the advance at the
+segment it was sensed on (a 2 mm step that meets the surface 0.6 mm in reports 0.6 mm in).
+`coarse_step_mm` is how far the ladder advances between verdicts when nothing is found; the
+press is bounded by the segment, whatever the step. This is what the "never 2 mm" law of
+2026-09-05 is about, and why `probe_circle` may keep its 2 mm radial step. Every coarse
+ladder (marchToContact for outline / CAM programs, probe_point, probe_vector,
+probe_sequence, probe_circle, the surface scans, the tool setter's coarse descent) goes
+through it; retreats move away from the work and stay whole.
+
+**Coarse press and the slow zone (operator, 2026-09-05, job d8f6ec1b5c11).** Before the
+segmenting above, a coarse step was executed whole by the controller before the runner saw
+the probe, so wherever the surface was found the probe was pressed past contact by up to a
+FULL coarse step (0.4 mm at station 1 with 2 mm steps; worst case the whole step), and
+`coarse_step_mm` was also the worst-case press. The slow zone was the answer for the
+surface scans and still applies (it saves time as much as press): From station 2 the runner knows the expected contact
 (the previous station's Z), so — like `run_tool_setter`'s `slow_zone_mm` — coarse steps now
 stop `slow_zone_mm` (default 1, min 0.3) above it and fine steps take over, down to
 `slow_zone + 2 × coarse` below it (coarse resumes lower, so a pocket edge costs seconds).
@@ -461,7 +482,13 @@ hand is now in the program tooling (work plan and hardware test order in
   program `keep_out` boxes are **volumes** nothing enters, not even a column. A hit refuses
   staging naming the step, the obstacle and the Z; the check re-runs when references resolve at
   run time. `rotate_b` with `swept_radius_mm` additionally refuses if the tip is inside that
-  cylinder (`insideSweptCylinder`).
+  cylinder (`insideSweptCylinder`). **`survey_bed`** (`surveyPlan.ts`, #141) checks every
+  descent column into a level and every link between waypoints, treating every stored box as a
+  **volume** (a camera has no business low over a footprint - it can look from above, as the
+  pose sweep does): a waypoint that cannot be stood on at a level is dropped from that pass and
+  reported (`result.dropped`, the confirm page, `index.json`), a link the level cannot make is
+  lifted to the park height leg by leg (`lifted_links`), and only a grid with nothing left to
+  capture is refused. Until 2026-09-21 the survey called `checkMotion` never.
 - **Discovery**: `summary.highestAt` / `lowestAt` (machine XY) locate a cylinder's crown or a
   face's high edge by reference; `surface_path expected_profile: {circle: {center_x,
   center_z_contact, radius, tip_radius?}}` models a cylinder along machine Y — each station's
@@ -673,8 +700,12 @@ waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping,
   showing current Z, target, delta, feed. Every request needs a `reason`.
 - **Guards on every direct move**: machine idle, toolhead off (headStatus/headPower),
   homed-first (override `operator_confirmed_clearance` only on the operator's explicit
-  word), travel cap, build-envelope check with overtravel allowance (machine −25..+40 —
-  X home rests at −19).
+  word), travel cap, and a check against the toolhead's RESOLVED travel (`machineTravel.ts`:
+  stated `travel_*` geometry, else the machine definition widened by positions the head
+  has been observed at — X home at −19 passes because the head has been there, not
+  because of an allowance). Every planner that puts a waypoint, station or march limit in
+  XY uses the same travel (`requirePlanningTravel` / `assertWithinTravel`); a bound it has
+  to clip is reported, never swallowed (issue #140).
 - **Verified-settle contract**: motion tools block until the returned position verifiably
   matches the move (Z parsed from the executed gcode, ±0.15 mm; XY at target; home must
   leave its pre-G28 position at least once). `wait_until_moved: false` opts out and always
@@ -888,7 +919,8 @@ least-squares fit, outside or inside a hole) · `probe_surface_path` (N −Z sta
 line: per-station contact, best-fit line slope, flatness) · `probe_surface_grid` (serpentine
 −Z grid: Z matrix, best-fit plane + residuals, ASCII height map) — the two surface scans hop
 at `last contact + z_safe_delta_mm` (cap 20) within `max_hop_mm` (cap 60), see "Surface
-scans" above · `survey_bed` (camera grid at gantry height).
+scans" above · `survey_bed` (camera grid at the current Z or stated `z_levels`, landmarks
+honoured by dropping / lifting with the reasons reported).
 
 ## Tool change workflows
 

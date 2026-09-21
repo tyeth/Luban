@@ -12,6 +12,7 @@ import {
     runToolSetterProcedure,
     setToolSetterConfig,
 } from '../toolSetter';
+import { MAX_TOOL_LENGTH_DELTA_MM, TOOL_SETTER_FLOOR_MARGIN_MM, within } from '../procedureLimits';
 import { validateGcode } from '../validator';
 import { getPositionSnapshot, machinePositionDiagnostics, requireReliableMachine } from './machine';
 
@@ -72,9 +73,9 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             if (numbers.referenceBitLengthMm <= 0 || numbers.longestBitLengthMm < numbers.referenceBitLengthMm - 0.001) {
                 throw new McpToolError('Bit lengths must be positive and longest >= reference.');
             }
-            const floorMarginMm = args.floor_margin_mm !== undefined ? Number(args.floor_margin_mm) : 3;
-            if (!Number.isFinite(floorMarginMm) || floorMarginMm < 0.5 || floorMarginMm > 20) {
-                throw new McpToolError('floor_margin_mm must be 0.5-20.');
+            const floorMarginMm = args.floor_margin_mm !== undefined ? Number(args.floor_margin_mm) : TOOL_SETTER_FLOOR_MARGIN_MM.default;
+            if (!within(floorMarginMm, TOOL_SETTER_FLOOR_MARGIN_MM)) {
+                throw new McpToolError(`floor_margin_mm must be ${TOOL_SETTER_FLOOR_MARGIN_MM.min}-${TOOL_SETTER_FLOOR_MARGIN_MM.max}.`);
             }
             const existing = getToolSetterConfig();
             const changeCoord = (value: number | undefined, previous: number | null): number | null => {
@@ -328,8 +329,8 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 }
             }
             const deltaMm = Number((newZ - oldZ).toFixed(3));
-            if (Math.abs(deltaMm) > 50) {
-                throw new McpToolError(`Computed length difference ${deltaMm} mm exceeds the 50 mm sanity `
+            if (Math.abs(deltaMm) > MAX_TOOL_LENGTH_DELTA_MM) {
+                throw new McpToolError(`Computed length difference ${deltaMm} mm exceeds the ${MAX_TOOL_LENGTH_DELTA_MM} mm sanity `
                     + 'limit - the two measurements are probably not an old/new pair of the same setup.');
             }
 

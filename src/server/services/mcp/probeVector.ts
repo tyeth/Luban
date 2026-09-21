@@ -13,14 +13,16 @@ import {
     assertChannelReady,
     assertMachineReadyForProcedure,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     abortRaiseToTop,
     knownMachinePosition,
 } from './probing';
 import { McpToolError } from './registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { MIN_USEFUL_MARCH_MM, clampRay } from './machineTravel';
+import { MARCH_SEGMENT_MM, MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
+import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // Vector probing: a sensor-gated march from the CURRENT position along an
 // ARBITRARY direction (any XY heading, optionally angled downward - never
@@ -35,8 +37,10 @@ import { connectionManager } from '../machine/ConnectionManager';
 export interface ProbeVectorPlan {
     unit: { x: number; y: number; z: number };
     start: { x: number; y: number; z: number }; // machine coords at staging
-    maxTravelMm: number; // after envelope clamping
+    maxTravelMm: number; // after clamping to the toolhead travel
     requestedTravelMm: number;
+    /** Which travel end shortened the march, when one did - shown on the confirm page. */
+    travelClippedBy: string | null;
     limit: { x: number; y: number; z: number };
     coarseStepMm: number;
     fineStepMm: number;
@@ -70,8 +74,8 @@ export function planProbeVector(args: {
     const unit = { x: dx / norm, y: dy / norm, z: dz / norm };
 
     const requested = Number(args.max_travel_mm);
-    if (!Number.isFinite(requested) || requested < 1 || requested > 150) {
-        throw new McpToolError('max_travel_mm is required: how far the probe may march before aborting (1-150).');
+    if (!within(requested, MARCH_TRAVEL_MM)) {
+        throw new McpToolError(`max_travel_mm is required: how far the probe may march before aborting (${MARCH_TRAVEL_MM.min}-${MARCH_TRAVEL_MM.max}).`);
     }
 
     const position = getPositionSnapshot();
@@ -87,28 +91,27 @@ export function planProbeVector(args: {
     const startZ = z >= traverseZ - TRAVERSE_Z_TOLERANCE_MM ? traverseZ : z;
     const start = { x, y, z: startZ };
 
-    // Clamp the travel SCALAR so the entire segment stays inside the same
-    // envelope the direct-move guards use (machine -25..size+40 for X/Y,
-    // Z never below 0) - clamping per-axis would change the direction.
-    let travel = requested;
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-    const clampAxis = (u: number, from: number, lo: number, hi: number) => {
-        if (Math.abs(u) < 1e-9) {
-            return Infinity;
+    // Clamp the travel SCALAR so the entire segment stays inside the
+    // toolhead's real XY travel (machineTravel.ts) and never below machine
+    // Z 0 - clamping per-axis would change the direction. Until 2026-09-21
+    // this used the garbage-beat filter's -25..size+40, which on an A350 let a
+    // -X march plan 6 mm past the end of the machine. What the clamp costs is
+    // carried in the plan and shown on the confirm page: a face the shortened
+    // march cannot reach would otherwise read as "no contact".
+    const ray = clampRay(start, unit, requested, requirePlanningTravel('a vector probe', { x, y }).limits);
+    let travel = ray.travelMm;
+    let clippedBy = ray.clippedBy;
+    if (unit.z < -1e-9) {
+        const toFloor = (0 - start.z) / unit.z;
+        if (toFloor < travel) {
+            travel = Number(Math.max(0, toFloor).toFixed(3));
+            clippedBy = 'machine Z 0 (the bed)';
         }
-        const bound = u > 0 ? hi : lo;
-        return (bound - from) / u;
-    };
-    if (size) {
-        travel = Math.min(travel, clampAxis(unit.x, start.x, -25, size.x + 40));
-        travel = Math.min(travel, clampAxis(unit.y, start.y, -25, size.y + 40));
     }
-    travel = Math.min(travel, clampAxis(unit.z, start.z, 0, Infinity));
-    if (!Number.isFinite(travel) || travel < 0.5) {
-        throw new McpToolError('The clamped probe travel is under 0.5 mm - already at the envelope edge '
-            + 'along this direction.');
+    if (!Number.isFinite(travel) || travel < MIN_USEFUL_MARCH_MM) {
+        throw new McpToolError(`The march, clamped to the toolhead travel, is under ${MIN_USEFUL_MARCH_MM} mm - already at `
+            + `${clippedBy || 'the travel limit'} along this direction.`);
     }
-    travel = Number(travel.toFixed(3));
 
     return {
         unit: {
@@ -119,16 +122,15 @@ export function planProbeVector(args: {
         start,
         maxTravelMm: travel,
         requestedTravelMm: requested,
+        travelClippedBy: clippedBy,
         limit: {
             x: Number((start.x + unit.x * travel).toFixed(3)),
             y: Number((start.y + unit.y * travel).toFixed(3)),
             z: Number((start.z + unit.z * travel).toFixed(3)),
         },
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
-        fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
-        confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
+        // Coarse / fine / backoff / sensor delay / confirm passes, clamped to
+        // the named limits (procedureLimits.ts; operator law 2026-09-05: never 2 mm).
+        ...resolveMarchParams(args),
     };
 }
 
@@ -162,8 +164,9 @@ export function describeProbeVectorPlanAsGcode(plan: ProbeVectorPlan): string {
     const lines = [
         '; TOUCH PROBE VECTOR MEASUREMENT (server-driven, sensor-gated on the probe channel)',
         `; march along unit direction ${dir} from the staging position, max travel ${plan.maxTravelMm} mm${
-            plan.maxTravelMm < plan.requestedTravelMm
-                ? ` (requested ${plan.requestedTravelMm}, clamped to the machine envelope)` : ''}`,
+            plan.travelClippedBy
+                ? ` (requested ${plan.requestedTravelMm}: shortened by ${plan.travelClippedBy} - a face beyond it reads as no contact)` : ''}`,
+        `; every move toward the work is sent as sensor-checked segments of <= ${MARCH_SEGMENT_MM} mm (the coarse step is the logical advance)`,
         '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the probe feed is checked',
         '; before the next line. The march stops at first contact; running the full ladder',
         `; without contact ABORTS at (${plan.limit.x}, ${plan.limit.y}, ${plan.limit.z}).`,
@@ -222,7 +225,7 @@ export async function runProbeVectorProcedure(plan: ProbeVectorPlan): Promise<ob
         phases.push({ phase, s: Number(s.toFixed(3)), note });
         mcpBroadcast('mcp:activity', { tool: 'probe_vector', phase, s: Number(s.toFixed(3)), note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const move = async (tool: string, s: number, feed: number) => {
         await moveMachineSettled(tool, moveWords(plan, s), feed);
     };
@@ -232,13 +235,16 @@ export async function runProbeVectorProcedure(plan: ProbeVectorPlan): Promise<ob
         // Coarse march to first contact.
         let coarseContactS: number | null = null;
         while (plan.maxTravelMm - s > 1e-9) {
-            const stepStart = Date.now();
-            s = Math.min(s + plan.coarseStepMm, plan.maxTravelMm);
-            await move('probe-vec:coarse', s, COARSE_FEED);
-            const sensed = await senseAfter('probe', stepStart, plan.sensorDelayMs);
-            if (sensed.contact) {
+            // The coarse step is the logical advance; the physical moves are
+            // <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+            const advance = await marchInSegments(
+                async (v) => move('probe-vec:coarse', v, COARSE_FEED),
+                s, Math.min(s + plan.coarseStepMm, plan.maxTravelMm), 'probe', plan.sensorDelayMs
+            );
+            s = advance.s;
+            if (advance.sensed.contact) {
                 coarseContactS = s;
-                announce('coarse-contact', s, `probe "${sensed.reading?.value}"`);
+                announce('coarse-contact', s, `probe "${advance.sensed.reading?.value}"`);
                 break;
             }
         }

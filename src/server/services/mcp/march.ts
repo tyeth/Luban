@@ -1,4 +1,5 @@
 import { mcpBroadcast } from './index';
+import { releaseTimeoutFor } from './procedureLimits';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
@@ -7,6 +8,7 @@ import {
     ProcedureAbort,
     TRAVEL_FEED,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
 } from './probing';
@@ -98,18 +100,21 @@ export async function marchToContact(
     params: MarchParams,
     announce: Announce
 ): Promise<MarchContact | null> {
-    const releaseTimeoutMs = Math.max(params.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(params.sensorDelayMs);
     const move = async (tool: string, s: number, feed: number) => {
         await moveMachineSettled(tool, wordsAlong(start, unit, s), feed);
     };
     let s = 0;
     let coarseContactS: number | null = null;
     while (maxTravelMm - s > 1e-9) {
-        const t0 = Date.now();
-        s = Math.min(s + params.coarseStepMm, maxTravelMm);
-        await move(`${tag}:coarse:${name}`, s, COARSE_FEED);
-        const sensed = await senseAfter('probe', t0, params.sensorDelayMs);
-        if (sensed.contact) {
+        // The coarse step is the logical advance; the physical moves that make
+        // it up are <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+        const advance = await marchInSegments(
+            async (v) => move(`${tag}:coarse:${name}`, v, COARSE_FEED),
+            s, Math.min(s + params.coarseStepMm, maxTravelMm), 'probe', params.sensorDelayMs
+        );
+        s = advance.s;
+        if (advance.sensed.contact) {
             coarseContactS = s;
             announce(`coarse-contact-${name}`, `${s.toFixed(3)} mm along`);
             break;
@@ -281,7 +286,7 @@ export async function steppedTraverse(
             const back = at(s);
             const t1 = Date.now();
             await moveMachineSettled(`${tag}:hop-back:${name}`, words(back), STEPPED_HOP_FEED);
-            const released = await senseReleaseAfter('probe', t1, Math.max(params.sensorDelayMs * 4, 3500));
+            const released = await senseReleaseAfter('probe', t1, releaseTimeoutFor(params.sensorDelayMs));
             if (released.contact) {
                 throw new ProcedureAbort(`Stepped traverse "${name}": probe still triggered after backing off ${STEPPED_HOP_STEP_MM} mm `
                     + `at (${back.x}, ${back.y}, ${back.z}).`);

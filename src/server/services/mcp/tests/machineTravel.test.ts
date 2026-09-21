@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 
-import { clampBand, describeClipping, resolveTravel } from '../machineTravel';
+import { clampBand, clampRay, describeClipping, outsideTravel, resolveTravel } from '../machineTravel';
 
 // The A350 as it actually is: a 320 x 350 definition, a machine frame that
 // runs X -19...339, and a home position at X-19 Y342 that PROVES the low X
@@ -148,5 +148,36 @@ export const tests: Array<[string, () => void]> = [
         const text = describeClipping('X', clampBand(79, 200, -19, 339));
         assert.match(text, /102 mm below X-19/);
         assert.match(text, /not planned/);
+    }],
+
+    ['a point inside the travel, or on its end within float noise, is not outside', () => {
+        const limits = { xMin: -19, xMax: 339, yMin: 0, yMax: 342 };
+        assert.equal(outsideTravel({ x: 100, y: 100 }, limits), null);
+        // The heartbeat's own reading of home: six microns past the end is the end.
+        assert.equal(outsideTravel({ x: -19.00000610351563, y: 342.0000001 }, limits), null);
+    }],
+
+    ['a point outside the travel says which end, and by how much', () => {
+        const limits = { xMin: -19, xMax: 339, yMin: 0, yMax: 342 };
+        // The old -25 slop's first waypoint, against the A350's real X minimum.
+        assert.equal(outsideTravel({ x: -25, y: 100 }, limits), 'X -25 is 6 mm below the X minimum -19');
+        assert.equal(outsideTravel({ x: 355, y: 350 }, limits),
+            'X 355 is 16 mm beyond the X maximum 339 and Y 350 is 8 mm beyond the Y maximum 342');
+    }],
+
+    ['a march is shortened to the travel end it would run into, and says which', () => {
+        const limits = { xMin: -19, xMax: 339, yMin: 0, yMax: 342 };
+        // -X from X10 for 40 mm reaches X-30; the travel stops at X-19.
+        const ray = clampRay({ x: 10, y: 100 }, { x: -1, y: 0 }, 40, limits);
+        assert.deepEqual(ray, { travelMm: 29, clippedMm: 11, clippedBy: 'the X minimum -19' });
+        // A diagonal is clamped as a scalar - the direction never changes.
+        const diag = clampRay({ x: 330, y: 100 }, { x: Math.SQRT1_2, y: Math.SQRT1_2 }, 50, limits);
+        assert.equal(diag.clippedBy, 'the X maximum 339');
+        assert.ok(Math.abs(diag.travelMm - 9 * Math.SQRT2) < 1e-3);
+    }],
+
+    ['a march that fits is untouched', () => {
+        const limits = { xMin: -19, xMax: 339, yMin: 0, yMax: 342 };
+        assert.deepEqual(clampRay({ x: 100, y: 100 }, { x: 0, y: 1 }, 25, limits), { travelMm: 25, clippedMm: 0, clippedBy: null });
     }],
 ];

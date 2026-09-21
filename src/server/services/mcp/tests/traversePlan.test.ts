@@ -3,7 +3,8 @@ import { strict as assert } from 'assert';
 import { ObstacleBox } from '../envelopeChecks';
 import { TraversePlanError, TraversePlanInput, mayDescend, planRaiseToTop, planToolSetterEnd, planTraverseXy } from '../traversePlan';
 
-const BOUNDS = { min: { x: 0, y: 0, z: 0 }, max: { x: 320, y: 340, z: 330 } };
+// The A350 travel as resolved with the head observed at home X-19: the definition's box, widened by the evidence.
+const TRAVEL = { xMin: -19, xMax: 320, yMin: 0, yMax: 350 };
 const OFFSET = { x: -51, y: -122, z: -328 };
 const ROTARY: ObstacleBox = { name: 'rotary-axis', machine: { x0: 140, y0: 0, x1: 200, y1: 350 }, clearanceZ: 328, mode: 'crossing' };
 
@@ -13,7 +14,7 @@ function input(over: Partial<TraversePlanInput> = {}): TraversePlanInput {
         frame: 'machine',
         currentMachine: { x: -19, y: 342, z: 328 },
         originOffset: OFFSET,
-        bounds: BOUNDS,
+        travel: TRAVEL,
         traverseZ: 328,
         feedRate: 1500,
         obstacles: [ROTARY],
@@ -72,8 +73,15 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(plan.header.includes('= machine (290.000, 105.000)'));
     }],
 
-    ['a target outside the travel is refused, naming the axis and the machine coordinates', () => {
-        refuses(() => planTraverseXy(input({ targets: [{ x: 400, y: 100 }] })), 'outside the travel on x');
+    ['a target outside the travel is refused, naming the axis, the overshoot and the machine coordinates', () => {
+        refuses(() => planTraverseXy(input({ targets: [{ x: 400, y: 100 }] })), 'X 400 is 80 mm beyond the X maximum 320');
+        // X-25 was admitted by the old -25 slop; the A350 travel stops at X-19.
+        refuses(() => planTraverseXy(input({ targets: [{ x: -25, y: 100 }] })), 'X -25 is 6 mm below the X minimum -19');
+        // The travel end itself passes, with the heartbeat's float noise tolerated.
+        assert.equal(planTraverseXy(input({ targets: [{ x: -19.00000610351563, y: 100 }] })).steps.length, 1);
+    }],
+    ['with no travel known, targets are not checked against one (the caller decides)', () => {
+        assert.equal(planTraverseXy(input({ travel: null, targets: [{ x: 400, y: 100 }] })).steps.length, 1);
         refuses(() => planTraverseXy(input({ frame: 'work', targets: [{ x: 0, y: 300 }] })), 'machine (51.000, 422.000)');
     }],
 

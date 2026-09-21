@@ -20,6 +20,7 @@ import {
     expectMachinePosition,
     knownMachinePosition,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -27,8 +28,9 @@ import {
     abortRaiseToTop,
 } from './probing';
 import { McpToolError } from './registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { outsideTravel } from './machineTravel';
+import { MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
+import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // A whole measurement CIRCUIT as ONE staged, operator-approved procedure
 // (operator-requested 2026-09-02: "I won't do separate approvals"). The
@@ -110,9 +112,10 @@ export function planProbeSequence(args: {
     }
     const staged = { x, y, z };
     const hopZ = safeTraverseZ();
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-    const inEnvelope = (px: number, py: number) => !size
-        || (px >= -25 && px <= size.x + 40 && py >= -25 && py <= size.y + 40);
+    // Every hop and every march's far limit inside the toolhead's real travel
+    // (machineTravel.ts), not the garbage-beat filter's -25..size+40.
+    const toolheadTravel = requirePlanningTravel('a probe sequence', { x, y });
+    const outside = (px: number, py: number) => outsideTravel({ x: px, y: py }, toolheadTravel.limits);
 
     // Simulate the walk so every step is anchored to concrete coordinates.
     const virtual = { ...staged };
@@ -125,8 +128,12 @@ export function planProbeSequence(args: {
         if (kind === 'hop') {
             const hx = Number(raw.x);
             const hy = Number(raw.y);
-            if (!Number.isFinite(hx) || !Number.isFinite(hy) || !inEnvelope(hx, hy)) {
-                throw new McpToolError(`${at}: hop needs finite x/y inside the machine envelope.`);
+            if (!Number.isFinite(hx) || !Number.isFinite(hy)) {
+                throw new McpToolError(`${at}: hop needs finite machine x/y.`);
+            }
+            const hopOutside = outside(hx, hy);
+            if (hopOutside) {
+                throw new McpToolError(`${at}: hop target is outside the toolhead travel: ${hopOutside}.`);
             }
             steps.push({ kind: 'hop', x: hx, y: hy });
             virtual.x = hx;
@@ -160,16 +167,21 @@ export function planProbeSequence(args: {
                 z: Number((dz / norm).toFixed(6)),
             };
             const travel = Number(raw.max_travel_mm);
-            if (!Number.isFinite(travel) || travel < 1 || travel > 150) {
-                throw new McpToolError(`${at}: max_travel_mm required (1-150).`);
+            if (!within(travel, MARCH_TRAVEL_MM)) {
+                throw new McpToolError(`${at}: max_travel_mm required (${MARCH_TRAVEL_MM.min}-${MARCH_TRAVEL_MM.max}).`);
             }
             const limit = {
                 x: virtual.x + unit.x * travel,
                 y: virtual.y + unit.y * travel,
                 z: virtual.z + unit.z * travel,
             };
-            if (!inEnvelope(limit.x, limit.y) || limit.z < 0) {
-                throw new McpToolError(`${at}: the march limit leaves the machine envelope.`);
+            const limitOutside = outside(limit.x, limit.y);
+            if (limitOutside) {
+                throw new McpToolError(`${at}: the march's far limit is outside the toolhead travel: ${limitOutside}. `
+                    + 'Shorten max_travel_mm or start the march nearer the face.');
+            }
+            if (limit.z < 0) {
+                throw new McpToolError(`${at}: the march's far limit is below machine Z 0 (the bed).`);
             }
             const onMissRaw = raw.on_miss === undefined ? 'continue' : String(raw.on_miss);
             if (onMissRaw !== 'continue' && onMissRaw !== 'abort') {
@@ -211,11 +223,9 @@ export function planProbeSequence(args: {
 
     return {
         steps,
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
-        fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
-        confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
+        // Coarse / fine / backoff / sensor delay / confirm passes, clamped to
+        // the named limits (procedureLimits.ts; operator law 2026-09-05: never 2 mm).
+        ...resolveMarchParams(args),
         hopZ,
         staged,
     };
@@ -319,7 +329,7 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
         phases.push({ phase, note });
         mcpBroadcast('mcp:activity', { tool: 'probe_sequence', phase, note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const results: {
         name: string;
         status: 'contact' | 'no_contact';
@@ -388,11 +398,14 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 let s = 0;
                 let coarseContactS: number | null = null;
                 while (step.maxTravelMm - s > 1e-9) {
-                    const t0 = Date.now();
-                    s = Math.min(s + plan.coarseStepMm, step.maxTravelMm);
-                    await move(`seq:coarse:${step.name}`, s, COARSE_FEED);
-                    const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
-                    if (sensed.contact) {
+                    // The coarse step is the logical advance; the physical moves
+                    // are <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+                    const advance = await marchInSegments(
+                        async (v) => move(`seq:coarse:${step.name}`, v, COARSE_FEED),
+                        s, Math.min(s + plan.coarseStepMm, step.maxTravelMm), 'probe', plan.sensorDelayMs
+                    );
+                    s = advance.s;
+                    if (advance.sensed.contact) {
                         coarseContactS = s;
                         announce(`coarse-contact-${step.name}`, `${s.toFixed(3)} mm along`);
                         break;

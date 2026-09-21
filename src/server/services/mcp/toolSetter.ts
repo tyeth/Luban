@@ -16,6 +16,7 @@ import {
     assertMachineReadyForProcedure,
     descendInSegments,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -23,6 +24,19 @@ import {
     raiseToTop,
     RaiseToTopPhases,
 } from './probing';
+import {
+    MARCH_SEGMENT_MM,
+    MAX_BIT_LENGTH_MM,
+    TOOL_SETTER_BACKOFF_MM,
+    TOOL_SETTER_CENTRE_TOLERANCE_MM,
+    TOOL_SETTER_RELEASE_TIMEOUT_MIN_MS,
+    TOOL_SETTER_SENSOR_DELAY_MS,
+    TOOL_SETTER_SLOW_ZONE_MM,
+    TOOL_SETTER_START_CLEARANCE_MM,
+    clampTo,
+    releaseTimeoutFor,
+    resolveMarchParams,
+} from './procedureLimits';
 import { McpToolError } from './registry';
 import { getPositionSnapshot, motionFloorZ, safeTraverseZ } from './tools/machine';
 
@@ -228,19 +242,18 @@ export function planToolSetterRun(args: {
             + 'longest bit in use, then store them with set_tool_setter_config.');
     }
     const bitLengthMm = Number(args.bit_length_mm);
-    if (!Number.isFinite(bitLengthMm) || bitLengthMm <= 0 || bitLengthMm > 300) {
+    if (!Number.isFinite(bitLengthMm) || bitLengthMm <= 0 || bitLengthMm > MAX_BIT_LENGTH_MM) {
         throw new McpToolError('bit_length_mm must be the approximate protrusion of the fitted bit in mm '
-            + '(0-300), as stated by the operator.');
+            + `(0-${MAX_BIT_LENGTH_MM}), as stated by the operator.`);
     }
-    const coarseStepMm = Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1); // operator law 2026-09-05: never 2 mm
-    const fineStepMm = Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5);
-    const backoffMm = Math.min(Math.max(Number(args.backoff_mm) || 0.3, fineStepMm), 2);
-    // 200ms default is tuned to the operator's local-broker latency; the
-    // hard floor and the overtravel tripwire backstop a missed message.
-    const sensorDelayMs = Math.min(Math.max(Number(args.sensor_delay_ms) || 200, 100), 10000);
-    const confirmPasses = Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10);
-    const startClearanceMm = Math.min(Math.max(Number(args.start_clearance_mm) || 30, 10), 150);
-    const slowZoneMm = Math.min(Math.max(Number(args.slow_zone_mm) || 1, fineStepMm), 10);
+    // The march parameters, with the setter's own backoff (a small disc) and
+    // sensor delay (local-broker latency) - procedureLimits.ts has the reasons.
+    const { coarseStepMm, fineStepMm, backoffMm, sensorDelayMs, confirmPasses } = resolveMarchParams(args, {
+        backoff: TOOL_SETTER_BACKOFF_MM,
+        delay: TOOL_SETTER_SENSOR_DELAY_MS,
+    });
+    const startClearanceMm = clampTo(args.start_clearance_mm, TOOL_SETTER_START_CLEARANCE_MM);
+    const slowZoneMm = clampTo(args.slow_zone_mm, { ...TOOL_SETTER_SLOW_ZONE_MM, min: Math.max(TOOL_SETTER_SLOW_ZONE_MM.min, fineStepMm) });
 
     const expectedTriggerZ = cfg.triggerZ + (bitLengthMm - cfg.referenceBitLengthMm);
     const startZ = cfg.triggerZ + (cfg.longestBitLengthMm - cfg.referenceBitLengthMm) + startClearanceMm;
@@ -289,6 +302,7 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
     const c = plan.config;
     const lines = [
         '; TOOL SETTER MEASUREMENT PROCEDURE (server-driven, sensor-gated)',
+        `; every move toward the setter is sent as sensor-checked segments of <= ${MARCH_SEGMENT_MM} mm (the coarse step is the logical advance)`,
         '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the toolsetter',
         '; feed is checked before the next line is issued. Descent stops at first',
         '; contact - the full ladder below only executes if the sensor stays silent,',
@@ -399,9 +413,9 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
             if (x === null || y === null || z === null) {
                 throw new ProcedureAbort('start_from_current: current machine position unknown.');
             }
-            if (Math.abs(x - c.centerX) > 1.5 || Math.abs(y - c.centerY) > 1.5) {
+            if (Math.abs(x - c.centerX) > TOOL_SETTER_CENTRE_TOLERANCE_MM || Math.abs(y - c.centerY) > TOOL_SETTER_CENTRE_TOLERANCE_MM) {
                 throw new ProcedureAbort(`start_from_current: machine XY (${x.toFixed(1)}, ${y.toFixed(1)}) `
-                    + `is not over the setter centre (${c.centerX}, ${c.centerY}) within 1.5 mm.`);
+                    + `is not over the setter centre (${c.centerX}, ${c.centerY}) within ${TOOL_SETTER_CENTRE_TOLERANCE_MM} mm.`);
             }
             if (z <= plan.floorZ) {
                 throw new ProcedureAbort(`start_from_current: machine Z ${z.toFixed(2)} is at or below the `
@@ -442,14 +456,17 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         // correctly-declared bit out of that regime).
         let coarseContactZ: number | null = null;
         while (currentZ - plan.coarseStepMm >= plan.coarseFloorZ - 1e-9) {
-            const stepStart = Date.now();
-            currentZ = Math.max(currentZ - plan.coarseStepMm, plan.coarseFloorZ);
-            await moveMachineSettled('toolsetter:coarse', { z: currentZ }, COARSE_FEED);
-            const sensed = await senseAfter(contactChannels, stepStart, plan.sensorDelayMs);
-            if (sensed.contact) {
+            // The coarse step is the logical advance; the physical moves are
+            // <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+            const advance = await marchInSegments(
+                async (v) => moveMachineSettled('toolsetter:coarse', { z: v }, COARSE_FEED),
+                currentZ, Math.max(currentZ - plan.coarseStepMm, plan.coarseFloorZ), contactChannels, plan.sensorDelayMs
+            );
+            currentZ = advance.s;
+            if (advance.sensed.contact) {
                 coarseContactZ = currentZ;
                 announce('coarse-contact', currentZ,
-                    `sensor "${sensed.reading?.value}" ABOVE the slow zone - bit longer than declared`);
+                    `sensor "${advance.sensed.reading?.value}" ABOVE the slow zone - bit longer than declared`);
                 break;
             }
         }
@@ -457,7 +474,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         // Release-type checks wait out the feed's real-world latency (the
         // release message has been observed arriving ~1s after the motion);
         // a short window here caused a false "hysteresis" abort on run 2.
-        const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 2500);
+        const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs, TOOL_SETTER_RELEASE_TIMEOUT_MIN_MS);
 
         // Phase 3: only after a coarse contact - retreat until released, so
         // the fine approach starts from a clear sensor.

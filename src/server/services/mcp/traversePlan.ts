@@ -4,6 +4,7 @@
 // into hand-written file jobs (which is how a frameless `G0 Z0` got staged on
 // 2026-09-12). Pure: no server imports, unit-tested in tests/traversePlan.test.ts.
 import { MotionSegment, ObstacleBox, POSITION_EPSILON_MM, checkMotion, describeViolations } from './envelopeChecks';
+import { TravelLimits, outsideTravel } from './machineTravel';
 
 export interface Xyz {
     x: number;
@@ -24,8 +25,12 @@ export interface TraversePlanInput {
     currentMachine: Xyz;
     /** machine = work - originOffset. */
     originOffset: Xyz;
-    /** Machine travel; null when the machine is unknown (bounds then unchecked). */
-    bounds: { min: Xyz; max: Xyz } | null;
+    /**
+     * The toolhead's XY travel as resolved for THIS rig (machineTravel.ts /
+     * planningTravel()); null when it is unknown, in which case targets are
+     * not checked against it - the caller decides whether that is acceptable.
+     */
+    travel: TravelLimits | null;
     /** The law-2 traverse height (mcpSafeTraverseZ). The current Z must be at or above it. */
     traverseZ: number;
     feedRate: number;
@@ -69,9 +74,6 @@ export class TraversePlanError extends Error {
     }
 }
 
-/** Travel a target may sit outside the nominal volume (the A350 X switch is at -19; Y/Z home a few mm past nominal). */
-export const XY_BOUNDS_LOW_MARGIN_MM = 25;
-export const XY_BOUNDS_HIGH_MARGIN_MM = 40;
 export const MAX_TRAVERSE_TARGETS = 20;
 /**
  * "At the traverse height" allows the heartbeat's float noise: home reports
@@ -104,7 +106,7 @@ export function wrapCommentText(text: string, width: number): string[] {
 const f3 = (n: number) => n.toFixed(3);
 
 export function planTraverseXy(input: TraversePlanInput): TraversePlan {
-    const { targets, frame, currentMachine, originOffset, bounds, traverseZ, feedRate, obstacles } = input;
+    const { targets, frame, currentMachine, originOffset, travel, traverseZ, feedRate, obstacles } = input;
     if (!Array.isArray(targets) || targets.length < 1 || targets.length > MAX_TRAVERSE_TARGETS) {
         throw new TraversePlanError(`Provide 1-${MAX_TRAVERSE_TARGETS} targets.`);
     }
@@ -148,13 +150,15 @@ export function planTraverseXy(input: TraversePlanInput): TraversePlan {
         const previousInFrame = toFrame(fromMachine);
         const target = { x: hasX ? x : previousInFrame.x, y: hasY ? y : previousInFrame.y };
         const m = toMachine(target);
-        if (bounds) {
-            const outside = (['x', 'y'] as const).filter((axis) => m[axis] < bounds.min[axis] - XY_BOUNDS_LOW_MARGIN_MM
-                || m[axis] > bounds.max[axis] + XY_BOUNDS_HIGH_MARGIN_MM);
-            if (outside.length) {
-                throw new TraversePlanError(`Target ${i + 1} ${frame} (${f3(target.x)}, ${f3(target.y)}) = machine (${f3(m.x)}, ${f3(m.y)}) is outside `
-                    + `the travel on ${outside.join('/')} (X ${bounds.min.x}..${bounds.max.x}, Y ${bounds.min.y}..${bounds.max.y}).`);
-            }
+        // The travel is the resolved one for this rig, compared with the
+        // heartbeat's float noise tolerated - not the nominal box plus a slop
+        // (until 2026-09-21: -25/+40, which admitted X-25 on a machine whose
+        // travel stops at X-19).
+        const outside = travel ? outsideTravel(m, travel) : null;
+        if (travel && outside) {
+            throw new TraversePlanError(`Target ${i + 1} ${frame} (${f3(target.x)}, ${f3(target.y)}) = machine (${f3(m.x)}, ${f3(m.y)}) is outside `
+                + `the toolhead travel: ${outside} (travel X ${travel.xMin}..${travel.xMax}, Y ${travel.yMin}..${travel.yMax}). `
+                + 'State a wider limit with set_probe_geometry travel_* only if this rig genuinely reaches there.');
         }
         const to: Xyz = { x: m.x, y: m.y, z: planZ };
         const distanceMm = Math.hypot(to.x - fromMachine.x, to.y - fromMachine.y);

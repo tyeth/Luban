@@ -13,6 +13,14 @@ import { McpToolError } from './registry';
 import { rotaryAxisPoints } from './rotaryGeometry';
 import { getToolSetterConfig } from './toolSetter';
 import { ResolvedTravel, TravelLimits, clampBand, describeClipping } from './machineTravel';
+import {
+    BOOTSTRAP_REACH_MM,
+    BOOTSTRAP_SEARCH_PITCH_MM,
+    BOOTSTRAP_SWEEP_STEP_MM,
+    BOOTSTRAP_Y_SPAN_MM,
+    MAX_BOOTSTRAP_POSES,
+    clampTo,
+} from './procedureLimits';
 import { getPositionSnapshot, motionFloorZ, planningTravel, safeTraverseZ } from './tools/machine';
 import { assertMachineReadyForProcedure, descendInSegments, moveMachineSettled, TRAVEL_FEED } from './probing';
 import { ProbeChannel } from './probeFeed';
@@ -163,9 +171,9 @@ export function planSearchStage(args: SearchPlanArgs): {
             + 'without inventing one. State it with set_probe_geometry (travel_x_min, travel_x_max, travel_y_min, '
             + 'travel_y_max) - the measured limits for this rig.');
     }
-    const reach = Math.min(Math.max(Number(args.reach_mm) || 200, 40), 400);
-    const pitch = Math.min(Math.max(Number(args.pitch_mm) || 40, 10), 120);
-    const ySpan = Math.min(Math.max(Number(args.y_span_mm) || 0, 0), 300);
+    const reach = clampTo(args.reach_mm, BOOTSTRAP_REACH_MM);
+    const pitch = clampTo(args.pitch_mm, BOOTSTRAP_SEARCH_PITCH_MM);
+    const ySpan = clampTo(args.y_span_mm, BOOTSTRAP_Y_SPAN_MM);
     const { bounds, clipped } = searchBand(setter.machine, travel.limits, reach, ySpan);
     return {
         waypoints: planSearchGrid({ ...bounds, pitchMm: pitch }),
@@ -185,8 +193,8 @@ export interface PosePlanArgs {
 
 export function planPoseStage(args: PosePlanArgs) {
     const raw = Array.isArray(args.poses) ? args.poses : [];
-    if (!raw.length || raw.length > 12) {
-        throw new McpToolError('Provide 1-12 poses: the toolhead XY to view each target from, derived from the search '
+    if (!raw.length || raw.length > MAX_BOOTSTRAP_POSES) {
+        throw new McpToolError(`Provide 1-${MAX_BOOTSTRAP_POSES} poses: the toolhead XY to view each target from, derived from the search `
             + 'stage\'s coarse offset. plan_view_pose computes them once a model exists.');
     }
     const poses: BootstrapPose[] = raw.map((p, i) => {
@@ -208,7 +216,7 @@ export function planPoseStage(args: PosePlanArgs) {
         poses,
         parkZ,
         floorZ,
-        stepMm: Number(args.step_mm) || 2,
+        stepMm: Number(args.step_mm) || BOOTSTRAP_SWEEP_STEP_MM,
         obstacles: landmarkStore.obstacleBoxes(),
         fromMachine: { x, y, z },
         ...clearanceOptions(),
@@ -216,7 +224,7 @@ export function planPoseStage(args: PosePlanArgs) {
     if (!plan.poses.length) {
         throw new McpToolError(`No pose survives the obstacle check: ${plan.dropped.map((d) => `${d.label}: ${d.reason}`).join(' ')}`);
     }
-    return { plan, parkZ, floorZ, stops: sweepStops(parkZ, floorZ, Number(args.step_mm) || 2) };
+    return { plan, parkZ, floorZ, stops: sweepStops(parkZ, floorZ, Number(args.step_mm) || BOOTSTRAP_SWEEP_STEP_MM) };
 }
 
 /** The gcode envelope an operator approves for either stage. */

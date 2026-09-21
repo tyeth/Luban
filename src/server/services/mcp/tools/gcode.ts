@@ -16,12 +16,24 @@ import { McpToolError, ToolRegistry } from '../registry';
 import { planTraverseXy } from '../traversePlan';
 import { JobFrame, TRANSPORT_REFUSAL, isPureTransport, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
+import { TRAVEL_EPSILON_MM } from '../machineTravel';
+import {
+    EVENT_POLL_MS,
+    MAX_WAIT_MS,
+    MAX_Z_TARGETS,
+    MOVE_Z_FEED,
+    SETTLE_MATCH_MM,
+    STOP_WAIT_DEFAULT_MS,
+    TRAVERSE_FEED,
+    clampTo,
+} from '../procedureLimits';
 import {
     PositionSnapshot,
     assertFreshHeartbeat,
     getMachineSizeByIdentifier,
     getPositionSnapshot,
     motionFloorZ,
+    requirePlanningTravel,
     safeTraverseZ,
 } from './machine';
 
@@ -150,8 +162,8 @@ async function waitForStableHeartbeat(
             const wanted = { x: expect.x, y: expect.y, z: expect.z };
             const axes = (['x', 'y', 'z'] as const).filter((axis) => wanted[axis] !== undefined);
             const atTarget = expect.frame === 'work'
-                ? axes.every((axis) => now.work[axis] !== null && Math.abs((now.work[axis] as number) - (wanted[axis] as number)) <= 0.15)
-                : matchFrame(now.work, now.originOffset, wanted, 0.15) !== null;
+                ? axes.every((axis) => now.work[axis] !== null && Math.abs((now.work[axis] as number) - (wanted[axis] as number)) <= SETTLE_MATCH_MM)
+                : matchFrame(now.work, now.originOffset, wanted, SETTLE_MATCH_MM) !== null;
             if (!atTarget) {
                 continue; // settled, but not AT the target yet - keep waiting
             }
@@ -440,7 +452,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             // this only removes the copying.
             let token = String(args.confirm_token || '');
             if (!token) {
-                const waitMs = Math.min(Math.max(Number(args.wait_for_approval_ms) || 0, 0), 120000);
+                const waitMs = Math.min(Math.max(Number(args.wait_for_approval_ms) || 0, 0), MAX_WAIT_MS);
                 if (waitMs <= 0) {
                     throw new McpToolError('Provide confirm_token (the operator\'s one-time code) or wait_for_approval_ms '
                         + '(1-120000) to wait for the operator to approve on the confirm page.');
@@ -564,7 +576,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                             jobManager.setActive(null);
                         }
                     });
-                const waitMs = Math.min(Math.max(Number(args.wait_ms) || PROCEDURE_START_WAIT_MS, 0), 120000);
+                const waitMs = Math.min(Math.max(Number(args.wait_ms) || PROCEDURE_START_WAIT_MS, 0), MAX_WAIT_MS);
                 const settledInTime = await Promise.race([
                     finished,
                     sleep(waitMs).then(() => null),
@@ -767,15 +779,15 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             const targets = args.z_targets !== undefined
                 ? args.z_targets.map(Number)
                 : [Number(args.z)];
-            if (!targets.length || targets.length > 20 || targets.some((t) => !Number.isFinite(t))) {
-                throw new McpToolError('Targets must be 1-20 finite numbers.');
+            if (!targets.length || targets.length > MAX_Z_TARGETS || targets.some((t) => !Number.isFinite(t))) {
+                throw new McpToolError(`Targets must be 1-${MAX_Z_TARGETS} finite numbers.`);
             }
             const targetZ = targets[targets.length - 1];
             const coordinateSystem = args.coordinate_system || 'work';
             if (!['work', 'machine'].includes(coordinateSystem)) {
                 throw new McpToolError('coordinate_system must be "work" or "machine".');
             }
-            const feedRate = Math.min(Math.max(Number(args.feed_rate) || 300, 50), 600);
+            const feedRate = clampTo(args.feed_rate, MOVE_Z_FEED);
 
             assertFreshHeartbeat('staging a Z move');
             const position = getPositionSnapshot();
@@ -795,12 +807,18 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (currentZ === null) {
                 throw new McpToolError('Current Z unknown; cannot describe the move to the operator.');
             }
+            // Z travel: the bed at machine 0, and at the top whichever is
+            // higher of the definition's size and the park height the machine
+            // homes to (an A350 homes at 328 against a 330 definition). Not
+            // size + 40: nothing has ever been observed up there, and a Z
+            // target past the top switch is an overtravel alarm, not a move.
             const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+            const zTop = Math.max(size ? size.z : 0, safeTraverseZ());
             for (const t of targets) {
                 const machineT = coordinateSystem === 'machine' ? t : t - position.originOffset.z;
-                if (size && (machineT < -1 || machineT > size.z + 40)) {
+                if (machineT < -TRAVEL_EPSILON_MM || machineT > zTop + TRAVEL_EPSILON_MM) {
                     throw new McpToolError(`Target ${coordinateSystem} Z ${t} (machine Z ${machineT.toFixed(1)}) `
-                        + `is outside the 0..${size.z} travel.`);
+                        + `is outside the Z travel 0..${zTop}.`);
                 }
             }
 
@@ -934,7 +952,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (coordinateSystem !== 'machine' && coordinateSystem !== 'work') {
                 throw new McpToolError('coordinate_system must be "machine" or "work".');
             }
-            const feedRate = Math.min(Math.max(Number(args.feed_rate) || 1500, 50), 3000);
+            const feedRate = clampTo(args.feed_rate, TRAVERSE_FEED);
             const reason = String(args.reason || '').trim();
             if (!reason) {
                 throw new McpToolError('reason is required; it is shown to the operator.');
@@ -957,7 +975,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (mx === null || my === null || mz === null) {
                 throw new McpToolError('Current machine position unknown; cannot plan the traverse.');
             }
-            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+            const travel = requirePlanningTravel('a traverse', { x: mx, y: my });
             let plan;
             try {
                 plan = planTraverseXy({
@@ -965,7 +983,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     frame: coordinateSystem,
                     currentMachine: { x: mx, y: my, z: mz },
                     originOffset: position.originOffset,
-                    bounds: size ? { min: { x: 0, y: 0, z: 0 }, max: { x: size.x, y: size.y, z: size.z } } : null,
+                    travel: travel.limits,
                     traverseZ: safeTraverseZ(),
                     motionFloorZ: motionFloorZ(),
                     feedRate,
@@ -997,6 +1015,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     distance_mm: Number(step.distanceMm.toFixed(1)),
                 })),
                 total_distance_mm: Number(plan.totalDistanceMm.toFixed(1)),
+                travel: { ...travel.limits, conflicts: travel.conflicts },
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: isBatch
                     ? 'Ask the operator to open confirm_url, review the DIRECT-move banner, the frame and every leg, and '
@@ -1071,7 +1090,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (!job) {
                 throw new McpToolError('Unknown job_id.');
             }
-            const waitMs = Math.min(Math.max(Number(args.wait_ms) || 0, 0), 120000);
+            const waitMs = Math.min(Math.max(Number(args.wait_ms) || 0, 0), MAX_WAIT_MS);
             const since = Math.max(0, Math.floor(Number(args.since_event) || 0));
             const startedWaiting = Date.now();
             let timedOut = false;
@@ -1080,7 +1099,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     timedOut = waitMs > 0;
                     break;
                 }
-                await sleep(Math.min(250, waitMs - (Date.now() - startedWaiting)));
+                await sleep(Math.min(EVENT_POLL_MS, waitMs - (Date.now() - startedWaiting)));
             }
             const state = connectionManager.getLatestMachineState();
             return {
@@ -1142,7 +1161,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (plan.action === 'request-procedure-stop') {
                 const request = requestProcedureStop('stop_gcode_job by the agent');
                 jobManager.appendEvent(job, 'stop-requested', { note: 'stop requested by the agent; the runner stops at the next step boundary and raises' });
-                const waitMs = Math.min(Math.max(Number(args.wait_ms) || 20000, 0), 120000);
+                const waitMs = Math.min(Math.max(Number(args.wait_ms) || STOP_WAIT_DEFAULT_MS, 0), MAX_WAIT_MS);
                 const deadline = Date.now() + waitMs;
                 while (!TERMINAL_JOB_STATES.includes(job.state) && Date.now() < deadline) {
                     await sleep(250);

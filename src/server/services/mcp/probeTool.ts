@@ -13,6 +13,7 @@ import {
     assertChannelReady,
     assertMachineReadyForProcedure,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -20,8 +21,9 @@ import {
     knownMachinePosition,
 } from './probing';
 import { McpToolError } from './registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { MIN_USEFUL_MARCH_MM, clampRay } from './machineTravel';
+import { MARCH_SEGMENT_MM, MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
+import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // Point probing with the spindle-mounted touch probe (normally-open, probe
 // feed channel, inverted polarity handled by the feed): a single-axis
@@ -40,7 +42,9 @@ export interface ProbePointPlan {
     direction: 1 | -1;
     start: { x: number; y: number; z: number }; // machine coords at staging
     maxTravelMm: number;
-    limitCoord: number; // start[axis] + direction * maxTravel, envelope-clamped
+    limitCoord: number; // start[axis] + direction * maxTravel, clamped to the toolhead travel
+    /** Which travel end shortened the march, when one did - shown on the confirm page. */
+    travelClippedBy: string | null;
     coarseStepMm: number;
     fineStepMm: number;
     backoffMm: number;
@@ -70,8 +74,8 @@ export function planProbePoint(args: {
         throw new McpToolError('Z probing is downward only (direction -1).');
     }
     const maxTravelMm = Number(args.max_travel_mm);
-    if (!Number.isFinite(maxTravelMm) || maxTravelMm < 1 || maxTravelMm > 150) {
-        throw new McpToolError('max_travel_mm is required: how far the probe may march before aborting (1-150).');
+    if (!within(maxTravelMm, MARCH_TRAVEL_MM)) {
+        throw new McpToolError(`max_travel_mm is required: how far the probe may march before aborting (${MARCH_TRAVEL_MM.min}-${MARCH_TRAVEL_MM.max}).`);
     }
 
     const position = getPositionSnapshot();
@@ -86,18 +90,31 @@ export function planProbePoint(args: {
     const traverseZ = safeTraverseZ();
     const startZ = z >= traverseZ - TRAVERSE_Z_TOLERANCE_MM ? traverseZ : z;
 
-    let limitCoord = { x, y, z: startZ }[axis] + direction * maxTravelMm;
-    // Clamp to the same envelope the direct-move guards use (machine
-    // -25..size+40 for X/Y; Z never below 0).
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+    // The far limit of the march stays inside the toolhead's real travel
+    // (machineTravel.ts; Z never below the bed at machine 0). Until
+    // 2026-09-21 this was the garbage-beat filter's -25..size+40, which on an
+    // A350 let a -X march plan 6 mm past the end of the machine. A march the
+    // travel shortened says so on the confirm page: a face beyond the
+    // shortened limit would otherwise read as "no contact".
+    const startCoord = { x, y, z: startZ }[axis];
+    let travel = maxTravelMm;
+    let clippedBy: string | null = null;
     if (axis === 'z') {
-        limitCoord = Math.max(limitCoord, 0);
-    } else if (size) {
-        limitCoord = Math.min(Math.max(limitCoord, -25), size[axis] + 40);
+        if (startCoord - travel < 0) {
+            travel = Number(Math.max(0, startCoord).toFixed(3));
+            clippedBy = 'machine Z 0 (the bed)';
+        }
+    } else {
+        const unit = { x: axis === 'x' ? direction : 0, y: axis === 'y' ? direction : 0 };
+        const ray = clampRay({ x, y }, unit, maxTravelMm, requirePlanningTravel('a point probe', { x, y }).limits);
+        travel = ray.travelMm;
+        clippedBy = ray.clippedBy;
     }
-    if (Math.abs(limitCoord - { x, y, z: startZ }[axis]) < 0.5) {
-        throw new McpToolError('The clamped probe travel is under 0.5 mm - already at the envelope edge.');
+    if (travel < MIN_USEFUL_MARCH_MM) {
+        throw new McpToolError(`The march, clamped to the toolhead travel, is under ${MIN_USEFUL_MARCH_MM} mm - already at `
+            + `${clippedBy || 'the travel limit'} along ${axis.toUpperCase()}${direction > 0 ? '+' : '-'}.`);
     }
+    const limitCoord = startCoord + direction * travel;
 
     return {
         axis,
@@ -105,11 +122,10 @@ export function planProbePoint(args: {
         start: { x, y, z: startZ },
         maxTravelMm,
         limitCoord: Number(limitCoord.toFixed(3)),
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
-        fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
-        confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
+        travelClippedBy: clippedBy,
+        // Coarse / fine / backoff / sensor delay / confirm passes, clamped to
+        // the named limits (procedureLimits.ts; operator law 2026-09-05: never 2 mm).
+        ...resolveMarchParams(args),
     };
 }
 
@@ -118,9 +134,11 @@ export function describeProbePlanAsGcode(plan: ProbePointPlan): string {
     const word = plan.axis.toUpperCase();
     const lines = [
         '; TOUCH PROBE POINT MEASUREMENT (server-driven, sensor-gated on the probe channel)',
+        `; every move toward the work is sent as sensor-checked segments of <= ${MARCH_SEGMENT_MM} mm (the coarse step is the logical advance)`,
         '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the probe feed is checked',
         '; before the next line. The march stops at first contact; running the full ladder',
-        `; without contact ABORTS at the travel limit ${word} ${plan.limitCoord.toFixed(3)}.`,
+        `; without contact ABORTS at the travel limit ${word} ${plan.limitCoord.toFixed(3)}${plan.travelClippedBy
+            ? ` (requested ${plan.maxTravelMm} mm: shortened by ${plan.travelClippedBy} - a face beyond it reads as no contact)` : ''}.`,
         `; anchored at machine (${plan.start.x.toFixed(2)}, ${plan.start.y.toFixed(2)}, ${plan.start.z.toFixed(2)})`
             + ' - re-verified before any motion',
         '; overtravel feed trips -> job stop + connection close + latched alarm',
@@ -186,7 +204,7 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         phases.push({ phase, coord: Number(coord.toFixed(3)), note });
         mcpBroadcast('mcp:activity', { tool: 'probe_point', phase, axis: plan.axis, coord: Number(coord.toFixed(3)), note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const startCoord = plan.start[plan.axis];
     const towards = (value: number) => (plan.direction === 1
         ? Math.min(value, plan.limitCoord) : Math.max(value, plan.limitCoord));
@@ -199,13 +217,16 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         // Coarse march to first contact.
         let coarseContact: number | null = null;
         while (Math.abs(current - plan.limitCoord) > 1e-9) {
-            const stepStart = Date.now();
-            current = towards(current + plan.direction * plan.coarseStepMm);
-            await move('probe:coarse', current, COARSE_FEED);
-            const sensed = await senseAfter('probe', stepStart, plan.sensorDelayMs);
-            if (sensed.contact) {
+            // The coarse step is the logical advance; the physical moves are
+            // <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+            const advance = await marchInSegments(
+                async (v) => move('probe:coarse', v, COARSE_FEED),
+                current, towards(current + plan.direction * plan.coarseStepMm), 'probe', plan.sensorDelayMs
+            );
+            current = advance.s;
+            if (advance.sensed.contact) {
                 coarseContact = current;
-                announce('coarse-contact', current, `probe "${sensed.reading?.value}"`);
+                announce('coarse-contact', current, `probe "${advance.sensed.reading?.value}"`);
                 break;
             }
         }
