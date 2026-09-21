@@ -42,6 +42,7 @@ import {
     isProcedureStopped,
     checkProcedureStop,
     sleep,
+    RECHECK_TOLERANCE_MM,
 } from './probing';
 import {
     RefResolveError,
@@ -559,7 +560,7 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                     }
                     checkCaptureView(view, { x: kx, y: ky, z: kz }, plan.hopZ, plan.keepOut, `op "${op.id}"`);
                     probeFeedService.clearExpectedContact();
-                    if (kz < plan.hopZ - 0.5) {
+                    if (kz < plan.hopZ - RECHECK_TOLERANCE_MM) {
                         await moveMachineSettled(`probe_program:${op.id}:raise`, { z: plan.hopZ }, TRAVEL_FEED);
                     }
                     await moveMachineSettled(`probe_program:${op.id}:view`, { x: view.x, y: view.y }, TRAVEL_FEED);
@@ -655,7 +656,7 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                 if (!trip) {
                     try {
                         const known = knownMachinePosition();
-                        if (known.position.z !== null && known.position.z < plan.hopZ - 0.5) {
+                        if (known.position.z !== null && known.position.z < plan.hopZ - RECHECK_TOLERANCE_MM) {
                             await moveMachineSettled('probe_program:abort-raise', { z: plan.hopZ }, TRAVEL_FEED);
                         }
                     } catch (raiseErr) {
