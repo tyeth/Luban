@@ -45,6 +45,15 @@ CAD coordinates alone for a re-clamped part.
 Every number is the CAD nominal; a face is probed along its INWARD normal from
 ``clearance`` mm outside it to ``overtravel`` mm past it (the target is the
 MCP's travel limit - keep it generous, a short cycle silently misses).
+
+TIP CONVENTION (the one the MCP applies, issue #175): every ``nominal=`` here is
+a SURFACE point on the CAD face. The MCP's recorded contact is the tip REFERENCE
+point - stylus-centre X/Y, stylus-BOTTOM Z, because the probe's effective length
+is measured on the tool setter to the tip bottom - and the surface it compares
+with the nominal is ``contact + (0, 0, r) - r * normal`` (r = tip radius from
+set_probe_geometry): no correction on a -Z (top) march, one radius on a side
+march. Nothing in this file is a tip-centre coordinate. The emitted program
+carries the same statement as a comment so the report can be read back alone.
 ``depth`` (side faces) pulls the sample points that far below the face's top
 edge, ``inset`` keeps them that far from every edge, ``grid`` = (along, across)
 sample counts, ``points`` = explicit (u, v) fractions instead of a grid.
@@ -274,6 +283,8 @@ def emit_probe_program(doc, selections, out_path, frame="work", placement=None, 
         "(Source: FreeCAD document %s. Coordinates: %s frame%s.)" % (
             doc.Name, frame.upper(), "" if placement is None else ", CAD mapped through the stated placement"),
         "(Every G38.2 marches along the INWARD face normal from %s mm outside to %s mm past the nominal surface.)" % (_r3(clearance), _r3(overtravel)),
+        "(TIP CONVENTION: nominals are SURFACE points. The MCP's contact is the tip REFERENCE point - stylus-centre XY, "
+        "stylus-BOTTOM Z - and it compares surface = contact + (0,0,r) - r*normal: no correction on a -Z march, one tip radius on a side march.)",
         "(Stage with run_probing_gcode frame=%s; the MCP re-derives links and marches under the motion laws.)" % frame,
         "(RESULTS documentid=%(documentid)s modelversion=%(modelversion)s toolpathid=%(toolpathid)s toolpath=%(toolpath)s)" % res,
         "G90 G94 G17 G21",

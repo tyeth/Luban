@@ -19,6 +19,7 @@ import { tests as cameraSelectionTests } from './cameraSelection.test';
 import { tests as directMovePlanTests } from './directMovePlan.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as frameRecoveryTests } from './frameRecovery.test';
+import { tests as inspectionReportTests } from './inspectionReport.test';
 import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
@@ -65,6 +66,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['marchCore', marchCoreTests],
     ['camLinks', camLinksTests],
     ['wallClearance', wallClearanceTests],
+    ['inspectionReport', inspectionReportTests],
 ];
 
 async function main(): Promise<void> {

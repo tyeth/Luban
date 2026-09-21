@@ -21,6 +21,7 @@ import {
     InspectionReport,
     ProbeResultRecord,
     ReportFormat,
+    TIP_CONVENTION,
     deviationAlongNormal,
     renderReport,
     reportExtension,
@@ -569,8 +570,9 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
             jobId,
             startedAt,
             endedAt: Date.now(),
-            frame: { originOffset: offset, convention: 'work = machine + originOffset; contacts are tip-centre positions' },
+            frame: { originOffset: offset, convention: 'work = machine + originOffset; contacts are tip REFERENCE points (stylus-centre XY, stylus-bottom Z)' },
             tipDiameterMm: plan.tipDiameterMm,
+            tipConvention: TIP_CONVENTION,
             results: plan.parsed.results,
             probes: records,
             linkContacts,
@@ -821,9 +823,11 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
                     let deviationMm: number | null = null;
                     let withinTolerance: boolean | null = null;
                     if (step.meta.nominal && plan.tipDiameterMm !== null) {
-                        // Surface = tip centre minus one tip radius along the
-                        // normal; without a stored tip diameter the deviation
-                        // stays null rather than being off by a stylus radius.
+                        // Surface per TIP_CONVENTION (inspectionReport.ts): the
+                        // contact is centre-XY / bottom-Z, pushed one radius back
+                        // along the normal's horizontal part only. Without a
+                        // stored tip diameter the deviation stays null rather
+                        // than being off by a stylus radius on a side march.
                         const nominalWork = step.meta.frame === 'machine' ? toWork(step.meta.nominal) : step.meta.nominal;
                         const normal = step.meta.normal || { x: -unit.x, y: -unit.y, z: -unit.z };
                         ({ deviationMm, withinTolerance } = deviationAlongNormal(

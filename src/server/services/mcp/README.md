@@ -622,9 +622,12 @@ normal IJK 6 dp, `O` = inspect surface offset, `U`/`L` tolerances with `L` signe
 nominal only. A `(RESULTS documentid= modelversion= toolpathid= toolpath=)` comment in the program
 fills the envelope. Also `csv`, `grbl` (`[PRB:x,y,z:1]`). Per probe the tip-centre contact in both
 frames, the B station, travel, distance short of the target, confirm spread, and the deviation of
-the SURFACE (tip centre minus one tip radius along the normal — the review caught the raw tip centre
-being compared, a bias of one stylus radius) with a tolerance verdict; without a stored tip
-diameter the deviation is null rather than wrong. Files land under the app data dir
+the SURFACE with a tolerance verdict, under ONE tip convention (`TIP_CONVENTION`, issue #175): a
+contact is the tip REFERENCE point — stylus-centre XY, stylus-BOTTOM Z, because the effective length
+is measured to the tip bottom — and surface = contact + (0,0,r) − r·normal (no correction on a −Z
+march, one radius on a side march; the 2026-09-07 review caught the raw contact being compared, the
+2026-09-21 pass-1 report caught the radius taken off −Z contacts too). Fusion's G801 gets the stylus
+CENTRE (Z + r). Without a stored tip diameter the deviation is null rather than wrong. Files land under the app data dir
 `mcp-inspection/<job>.<ext>`. Aborts keep the partial report.
 
 **Test material for the translator (2026-09-07 survey, `docs/CAM_TEST_CATALOGUE.md`).** A second
