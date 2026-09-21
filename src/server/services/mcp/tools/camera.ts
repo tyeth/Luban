@@ -28,7 +28,7 @@ import { jobManager } from '../jobs';
 import { bumpGcodeSequence, noteDirectGcodeEnd, noteDirectGcodeStart } from '../positionOfRecord';
 import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
-import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
+import { gateDirectXy, planGotoWorkOrigin } from '../directMovePlan';
 import { clearanceOptions } from '../clearanceContext';
 import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
 import { landmarkStore } from '../landmarks';
@@ -41,9 +41,12 @@ import {
     getPositionSnapshot,
     motionFloorZ,
     requirePlanningTravel,
+    motionFloorZ,
+    safeTraverseZ,
 } from './machine';
+import { validateStagedEnvelope } from './staging';
 import { reliableForMotion } from '../machinePosition';
-import { DIRECT_MOVE_FEED, TRACK_PATCH_PX, TRACK_SEARCH_RADIUS_PX, clampCount, clampTo } from '../procedureLimits';
+import { DIRECT_MOVE_FEED, TRACK_PATCH_PX, TRACK_SEARCH_RADIUS_PX, TRAVEL_FEED, TRAVERSE_FEED, clampCount, clampTo } from '../procedureLimits';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
 // action only. move_and_capture performs ONE bounded XY move at the current
@@ -274,9 +277,58 @@ export interface BoundedMoveArgs {
     operator_confirmed_clearance?: boolean;
     wait_until_moved?: boolean;
     capture?: boolean;
-    // Internal (not exposed in any tool schema): lifts the per-call travel
-    // limit for fixed, operator-set destinations like the work origin.
-    unbounded_travel?: boolean;
+}
+
+/**
+ * Wait for a post-command heartbeat that satisfies `matches`, twice in a row,
+ * so a returned position is what the firmware says rather than what was
+ * commanded (#11). null when it does not happen within SETTLE_TIMEOUT_MS.
+ */
+async function settleUntil(issuedAt: number, matches: (now: PositionSnapshot) => boolean): Promise<PositionSnapshot | null> {
+    let stableReports = 0;
+    let lastTimestamp = 0;
+    const deadline = issuedAt + SETTLE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        await sleep(SETTLE_POLL_MS);
+        const now = getPositionSnapshot();
+        const reportTime = Date.now() - now.reportAgeMs;
+        if (reportTime <= issuedAt || reportTime === lastTimestamp) {
+            continue; // not a fresh post-command report
+        }
+        lastTimestamp = reportTime;
+        if (matches(now)) {
+            stableReports += 1;
+            if (stableReports >= 2) {
+                return now;
+            }
+        } else {
+            stableReports = 0;
+        }
+    }
+    return null;
+}
+
+/**
+ * The Z gate's raise (operator ruling 2026-09-21, "move_and_capture should be
+ * z gated first"): a Z-only machine-frame move to the traverse height - the
+ * one move that cannot descend (law 8) - awaited until the heartbeat reports
+ * it twice. Throws if the controller refuses it or it does not settle; the
+ * XY is never sent on an unproven Z.
+ */
+async function raiseBeforeXy(channel: GcodeChannel, fromZ: number, toZ: number, reason: string): Promise<{ from: number; to: number }> {
+    const gcode = ['G90', 'G53;', `G1 Z${toZ.toFixed(3)} F${TRAVEL_FEED};`, 'G54;'].join('\n');
+    const issuedAt = Date.now();
+    const executed = await sendGcodeVisible(channel, `raise before xy - ${reason.slice(0, 50)}`, gcode);
+    if (executed.result !== 0) {
+        throw new McpToolError(`Raise to the traverse height rejected by controller: ${executed.text || executed.result}. The XY move was NOT sent.`);
+    }
+    const settled = await settleUntil(issuedAt, (now) => now.machine.z !== null && Math.abs(now.machine.z - toZ) <= SETTLE_TOLERANCE_MM);
+    if (!settled) {
+        const last = positionOrNull();
+        throw new McpToolError(`Raise from machine Z ${fromZ.toFixed(3)} to Z ${toZ.toFixed(3)} did not settle within ${SETTLE_TIMEOUT_MS / 1000}s; `
+            + `the XY move was NOT sent. Last reported machine position: ${JSON.stringify(last && last.machine)}`);
+    }
+    return { from: fromZ, to: toZ };
 }
 
 // Pacing guard (2026-09-01, interface-respect): direct XY moves are single
@@ -337,7 +389,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
 
     const travel = Math.hypot(target.x - current.x, target.y - current.y);
     const maxTravel = Number(config.get('mcpMaxJogDistance')) || DEFAULT_MAX_TRAVEL_MM;
-    if (!args.unbounded_travel && travel > maxTravel) {
+    if (travel > maxTravel) {
         throw new McpToolError(`Requested travel ${travel.toFixed(1)} mm exceeds the ${maxTravel} mm `
                     + 'per-call limit. Split the approach, or submit a gcode job.');
     }
@@ -347,34 +399,49 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         y: target.y - before.originOffset.y,
     };
 
-    // OPERATOR LAW (2026-09-01, after the probe crash): X/Y traverses happen
-    // at top gantry height. An XY move below the safe traverse Z, or one
-    // whose path crosses an obstacle landmark below its clearance height, is
-    // refused unless the operator has EXPLICITLY confirmed this corridor -
-    // never on the model's own judgment, never derived from assumptions
-    // about what is on the bed.
-    const machineZ = before.machine.z;
-    if (args.operator_confirmed_clearance !== true && machineZ !== null) {
-        const traverseFloor = motionFloorZ();
-        // Tolerance: home reports 327.999 for Z328 (heartbeat float noise).
-        if (machineZ < traverseFloor - TRAVERSE_Z_TOLERANCE_MM) {
-            throw new McpToolError(`XY move refused: machine Z ${machineZ.toFixed(1)} is below the motion `
-                + `floor ${traverseFloor} (law 2). Retreat Z first (move_z, operator-`
-                + 'confirmed), then traverse, then descend at the destination. Only the operator\'s '
-                + 'explicit word (operator_confirmed_clearance: true) authorises a lower corridor.');
-        }
+    const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+    if (!channel || typeof channel.executeGcode !== 'function') {
+        throw new McpToolError('The connected channel does not support direct moves.');
+    }
+
+    // OPERATOR LAW (2026-09-01, after the probe crash; made a hard gate on
+    // 2026-09-21 - "move_and_capture should be z gated first"): X/Y happens at
+    // the safe traverse height, and that precondition is established BEFORE
+    // any XY is commanded, from the position of record (assertSafeToMove has
+    // already required a fresh, reliable one). An unknown Z refuses. A head
+    // below the height is raised straight up first - the one move that cannot
+    // descend (law 8) - and the XY is sent only once that raise has settled.
+    // The height is the MOTION FLOOR, not the park height (operator ruling
+    // 2026-09-21): a head already above the floor is legal to traverse at and
+    // is not forced up to Z328 for a nudge. Until 2026-09-21 this check ran
+    // after the travel cap and was skipped outright when machine Z was null.
+    // The only escape hatch is operator_confirmed_clearance: the operator's
+    // explicit word for the corridor at the CURRENT Z - never the model's own
+    // judgment, never derived from assumptions about what is on the bed.
+    const gate = gateDirectXy(before.machine.z, motionFloorZ(), args.operator_confirmed_clearance === true);
+    if (gate.action === 'refuse' || gate.planZ === null) {
+        throw new McpToolError(`XY move refused: ${gate.reason}`);
+    }
+    let raisedFirst: { from: number; to: number } | null = null;
+    if (gate.action === 'raise' && gate.fromZ !== null && gate.toZ !== null) {
+        raisedFirst = await raiseBeforeXy(channel, gate.fromZ, gate.toZ, reason);
+    }
+    // Landmarks are checked at the Z the XY will ACTUALLY run at (the raised
+    // height, or the current one), never at a height the head has left.
+    const planZ = gate.planZ;
+    if (args.operator_confirmed_clearance !== true) {
         const machineFrom = { x: before.machine.x, y: before.machine.y };
         if (machineFrom.x !== null && machineFrom.y !== null) {
             const clearance = clearanceOptions();
             const obstacles = landmarkStore.obstaclesOnPath(
-                machineFrom.x, machineFrom.y, machineTarget.x, machineTarget.y, machineZ,
+                machineFrom.x, machineFrom.y, machineTarget.x, machineTarget.y, planZ,
                 undefined, clearance.toolProtrusionMm, clearance.clearanceMarginMm
             );
             if (obstacles.length) {
                 throw new McpToolError('XY move refused: the path crosses obstacle landmark(s) '
                     + `${obstacles.map((l) => describeObstacleRequirement(l)).join(', ')} `
-                    + `while at machine Z ${machineZ.toFixed(3)}. Raise Z above the requirement, or get the `
-                    + 'operator\'s explicit confirmation for this corridor.');
+                    + `at machine Z ${planZ.toFixed(3)}${raisedFirst ? ' (the head was raised there first and stays there)' : ''}. `
+                    + 'Raise Z above the requirement with move_z, or get the operator\'s explicit confirmation for this corridor.');
             }
         }
     }
@@ -387,11 +454,6 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         [{ label: 'Target', x: machineTarget.x, y: machineTarget.y }],
         requirePlanningTravel('a direct move', { x: before.machine.x, y: before.machine.y })
     );
-
-    const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
-    if (!channel || typeof channel.executeGcode !== 'function') {
-        throw new McpToolError('The connected channel does not support direct moves.');
-    }
 
     // Pacing: warn on the 2nd+ direct move inside the window; refuse from
     // the 4th unless the operator explicitly confirmed the sequence.
@@ -429,6 +491,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
             commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
             position: null,
             position_verified: false,
+            raised_first: raisedFirst,
             pacing_warning: pacingWarning,
             note: 'wait_until_moved was false: move accepted but not awaited, and no frame was '
                 + 'captured (it would not show the commanded position). Poll get_position.',
@@ -438,31 +501,12 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     // Wait for a post-move heartbeat that reports the target, twice,
     // so the returned position is what the firmware says, not what
     // was commanded (#11).
-    let settled: PositionSnapshot | null = null;
-    let stableReports = 0;
-    let lastTimestamp = 0;
-    const deadline = issuedAt + SETTLE_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-        await sleep(SETTLE_POLL_MS);
-        const now = getPositionSnapshot();
-        const reportTime = Date.now() - now.reportAgeMs;
-        if (reportTime <= issuedAt || reportTime === lastTimestamp) {
-            continue; // not a fresh post-move report
-        }
-        lastTimestamp = reportTime;
+    const settled = await settleUntil(issuedAt, (now) => {
         const reported = coordinateSystem === 'work' ? now.work : now.machine;
-        if (reported.x !== null && reported.y !== null
-                    && Math.abs(reported.x - target.x) <= SETTLE_TOLERANCE_MM
-                    && Math.abs(reported.y - target.y) <= SETTLE_TOLERANCE_MM) {
-            stableReports += 1;
-            if (stableReports >= 2) {
-                settled = now;
-                break;
-            }
-        } else {
-            stableReports = 0;
-        }
-    }
+        return reported.x !== null && reported.y !== null
+            && Math.abs(reported.x - target.x) <= SETTLE_TOLERANCE_MM
+            && Math.abs(reported.y - target.y) <= SETTLE_TOLERANCE_MM;
+    });
     if (!settled) {
         const last = positionOrNull();
         throw new McpToolError('Move did not settle at the target within '
@@ -477,6 +521,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
             commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
             position: getPositionSnapshot(),
             position_verified: true,
+            raised_first: raisedFirst,
             pacing_warning: pacingWarning,
             note: 'position is firmware-reported after settling; capture was false so no frame was taken',
         };
@@ -488,6 +533,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         commanded: { ...target, coordinate_system: coordinateSystem, feed_rate: feedRate },
         position: after,
         position_verified: true,
+        raised_first: raisedFirst,
         pacing_warning: pacingWarning,
         note: 'position is firmware-reported after settling, not the commanded target',
     });
@@ -531,6 +577,66 @@ async function previewOne(entry: string): Promise<{ device: string; frame: Captu
     }
 }
 
+
+/**
+ * goto_work_origin, STAGED (operator ruling 2026-09-21: "goto work origin is
+ * a risk"). Work (0, 0) is resolved through the heartbeat's origin offset at
+ * staging, planned like a traverse - motion floor, toolhead travel, landmark
+ * crossings, all against the RESOLVED machine destination - and emitted in
+ * MACHINE coordinates, so the confirm page shows where the head will go and
+ * the approved job goes exactly there. The offset must be the heartbeat's own
+ * on a position the record trusts: resolving work zero through a cached or
+ * assumed offset is how this move becomes dangerous. No escape hatch - the
+ * confirm page is the operator's word.
+ */
+async function stageGotoWorkOrigin(args: { reason?: string; feed_rate?: number; wait_until_moved?: boolean }): Promise<object> {
+    const reason = String(args.reason || '').trim();
+    if (!reason) {
+        throw new McpToolError('reason is required: say why the head should go to the work origin (it is shown to the operator).');
+    }
+    const feedRate = clampTo(args.feed_rate, TRAVERSE_FEED);
+    const position = getPositionSnapshot();
+    // Overtravel, fresh + reliable heartbeat, idle, toolhead off, homed - the
+    // same gate as a direct move, with no operator override.
+    assertSafeToMove(position, false);
+    const { x, y, z } = position.machine;
+    if (x === null || y === null || z === null) {
+        throw new McpToolError('Current machine position unknown; cannot plan the move to the work origin.');
+    }
+    const travel = requirePlanningTravel('the move to the work origin', { x, y });
+    let plan;
+    try {
+        plan = planGotoWorkOrigin({
+            currentMachine: { x, y, z },
+            originOffset: position.originOffset,
+            offsetSource: position.originOffsetSource,
+            positionWarnings: position.warnings,
+            travel: travel.limits,
+            traverseZ: safeTraverseZ(),
+            motionFloorZ: motionFloorZ(),
+            feedRate,
+            obstacles: landmarkStore.obstacleBoxes(),
+            ...clearanceOptions(),
+            reason,
+        });
+    } catch (err) {
+        if ((err as Error).name === 'TraversePlanError') {
+            throw new McpToolError((err as Error).message);
+        }
+        throw err;
+    }
+    const validation = validateStagedEnvelope(plan.reviewText, 'goto_work_origin');
+    const job = jobManager.submit(plan.reviewText, plan.name, 'cnc', validation, 'direct');
+    job.waitUntilMoved = args.wait_until_moved !== false;
+    return {
+        job: jobManager.describe(job),
+        destination_machine: plan.destinationMachine,
+        work_origin_offset_at_staging: position.originOffset,
+        current_machine: { x, y, z },
+        note: 'Staged, awaiting the operator\'s click on the confirm page - read them the MACHINE destination, not "work zero". '
+            + 'Then start_gcode_job {job_id, wait_for_approval_ms: 110000}. Z is not touched; no frame is captured on arrival - call capture_frame after.',
+    };
+}
 
 /**
  * MACHINE home, shared by the `home` tool and the probe_program `home` op:
@@ -1204,56 +1310,45 @@ export function registerCameraTools(registry: ToolRegistry): void {
 
     registry.register({
         name: 'goto_work_origin',
-        description: 'Go to the WORK origin: one bounded XY move to work X0 Y0 at the CURRENT Z - '
-            + 'semantically distinct from home, which drives to the machine limit switches. Z is '
-            + 'deliberately not touched; position Z via submit_gcode_job first if needed. Same '
-            + 'guards as move_and_capture (idle, toolhead off, homed-first, safe traverse height, '
-            + 'obstacle landmarks, pacing), and a frame is captured on arrival.',
+        description: 'STAGE a move to the WORK origin: one XY move to work X0 Y0 at the CURRENT Z, planned like '
+            + 'traverse_xy and approved on the confirm page (operator ruling 2026-09-21: "goto work origin is a '
+            + 'risk"). The page shows the destination in MACHINE coordinates - work origins are operator-set and '
+            + 'die on a machine reboot, so "work zero" can be anywhere on the bed - and the move is emitted in the '
+            + 'machine frame, so what the page shows is where the head goes even if the origin is re-zeroed before '
+            + 'start. Refused while the position of record or the origin offset is not trustworthy (awaiting-resync, '
+            + 'stale, cached or assumed offset, warnings), below the motion floor (law 2 - raise with move_z first), '
+            + 'outside the toolhead travel, or across a landmark below its clearance. Semantically distinct from '
+            + 'home, which drives to the machine limit switches. Z is deliberately not touched. Follow with '
+            + 'start_gcode_job {job_id, wait_for_approval_ms: 110000}. No frame is captured on arrival - call '
+            + 'capture_frame after.',
         inputSchema: {
             type: 'object',
             properties: {
-                reason: { type: 'string', description: 'Why this move is needed; shown to the operator.' },
-                feed_rate: { type: 'number', description: `mm/min, default ${DEFAULT_FEED_RATE}, max 3000.` },
-                operator_confirmed_clearance: {
-                    type: 'boolean',
-                    description: 'Set true ONLY when the human operator has explicitly confirmed the '
-                        + 'current Z and an obstacle-free path at this Z; skips the homed-first requirement.',
-                },
+                reason: { type: 'string', description: 'Why this move is needed; shown to the operator on the confirm page.' },
+                feed_rate: { type: 'number', description: `mm/min, default ${TRAVERSE_FEED.default}, max ${TRAVERSE_FEED.max}.` },
                 wait_until_moved: {
                     type: 'boolean',
-                    description: 'Default true: settle at the origin and capture there. false returns '
-                        + 'right after the controller accepts the move - no settle, no frame; poll '
-                        + 'get_position afterwards.',
+                    description: 'Default true: start_gcode_job blocks until the move verifiably settles at the '
+                        + 'origin. false returns right after the controller accepts it; poll get_position afterwards.',
                 },
             },
             required: ['reason'],
             additionalProperties: false,
         },
-        handler: async (args: { reason?: string; feed_rate?: number; operator_confirmed_clearance?: boolean; wait_until_moved?: boolean }) => {
-            // The work origin is a fixed, operator-set destination, so the
-            // per-call travel limit (meant to bound the blast radius of a
-            // wrong coordinate) does not apply; every other guard does.
-            return executeBoundedMoveAndCapture({
-                x: 0,
-                y: 0,
-                coordinate_system: 'work',
-                reason: args.reason,
-                feed_rate: args.feed_rate,
-                operator_confirmed_clearance: args.operator_confirmed_clearance,
-                wait_until_moved: args.wait_until_moved,
-                unbounded_travel: true,
-            });
-        },
+        handler: async (args: { reason?: string; feed_rate?: number; wait_until_moved?: boolean }) => stageGotoWorkOrigin(args),
     });
 
     registry.register({
         name: 'move_and_capture',
-        description: 'ONE vision-driven XY reposition at the current Z: move, settle-verify, and '
-            + 'capture a position-stamped frame. This is NOT a transport primitive - travel and '
-            + 'sequences belong in staged operator-approved mechanisms (survey_bed, move_z batches, '
-            + 'probing procedures, submit_gcode_job), and rapid sequential calls are refused '
-            + '(pacing guard). XY happens at top gantry height (safe traverse guard) with obstacle '
-            + 'landmarks enforced. No Z parameter by design. Requires an idle machine, toolhead '
+        description: 'ONE vision-driven XY reposition: Z-GATED FIRST (operator ruling 2026-09-21), then move, '
+            + 'settle-verify, and capture a position-stamped frame. Before any XY is commanded the tool '
+            + 'establishes from the position of record that the head is at the safe traverse height '
+            + '(mcpSafeTraverseZ, machine Z328): if it is below, it is raised straight up to it first and the '
+            + 'XY is sent only once that raise has settled; if Z cannot be established (unknown, unreliable) '
+            + 'the call is refused. This is NOT a transport primitive - travel and sequences belong in staged '
+            + 'operator-approved mechanisms (traverse_xy, survey_bed, move_z batches, probing procedures, '
+            + 'submit_gcode_job), and rapid sequential calls are refused (pacing guard). Obstacle landmarks '
+            + 'are checked at the Z the XY actually runs at. No Z parameter by design. Requires an idle machine, toolhead '
             + `off, a stated reason. Travel per call is capped (mcpMaxJogDistance, default ${DEFAULT_MAX_TRAVEL_MM} mm).`,
         inputSchema: {
             type: 'object',
@@ -1270,7 +1365,9 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 operator_confirmed_clearance: {
                     type: 'boolean',
                     description: 'Set true ONLY when the human operator has explicitly confirmed the '
-                        + 'current Z and an obstacle-free path at this Z; skips the homed-first requirement.',
+                        + 'current Z and an obstacle-free path at this Z: the XY then runs at the CURRENT Z '
+                        + '(no raise to the traverse height) and the homed-first requirement is skipped. The '
+                        + 'one escape hatch - never on the model\'s own judgment.',
                 },
                 wait_until_moved: {
                     type: 'boolean',

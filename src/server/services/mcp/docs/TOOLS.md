@@ -26,10 +26,10 @@ session.
 ## Direct motion (each is one approved job)
 
 - `home` — machine home (`G53;G28;G54`; also homes B). Default first step after (re)connecting; raises Z first and clears the NOT-HOMED state. It is not a remedy for a `get_position` reliability of `awaiting-resync` or `stale` — a rejected or aged beat is a reporting fault, not a position fault, and motion is refused until the record recovers on its own (next coherent beat, ~2 s).
-- `goto_work_origin` — move to work X0 Y0. Distinct from `home`.
+- `goto_work_origin` — STAGE a move to work X0 Y0 (confirm page shows the destination in MACHINE coordinates; refused while the origin offset is untrusted). Distinct from `home`, which runs on the call.
 - `move_z {z | z_targets[], coordinate_system: "machine"|"work", feed_rate?, reason}` — single Z target or a batch; one approval covers the list, one `start_gcode_job` per step. Only on the operator's explicit request.
 - `traverse_xy {x?, y? | targets: [{x?, y?}], coordinate_system?: "machine" (default) | "work", feed_rate?, reason}` — law-2 TRANSPORT: an absolute XY target or an ordered `targets` series at the height the head is already at (>= the motion floor), one approval, one `start_gcode_job` per leg, like `move_z`. Refused unless the head is already at/above `mcpMotionFloorZ` (default 320; no override); every leg checked against landmarks and the travel; Z never written; default frame machine (`G53` per step). Use this, never a hand-written file job, to move the head.
-- `move_and_capture` — one guarded XY move followed by a position-stamped frame; the unit of visual alignment.
+- `move_and_capture` — one guarded XY move followed by a position-stamped frame; the unit of visual alignment. Z-gated first: the head is raised to the safe traverse height before any XY, and the call is refused when Z cannot be established.
 - `goto_tool_change_position` — two approved steps: Z up, then XY to the operator-set park spot.
 
 - `restore_work_frame {reason?}` — `G90` + `G54` on their own lines, NO MOTION. The cure for a controller left in the machine workspace by a job that declared `G53` and never handed the frame back: every beat then carries machine coordinates with the work-origin offset still populated, `raw − offset` is impossible, and the position of record refuses everything - including this, which is why it is explicitly allowed while `awaiting-resync` or `stale`. Reports the position before and after. A re-home is not the remedy.
