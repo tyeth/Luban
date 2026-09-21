@@ -261,6 +261,15 @@ start position — expect it, do not act on it.
   height change between consecutive stations, not by the surface's name: spacing × steepest
   credible slope ≪ `z_safe_delta_mm` → `guarded`; a station may sit more than `z_safe_delta_mm`
   above or below its neighbour (steps, pockets, edges, unknown stock) → `stepped`.
+- **Stepped links in `run_probing_gcode`** (`link_mode` `"stepped"` / `"wall"`, between
+  consecutive stations only): a touch-probing traverse at the programmed height. Toward a TOP
+  station a contact lifts `hop_lift_mm` (+Z) and retries; toward a SIDE-MARCH station (a pocket
+  wall) a contact is a wall — back off 1 mm, retreat `hop_lift_mm` along the path just travelled
+  (the only proven-clear direction, never +Z), record it as a `link_contact`, mark the station
+  `blocked`, continue. A contact during the guarded descent at such a link's destination is a
+  `blocked` station, not a crash: the head lifts straight back up the column it came down. A
+  `blocked` station is a normal report outcome; `top_z_machine` (measured, never a guess) caps
+  the +Z lifts at the top; an abort still obeys law 8.
 - **`apply_tool_length_offset`** — the one sanctioned work-origin write: a single `G92` shifting
   work Z by (new − old) trigger height, what the touchscreen wizard does after its two operator
   confirmations. Requires a reliable position and a measurement pair from this connection.

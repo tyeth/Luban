@@ -12,6 +12,7 @@
  * server (config/settings.base is ESM-only and breaks ts-node).
  */
 import { tests as bootstrapPlanTests } from './bootstrapPlan.test';
+import { tests as camLinksTests } from './camLinks.test';
 import { tests as cameraGeometryTests } from './cameraGeometry.test';
 import { tests as cameraModelTests } from './cameraModel.test';
 import { tests as cameraSelectionTests } from './cameraSelection.test';
@@ -22,6 +23,7 @@ import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as machineTravelTests } from './machineTravel.test';
+import { tests as marchCoreTests } from './marchCore.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as probeFeedHealthTests } from './probeFeedHealth.test';
 import { tests as procedureLimitsTests } from './procedureLimits.test';
@@ -59,6 +61,8 @@ const suites: Array<[string, TestCase[]]> = [
     ['jobEnding', jobEndingTests],
     ['landmarkClearance', landmarkClearanceTests],
     ['mjpegFanout', mjpegFanoutTests],
+    ['marchCore', marchCoreTests],
+    ['camLinks', camLinksTests],
 ];
 
 async function main(): Promise<void> {

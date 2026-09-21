@@ -13,8 +13,20 @@ CNC probe):
   as `probe_stock_outline`);
 - `G38.4` / `G38.5` become a probe-away until release;
 - `G0`/`G1` links follow law 2: `link_mode` `"raise"` (default; XY at the traverse height with
-  guarded segmented descents) or `"stepped"` (a touch-probing traverse at the programmed height,
-  lifting `hop_lift_mm` on contact);
+  guarded segmented descents), `"stepped"` (a touch-probing traverse at the programmed height) or
+  `"wall"`. A stepped link heading for a TOP station (a −Z cycle) lifts `hop_lift_mm` (+Z) on
+  contact and retries; a stepped link heading for a SIDE-MARCH station (a pocket wall) treats a
+  contact as a WALL: back off 1 mm, retreat `hop_lift_mm` along the path just travelled (never
+  +Z), record it as a `link_contact` wall point (tip centre, travel direction, the station it was
+  heading for), mark that station `blocked` and continue — `"wall"` forces this on every link. A
+  contact during the guarded descent at a stepped link's destination is a `blocked` station too
+  (the head lifts straight back to the link height and continues), never a crash. Pass
+  `top_z_machine` (a MEASURED top, never a guess): a +Z lift that would rise above it marks the
+  station blocked instead of climbing out of the pocket, and a raise-mode descent contact AT the
+  top (within one guarded 1 mm step) is a blocked station rather than a collision. `blocked`
+  stations appear in the report with `blockedBy`, link contacts under `linkContacts` (and as extra
+  CSV rows), `summary.blocked` counts them. An ABORT still raises straight to the traverse height
+  (law 8), holding only while the probe reads contact;
 - a bare `G0 B<angle>` line is a 3+2 station (raise, then the verified rotation); `B` with XYZ,
   incremental `B` and `A`/`C` are refused;
 - feeds in the file are ignored; `M3`/`M4` (a spinning tool during a probe is a crash), `M0`/`M1`,
