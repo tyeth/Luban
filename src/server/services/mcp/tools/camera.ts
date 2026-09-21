@@ -1,5 +1,8 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
+import fs from 'fs';
+import path from 'path';
+
 import logger from '../../../lib/logger';
 import config from '../../configstore';
 import { mcpBroadcast } from '../index';
@@ -30,6 +33,7 @@ import { clearanceOptions } from '../clearanceContext';
 import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
 import { landmarkStore } from '../landmarks';
 import { probeFeedService } from '../probeFeed';
+import { programFrameRoot } from '../programFrames';
 import {
     assertFreshHeartbeat,
     PositionSnapshot,
@@ -527,6 +531,94 @@ async function previewOne(entry: string): Promise<{ device: string; frame: Captu
     }
 }
 
+
+/**
+ * MACHINE home, shared by the `home` tool and the probe_program `home` op:
+ * Luban's own G53;G28;G54 (home in the machine workspace, reselect workspace
+ * 0), then - unless `waitUntilHomed` is false - wait for two consecutive
+ * identical heartbeats that report homed and idle. With the rotary fitted G28
+ * also homes B: whoever calls this has told the operator the stock will turn.
+ */
+export async function homeMachine(tool: string, waitUntilHomed: boolean = true): Promise<object> {
+    probeFeedService.assertNoOvertravel();
+    const before = getPositionSnapshot();
+    if (before.machineStatus !== 'idle') {
+        throw new McpToolError(`Machine is ${before.machineStatus || 'in an unknown state'}, not idle.`);
+    }
+    const state = connectionManager.getLatestMachineState() as { headStatus?: unknown; headPower?: unknown } | null;
+    const headPower = Number(state?.headPower);
+    if ((Number.isFinite(headPower) && headPower > 0) || state?.headStatus === true || state?.headStatus === 'on') {
+        throw new McpToolError('Toolhead appears to be on (headStatus/headPower); refusing to home.');
+    }
+
+    const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+    if (!channel || typeof channel.executeGcode !== 'function') {
+        throw new McpToolError('The connected channel does not support direct commands.');
+    }
+
+    const issuedAt = Date.now();
+    // Luban's own Home button sends G53; G28; G54 - home in the
+    // machine workspace, then reselect workspace 0. A bare G28 leaves
+    // the controller reporting positions in an unselected workspace
+    // (observed: derived machine Y 464/Z 656 on the A350).
+    const executed = await sendGcodeVisible(channel, tool, 'G53;\nG28;\nG54;');
+    if (executed.result !== 0) {
+        throw new McpToolError(`Homing rejected by controller: ${executed.text || executed.result}`);
+    }
+
+    if (!waitUntilHomed) {
+        return {
+            homed: null,
+            position_verified: false,
+            note: 'wait_until_moved was false: G28 accepted but not awaited (homing takes '
+                + '~15-20s). Poll get_position until isHomed is true and the position is '
+                + 'stable before any motion.',
+        };
+    }
+
+    // Homing on the A350 takes tens of seconds; wait for TWO
+    // consecutive identical heartbeats (position AND offset) that
+    // report homed and idle. A single fresh heartbeat is not enough:
+    // mid-sequence the controller reports from the G53 workspace
+    // (offset zeroed) before G54 reselects workspace 0, and returning
+    // that transient produced a nonsense snapshot on hardware.
+    const deadline = issuedAt + HOME_TIMEOUT_MS;
+    const initialFingerprint = JSON.stringify([before.work, before.originOffset]);
+    let sawChange = false;
+    let previous: string | null = null;
+    while (Date.now() < deadline) {
+        await sleep(HOME_POLL_MS);
+        const now = positionOrNull();
+        if (!now) {
+            continue;
+        }
+        const reportTime = Date.now() - now.reportAgeMs;
+        const fingerprint = JSON.stringify([now.work, now.originOffset]);
+        const stable = fingerprint === previous;
+        previous = fingerprint;
+        if (fingerprint !== initialFingerprint) {
+            sawChange = true;
+        }
+        // The heartbeat lags ~1s, so two identical post-issue beats can
+        // both predate the motion. Require the position to have moved
+        // off its pre-G28 value at least once - homing always travels -
+        // before accepting stability (or 25s, if it started at home).
+        const changeOk = sawChange || Date.now() - issuedAt > 25000;
+        if (reportTime > issuedAt && stable && changeOk && now.isHomed === true && now.machineStatus === 'idle') {
+            return {
+                homed: true,
+                position: now,
+                note: 'Work origins are user-set per workspace and persist across homing. '
+                    + 'Check position.warnings, and if coordinates look wrong verify the frame '
+                    + 'with query_firmware_position before trusting work coordinates.',
+            };
+        }
+    }
+    const last = positionOrNull();
+    throw new McpToolError(`Machine did not report homed within ${HOME_TIMEOUT_MS / 1000}s. `
+        + `Last state: ${JSON.stringify(last && { isHomed: last.isHomed, machineStatus: last.machineStatus })}`);
+}
+
 export function registerCameraTools(registry: ToolRegistry): void {
     registry.register({
         name: 'list_cameras',
@@ -567,6 +659,57 @@ export function registerCameraTools(registry: ToolRegistry): void {
         handler: async () => {
             const frame = await captureFrame();
             return frameContent(frame, { position: positionOrNull() });
+        },
+    });
+
+    registry.register({
+        name: 'get_frame',
+        description: 'Return a frame that was captured earlier, by frame_id: one of the last 12 captures cached in memory '
+            + '(capture_frame, move_and_capture, preview_cameras, visual_servo), or a frame a probe_program `capture` op saved '
+            + 'on its job record (result.ops[].result.file - pass that path as `file`; it is read only from the MCP program-frame '
+            + 'directory). This is how the frames of a one-approval look-rotate-look program are viewed after it finishes. '
+            + 'Read-only, no motion, no new capture.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                frame_id: { type: 'string', description: 'frame_id of a cached frame (from any capture result).' },
+                file: { type: 'string', description: 'Path a probe_program capture op reported as result.file, for when the frame has left the cache.' },
+            },
+            additionalProperties: false,
+        },
+        handler: async (args: { frame_id?: string; file?: string }) => {
+            const frameId = String(args.frame_id || '').trim();
+            let jpg = frameId ? getCachedFrame(frameId) : null;
+            let source: 'cache' | 'file' = 'cache';
+            if (!jpg && args.file) {
+                const file = path.resolve(String(args.file));
+                const root = path.resolve(programFrameRoot());
+                if (!file.startsWith(root + path.sep)) {
+                    throw new McpToolError(`file must be inside the MCP program-frame directory ${root}.`);
+                }
+                if (!fs.existsSync(file)) {
+                    throw new McpToolError(`No frame file at ${file}.`);
+                }
+                jpg = fs.readFileSync(file);
+                source = 'file';
+            }
+            if (!jpg) {
+                throw new McpToolError(`No cached frame "${frameId}" (the cache keeps the last 12); pass the file path a program capture reported.`);
+            }
+            return {
+                mcpContent: [
+                    { type: 'image', data: jpg.toString('base64'), mimeType: 'image/jpeg' },
+                    {
+                        type: 'text',
+                        text: JSON.stringify({
+                            frame_id: frameId || null,
+                            source,
+                            device: frameId ? getCachedFrameDevice(frameId) : null,
+                            file: source === 'file' ? args.file : null,
+                        }),
+                    },
+                ],
+            };
         },
     });
 
@@ -1056,85 +1199,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
             },
             additionalProperties: false,
         },
-        handler: async (args: { wait_until_moved?: boolean }) => {
-            probeFeedService.assertNoOvertravel();
-            const before = getPositionSnapshot();
-            if (before.machineStatus !== 'idle') {
-                throw new McpToolError(`Machine is ${before.machineStatus || 'in an unknown state'}, not idle.`);
-            }
-            const state = connectionManager.getLatestMachineState() as { headStatus?: unknown; headPower?: unknown } | null;
-            const headPower = Number(state?.headPower);
-            if ((Number.isFinite(headPower) && headPower > 0) || state?.headStatus === true || state?.headStatus === 'on') {
-                throw new McpToolError('Toolhead appears to be on (headStatus/headPower); refusing to home.');
-            }
-
-            const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
-            if (!channel || typeof channel.executeGcode !== 'function') {
-                throw new McpToolError('The connected channel does not support direct commands.');
-            }
-
-            const issuedAt = Date.now();
-            // Luban's own Home button sends G53; G28; G54 - home in the
-            // machine workspace, then reselect workspace 0. A bare G28 leaves
-            // the controller reporting positions in an unselected workspace
-            // (observed: derived machine Y 464/Z 656 on the A350).
-            const executed = await sendGcodeVisible(channel, 'home', 'G53;\nG28;\nG54;');
-            if (executed.result !== 0) {
-                throw new McpToolError(`Homing rejected by controller: ${executed.text || executed.result}`);
-            }
-
-            if (args.wait_until_moved === false) {
-                return {
-                    homed: null,
-                    position_verified: false,
-                    note: 'wait_until_moved was false: G28 accepted but not awaited (homing takes '
-                        + '~15-20s). Poll get_position until isHomed is true and the position is '
-                        + 'stable before any motion.',
-                };
-            }
-
-            // Homing on the A350 takes tens of seconds; wait for TWO
-            // consecutive identical heartbeats (position AND offset) that
-            // report homed and idle. A single fresh heartbeat is not enough:
-            // mid-sequence the controller reports from the G53 workspace
-            // (offset zeroed) before G54 reselects workspace 0, and returning
-            // that transient produced a nonsense snapshot on hardware.
-            const deadline = issuedAt + HOME_TIMEOUT_MS;
-            const initialFingerprint = JSON.stringify([before.work, before.originOffset]);
-            let sawChange = false;
-            let previous: string | null = null;
-            while (Date.now() < deadline) {
-                await sleep(HOME_POLL_MS);
-                const now = positionOrNull();
-                if (!now) {
-                    continue;
-                }
-                const reportTime = Date.now() - now.reportAgeMs;
-                const fingerprint = JSON.stringify([now.work, now.originOffset]);
-                const stable = fingerprint === previous;
-                previous = fingerprint;
-                if (fingerprint !== initialFingerprint) {
-                    sawChange = true;
-                }
-                // The heartbeat lags ~1s, so two identical post-issue beats can
-                // both predate the motion. Require the position to have moved
-                // off its pre-G28 value at least once - homing always travels -
-                // before accepting stability (or 25s, if it started at home).
-                const changeOk = sawChange || Date.now() - issuedAt > 25000;
-                if (reportTime > issuedAt && stable && changeOk && now.isHomed === true && now.machineStatus === 'idle') {
-                    return {
-                        homed: true,
-                        position: now,
-                        note: 'Work origins are user-set per workspace and persist across homing. '
-                            + 'Check position.warnings, and if coordinates look wrong verify the frame '
-                            + 'with query_firmware_position before trusting work coordinates.',
-                    };
-                }
-            }
-            const last = positionOrNull();
-            throw new McpToolError(`Machine did not report homed within ${HOME_TIMEOUT_MS / 1000}s. `
-                + `Last state: ${JSON.stringify(last && { isHomed: last.isHomed, machineStatus: last.machineStatus })}`);
-        },
+        handler: async (args: { wait_until_moved?: boolean }) => homeMachine('home', args.wait_until_moved !== false),
     });
 
     registry.register({

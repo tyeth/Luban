@@ -1,6 +1,8 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention (planProbeProgram takes the
 // probe_program arguments verbatim).
+import fs from 'fs';
+
 import { KeepOutError, ObstacleBox, insideSweptCylinder, normalizeKeepOut } from './envelopeChecks';
 import { ExpandedGroup, GroupExpandError, expandProgramGroups } from './programGroups';
 import { mcpBroadcast } from './index';
@@ -35,6 +37,8 @@ import {
     procedureStopRequested,
     rotateB,
     isProcedureStopped,
+    checkProcedureStop,
+    sleep,
 } from './probing';
 import {
     RefResolveError,
@@ -47,14 +51,27 @@ import {
     validateRef,
 } from './programRefs';
 import { B_AXIS_DEG, MAX_SWEPT_RADIUS_MM, within } from './procedureLimits';
+import { captureFrame } from './camera';
+import { programFramePath } from './programFrames';
+import {
+    CAPTURE_EVENT_BUDGET,
+    CaptureOpArgs,
+    HOME_EVENT_BUDGET,
+    PROGRAM_OP_KINDS,
+    captureOpArgs,
+    homeOrderError,
+    isProgramOpKind,
+} from './programOps';
 import { McpToolError } from './registry';
 import { AxisNamespace, missingGeometryNote, programSeedNamespaces } from './rotaryGeometry';
 import { deriveStockSection } from './stockGeometry';
+import { homeMachine } from './tools/camera';
 import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
 
 // A composite probing PROGRAM: an ordered list of operations - rotate the
 // rotary axis, top-surface scans (path / grid), probe sequences (side and
-// end marches) - staged ONCE, approved ONCE on a single confirm page that
+// end marches), no-motion camera captures and a closing machine home
+// (programOps.ts) - staged ONCE, approved ONCE on a single confirm page that
 // enumerates every operation's envelope and every rotation, and run by ONE
 // runner that hands the machine from operation to operation. Operator
 // request 2026-09-05 after a four-face survey that took 18 approvals.
@@ -74,7 +91,7 @@ import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
 export { describeRef, isRef, lookupPath, refOpIds, resolveRef, substituteRefs } from './programRefs';
 export type { RefSpec } from './programRefs';
 
-export type ProgramOpKind = 'rotate_b' | 'surface_path' | 'surface_grid' | 'sequence' | 'stock_outline';
+export type ProgramOpKind = 'rotate_b' | 'surface_path' | 'surface_grid' | 'sequence' | 'stock_outline' | 'capture' | 'home';
 
 export interface ProgramOp {
     id: string;
@@ -101,8 +118,12 @@ export interface ProbeProgramPlan {
     keepOut: ObstacleBox[];
     /** `group` ops expanded at staging (for the page header). */
     groups: ExpandedGroup[];
-    /** Estimated job events this program writes (100 + 120/station + 60/probe + 20/rotation). */
+    /** Estimated job events this program writes (100 + 120/station + 60/probe + 20/rotation + 10/capture + 30/home). */
     eventBudget: number;
+    /** The program ends with a `home` op: every axis to its switches, B back to 0. */
+    homesAtEnd: boolean;
+    /** No-motion frame captures in the program, by op id. */
+    captures: string[];
 }
 
 const MAX_OPS = 80;
@@ -179,7 +200,7 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
         throw err;
     }
     if (!Array.isArray(args.ops) || args.ops.length < 1) {
-        throw new McpToolError('ops is required: operations of kind rotate_b | surface_path | surface_grid | sequence | stock_outline | group.');
+        throw new McpToolError(`ops is required: operations of kind ${PROGRAM_OP_KINDS.join(' | ')} | group.`);
     }
     let expandedOps: unknown[];
     let groups: ExpandedGroup[];
@@ -208,6 +229,11 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
     const rotations: number[] = [];
     let anyRotate = false;
     let eventBudget = 100;
+    const captures: string[] = [];
+    const homeOrder = homeOrderError(expandedOps.map((raw) => String((raw as { kind?: unknown } | null)?.kind || '')));
+    if (homeOrder) {
+        throw new McpToolError(homeOrder);
+    }
 
     expandedOps.forEach((raw, index) => {
         const where = `ops[${index}]`;
@@ -227,8 +253,8 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
         }
         ids.add(id);
         const kind = String(op.kind || '') as ProgramOpKind;
-        if (!['rotate_b', 'surface_path', 'surface_grid', 'sequence', 'stock_outline'].includes(kind)) {
-            throw new McpToolError(`${where}: kind must be rotate_b, surface_path, surface_grid, sequence or stock_outline.`);
+        if (!isProgramOpKind(kind)) {
+            throw new McpToolError(`${where}: kind must be one of ${PROGRAM_OP_KINDS.join(', ')} (or group).`);
         }
         const onFail = op.on_fail === 'skip' ? 'skip' : 'stop';
         const opArgs: { [key: string]: unknown } = {};
@@ -238,6 +264,39 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
             }
         }
 
+        if (kind === 'capture') {
+            // No motion: a frame from wherever the previous op left the head,
+            // stamped with the position of record and B, saved on the job.
+            let capture: CaptureOpArgs;
+            try {
+                capture = captureOpArgs(opArgs, where);
+            } catch (err) {
+                throw new McpToolError((err as Error).message);
+            }
+            captures.push(id);
+            eventBudget += CAPTURE_EVENT_BUDGET;
+            ops.push({ id, kind, args: { settle_ms: capture.settle_ms, label: capture.label }, on_fail: onFail, refs: [] });
+            previews.push({
+                id,
+                text: `; CAPTURE FRAME${capture.label ? ` "${capture.label}"` : ''}: NO MOTION - wait ${capture.settle_ms} ms for the platform/rotary to settle, `
+                    + 'then one frame from the selected camera, stamped with the machine position and B, saved on the job record (result.file; view with get_frame).',
+            });
+            return;
+        }
+        if (kind === 'home') {
+            if (Object.keys(opArgs).length) {
+                throw new McpToolError(`${where} (home): takes no arguments.`);
+            }
+            eventBudget += HOME_EVENT_BUDGET;
+            ops.push({ id, kind, args: {}, on_fail: 'stop', refs: [] });
+            previews.push({
+                id,
+                text: '; MACHINE HOME (last op): G53; G28; G54 - Z rises first, then every axis drives to its limit switch (home X-19 Y342 Z328).\n'
+                    + `; ALSO HOMES B: stock on the rotary turns back to B0${anyRotate ? ` from the B ${rotations[rotations.length - 1]} the program left it at` : ''}. `
+                    + 'Verified by two identical homed+idle heartbeats.',
+            });
+            return;
+        }
         if (kind === 'rotate_b') {
             const b = Number(opArgs.b);
             if (!within(b, B_AXIS_DEG)) {
@@ -324,6 +383,8 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
         keepOut,
         groups,
         eventBudget,
+        homesAtEnd: ops.length > 0 && ops[ops.length - 1].kind === 'home',
+        captures,
     };
 }
 
@@ -335,8 +396,14 @@ export function describeProbeProgramAsGcode(plan: ProbeProgramPlan): string {
         '; every operation runs through its own runner (position of record, crash guard, hop envelope, slow zone,',
         `; <= 5 mm descent segments) and ends raised at the safe traverse height Z${plan.hopZ}; the next op starts there.`,
         plan.rotations.length
-            ? `; THE STOCK WILL ROTATE: B schedule ${plan.rotations.map((b) => `${b} deg`).join(' -> ')} (absolute), only with the toolhead at Z >= ${plan.hopZ}.`
-            : '; no rotations in this program.',
+            ? `; THE STOCK WILL ROTATE: B schedule ${plan.rotations.map((b) => `${b} deg`).join(' -> ')}${plan.homesAtEnd ? ' -> 0 (home)' : ''} (absolute), only with the toolhead at Z >= ${plan.hopZ}.`
+            : `; no rotations in this program${plan.homesAtEnd ? ' (the closing home still homes B to 0)' : ''}.`,
+        ...(plan.homesAtEnd
+            ? ['; ENDS WITH MACHINE HOME: G53; G28; G54 - every axis to its switches, B to 0; the program does not end raised in place but AT HOME (X-19 Y342 Z328).']
+            : []),
+        ...(plan.captures.length
+            ? [`; CAMERA CAPTURES (no motion): ${plan.captures.length} frame(s) - op(s) ${plan.captures.join(', ')} - saved on the job record, view with get_frame.`]
+            : []),
         '; A failed operation (no contact where required, hop-guard contact, alarm, rotation not settled) stops the program',
         '; raised at the traverse height and keeps every earlier result; on_fail: skip records the failure and continues.',
         '; References ({from: "<op>.<path>"}, mid/diff/min/max of paths, +/- a number or path) resolve at run time from earlier',
@@ -425,6 +492,46 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
         announce(`op-${op.id}-start`, `${index + 1}/${plan.ops.length} ${op.kind}`);
         try {
             probeFeedService.assertNoOvertravel();
+            if (op.kind === 'capture') {
+                // No motion. The head is wherever the previous op ended (raised,
+                // or at the staged position for a first op); the frame says so.
+                checkProcedureStop();
+                const settleMs = Number(op.args.settle_ms) || 0;
+                if (settleMs > 0) {
+                    await sleep(settleMs);
+                }
+                const frame = await captureFrame();
+                const snapshot = getPositionSnapshot();
+                const file = programFramePath(startedAt, plan.name, op.id);
+                fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
+                const outcome = {
+                    frameId: frame.frameId,
+                    file,
+                    label: op.args.label ?? null,
+                    capturedAt: frame.capturedAt,
+                    device: frame.device,
+                    provider: frame.provider,
+                    source: frame.source,
+                    mimeType: frame.mimeType,
+                    machine: snapshot.machine,
+                    reliability: snapshot.reliability,
+                    b: snapshot.b,
+                    note: 'No motion. View with get_frame {frame_id} (last 12 cached) or get_frame {file}. A frame finds things, it clears nothing.',
+                };
+                results[op.id] = outcome;
+                report.push({ id: op.id, kind: op.kind, b: currentB, status: 'completed', resolvedRefs: resolved, startedAt: opStarted, endedAt: Date.now(), result: outcome });
+                announce(`op-${op.id}-done`, `frame ${frame.frameId} at machine (${snapshot.machine.x}, ${snapshot.machine.y}, ${snapshot.machine.z}) B${snapshot.b ?? '?'}`);
+                continue;
+            }
+            if (op.kind === 'home') {
+                checkProcedureStop();
+                const outcome = await homeMachine(`probe_program:${op.id}`, true);
+                currentB = 0;
+                results[op.id] = outcome;
+                report.push({ id: op.id, kind: op.kind, b: currentB, status: 'completed', resolvedRefs: resolved, startedAt: opStarted, endedAt: Date.now(), result: outcome });
+                announce(`op-${op.id}-done`, 'machine homed (B 0)');
+                continue;
+            }
             if (op.kind === 'rotate_b') {
                 const b = Number(op.args.b);
                 const requireZ = Number(op.args.require_z_at_least);
@@ -470,7 +577,7 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
             // A requested stop (stop_gcode_job) ends the PROGRAM, whatever the
             // op's on_fail says.
             const stop = procedureStopRequested();
-            if (trip || stop || op.on_fail === 'stop' || op.kind === 'rotate_b') {
+            if (trip || stop || op.on_fail === 'stop' || op.kind === 'rotate_b' || op.kind === 'home') {
                 stoppedAt = op.id;
                 // Every sub-runner raises to the traverse height on its own
                 // abort; make sure of it here for the program as a whole

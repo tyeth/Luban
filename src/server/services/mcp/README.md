@@ -444,6 +444,24 @@ standalone tool's result object. The four-face survey that took 18 approvals is 
 `rotate_b 90 → sequence (centre) → surface_path N–S (expected from the centre) → surface_path
 W–E → sequence (sides) → rotate_b 180 → …`.
 
+**`capture` and `home` ops (2026-09-21).** The operator asked for "move over the stock, photo,
+rotate B to 180, photo, home" as ONE approval; every motion in it had a program op or a gated
+tool, the two non-probing steps did not, so it cost three confirm pages. `capture {settle_ms?,
+label?}` is NO motion: after a damping wait (`CAPTURE_SETTLE_MS`) it takes one frame from the
+selected camera from wherever the previous op left the head, stamps it with the position of
+record and B, saves it under `<userData>/mcp-program-frames/<stamp>_<program>/<opId>.jpg`
+(`programFrames.ts`) and reports `frameId` + `file` on the op result; `get_frame {frame_id |
+file}` shows it afterwards (the in-memory cache keeps 12, a program may take more). `home {}`
+is the same `G53;G28;G54` + two-identical-homed-beats wait as the `home` tool (now the shared
+`homeMachine` in `tools/camera.ts`), allowed only as the LAST op (`programOps.homeOrderError`)
+because it drives every axis to its switches and homes B, so nothing after it could relate to
+what came before; the page says the program ends AT HOME, not raised in place, and folds the
+B → 0 into the rotation schedule. Both kinds are refused inside nothing: a `group` may repeat a
+`capture` per angle (`label: "B ${b}"`), never a `home`. Pure rules and tests: `programOps.ts`,
+`tests/programOps.test.ts`. `survey_bed b_levels` was reviewed as the alternative and rejected:
+a per-B mosaic has no plane, seam checks would read a rotated scene as a knocked camera, and
+it would duplicate the `rotate_b` guard set.
+
 **New stock from the jig alone (mcp/48, 2026-09-06).** What the manual four-face survey did by
 hand is now in the program tooling (work plan and hardware test order in
 [docs/NEW_STOCK_SURVEY_TODO.md](docs/NEW_STOCK_SURVEY_TODO.md)):
