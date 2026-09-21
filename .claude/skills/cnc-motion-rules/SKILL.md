@@ -19,7 +19,8 @@ item, quoting the tool result — not an essay):
    `heartbeat` or `cached-offset` (never `awaiting-resync` or `stale`), `warnings` empty,
    `isHomed` true, `machineStatus` idle. `get_stored_state` for landmarks, limits, geometry.
    Not homed → homing is itself a motion (law 1), and it also homes B: stock on the rotary
-   rotates — say so before staging it.
+   rotates — say so before calling it. `home` runs on the call, with no confirm page (law 6):
+   the operator's word in chat is its whole authority, so get that word first.
 2. **Frame.** Every number you plan with is MACHINE frame, or the job declares the WORK frame
    and the MCP resolves it (§2). Never convert a file's coordinates by hand. No bare `Z`.
 3. **Height.** Any XY move over 1 mm runs at or above the MOTION FLOOR — machine **Z320**
@@ -114,9 +115,15 @@ item, quoting the tool result — not an essay):
    way, but ONLY while a procedure or MCP motion is in progress; pressed by hand with the
    machine idle it just flashes the pill. Do not disconnect the probe feed while anything might
    move.
-6. **Chat is not a motion gate — the staged job is.** Every motion tool stages a job and needs
-   the operator's click: `traverse_xy`, `move_z`, `home`, `goto_tool_change_position`,
-   `submit_gcode_job`, and every `probe_*` / `run_tool_setter` / `probe_program`. After
+6. **Chat is not a motion gate — the staged job is.** Every transport, Z and measuring tool
+   stages a job and needs the operator's click: `traverse_xy`, `move_z`, `goto_work_origin`,
+   `goto_tool_change_position`, `submit_gcode_job`, and every `probe_*` / `run_tool_setter` /
+   `probe_program`. **Two tools move on the call itself, with no confirm page** (operator
+   ruling, 2026-09-21): `home` — homing is safe: Z rises first, then every axis to its switch,
+   B included; it still needs the operator's explicit word (law 1) and a reliable position
+   (§3), and you say the stock will turn before calling it — and `move_and_capture`, the
+   ≤ 100 mm vision nudge, which is Z-gated inside the tool (law 7). Everything else that moves
+   the head reaches the operator as a page. After
    staging, call `start_gcode_job {job_id, wait_for_approval_ms: 110000}` (a keep-alive, not a
    review budget — it does not scale with job size); `approved: false, timed_out: true` means
    call again, never restage. The operator never relays a code through chat. **Deliver the
@@ -127,7 +134,11 @@ item, quoting the tool result — not an essay):
    program form, do not skip the page, do not lecture.
 7. **Use tools for their purpose, through the MCP surface only.** `move_and_capture` is a
    vision reposition (≤ 100 mm, a safety cap the assistant never raises, pacing-guarded), not
-   transport. Transport is `traverse_xy`. Z is `move_z` with `coordinate_system: "machine"`.
+   transport, and it is **Z-gated first**: before any XY is commanded the tool proves from the
+   position of record that the head is at the park height (machine Z328), raises it straight
+   up there first if it is not, and refuses the call outright when Z cannot be established —
+   you do not pre-check this, and you never pass `operator_confirmed_clearance` to skip it
+   (§4). Transport is `traverse_xy`. Z is `move_z` with `coordinate_system: "machine"`.
    Programs someone generated (Luban, CAM) are exactly what `submit_gcode_job` is for — law 7
    forbids file jobs as TRANSPORT, not file jobs. A script looping motion calls is an
    unsupervised procedure without a confirm page. Never touch the backend, configstore, or
@@ -247,14 +258,20 @@ start position — expect it, do not act on it.
 - **`apply_tool_length_offset`** — the one sanctioned work-origin write: a single `G92` shifting
   work Z by (new − old) trigger height, what the touchscreen wizard does after its two operator
   confirmations. Requires a reliable position and a measurement pair from this connection.
-- **`operator_confirmed_clearance`** — skips the homed-first / traverse-floor guard on a direct
-  move. Only on the operator's explicit words, for the corridor they named, in an emergency.
+- **`operator_confirmed_clearance`** — on `move_and_capture` only: skips the homed-first guard
+  and the raise-to-park-height gate, so the XY runs at the CURRENT Z in the corridor the operator
+  named. Only on the operator's explicit words, in an emergency; an unknown Z is refused even
+  then. `goto_work_origin` has no such switch — its confirm page is the operator's word.
 
 ## 5. Vocabulary (operator-defined)
 
 - **Home / homing** = machine home, `G53;G28;G54` like Luban's button — ALWAYS. Also homes B.
   It clears the NOT-HOMED state; it is not a remedy for `awaiting-resync` or `stale`.
-- **Goto work origin** = XY to work (0, 0) at the current Z. Never called "home".
+- **Goto work origin** = XY to work (0, 0) at the current Z, STAGED like `traverse_xy`: the
+  confirm page shows the destination in MACHINE coordinates (a work origin is operator-set and
+  dies on a reboot, so "work zero" can be anywhere on the bed — read the operator the machine
+  numbers), and it is refused while the origin offset is not the heartbeat's own or the position
+  is not trusted (§3). Never called "home".
 - **Motion floor** = `mcpMotionFloorZ` = machine Z320: the lowest Z any XY move may happen at.
 - **Park height** (a.k.a. traverse height) = `mcpSafeTraverseZ` = machine Z328: where procedures
   hop, retreat on abort, and end. `get_stored_state.limits` reports both.
@@ -304,6 +321,12 @@ the pair every time; the start call is what reaches the operator's click.
 // Transport at the traverse height (default frame machine; series form: "targets": [{"x","y"}, ...])
 traverse_xy {"x": 290, "y": 105, "coordinate_system": "machine", "reason": "..."}
 start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+// Work origin: XY to work (0, 0) at the current Z, STAGED - the page shows the MACHINE destination
+goto_work_origin {"reason": "..."}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+// Machine home runs ON THE CALL - no confirm page, no start_gcode_job (operator ruling 2026-09-21: safe).
+// Needs the operator's explicit word (law 1) and a reliable position; homes B too - say the stock will turn.
+home {}
 // Z, one operator-confirmed step per target
 move_z {"z": 328, "coordinate_system": "machine", "reason": "..."}
 start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
