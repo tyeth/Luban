@@ -87,10 +87,12 @@ It can sit differently after every power cycle, be knocked, be re-aimed, or be a
 - `probe_surface_path` — N minus-Z stations along a line: per-station contact, best-fit slope, flatness.
 - `probe_surface_grid` — serpentine minus-Z grid: Z matrix, best-fit plane and residuals, ASCII height map. Both scans hop at last contact plus `z_safe_delta_mm`.
 - `probe_stock_outline` — from an estimate of a block, find its top, true outline and centre in one approved procedure.
-- `probe_program` — composite program: an ordered list of operations, derived references, jig geometry, keep-out and groups under one approval. The new-stock survey lives here. Op kinds: `rotate_b`, `surface_path`, `surface_grid`, `sequence`, `stock_outline`, `capture` (no motion: a position- and B-stamped frame saved on the job record) and `home` (machine home, last op only, homes B too) — so "hop, capture, rotate_b 180, capture, home" is one click.
+- `probe_program` — composite program: an ordered list of operations, derived references, jig geometry, keep-out and groups under one approval. The new-stock survey lives here. Op kinds: `rotate_b`, `surface_path`, `surface_grid`, `sequence`, `stock_outline`, `capture {x?, y?}` (a position- and B-stamped frame saved on the job record; with x/y it first hops there at the traverse height, travel- and obstacle-checked like a sequence hop, else no motion) and `home` (machine home, last op only, homes B too) — so "capture at (x, y), rotate_b 180, capture, home" is one click.
 - `set_probe_geometry` — jig and tool constants a rotary `probe_program` can reference as the `axis` namespace. Measured or operator-stated, with a reason.
 
 ## CAM probing programs
+
+- FreeCAD side: `docs/post/freecad_probe_emitter.py` writes a `run_probing_gcode` program with `(PROBE ...)` nominals, normals and tolerances read straight off the selected faces (the Path Probe operation carries none of that, so it is bypassed, along with the post processor). `frame="machine"` + a measured `App.Placement` for a re-clamped part.
 
 - `run_probing_gcode` — stage a CAM-generated probing program (Fusion 360, FreeCAD, any Grbl/Marlin post, or hand-written). `G38` cycles are translated into staged probes, never sent raw. Returns an inspection report.
 - `get_inspection_report` — re-render a finished or aborted probing run's report in another format, such as Fusion's.

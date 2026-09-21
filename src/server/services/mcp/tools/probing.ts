@@ -964,8 +964,9 @@ ${describeProbeOutlinePlanAsGcode(plan)}`;
         description: 'Stage a COMPOSITE probing program for ONE human approval: an ordered list of operations - '
             + 'rotate_b (turn the rotary axis to an absolute B, toolhead at/above the traverse height), '
             + 'surface_path, surface_grid, sequence and stock_outline (the same arguments as the standalone tools), '
-            + 'capture (NO motion: one camera frame from wherever the previous op left the head, stamped with position '
-            + 'and B, saved on the job record - view it afterwards with get_frame) and home (machine home, LAST op only; '
+            + 'capture (one camera frame, stamped with position and B, saved on the job record - view it afterwards with '
+            + 'get_frame; give it x/y and it first hops there at the traverse height like a sequence hop, else no motion) '
+            + 'and home (machine home, LAST op only; '
             + 'it also homes B) - run by one '
             + 'runner that hands the machine from op to op, each ending raised at the traverse height. Numbers an op '
             + 'cannot know at staging are REFERENCES to earlier results: {"from": "<opId>.<path>", "plus"?, "minus"?, '
@@ -983,8 +984,8 @@ ${describeProbeOutlinePlanAsGcode(plan)}`;
             + 'raised, keeping earlier results) if the value resolves outside them. A failed op stops the program '
             + 'unless on_fail: "skip". Result: per-op status and the standalone tool\'s result object (stations, fits, '
             + 'timing), plus the B schedule. Use it to string the four faces, sides and end of a rotary stock into one '
-            + 'approved operation instead of 18 approvals - or "hop, capture, rotate_b 180, capture, home" to look at both '
-            + 'sides of a rotary part under one click.',
+            + 'approved operation instead of 18 approvals - or "capture at (x, y), rotate_b 180, capture, home" to look '
+            + 'at both sides of a rotary part under one click.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -993,7 +994,8 @@ ${describeProbeOutlinePlanAsGcode(plan)}`;
                     type: 'array',
                     description: 'Ordered operations. Each: {id, kind, on_fail?, ...args}. kinds: rotate_b {b, require_z_at_least?, '
                         + 'swept_radius_mm? (largest reach of THIS stock and clamping about the axis - adds a tip-outside-the-cylinder check)}; '
-                        + 'capture {settle_ms? (default 500, max 5000), label?} - no motion, a frame from the current position; '
+                        + 'capture {x?, y?, settle_ms? (default 500, max 5000), label?} - a frame; with x/y (machine) it raises and hops '
+                        + 'there first (travel + obstacle checked), without them no motion; '
                         + 'home {} - G53;G28;G54, every axis to its switches AND B to 0, allowed only as the last op; '
                         + 'surface_path / surface_grid / sequence / stock_outline: the standalone tool arguments, where ANY number (start_z_machine, '
                         + 'expected_z_machine, floor_z_machine, start_x/end_x, sequence hop x/y and descend z, expected_profile.circle.*) '

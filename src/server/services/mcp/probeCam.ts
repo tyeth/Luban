@@ -51,6 +51,7 @@ import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 import DataStorage from '../../DataStorage';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 
 // run_probing_gcode (mcp/49, operator request 2026-09-07): a probing program
 // written by CAM (Fusion 360, FreeCAD, a Grbl/Marlin post, or by hand) is
@@ -415,7 +416,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
         }
         const guardTop = toZ + DESCENT_GUARD_MM;
         probeFeedService.clearExpectedContact();
-        if (zNow > guardTop + 1e-9) {
+        if (zNow > guardTop + TRAVERSE_Z_TOLERANCE_MM) {
             await descendInSegments(`${tag}:descend:${label}`, zNow, guardTop, 'probe', plan.march.sensorDelayMs);
         }
         let gz = Math.min(Math.max(zNow, toZ), guardTop);
@@ -450,7 +451,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
             const label = `L${step.line}`;
             if (step.kind === 'rotate') {
                 probeFeedService.clearExpectedContact();
-                if (current.z < plan.hopZ - 1e-9) {
+                if (current.z < plan.hopZ - TRAVERSE_Z_TOLERANCE_MM) {
                     await moveMachineSettled(`${tag}:raise:${label}`, { z: plan.hopZ }, TRAVEL_FEED);
                     current = { ...current, z: plan.hopZ };
                 }
@@ -470,7 +471,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
                         await guardedDescent(label, step.target.z);
                     }
                 } else if (plan.linkMode === 'raise') {
-                    if (current.z < plan.hopZ - 1e-9) {
+                    if (current.z < plan.hopZ - TRAVERSE_Z_TOLERANCE_MM) {
                         await moveMachineSettled(`${tag}:raise:${label}`, { z: plan.hopZ }, TRAVEL_FEED);
                     }
                     await moveMachineSettled(`${tag}:traverse:${label}`, { x: step.target.x, y: step.target.y }, TRAVEL_FEED);
@@ -593,7 +594,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
         }
 
         probeFeedService.clearExpectedContact();
-        if (current.z < plan.hopZ - 1e-9) {
+        if (current.z < plan.hopZ - TRAVERSE_Z_TOLERANCE_MM) {
             await moveMachineSettled(`${tag}:final-raise`, { z: plan.hopZ }, TRAVEL_FEED);
         }
         const result = build(null);

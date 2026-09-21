@@ -127,14 +127,16 @@ dominates; on stock known to vary < 5 mm use `z_safe_delta_mm: 5`, `confirm_pass
 
 Ops: `rotate_b` (absolute B; refused unless the head is at/above the traverse height;
 `swept_radius_mm` adds the tip-outside-the-cylinder check), `surface_path`, `surface_grid`,
-`sequence`, `stock_outline`, `capture {settle_ms?, label?}` (NO motion: one frame from wherever
-the previous op left the head, stamped with position and B, saved on the job record — read it
-back with `get_frame {frame_id}` or `get_frame {file}`), `home {}` (machine home, the LAST op
+`sequence`, `stock_outline`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
+position and B, saved on the job record — read it back with `get_frame {frame_id}` or
+`get_frame {file}`; with `x/y` it first raises and hops there at 328, travel- and
+obstacle-checked like a sequence hop — a hop-only `sequence` is refused as pure motion, so this
+is how a program places the camera; without `x/y` it is NO motion), `home {}` (machine home, the LAST op
 only; it also homes B — the page says so), and `group {for_b: [0, 90, 180, 270], ops}` which
 runs its inner ops once per angle (`${b}` in strings; a `capture` may sit inside, a `home` may
 not). Every probing op ends raised at 328; a program that ends with `home` ends AT HOME.
-**Look at both sides of a rotary part under one click**: `sequence {hop x,y}` → `capture` →
-`rotate_b 180` → `capture` → `home`. References (grammar in
+**Look at both sides of a rotary part under one click**: `capture {x, y}` → `rotate_b 180` →
+`capture` → `home`. References (grammar in
 `cnc-motion-rules` §8) may sit in any numeric argument; bounds are mandatory (law 3); order ops
 so every reference points backwards; `on_fail: "skip"` lets a non-critical op fail without
 ending the program (a requested stop always ends it). Staging REFUSES a program whose event

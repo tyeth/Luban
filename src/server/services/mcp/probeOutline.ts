@@ -54,6 +54,7 @@ import {
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 
 // probe_stock_outline (operator request 2026-09-06): find a block's top and
 // its true outline - and so its centre - from an ESTIMATE of where it is and
@@ -457,7 +458,7 @@ export async function runProbeOutlineProcedure(plan: ProbeOutlinePlan): Promise<
         }
         const guardTop = toZ + DESCENT_GUARD_MM;
         probeFeedService.clearExpectedContact();
-        if (zNow > guardTop + 1e-9) {
+        if (zNow > guardTop + TRAVERSE_Z_TOLERANCE_MM) {
             await descendInSegments(`${tag}:descend:${label}`, zNow, guardTop, 'probe', plan.march.sensorDelayMs);
         }
         let gz = Math.min(Math.max(zNow, toZ), guardTop);
@@ -491,7 +492,7 @@ export async function runProbeOutlineProcedure(plan: ProbeOutlinePlan): Promise<
             if (i > 0) {
                 const prev = plan.topPoints[i - 1];
                 const hopZ = Math.min(round3((lastContactZ === null ? plan.startZMachine : lastContactZ) + plan.hopLiftMm), plan.hopZ);
-                if (hopZ > currentZ + 1e-9) {
+                if (hopZ > currentZ + TRAVERSE_Z_TOLERANCE_MM) {
                     probeFeedService.clearExpectedContact();
                     await moveMachineSettled(`${tag}:lift:${tp.label}`, { z: hopZ }, TRAVEL_FEED);
                 }

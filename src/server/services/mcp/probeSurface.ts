@@ -70,6 +70,7 @@ import {
     summarizeZ,
 } from './surfaceScan';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 
 // Top-surface scans with the spindle touch probe: N stations along a line
 // (probe_surface_path) or over a serpentine grid (probe_surface_grid), each
@@ -779,7 +780,7 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                 + '- the approach to station 1 must descend, never rise into the surface. Re-stage from a verified position.');
         }
         announce('descend-from', `Z${zNow} (${known.source}) to guard top Z${guardTop} in <= ${DESCENT_SEGMENT_MM} mm segments (crash guard armed)`);
-        if (zNow > guardTop + 1e-9) {
+        if (zNow > guardTop + TRAVERSE_Z_TOLERANCE_MM) {
             await descendInSegments(`${plan.tool}:descend`, zNow, guardTop, 'probe', plan.sensorDelayMs);
         }
         let gz = Math.min(zNow === null ? guardTop : Math.max(zNow, plan.startZMachine), guardTop);

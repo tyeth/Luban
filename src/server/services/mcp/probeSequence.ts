@@ -31,6 +31,7 @@ import { McpToolError } from './registry';
 import { outsideTravel } from './machineTravel';
 import { MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
 import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 
 // A whole measurement CIRCUIT as ONE staged, operator-approved procedure
 // (operator-requested 2026-09-02: "I won't do separate approvals"). The
@@ -362,7 +363,7 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                     throw new ProcedureAbort(`Descend step ${stepIndex}: the toolhead is at machine Z${zNow} (${known.source}), BELOW the `
                         + `planned descent target Z${step.z} - a descent never rises. Re-stage from a verified position.`);
                 }
-                if (zNow !== null && zNow > guardTop + 1e-9) {
+                if (zNow !== null && zNow > guardTop + TRAVERSE_Z_TOLERANCE_MM) {
                     // Operator law 2026-09-05: descents in <= 5 mm sensor-checked
                     // segments, never one long move toward the work.
                     await descendInSegments(`seq:descend:${stepIndex}`, zNow, guardTop, 'probe', plan.sensorDelayMs);

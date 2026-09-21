@@ -22,7 +22,7 @@ import { McpToolError } from './registry';
 import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
 import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot, safeTraverseZ } from './tools/machine';
 import { ProcedureAbort, ProcedureStopped } from './procedureAbort';
-import { planRaiseToTop } from './traversePlan';
+import { TRAVERSE_Z_TOLERANCE_MM, planRaiseToTop } from './traversePlan';
 
 // The shared sensor-gated motion engine: settled single moves on the direct
 // path, contact/release sensing against a probe feed channel, and the
@@ -736,7 +736,10 @@ export async function rotateB(tool: string, targetDeg: number, requireZAtLeast: 
     checkProcedureStop();
     probeFeedService.assertNoOvertravel();
     const known = knownMachinePosition();
-    if (known.position.z === null || known.position.z < requireZAtLeast - 1e-9) {
+    // The heartbeat reads the park height as 327.999 (POSITION_EPSILON_MM); a
+    // 1e-9 comparison here refused every rotation from home on 2026-09-21,
+    // exactly as run_tool_setter did on 2026-09-16 before its tolerance fix.
+    if (known.position.z === null || known.position.z < requireZAtLeast - TRAVERSE_Z_TOLERANCE_MM) {
         throw new ProcedureAbort(`Rotation refused: toolhead machine Z is ${known.position.z} (${known.source}), below the required Z${requireZAtLeast}.`);
     }
     const snapshot = getPositionSnapshot();
@@ -843,7 +846,7 @@ export async function descendInSegments(
     options: { feed?: number; serialCheck?: boolean } = {}
 ): Promise<{ segments: number }> {
     const feed = options.feed === undefined ? TRAVEL_FEED : options.feed;
-    if (toZ >= fromZ - 1e-9) {
+    if (toZ >= fromZ - TRAVERSE_Z_TOLERANCE_MM) {
         await moveMachineSettled(tool, { z: Number(toZ.toFixed(3)) }, feed);
         return { segments: 1 };
     }
