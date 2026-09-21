@@ -46,6 +46,7 @@ import {
     isProcedureStopped,
     abortRaiseToTop,
 } from './probing';
+import { GPIO_SENSOR_DELAY_MS, HOP_LIFT_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
@@ -172,9 +173,9 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
     if (!['json', 'fusion', 'renishaw', 'csv', 'grbl'].includes(reportFormat)) {
         throw new McpToolError('report_format must be fusion, renishaw, csv, grbl or json.');
     }
-    const hopLift = args.hop_lift_mm === undefined ? 2 : Number(args.hop_lift_mm);
-    if (!Number.isFinite(hopLift) || hopLift < 0.5 || hopLift > 10) {
-        throw new McpToolError('hop_lift_mm must be 0.5-10.');
+    const hopLift = args.hop_lift_mm === undefined ? HOP_LIFT_MM.default : Number(args.hop_lift_mm);
+    if (!within(hopLift, HOP_LIFT_MM)) {
+        throw new McpToolError(`hop_lift_mm must be ${HOP_LIFT_MM.min}-${HOP_LIFT_MM.max}.`);
     }
 
     const snapshot = getPositionSnapshot();
@@ -240,13 +241,8 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
         linkMode,
         hopLiftMm: hopLift,
         onMiss,
-        march: {
-            coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law: never 2 mm
-            fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-            backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-            sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 30), 10000),
-            confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
-        },
+        // Operator law 2026-09-05: never 2 mm; GPIO sensor floor (procedureLimits.ts).
+        march: resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS }),
         hopZ,
         staged: { x, y, z },
         originOffset,
@@ -574,7 +570,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
                 s = Math.min(s + plan.march.coarseStepMm, length);
                 const p = { x: r3(current.x + unit.x * s), y: r3(current.y + unit.y * s), z: r3(current.z + unit.z * s) };
                 await moveMachineSettled(`${tag}:away:${label}`, p, COARSE_FEED);
-                const sensed = await senseReleaseAfter('probe', t0, Math.max(plan.march.sensorDelayMs * 4, 3500));
+                const sensed = await senseReleaseAfter('probe', t0, releaseTimeoutFor(plan.march.sensorDelayMs));
                 if (!sensed.contact) {
                     releasedAt = s;
                 }

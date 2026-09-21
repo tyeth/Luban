@@ -9,6 +9,7 @@
 // target being the travel limit.
 //
 // No server imports: unit-testable with ts-node.
+import { B_AXIS_DEG, MAX_DWELL_S, within } from './procedureLimits';
 
 export type Xyz = { x: number; y: number; z: number };
 
@@ -405,7 +406,7 @@ export function parseProbingGcode(text: string, options: ParseOptions): ParsedPr
                 seconds = axis.P > 30 ? axis.P / 1000 : axis.P;
             }
             if (seconds > 0) {
-                steps.push({ kind: 'dwell', line: lineNo, source: raw.trim(), seconds: Math.min(seconds, 60) });
+                steps.push({ kind: 'dwell', line: lineNo, source: raw.trim(), seconds: Math.min(seconds, MAX_DWELL_S) });
             }
             return;
         }
@@ -425,8 +426,8 @@ export function parseProbingGcode(text: string, options: ParseOptions): ParsedPr
                 throw new ProbeGcodeError(lineNo, 'B word without a motion mode (G0/G1).');
             }
             const b = Number(axis.B);
-            if (!Number.isFinite(b) || b < -360 || b > 360) {
-                throw new ProbeGcodeError(lineNo, `B${axis.B} is outside -360..360.`);
+            if (!within(b, B_AXIS_DEG)) {
+                throw new ProbeGcodeError(lineNo, `B${axis.B} is outside ${B_AXIS_DEG.min}..${B_AXIS_DEG.max}.`);
             }
             if (currentB === null || Math.abs(b - currentB) > 1e-6) {
                 steps.push({ kind: 'rotate', line: lineNo, source: raw.trim(), bDeg: r3(b), fromB: currentB });

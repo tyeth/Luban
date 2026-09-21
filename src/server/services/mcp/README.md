@@ -173,6 +173,9 @@ mcp/
                  lift a link to the park height, report both (issue #141)
   machineTravel.ts  pure: the toolhead travel (stated -> observed -> nominal), clampBand /
                  clampRay / outsideTravel with the clipping reported (issues #139, #140)
+  procedureLimits.ts  pure: every cap a planner applies to its ARGUMENTS, named once with its
+                 reason (march steps, delays, passes, survey pitch, feeds, waits) - caps on what
+                 may be asked for, never statements about the machine
   positionOfRecord.ts  pure: frame matching, controller-echo record, offset judgement,
                  the gcode sequence counter
   machinePosition.ts  pure: the judged machine position of record + reliability state

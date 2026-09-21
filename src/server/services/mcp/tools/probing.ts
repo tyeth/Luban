@@ -41,6 +41,14 @@ import { clampBand, describeClipping } from '../machineTravel';
 import { clearanceOptions } from '../clearanceContext';
 import { landmarkStore } from '../landmarks';
 import { SurveyLeg, describeSurveyLegs, planSurvey } from '../surveyPlan';
+import {
+    MAX_OVERLAP_FRACTION,
+    MAX_SURVEY_LEVELS,
+    SURVEY_LINK_FEED_FACTOR,
+    SURVEY_MARGIN_MM,
+    SURVEY_PITCH_MM,
+    clampTo,
+} from '../procedureLimits';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -621,8 +629,8 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             if (rawLevels.some((level) => !Number.isFinite(level))) {
                 throw new McpToolError('z_levels must be finite machine Z heights.');
             }
-            if (rawLevels.length > 6) {
-                throw new McpToolError('At most 6 z_levels: each one is a full pass of the grid.');
+            if (rawLevels.length > MAX_SURVEY_LEVELS) {
+                throw new McpToolError(`At most ${MAX_SURVEY_LEVELS} z_levels: each one is a full pass of the grid.`);
             }
             const levels = [...new Set(rawLevels.map((level) => Number(level.toFixed(3))))].sort((a, b) => b - a);
             const belowFloor = levels.filter((level) => level < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM);
@@ -632,13 +640,13 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     + 'operator_confirmed_clearance: true only on the operator\'s explicit word that these heights '
                     + 'clear everything on the bed.');
             }
-            let pitch = Math.min(Math.max(Number(args.pitch_mm) || 80, 20), 160);
+            let pitch = clampTo(args.pitch_mm, SURVEY_PITCH_MM);
             let pitchNote = `pitch ${pitch} mm (stated)`;
             const planeZ = Number.isFinite(Number(args.plane_z)) ? Number(args.plane_z) : 0;
             if (args.overlap_fraction !== undefined) {
                 const overlap = Number(args.overlap_fraction);
-                if (!Number.isFinite(overlap) || overlap < 0 || overlap > 0.9) {
-                    throw new McpToolError('overlap_fraction must be between 0 and 0.9.');
+                if (!Number.isFinite(overlap) || overlap < 0 || overlap > MAX_OVERLAP_FRACTION) {
+                    throw new McpToolError(`overlap_fraction must be between 0 and ${MAX_OVERLAP_FRACTION}.`);
                 }
                 // A verified model, or nothing: the field of view is the whole
                 // basis of the number, and guessing it is what this replaces.
@@ -650,7 +658,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     + `field of view on plane Z ${planeZ} at ${(overlap * 100).toFixed(0)}% overlap`
                     + `${fov.extrapolated ? ' (EXTRAPOLATED: this Z is outside the band the model was solved over)' : ''}`;
             }
-            const margin = Math.min(Math.max(Number(args.margin_mm) || 10, 0), 50);
+            const margin = clampTo(args.margin_mm, SURVEY_MARGIN_MM);
 
             // Serpentine grid. The bounds default to the toolhead's travel
             // inset by the margin, and stated bounds are clamped INTO that
@@ -770,7 +778,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                             continue;
                         }
                         if (leg.kind === 'hop') {
-                            await moveMachineSettled(leg.lifted ? 'survey:lifted-link' : 'survey:move', { x: leg.x, y: leg.y }, TRAVEL_FEED * 4);
+                            await moveMachineSettled(leg.lifted ? 'survey:lifted-link' : 'survey:move', { x: leg.x, y: leg.y }, TRAVEL_FEED * SURVEY_LINK_FEED_FACTOR);
                             continue;
                         }
                         let frame;

@@ -28,6 +28,7 @@ import {
 } from './probing';
 import { McpToolError } from './registry';
 import { outsideTravel } from './machineTravel';
+import { MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
 import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // A whole measurement CIRCUIT as ONE staged, operator-approved procedure
@@ -165,8 +166,8 @@ export function planProbeSequence(args: {
                 z: Number((dz / norm).toFixed(6)),
             };
             const travel = Number(raw.max_travel_mm);
-            if (!Number.isFinite(travel) || travel < 1 || travel > 150) {
-                throw new McpToolError(`${at}: max_travel_mm required (1-150).`);
+            if (!within(travel, MARCH_TRAVEL_MM)) {
+                throw new McpToolError(`${at}: max_travel_mm required (${MARCH_TRAVEL_MM.min}-${MARCH_TRAVEL_MM.max}).`);
             }
             const limit = {
                 x: virtual.x + unit.x * travel,
@@ -221,11 +222,9 @@ export function planProbeSequence(args: {
 
     return {
         steps,
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
-        fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
-        confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
+        // Coarse / fine / backoff / sensor delay / confirm passes, clamped to
+        // the named limits (procedureLimits.ts; operator law 2026-09-05: never 2 mm).
+        ...resolveMarchParams(args),
         hopZ,
         staged,
     };
@@ -329,7 +328,7 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
         phases.push({ phase, note });
         mcpBroadcast('mcp:activity', { tool: 'probe_sequence', phase, note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const results: {
         name: string;
         status: 'contact' | 'no_contact';

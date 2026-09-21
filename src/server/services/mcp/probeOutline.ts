@@ -42,6 +42,15 @@ import {
     isProcedureStopped,
     abortRaiseToTop,
 } from './probing';
+import {
+    GPIO_SENSOR_DELAY_MS,
+    MAX_DESCENT_BAND_MM,
+    SIDE_DEFAULT_TRAVEL_MM,
+    SIDE_MAX_TRAVEL_MM,
+    SIDE_MIN_REACH_MARGIN_MM,
+    SIDE_TRAVEL_BEYOND_ESTIMATE_MM,
+    resolveMarchParams,
+} from './procedureLimits';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
@@ -221,8 +230,8 @@ export function planProbeOutline(args: OutlineArgs, extraObstacles: ObstacleBox[
     if (floorZ >= startZ) {
         throw new McpToolError(`floor_z_machine ${floorZ} must be below start_z_machine ${startZ}.`);
     }
-    if (startZ - floorZ > 150) {
-        throw new McpToolError('start_z_machine - floor_z_machine exceeds 150 mm.');
+    if (startZ - floorZ > MAX_DESCENT_BAND_MM) {
+        throw new McpToolError(`start_z_machine - floor_z_machine exceeds ${MAX_DESCENT_BAND_MM} mm.`);
     }
     const topCount = Math.round(num(args.top_points, 'top_points', 1, 5, 3));
     const holeTol = num(args.hole_tolerance_mm, 'hole_tolerance_mm', 0.2, 50, 2);
@@ -257,12 +266,16 @@ export function planProbeOutline(args: OutlineArgs, extraObstacles: ObstacleBox[
     }));
 
     // Side points: start outside the estimate by overextend_mm and march
-    // side_max_travel_mm - generous by default (25) so the combined error of
-    // the centre and the width estimate cannot hide a face; never less than
-    // what reaches the estimate itself plus 10 mm.
-    const travel = Math.min(150, num(args.side_max_travel_mm, 'side_max_travel_mm', 5, 150, Math.max(25, round3(2 * overextend + 10))));
-    if (travel < overextend + 5) {
-        throw new McpToolError(`side_max_travel_mm ${travel} does not even reach the estimated face (overextend ${overextend} mm + 5): raise it.`);
+    // side_max_travel_mm - generous by default so the combined error of the
+    // centre and the width estimate cannot hide a face; never less than what
+    // reaches the estimate itself plus a margin (procedureLimits.ts).
+    const travel = Math.min(SIDE_MAX_TRAVEL_MM.max, num(
+        args.side_max_travel_mm, 'side_max_travel_mm', SIDE_MAX_TRAVEL_MM.min, SIDE_MAX_TRAVEL_MM.max,
+        Math.max(SIDE_DEFAULT_TRAVEL_MM, round3(2 * overextend + SIDE_TRAVEL_BEYOND_ESTIMATE_MM))
+    ));
+    if (travel < overextend + SIDE_MIN_REACH_MARGIN_MM) {
+        throw new McpToolError(`side_max_travel_mm ${travel} does not even reach the estimated face (overextend ${overextend} mm `
+            + `+ ${SIDE_MIN_REACH_MARGIN_MM}): raise it.`);
     }
     const sidePoints: OutlineSidePoint[] = [];
     for (const side of sides) {
@@ -313,13 +326,8 @@ export function planProbeOutline(args: OutlineArgs, extraObstacles: ObstacleBox[
         sidePoints,
         hopLiftMm: hopLift,
         sideStandoffMm: sideStandoff,
-        march: {
-            coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law: never 2 mm
-            fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-            backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-            sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 30), 10000),
-            confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
-        },
+        // Operator law 2026-09-05: never 2 mm; GPIO sensor floor (procedureLimits.ts).
+        march: resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS }),
         hopZ,
         staged: { x, y, z },
         tipDiameterMm: geometry ? geometry.tipDiameter : null,

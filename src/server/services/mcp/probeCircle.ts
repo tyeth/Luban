@@ -19,6 +19,21 @@ import {
     abortRaiseToTop,
 } from './probing';
 import { DESCENT_GUARD_MM } from './probeSequence';
+import {
+    CIRCLE_APPROACH_CLEARANCE_MM,
+    CIRCLE_COARSE_STEP_MM,
+    CIRCLE_CONFIRM_PASSES,
+    CIRCLE_POINTS,
+    CIRCLE_PROBE_DEPTH_MM,
+    CIRCLE_RESIDUAL_WARN_MM,
+    MAX_CIRCLE_DIAMETER_MM,
+    MAX_STATED_MACHINE_Z_MM,
+    MIN_RADIAL_APPROACH_MM,
+    clampCount,
+    clampTo,
+    releaseTimeoutFor,
+    resolveMarchParams,
+} from './procedureLimits';
 import { McpToolError } from './registry';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
@@ -92,13 +107,13 @@ export function planProbeCircle(args: {
     const inside = args.inside === true;
     const dMin = Number(args.diameter_min_mm);
     const dMax = Number(args.diameter_max_mm);
-    if (!Number.isFinite(dMin) || !Number.isFinite(dMax) || dMin <= 0 || dMax < dMin || dMax > 100) {
+    if (!Number.isFinite(dMin) || !Number.isFinite(dMax) || dMin <= 0 || dMax < dMin || dMax > MAX_CIRCLE_DIAMETER_MM) {
         throw new McpToolError('diameter_min_mm and diameter_max_mm are required: the operator\'s bounds '
-            + 'on the feature diameter (0 < min <= max <= 100). They bound every march - a wrong guess '
+            + `on the feature diameter (0 < min <= max <= ${MAX_CIRCLE_DIAMETER_MM}). They bound every march - a wrong guess `
             + 'aborts instead of pressing on.');
     }
-    const pointCount = Math.min(Math.max(Math.round(Number(args.points) || 8), 4), 16);
-    const approach = Math.min(Math.max(Number(args.approach_clearance_mm) || 5, 1), 20);
+    const pointCount = clampCount(args.points, CIRCLE_POINTS);
+    const approach = clampTo(args.approach_clearance_mm, CIRCLE_APPROACH_CLEARANCE_MM);
 
     const position = getPositionSnapshot();
     const { x, y, z } = position.machine;
@@ -133,16 +148,16 @@ export function planProbeCircle(args: {
         }
         center = { x: centerX, y: centerY };
         topZ = Number(args.top_z_machine);
-        if (!Number.isFinite(topZ) || topZ <= 0 || topZ > 400) {
+        if (!Number.isFinite(topZ) || topZ <= 0 || topZ > MAX_STATED_MACHINE_Z_MM) {
             throw new McpToolError('top_z_machine is required: the toolhead machine Z at which the probe '
                 + 'tip touches the feature TOP - a measured or operator-stated number, never a guess.');
         }
-        const probeDepth = Math.min(Math.max(Number(args.probe_depth_mm) || 3, 0.5), 20);
+        const probeDepth = clampTo(args.probe_depth_mm, CIRCLE_PROBE_DEPTH_MM);
         probeZ = Number((topZ - probeDepth).toFixed(3));
         startRadius = Number((dMax / 2 + approach).toFixed(3));
         limitRadius = Number((dMin / 2).toFixed(3));
-        if (startRadius - limitRadius < 1) {
-            throw new McpToolError('Less than 1 mm between the approach start radius and the '
+        if (startRadius - limitRadius < MIN_RADIAL_APPROACH_MM) {
+            throw new McpToolError(`Less than ${MIN_RADIAL_APPROACH_MM} mm between the approach start radius and the `
                 + 'min-diameter floor - widen approach_clearance_mm or the diameter bounds.');
         }
     }
@@ -176,11 +191,10 @@ export function planProbeCircle(args: {
         startRadiusMm: startRadius,
         limitRadiusMm: limitRadius,
         points,
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 0.5, 0.2), 2),
-        fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
-        confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 2), 1), 5),
+        // Radial marches: 0.5 mm coarse default, fewer confirm passes per
+        // azimuth - and, since 2026-09-21, the same 1 mm coarse cap as every
+        // other march (operator law 2026-09-05; this planner alone allowed 2).
+        ...resolveMarchParams(args, { coarse: CIRCLE_COARSE_STEP_MM, passes: CIRCLE_CONFIRM_PASSES }),
         staged,
     };
 }
@@ -329,7 +343,7 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
         phases.push({ phase, note });
         mcpBroadcast('mcp:activity', { tool: 'probe_circle', phase, note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const contacts: { azimuthDeg: number; x: number; y: number; radius: number; passRadii: number[]; spreadMm: number }[] = [];
 
     const radialXY = (azimuthRad: number, r: number) => ({
@@ -521,8 +535,8 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
                     + `diameter is ${tipMin}..${tipMax} mm). Fit residuals rms ${fit.rmsResidual} / max `
                     + `${fit.maxResidual} mm - direction-dependent residuals mean an out-of-round tip or `
                     + `feature. Worst per-point confirm spread ${worstSpread} mm. All in MACHINE coordinates.`,
-            warning: fit.maxResidual > 0.2
-                ? 'Max fit residual exceeds 0.2 mm: the feature or the probe tip is significantly '
+            warning: fit.maxResidual > CIRCLE_RESIDUAL_WARN_MM
+                ? `Max fit residual exceeds ${CIRCLE_RESIDUAL_WARN_MM} mm: the feature or the probe tip is significantly `
                     + 'out of round, or a contact was bad. Inspect residualsMm by azimuth.'
                 : undefined,
         };

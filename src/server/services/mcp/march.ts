@@ -1,4 +1,5 @@
 import { mcpBroadcast } from './index';
+import { releaseTimeoutFor } from './procedureLimits';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
@@ -98,7 +99,7 @@ export async function marchToContact(
     params: MarchParams,
     announce: Announce
 ): Promise<MarchContact | null> {
-    const releaseTimeoutMs = Math.max(params.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(params.sensorDelayMs);
     const move = async (tool: string, s: number, feed: number) => {
         await moveMachineSettled(tool, wordsAlong(start, unit, s), feed);
     };
@@ -281,7 +282,7 @@ export async function steppedTraverse(
             const back = at(s);
             const t1 = Date.now();
             await moveMachineSettled(`${tag}:hop-back:${name}`, words(back), STEPPED_HOP_FEED);
-            const released = await senseReleaseAfter('probe', t1, Math.max(params.sensorDelayMs * 4, 3500));
+            const released = await senseReleaseAfter('probe', t1, releaseTimeoutFor(params.sensorDelayMs));
             if (released.contact) {
                 throw new ProcedureAbort(`Stepped traverse "${name}": probe still triggered after backing off ${STEPPED_HOP_STEP_MM} mm `
                     + `at (${back.x}, ${back.y}, ${back.z}).`);

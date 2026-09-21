@@ -46,6 +46,7 @@ import {
     substituteRefs,
     validateRef,
 } from './programRefs';
+import { B_AXIS_DEG, MAX_SWEPT_RADIUS_MM, within } from './procedureLimits';
 import { McpToolError } from './registry';
 import { AxisNamespace, missingGeometryNote, programSeedNamespaces } from './rotaryGeometry';
 import { deriveStockSection } from './stockGeometry';
@@ -239,8 +240,8 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
 
         if (kind === 'rotate_b') {
             const b = Number(opArgs.b);
-            if (!Number.isFinite(b) || b < -360 || b > 360) {
-                throw new McpToolError(`${where} (rotate_b): b is required, absolute degrees in -360..360.`);
+            if (!within(b, B_AXIS_DEG)) {
+                throw new McpToolError(`${where} (rotate_b): b is required, absolute degrees in ${B_AXIS_DEG.min}..${B_AXIS_DEG.max}.`);
             }
             const requireZ = opArgs.require_z_at_least === undefined ? hopZ : Number(opArgs.require_z_at_least);
             if (!Number.isFinite(requireZ) || requireZ < hopZ) {
@@ -252,8 +253,8 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
             let sweptRadius: number | null = null;
             if (opArgs.swept_radius_mm !== undefined && opArgs.swept_radius_mm !== null) {
                 sweptRadius = Number(opArgs.swept_radius_mm);
-                if (!Number.isFinite(sweptRadius) || sweptRadius <= 0 || sweptRadius > 200) {
-                    throw new McpToolError(`${where} (rotate_b): swept_radius_mm must be 0-200 (largest reach of the stock and clamping about the axis).`);
+                if (!Number.isFinite(sweptRadius) || sweptRadius <= 0 || sweptRadius > MAX_SWEPT_RADIUS_MM) {
+                    throw new McpToolError(`${where} (rotate_b): swept_radius_mm must be 0-${MAX_SWEPT_RADIUS_MM} (largest reach of the stock and clamping about the axis).`);
                 }
                 if (!seeds.axis) {
                     throw new McpToolError(`${where} (rotate_b): swept_radius_mm needs the rotary axis and probe length. ${missingGeometryNote()}`);

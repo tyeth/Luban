@@ -21,6 +21,7 @@ import {
 } from './probing';
 import { McpToolError } from './registry';
 import { MIN_USEFUL_MARCH_MM, clampRay } from './machineTravel';
+import { MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
 import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // Point probing with the spindle-mounted touch probe (normally-open, probe
@@ -72,8 +73,8 @@ export function planProbePoint(args: {
         throw new McpToolError('Z probing is downward only (direction -1).');
     }
     const maxTravelMm = Number(args.max_travel_mm);
-    if (!Number.isFinite(maxTravelMm) || maxTravelMm < 1 || maxTravelMm > 150) {
-        throw new McpToolError('max_travel_mm is required: how far the probe may march before aborting (1-150).');
+    if (!within(maxTravelMm, MARCH_TRAVEL_MM)) {
+        throw new McpToolError(`max_travel_mm is required: how far the probe may march before aborting (${MARCH_TRAVEL_MM.min}-${MARCH_TRAVEL_MM.max}).`);
     }
 
     const position = getPositionSnapshot();
@@ -121,11 +122,9 @@ export function planProbePoint(args: {
         maxTravelMm,
         limitCoord: Number(limitCoord.toFixed(3)),
         travelClippedBy: clippedBy,
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.2), 1), // operator law 2026-09-05: never 2 mm
-        fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 100), 10000),
-        confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
+        // Coarse / fine / backoff / sensor delay / confirm passes, clamped to
+        // the named limits (procedureLimits.ts; operator law 2026-09-05: never 2 mm).
+        ...resolveMarchParams(args),
     };
 }
 
@@ -203,7 +202,7 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         phases.push({ phase, coord: Number(coord.toFixed(3)), note });
         mcpBroadcast('mcp:activity', { tool: 'probe_point', phase, axis: plan.axis, coord: Number(coord.toFixed(3)), note });
     };
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const startCoord = plan.start[plan.axis];
     const towards = (value: number) => (plan.direction === 1
         ? Math.min(value, plan.limitCoord) : Math.max(value, plan.limitCoord));

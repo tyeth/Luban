@@ -39,6 +39,7 @@ import {
     requirePlanningTravel,
 } from './machine';
 import { reliableForMotion } from '../machinePosition';
+import { DIRECT_MOVE_FEED, TRACK_PATCH_PX, TRACK_SEARCH_RADIUS_PX, clampCount, clampTo } from '../procedureLimits';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
 // action only. move_and_capture performs ONE bounded XY move at the current
@@ -47,7 +48,7 @@ import { reliableForMotion } from '../machinePosition';
 // and door interlock stay in charge.
 
 const DEFAULT_MAX_TRAVEL_MM = 100;
-const DEFAULT_FEED_RATE = 1500;
+const DEFAULT_FEED_RATE = DIRECT_MOVE_FEED.default;
 const SETTLE_TOLERANCE_MM = 0.1;
 const SETTLE_TIMEOUT_MS = 30000;
 const SETTLE_POLL_MS = 250;
@@ -313,7 +314,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     if (!['work', 'machine'].includes(coordinateSystem)) {
         throw new McpToolError('coordinate_system must be "work" or "machine".');
     }
-    const feedRate = Math.min(Math.max(Number(args.feed_rate) || DEFAULT_FEED_RATE, 100), 3000);
+    const feedRate = clampTo(args.feed_rate, DIRECT_MOVE_FEED);
 
     const before = getPositionSnapshot();
     assertSafeToMove(before, args.operator_confirmed_clearance === true);
@@ -894,9 +895,9 @@ export function registerCameraTools(registry: ToolRegistry): void {
             if (!Number.isFinite(u) || !Number.isFinite(v)) {
                 throw new McpToolError('point.u and point.v must be numbers.');
             }
-            let patch = Math.round(Number(args.patch_size) || 41);
-            patch = Math.min(Math.max(patch % 2 === 0 ? patch + 1 : patch, 11), 101);
-            const radius = Math.min(Math.max(Math.round(Number(args.search_radius) || 120), 20), 250);
+            let patch = Math.round(Number(args.patch_size) || TRACK_PATCH_PX.default);
+            patch = Math.min(Math.max(patch % 2 === 0 ? patch + 1 : patch, TRACK_PATCH_PX.min), TRACK_PATCH_PX.max);
+            const radius = clampCount(args.search_radius, TRACK_SEARCH_RADIUS_PX);
 
             let expected: { du: number; dv: number } | undefined;
             if (args.expected_shift) {

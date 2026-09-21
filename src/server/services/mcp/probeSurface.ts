@@ -29,6 +29,19 @@ import {
     isProcedureStopped,
     abortRaiseToTop,
 } from './probing';
+import {
+    GPIO_SENSOR_DELAY_MS,
+    HOP_LIFT_MM,
+    MAX_DESCENT_BAND_MM,
+    MAX_PROFILE_RADIUS_MM,
+    MAX_TIP_RADIUS_MM,
+    SURFACE_COARSE_STEP_MM,
+    SURFACE_SLOW_ZONE_MM,
+    clampTo,
+    releaseTimeoutFor,
+    resolveMarchParams,
+    within,
+} from './procedureLimits';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
 import {
@@ -193,14 +206,15 @@ function parseProfile(raw: unknown, stations: SurfaceStation[], startZ: number, 
     const centerX = Number(circle.center_x);
     const centerZ = Number(circle.center_z_contact);
     const radius = Number(circle.radius);
-    if (!Number.isFinite(centerX) || !Number.isFinite(centerZ) || !Number.isFinite(radius) || radius <= 0 || radius > 200) {
-        throw new McpToolError('expected_profile.circle needs finite center_x, center_z_contact (toolhead Z with the tip on the axis) and radius (0-200).');
+    if (!Number.isFinite(centerX) || !Number.isFinite(centerZ) || !Number.isFinite(radius) || radius <= 0 || radius > MAX_PROFILE_RADIUS_MM) {
+        throw new McpToolError('expected_profile.circle needs finite center_x, center_z_contact (toolhead Z with the tip on the axis) '
+            + `and radius (0-${MAX_PROFILE_RADIUS_MM}).`);
     }
     let tipRadius: number;
     if (circle.tip_radius !== undefined) {
         tipRadius = Number(circle.tip_radius);
-        if (!Number.isFinite(tipRadius) || tipRadius < 0 || tipRadius > 15) {
-            throw new McpToolError('expected_profile.circle.tip_radius must be 0-15 mm.');
+        if (!Number.isFinite(tipRadius) || tipRadius < 0 || tipRadius > MAX_TIP_RADIUS_MM) {
+            throw new McpToolError(`expected_profile.circle.tip_radius must be 0-${MAX_TIP_RADIUS_MM} mm.`);
         }
     } else {
         const geometry = probeGeometry();
@@ -247,8 +261,8 @@ function finishPlan(
     if (floorZ >= startZ) {
         throw new McpToolError(`floor_z_machine ${floorZ} must be below start_z_machine ${startZ}.`);
     }
-    if (startZ - floorZ > 150) {
-        throw new McpToolError(`start_z_machine - floor_z_machine = ${(startZ - floorZ).toFixed(1)} mm exceeds 150 mm.`);
+    if (startZ - floorZ > MAX_DESCENT_BAND_MM) {
+        throw new McpToolError(`start_z_machine - floor_z_machine = ${(startZ - floorZ).toFixed(1)} mm exceeds ${MAX_DESCENT_BAND_MM} mm.`);
     }
 
     const position = getPositionSnapshot();
@@ -278,9 +292,9 @@ function finishPlan(
     if (hopMode !== 'guarded' && hopMode !== 'stepped') {
         throw new McpToolError('hop_mode must be "guarded" (hop at last contact + z_safe_delta, contact aborts) or "stepped" (touch-probing traverse that lifts on contact).');
     }
-    const hopLiftMm = args.hop_lift_mm === undefined ? 2 : Number(args.hop_lift_mm);
-    if (!Number.isFinite(hopLiftMm) || hopLiftMm < 0.5 || hopLiftMm > 10) {
-        throw new McpToolError('hop_lift_mm must be 0.5-10.');
+    const hopLiftMm = args.hop_lift_mm === undefined ? HOP_LIFT_MM.default : Number(args.hop_lift_mm);
+    if (!within(hopLiftMm, HOP_LIFT_MM)) {
+        throw new McpToolError(`hop_lift_mm must be ${HOP_LIFT_MM.min}-${HOP_LIFT_MM.max}.`);
     }
 
     // Law 4 (mcp/48): station-1 descent, every hop at its lowest possible
@@ -308,17 +322,12 @@ function finishPlan(
         worstHopMm,
         hopZ,
         staged: { x, y, z },
-        // Operator (2026-09-05, job cdbc29371b97): never 2 mm - the coarse
-        // step is also the press into the probe wherever it finds the
-        // surface. 1 mm max; 0.5 when the step cadence can carry it.
-        coarseStepMm: Math.min(Math.max(Number(args.coarse_step_mm) || 1, 0.5), 1),
-        fineStepMm: Math.min(Math.max(Number(args.fine_step_mm) || 0.1, 0.02), 0.5),
-        backoffMm: Math.min(Math.max(Number(args.backoff_mm) || 1, Number(args.fine_step_mm) || 0.1), 3),
-        // Floor 30 ms: on the GPIO transport the trigger led the controller
-        // reply on every contact of jobs 1db4/d8f6 (tightest lead 5 ms).
-        sensorDelayMs: Math.min(Math.max(Number(args.sensor_delay_ms) || 300, 30), 10000),
-        confirmPasses: Math.min(Math.max(Math.round(Number(args.confirm_passes) || 3), 1), 10),
-        slowZoneMm: Math.min(Math.max(Number(args.slow_zone_mm) || 1, 0.3), env.zSafeDeltaMm),
+        // Operator (2026-09-05, job cdbc29371b97): never 2 mm. The surface
+        // scans floor the coarse step at 0.5 and run on the GPIO transport's
+        // 30 ms sensor floor - both named, with their reasons, in
+        // procedureLimits.ts.
+        ...resolveMarchParams(args, { coarse: SURFACE_COARSE_STEP_MM, delay: GPIO_SENSOR_DELAY_MS }),
+        slowZoneMm: clampTo(args.slow_zone_mm, { ...SURFACE_SLOW_ZONE_MM, max: env.zSafeDeltaMm }),
         expectedZMachine: profile && expectedZ === null ? circleExpectedZ(profile, stations[0].x) : expectedZ,
         floorExplicit: args.floor_z_machine !== undefined && args.floor_z_machine !== null && args.floor_z_machine !== '',
         profile,
@@ -523,7 +532,7 @@ async function marchDownZ(
     announce: (phase: string, note?: string) => void
 ): Promise<{ contactZ: number; passContacts: number[]; spreadMm: number; approach: 'slow-zone' | 'coarse-contact'; worstPressMm: number } | null> {
     const travel = Number((startZ - floorZ).toFixed(3));
-    const releaseTimeoutMs = Math.max(plan.sensorDelayMs * 4, 3500);
+    const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const zAt = (s: number) => Number((startZ - s).toFixed(3));
     const move = async (tool: string, s: number, feed: number) => {
         await moveMachineSettled(tool, { z: zAt(s) }, feed);
@@ -895,7 +904,7 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
             // crash guard for the hop.
             const t0 = Date.now();
             await moveMachineSettled(`${plan.tool}:retract:${station.label}`, { z: retractTo }, TRAVEL_FEED);
-            const released = await senseReleaseAfter('probe', t0, Math.max(plan.sensorDelayMs * 4, 3500));
+            const released = await senseReleaseAfter('probe', t0, releaseTimeoutFor(plan.sensorDelayMs));
             if (released.contact) {
                 throw new ProcedureAbort(`Station "${station.label}": probe still triggered after retracting to Z${retractTo} - stuck probe or feed fault.`);
             }
