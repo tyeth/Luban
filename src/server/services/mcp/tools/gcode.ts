@@ -16,6 +16,7 @@ import { McpToolError, ToolRegistry } from '../registry';
 import { planTraverseXy } from '../traversePlan';
 import { JobFrame, TRANSPORT_REFUSAL, isPureTransport, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
+import { stagingFrameContext, validateStagedEnvelope } from './staging';
 import { TRAVEL_EPSILON_MM } from '../machineTravel';
 import {
     EVENT_POLL_MS,
@@ -45,29 +46,6 @@ import {
 
 const HEAD_TYPES = ['cnc', 'laser', 'printing'];
 const JOB_FRAMES: JobFrame[] = ['machine', 'work'];
-
-/**
- * Live context for resolveJobFrame(): the work-origin Z offset the position
- * of record currently holds and whether it can be trusted for resolving a
- * work-frame job's extents to machine coordinates. With no machine or no
- * heartbeat a machine-frame job can still be staged; a work-frame one is
- * accepted with its machine extents marked unresolved.
- */
-function stagingFrameContext(frameArgument: JobFrame | null) {
-    let originOffsetZ: number | null = null;
-    let offsetReliable = false;
-    let machineZMax: number | null = null;
-    try {
-        const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-        machineZMax = size ? size.z : null;
-        const position = getPositionSnapshot();
-        originOffsetZ = position.originOffset.z;
-        offsetReliable = position.originOffsetSource === 'heartbeat' && position.warnings.length === 0;
-    } catch (err) {
-        // Not connected / no heartbeat yet: resolution falls back to "unresolved".
-    }
-    return { frameArgument, originOffsetZ, offsetReliable, machineZMax };
-}
 
 interface JobChannel {
     executeGcode?: (gcode: string) => Promise<{ result: number; text?: string }>;
@@ -865,7 +843,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 ? `z-series ${coordinateSystem} [${targets.map((t) => t.toFixed(1)).join(', ')}] - ${String(args.reason).slice(0, 40)}`
                 : `z-move ${coordinateSystem} Z${targetZ.toFixed(1)} (${delta >= 0 ? '+' : ''}${delta.toFixed(1)}mm) - ${String(args.reason).slice(0, 40)}`;
 
-            const validation = validateGcode(reviewText);
+            const validation = validateStagedEnvelope(reviewText, 'move_z');
             const job = jobManager.submit(reviewText, name, 'cnc', validation, 'direct', isBatch ? steps : undefined);
             job.waitUntilMoved = args.wait_until_moved !== false;
 
@@ -998,7 +976,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 throw err;
             }
             const isBatch = plan.steps.length > 1;
-            const validation = validateGcode(plan.reviewText);
+            const validation = validateStagedEnvelope(plan.reviewText, 'traverse_xy');
             const stepGcodes = isBatch ? plan.steps.map((step) => step.gcode) : undefined;
             const job = jobManager.submit(plan.reviewText, plan.name, 'cnc', validation, 'direct', stepGcodes);
             job.waitUntilMoved = args.wait_until_moved !== false;

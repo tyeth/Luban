@@ -268,6 +268,14 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(isPureTransport(validateGcode(long.join('\n'))), false, 'beyond it, the file is doing something');
     }],
 
+    ['G28 is homing travel the extents cannot see, so it is reported beside them', () => {
+        const report = validateGcode('G90\nG53;\nG28; home\nG1 Z300\nG54;');
+        assert.equal(report.usesHoming, true);
+        assert.equal(report.motionLineCount, 1, 'G28 is not a G0..G3 motion line');
+        assert.ok(report.warnings.some((w) => w.includes('G28') && w.includes('do NOT include the homing travel')), report.warnings.join('\n'));
+        assert.equal(validateGcode(MOVE_Z_MACHINE).usesHoming, false);
+    }],
+
     ['G38 is recorded so a probing program is never mistaken for a transit', () => {
         assert.equal(validateGcode('G90\nG54\nG38.2 Z-10 F50').usesProbing, true);
         assert.equal(validateGcode(MOVE_Z_MACHINE).usesProbing, false);

@@ -13,7 +13,7 @@ import {
     setToolSetterConfig,
 } from '../toolSetter';
 import { MAX_TOOL_LENGTH_DELTA_MM, TOOL_SETTER_FLOOR_MARGIN_MM, within } from '../procedureLimits';
-import { validateGcode } from '../validator';
+import { validateStagedEnvelope } from './staging';
 import { getPositionSnapshot, machinePositionDiagnostics, requireReliableMachine } from './machine';
 
 export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
@@ -175,7 +175,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             }
             const plan = planToolSetterRun(args);
             const envelope = describePlanAsGcode(plan);
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'run_tool_setter');
             const job = jobManager.submit(
                 envelope,
                 `tool-setter bit ${plan.bitLengthMm}mm - ${String(args.reason).slice(0, 40)}`,
@@ -257,7 +257,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 `G90\nG53;\nG0 X${cfg.changeX.toFixed(3)}${cfg.changeY !== null ? ` Y${cfg.changeY.toFixed(3)}` : ''};\nG54;`,
             ];
             const reviewText = steps.join('\n; --- next approved step ---\n');
-            const validation = validateGcode(reviewText);
+            const validation = validateStagedEnvelope(reviewText, 'goto_tool_change_position');
             const job = jobManager.submit(
                 reviewText,
                 `tool-change park Z${cfg.changeZ} X${cfg.changeX} - ${String(args.reason).slice(0, 40)}`,
@@ -357,7 +357,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 '; the ONE sanctioned work-origin write: what the touchscreen tool-change wizard does after its two confirmations',
                 `G92 Z${newWorkZ.toFixed(3)}`,
             ].join('\n');
-            const validation = validateGcode(gcode);
+            const validation = validateStagedEnvelope(gcode, 'apply_tool_length_offset');
             // The generic validator warning points at this tool as the sanctioned
             // path - on this tool's own page it would only confuse. Say it plainly.
             validation.warnings = validation.warnings.filter((w) => !w.startsWith('Contains G92'));

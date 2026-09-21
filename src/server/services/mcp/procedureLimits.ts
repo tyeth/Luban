@@ -42,6 +42,19 @@ export function within(value: number, range: Range): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Feeds the procedure runners command (probing.ts moveMachineSettled and the
+// marches). Named here, pure, so the confirm-page describers can render the
+// runner's plan without importing the server.
+// ---------------------------------------------------------------------------
+
+/** mm/min for raises, hops and retreats; matches the move_z cap (MOVE_Z_FEED.max). */
+export const TRAVEL_FEED = 600;
+/** Coarse march steps and guarded descent steps. */
+export const COARSE_FEED = 100;
+/** Fine march steps after contact. */
+export const FINE_FEED = 60;
+
+// ---------------------------------------------------------------------------
 // The sensor-gated march (march.ts): coarse steps to contact, retreat to
 // release, fine steps, confirm cycles.
 // ---------------------------------------------------------------------------

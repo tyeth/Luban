@@ -390,6 +390,7 @@ export function describeProbeOutlinePlanAsGcode(plan: ProbeOutlinePlan): string 
         previous = p;
     }
     lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; finish at the safe traverse height (also on any abort)`);
+    lines.push('G54;');
     return lines.join('\n');
 }
 

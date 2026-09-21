@@ -49,7 +49,7 @@ import {
     SURVEY_PITCH_MM,
     clampTo,
 } from '../procedureLimits';
-import { validateGcode } from '../validator';
+import { validateStagedEnvelope } from './staging';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
 // survey: the survey gives the agent visual context ("measure the stock on
@@ -94,7 +94,7 @@ export function registerProbingTools(registry: ToolRegistry, getConfirmBaseUrl: 
             const plan = planProbePoint(args as Parameters<typeof planProbePoint>[0]);
             const envelope = `; reason: ${String(args.reason).trim()}
 ${describeProbePlanAsGcode(plan)}`;
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'probe_point');
             const job = jobManager.submit(
                 envelope,
                 `probe ${plan.direction === 1 ? '+' : '-'}${plan.axis.toUpperCase()} `
@@ -155,7 +155,7 @@ ${describeProbePlanAsGcode(plan)}`;
             const plan = planProbeVector(args as Parameters<typeof planProbeVector>[0]);
             const envelope = `; reason: ${String(args.reason).trim()}
 ${describeProbeVectorPlanAsGcode(plan)}`;
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'probe_vector');
             const job = jobManager.submit(
                 envelope,
                 `probe-vector (${plan.unit.x},${plan.unit.y},${plan.unit.z}) ${plan.maxTravelMm}mm `
@@ -236,7 +236,7 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
             const plan = planProbeSequence(args as Parameters<typeof planProbeSequence>[0]);
             const envelope = `; reason: ${String(args.reason).trim()}
 ${describeProbeSequencePlanAsGcode(plan)}`;
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'probe_sequence');
             const marches = plan.steps.filter((s) => s.kind === 'probe').length;
             const job = jobManager.submit(
                 envelope,
@@ -322,7 +322,7 @@ ${describeProbeSequencePlanAsGcode(plan)}`;
             const plan = planProbeCircle(args as Parameters<typeof planProbeCircle>[0]);
             const envelope = `; reason: ${String(args.reason).trim()}
 ${describeProbeCirclePlanAsGcode(plan)}`;
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'probe_circle');
             const job = jobManager.submit(
                 envelope,
                 `probe-circle${plan.inside ? ' INSIDE' : ''} ${plan.points.length}pts d${plan.diameterMinMm}-${plan.diameterMaxMm} `
@@ -437,7 +437,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
     const stageSurfaceScan = (plan: ProbeSurfacePlan, reason: string, label: string) => {
         const envelope = `; reason: ${reason}
 ${describeProbeSurfacePlanAsGcode(plan)}`;
-        const validation = validateGcode(envelope);
+        const validation = validateStagedEnvelope(envelope, 'probe_surface');
         const job = jobManager.submit(
             envelope,
             `surface-${plan.kind} ${plan.stations.length}st ${label} - ${reason.slice(0, 40)}`,
@@ -751,7 +751,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 ]),
                 'G54;',
             ].join('\n');
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'survey_bed');
             const job = jobManager.submit(
                 envelope,
                 `bed-survey ${plan.captureCount}pts pitch${pitch} - ${String(args.reason).slice(0, 40)}`,
@@ -939,7 +939,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             const plan = planProbeOutline(args as Parameters<typeof planProbeOutline>[0]);
             const envelope = `; reason: ${reason}
 ${describeProbeOutlinePlanAsGcode(plan)}`;
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'probe_stock_outline');
             const job = jobManager.submit(
                 envelope,
                 `stock-outline ${plan.topPoints.length}top/${plan.sidePoints.length}sides - ${reason.slice(0, 40)}`,
@@ -1037,7 +1037,7 @@ ${describeProbeOutlinePlanAsGcode(plan)}`;
             }
             const envelope = `; reason: ${reason}
 ${describeProbeProgramAsGcode(plan)}`;
-            const validation = validateGcode(envelope);
+            const validation = validateStagedEnvelope(envelope, 'probe_program');
             const job = jobManager.submit(
                 envelope,
                 `program ${plan.name} (${plan.ops.length} ops${plan.rotations.length ? `, B ${plan.rotations.join('/')}` : ''}) - ${reason.slice(0, 40)}`,

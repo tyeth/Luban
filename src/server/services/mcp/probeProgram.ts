@@ -57,6 +57,7 @@ import {
 } from './programRefs';
 import { B_AXIS_DEG, MAX_SWEPT_RADIUS_MM, within } from './procedureLimits';
 import { captureFrame } from './camera';
+import { describeCaptureOp, describeHomeOp, describeRotateOp } from './programEnvelope';
 import { programFramePath } from './programFrames';
 import {
     CAPTURE_EVENT_BUDGET,
@@ -327,15 +328,7 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
                 on_fail: onFail,
                 refs: [],
             });
-            const viewText = capture.view
-                ? `; VIEW FROM machine (${capture.view.x}, ${capture.view.y}): raise to Z${hopZ} first (law 2), hop there at Z${hopZ} (checked against the travel and every obstacle box like a sequence hop),\n`
-                : '; NO MOTION - the frame is taken from wherever the previous op left the head.\n';
-            previews.push({
-                id,
-                text: `; CAPTURE FRAME${capture.label ? ` "${capture.label}"` : ''}:\n${viewText}`
-                    + `; wait ${capture.settle_ms} ms for the platform/rotary to settle, then one frame from the selected camera, stamped with the machine position and B, `
-                    + 'saved on the job record (result.file; view with get_frame).',
-            });
+            previews.push({ id, text: describeCaptureOp(capture, hopZ) });
             return;
         }
         if (kind === 'home') {
@@ -344,12 +337,7 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
             }
             eventBudget += HOME_EVENT_BUDGET;
             ops.push({ id, kind, args: {}, on_fail: 'stop', refs: [] });
-            previews.push({
-                id,
-                text: '; MACHINE HOME (last op): G53; G28; G54 - Z rises first, then every axis drives to its limit switch (home X-19 Y342 Z328).\n'
-                    + `; ALSO HOMES B: stock on the rotary turns back to B0${anyRotate ? ` from the B ${rotations[rotations.length - 1]} the program left it at` : ''}. `
-                    + 'Verified by two identical homed+idle heartbeats.',
-            });
+            previews.push({ id, text: describeHomeOp(anyRotate ? rotations[rotations.length - 1] : null) });
             return;
         }
         if (kind === 'rotate_b') {
@@ -382,9 +370,9 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
             eventBudget += eventBudgetFor({ kind: 'rotate_b' });
             ops.push({ id, kind, args: { b, require_z_at_least: requireZ, swept_radius_mm: sweptRadius }, on_fail: 'stop', refs: [] });
             const swept = sweptRadius !== null && seeds.axis
-                ? `\n; swept cylinder (this stock): axis X${seeds.axis.x}, physical Z${seeds.axis.z_physical}, radius ${sweptRadius} -> the probe tip clears it with the toolhead at Z >= ${(seeds.axis.z_contact + sweptRadius).toFixed(3)}`
+                ? `; swept cylinder (this stock): axis X${seeds.axis.x}, physical Z${seeds.axis.z_physical}, radius ${sweptRadius} -> the probe tip clears it with the toolhead at Z >= ${(seeds.axis.z_contact + sweptRadius).toFixed(3)}`
                 : '';
-            previews.push({ id, text: `; ROTATE STOCK: B -> ${b} deg (absolute), requires toolhead machine Z >= ${requireZ}${swept}\nG90\nG53;\nG0 B${b.toFixed(3)} F${ROTATE_FEED}\nM400; wait for the planner to drain\nM114; believed only after the turn's physical time (${Math.round(Math.abs(b - (snapshot.b ?? 180)) / ROTATE_FEED * 60)} s from B${snapshot.b ?? '?'}), then two idle heartbeats at B${b}` });
+            previews.push({ id, text: describeRotateOp({ b, requireZ, fromB: snapshot.b, rotateFeed: ROTATE_FEED, swept: swept || null }) });
             return;
         }
 
@@ -443,48 +431,9 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
     };
 }
 
-export function describeProbeProgramAsGcode(plan: ProbeProgramPlan): string {
-    const lines = [
-        `; PROBE PROGRAM "${plan.name}": ${plan.ops.length} operations, ONE approval; about ${plan.eventBudget} job events`,
-        ...plan.groups.map((g) => `; GROUP "${g.id}": ${g.innerCount} op(s) repeated at B ${g.angles.join(' / ')} deg (each preceded by a rotation)`),
-        `; anchored at machine (${plan.staged.x}, ${plan.staged.y}, ${plan.staged.z})${plan.staged.b === null ? '' : ` B${plan.staged.b}`}`,
-        '; every operation runs through its own runner (position of record, crash guard, hop envelope, slow zone,',
-        `; <= 5 mm descent segments) and ends raised at the safe traverse height Z${plan.hopZ}; the next op starts there.`,
-        plan.rotations.length
-            ? `; THE STOCK WILL ROTATE: B schedule ${plan.rotations.map((b) => `${b} deg`).join(' -> ')}${plan.homesAtEnd ? ' -> 0 (home)' : ''} (absolute), only with the toolhead at Z >= ${plan.hopZ}.`
-            : `; no rotations in this program${plan.homesAtEnd ? ' (the closing home still homes B to 0)' : ''}.`,
-        ...(plan.homesAtEnd
-            ? ['; ENDS WITH MACHINE HOME: G53; G28; G54 - every axis to its switches, B to 0; the program does not end raised in place but AT HOME (X-19 Y342 Z328).']
-            : []),
-        ...(plan.captures.length
-            ? [`; CAMERA CAPTURES (no motion): ${plan.captures.length} frame(s) - op(s) ${plan.captures.join(', ')} - saved on the job record, view with get_frame.`]
-            : []),
-        '; A failed operation (no contact where required, hop-guard contact, alarm, rotation not settled) stops the program',
-        '; raised at the traverse height and keeps every earlier result; on_fail: skip records the failure and continues.',
-        '; References ({from: "<op>.<path>"}, mid/diff/min/max of paths, +/- a number or path) resolve at run time from earlier',
-        '; results and are REFUSED outside their approved bounds.',
-    ];
-    if (plan.keepOut.length) {
-        lines.push(`; KEEP-OUT for this clamping (${plan.keepOut.length}, checked with the stored landmarks against every hop, column and march):`);
-        for (const k of plan.keepOut) {
-            lines.push(`;   "${k.name}": machine X ${k.machine.x0}..${k.machine.x1}, Y ${k.machine.y0}..${k.machine.y1}, toolhead must stay at Z >= ${k.clearanceZ} over it (+5 mm margin)`);
-        }
-    }
-    if (plan.seeds.axis) {
-        const a = plan.seeds.axis;
-        lines.push(`; JIG GEOMETRY (operator settings, namespace "axis"): axis X${a.x}, physical Z${a.z_physical}, probe ${a.probe_length} mm`
-            + ` -> axis.z_contact ${a.z_contact}${a.tip_radius === null ? '' : `, tip radius ${a.tip_radius}`}`);
-    }
-    plan.ops.forEach((op, index) => {
-        lines.push('');
-        lines.push(`; ===== OP ${index + 1}/${plan.ops.length} "${op.id}" (${op.kind}${op.on_fail === 'skip' ? ', on_fail: skip' : ''}) =====`);
-        const preview = plan.previews.find((p) => p.id === op.id);
-        lines.push(preview ? preview.text : '; (no preview)');
-    });
-    lines.push('');
-    lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; program ends raised at the safe traverse height (also on abort)`);
-    return lines.join('\n');
-}
+// The confirm-page body lives in programEnvelope.ts (pure, unit-tested); the
+// plan type is structurally what it renders.
+export { describeProbeProgramAsGcode } from './programEnvelope';
 
 export interface ProgramOpResult {
     id: string;
