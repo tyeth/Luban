@@ -92,6 +92,8 @@ It can sit differently after every power cycle, be knocked, be re-aimed, or be a
 
 ## CAM probing programs
 
+- FreeCAD side: `docs/post/freecad_probe_emitter.py` writes a `run_probing_gcode` program with `(PROBE ...)` nominals, normals and tolerances read straight off the selected faces (the Path Probe operation carries none of that, so it is bypassed, along with the post processor). `frame="machine"` + a measured `App.Placement` for a re-clamped part.
+
 - `run_probing_gcode` — stage a CAM-generated probing program (Fusion 360, FreeCAD, any Grbl/Marlin post, or hand-written). `G38` cycles are translated into staged probes, never sent raw. Returns an inspection report.
 - `get_inspection_report` — re-render a finished or aborted probing run's report in another format, such as Fusion's.
 

@@ -40,3 +40,17 @@ format; the file lands under the app data dir `mcp-inspection/`.
 
 The repo ships a Fusion post that writes all of this: `src/server/services/mcp/docs/post/snapmaker-probing.cps`
 (unverified in Fusion; review in `docs/FUSION_POST_REVIEW.md`).
+
+**FreeCAD: do not post-process a Probe operation - emit the program from the CAD.** FreeCAD's
+`Path.Op.Probe` carries no nominals, normals, tolerances or point identity, so no post can write the
+`(PROBE ...)` metadata, and its trajectory is discarded by the runner anyway. Use
+`src/server/services/mcp/docs/post/freecad_probe_emitter.py` inside FreeCAD (GUI console, macro, or
+headless `FreeCADCmd.exe -c` on the saved `.FCStd` - the headless route never opens a dialog):
+`emit_probe_program(doc, [{object, face: "FaceN", name, group, role, grid|points, inset, depth, tol}],
+out.nc, frame="work"|"machine", placement=None, clearance=10, overtravel=10)`. Each face is probed
+along its inward normal from `clearance` outside to `overtravel` past the CAD surface; grid samples that
+fall in a hole (a rim around a window) are DROPPED with a warning, never snapped to the lip - name the
+points instead. Pass the MEASURED model-to-machine `App.Placement` with `frame="machine"` for a
+re-clamped part; CAD coordinates alone only ever describe the nominal. `describe(doc, spec)` is the dry
+run. `run_probing_gcode` and `get_inspection_report` are still HARDWARE-UNTESTED: the first run is
+three points on a known flat face, not a real inspection.

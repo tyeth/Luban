@@ -444,6 +444,22 @@ standalone tool's result object. The four-face survey that took 18 approvals is 
 `rotate_b 90 → sequence (centre) → surface_path N–S (expected from the centre) → surface_path
 W–E → sequence (sides) → rotate_b 180 → …`.
 
+**FreeCAD probe emitter (2026-09-21, `docs/post/freecad_probe_emitter.py`).** The FreeCAD route
+into `run_probing_gcode` was reviewed (HANDOFF-probing-gcode-pipeline): the MCP contract needs
+nothing, the snapmaker post's only refusals (`M76`, `M6 T2`) would go with `--no-tool_change`,
+but `Path.Op.Probe` carries no nominals / normals / tolerances / identity, so no post can emit the
+`(PROBE ...)` metadata the inspection report compares against - and the posted trajectory is
+discarded by the runner anyway. So the post is bypassed: a ~250-line FreeCAD-side script reads the
+nominal point and outward normal off each selected face (grid or named `points`, `inset` from the
+edges, `depth` below a side face's top edge), drops any sample that falls in a hole rather than
+snapping it to the lip (the top rim of the QuadEink part is a 9.5-15 mm ring around a window),
+and writes `(RESULTS ...)` + per-cycle `(PROBE id name group role nominal normal tol offset frame)`
++ `G0` approach + one generous `G38.2` per point, in the work frame or - through a stated
+`App.Placement` - the machine frame. Verified with `parseProbingGcode` (3- and 7-point programs,
+no warnings) and run headless with `FreeCADCmd.exe -c` against the saved document, which never
+opens the export dialog the GUI post does. Hardware status unchanged: `run_probing_gcode` is
+still untested on metal; first run = three points on a known flat face.
+
 **`capture` and `home` ops (2026-09-21).** The operator asked for "move over the stock, photo,
 rotate B to 180, photo, home" as ONE approval; every motion in it had a program op or a gated
 tool, the two non-probing steps did not, so it cost three confirm pages. `capture {x?, y?, settle_ms?,
