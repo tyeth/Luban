@@ -22,7 +22,10 @@ export function registerCamTools(registry: ToolRegistry, getConfirmBaseUrl: () =
             + 'continue; "wall" forces the wall behaviour on every link). A contact during the guarded descent at a stepped '
             + 'link\'s destination is a BLOCKED station too (lift back to the link height, continue), never a crash; a '
             + 'blocked station is a normal report outcome (status blocked, blockedBy). top_z_machine (a MEASURED top) caps '
-            + 'stepped +Z lifts at the top and makes a raise-mode descent contact AT the top a blocked station. a bare G0 B<angle> line -> '
+            + 'stepped +Z lifts at the top and makes a raise-mode descent contact AT the top a blocked station. PLANNING CHECK: every '
+            + 'station start and link path must keep the tip (stored tip radius) + wall_margin_mm clear of the MEASURED known_walls you '
+            + 'declare (lines / corner arcs) - refused otherwise - and of the walls the program\'s own nominals describe (warned); '
+            + 'corner-arc marches report their angle off the radial. A bare G0 B<angle> line -> '
             + 'a 3+2 station (raise to the traverse height, then the verified rotation; B with XYZ, incremental B and A/C '
             + 'refused); G4 dwells; G90/G91, G53, G20/G21 honoured; programmed feeds ignored. Refused: M3/M4 (spindle with '
             + 'the probe fitted), M0/M1, M6, G28, G92/G55-G59, arcs, macro variables. Coordinates are the CAM WCS (work frame) '
@@ -57,6 +60,36 @@ export function registerCamTools(registry: ToolRegistry, getConfirmBaseUrl: () =
                         + 'that would rise above it marks the station blocked instead (the link would leave the pocket); a raise-mode descent '
                         + 'contact within one guarded step of it is a blocked station, not a collision.',
                 },
+                known_walls: {
+                    type: 'array',
+                    maxItems: 40,
+                    items: {
+                        type: 'object',
+                        properties: {
+                            name: { type: 'string' },
+                            kind: { type: 'string', enum: ['line', 'arc'] },
+                            a: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, additionalProperties: false },
+                            b: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, additionalProperties: false },
+                            normal: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, additionalProperties: false },
+                            center: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, additionalProperties: false },
+                            radius: { type: 'number' },
+                            material: { type: 'string', enum: ['inside', 'outside'] },
+                            from_deg: { type: 'number' },
+                            to_deg: { type: 'number' },
+                            z_top: { type: 'number' },
+                            z_bottom: { type: 'number' },
+                        },
+                        additionalProperties: false,
+                    },
+                    description: 'MEASURED walls (from an earlier program\'s contacts or a fitted arc), in the program frame, for the planning clearance '
+                        + 'check: {kind: "line", a, b, normal (unit vector toward the FREE side)} or {kind: "arc", center, radius, material: "outside" '
+                        + '(pocket corner / lobe) | "inside" (boss), from_deg?, to_deg?}; z_top/z_bottom bound the wall in Z. Every station start and '
+                        + 'link path must keep the tip (stored tip radius) + wall_margin_mm clear of them or the program is refused; a corner-arc '
+                        + 'march is reported by its angle off the radial from the centre. Walls the program\'s own (PROBE nominal= normal=) side '
+                        + 'marches describe are checked too and only warn (CAD intent, extent unknown).',
+                },
+                wall_margin_mm: { type: 'number', description: 'REQUIRED with known_walls: air beyond the tip radius every station start and link path keeps from them (0-20, the walls\' measurement uncertainty).' },
+                radial_tolerance_deg: { type: 'number', description: 'Optional (0-90): warn when a march into a known arc runs further off the radial from its centre than this.' },
                 on_miss: { type: 'string', enum: ['abort', 'continue'], description: 'G38.2 without contact: abort (default, Grbl semantics) or record no_contact and continue.' },
                 report_format: { type: 'string', enum: REPORT_FORMATS, description: 'Primary report rendering, default fusion (Inspect Surface G800/G801); renishaw for Probe WCS / Probe Geometry features. JSON is always stored too.' },
                 coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger).' },
@@ -100,6 +133,14 @@ ${describeProbeCamPlanAsGcode(plan)}`;
                     warnings: plan.warnings,
                     hopZ: plan.hopZ,
                     staged: plan.staged,
+                    wallCheck: {
+                        tipRadiusMm: plan.wallCheck.tipRadiusMm,
+                        marginMm: plan.wallCheck.marginMm,
+                        declaredWalls: plan.wallCheck.walls.filter((w) => w.source === 'declared').length,
+                        nominalWalls: plan.wallCheck.walls.filter((w) => w.source === 'nominal').length,
+                        warnings: plan.wallCheck.warnings,
+                        radial: plan.wallCheck.radial,
+                    },
                 },
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: 'Ask the operator to open confirm_url and review the TRANSLATED program (every original line with the '
