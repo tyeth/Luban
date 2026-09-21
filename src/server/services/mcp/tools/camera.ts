@@ -33,9 +33,10 @@ import { probeFeedService } from '../probeFeed';
 import {
     assertFreshHeartbeat,
     PositionSnapshot,
-    getMachineSizeByIdentifier,
+    assertWithinTravel,
     getPositionSnapshot,
     motionFloorZ,
+    requirePlanningTravel,
 } from './machine';
 import { reliableForMotion } from '../machinePosition';
 
@@ -336,8 +337,6 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
                     + 'per-call limit. Split the approach, or submit a gcode job.');
     }
 
-    // Envelope check in machine coordinates when the build volume is known.
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
     const machineTarget = coordinateSystem === 'machine' ? target : {
         x: target.x - before.originOffset.x,
         y: target.y - before.originOffset.y,
@@ -374,17 +373,15 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
             }
         }
     }
-    if (size) {
-        // Floors allow real overtravel: the A350 X home switch sits at
-        // machine -19, so "keep the current X while parked at home" must
-        // pass (a target at the machine's own resting position was being
-        // rejected live). Matches the position-sanity bounds.
-        if (machineTarget.x < -25 || machineTarget.x > size.x + 40
-                    || machineTarget.y < -25 || machineTarget.y > size.y + 40) {
-            throw new McpToolError(`Target (machine ${machineTarget.x.toFixed(1)}, ${machineTarget.y.toFixed(1)}) `
-                        + `is outside the ${size.x}x${size.y} build area (overtravel allowance -25..+40).`);
-        }
-    }
+    // The target inside the toolhead's travel as resolved for this rig. The
+    // A350 X home switch sits at machine -19, so "keep the current X while
+    // parked at home" passes because the head has been OBSERVED there, not
+    // because of a -25 allowance that also admitted six unreachable
+    // millimetres beyond it.
+    assertWithinTravel(
+        [{ label: 'Target', x: machineTarget.x, y: machineTarget.y }],
+        requirePlanningTravel('a direct move', { x: before.machine.x, y: before.machine.y })
+    );
 
     const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
     if (!channel || typeof channel.executeGcode !== 'function') {

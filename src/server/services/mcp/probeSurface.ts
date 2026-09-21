@@ -55,8 +55,7 @@ import {
     stationEnvelope,
     summarizeZ,
 } from './surfaceScan';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // Top-surface scans with the spindle touch probe: N stations along a line
 // (probe_surface_path) or over a serpentine grid (probe_surface_grid), each
@@ -252,16 +251,11 @@ function finishPlan(
         throw new McpToolError(`start_z_machine - floor_z_machine = ${(startZ - floorZ).toFixed(1)} mm exceeds 150 mm.`);
     }
 
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-    if (size) {
-        for (const st of stations) {
-            if (st.x < -25 || st.x > size.x + 40 || st.y < -25 || st.y > size.y + 40) {
-                throw new McpToolError(`Station ${st.label} (${st.x}, ${st.y}) is outside the machine envelope.`);
-            }
-        }
-    }
-
     const position = getPositionSnapshot();
+    assertWithinTravel(
+        stations.map((st) => ({ label: `Station ${st.label}`, x: st.x, y: st.y })),
+        requirePlanningTravel('a surface scan', { x: position.machine.x, y: position.machine.y })
+    );
     const { x, y, z } = position.machine;
     if (x === null || y === null || z === null) {
         throw new McpToolError('Current machine position unknown; cannot anchor the scan.');

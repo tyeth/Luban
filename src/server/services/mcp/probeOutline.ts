@@ -44,8 +44,7 @@ import {
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // probe_stock_outline (operator request 2026-09-06): find a block's top and
 // its true outline - and so its centre - from an ESTIMATE of where it is and
@@ -284,16 +283,20 @@ export function planProbeOutline(args: OutlineArgs, extraObstacles: ObstacleBox[
         });
     }
 
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-    if (size) {
-        const limits = sidePoints.map((p) => ({ x: p.start.x + p.unit.x * p.travelMm, y: p.start.y + p.unit.y * p.travelMm }));
-        const points = [...topPoints, ...sidePoints.map((p) => p.start), ...limits];
-        for (const p of points) {
-            if (p.x < -25 || p.x > size.x + 40 || p.y < -25 || p.y > size.y + 40) {
-                throw new McpToolError(`Point (${round3(p.x)}, ${round3(p.y)}) is outside the machine envelope - shrink the estimate or overextend_mm.`);
-            }
-        }
-    }
+    // Every point the procedure visits - top stations, side-march starts and
+    // the far end of every side march - inside the toolhead's real travel.
+    assertWithinTravel(
+        [
+            ...topPoints.map((p) => ({ label: `Top point "${p.label}"`, x: p.x, y: p.y })),
+            ...sidePoints.map((p) => ({ label: `Side march ${p.label} start`, x: p.start.x, y: p.start.y })),
+            ...sidePoints.map((p) => ({
+                label: `Side march ${p.label} far limit (shrink the estimate, overextend_mm or side_max_travel_mm)`,
+                x: round3(p.start.x + p.unit.x * p.travelMm),
+                y: round3(p.start.y + p.unit.y * p.travelMm),
+            })),
+        ],
+        requirePlanningTravel('a stock outline')
+    );
 
     const geometry = probeGeometry();
     const plan: ProbeOutlinePlan = {

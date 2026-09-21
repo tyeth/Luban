@@ -5,7 +5,6 @@ import * as fs from 'fs-extra';
 import path from 'path';
 
 import DataStorage from '../../../DataStorage';
-import { connectionManager } from '../../machine/ConnectionManager';
 import { captureFrame } from '../camera';
 import { jobEventLimit, jobManager } from '../jobs';
 import { describeProbeCirclePlanAsGcode, planProbeCircle, runProbeCircleProcedure } from '../probeCircle';
@@ -32,11 +31,12 @@ import { judgeCameraModel } from '../cameraModel';
 import { cameraModelStore } from '../cameraModelStore';
 import { renderMosaic } from '../surveyRender';
 import {
-    getMachineSizeByIdentifier,
     getPositionSnapshot,
     motionFloorZ,
+    requirePlanningTravel,
     requireReliableMachine,
 } from './machine';
+import { clampBand, describeClipping } from '../machineTravel';
 import { validateGcode } from '../validator';
 
 // The spindle touch probe (probe feed channel) and the whole-bed camera
@@ -557,7 +557,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         + 'index. Default 0 (the bed). A frame cannot tell how far away what it sees is, so this is '
                         + 'stated, never inferred.',
                 },
-                margin_mm: { type: 'number', description: 'Inset from the default bounds, default 10.' },
+                margin_mm: { type: 'number', description: 'Inset of the default bounds from the toolhead travel, default 10 (0-50).' },
                 z_levels: {
                     type: 'array',
                     description: 'Machine Z heights to run the whole grid at, highest first; one approval covers the '
@@ -566,8 +566,8 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         + 'current Z alone.',
                     items: { type: 'number' },
                 },
-                x_min: { type: 'number', description: 'Machine-coord grid bounds. Defaults: margin..(size-margin).' },
-                x_max: { type: 'number', description: 'Set beyond the nominal size to cover reachable overtravel (e.g. the far-X column the camera angle otherwise misses - setup-specific, so state it explicitly).' },
+                x_min: { type: 'number', description: 'Machine-coord grid bounds. Default: the toolhead travel inset by margin_mm - the travel as stated for this rig (set_probe_geometry travel_*), widened by where the head has been observed, else the machine definition.' },
+                x_max: { type: 'number', description: 'A bound beyond the travel is clipped to it and the clipping REPORTED (result.clipped, and on the confirm page) - never silently planned. To survey reachable overtravel the definition omits (the far-X column the camera angle otherwise misses), state the travel with set_probe_geometry travel_x_max.' },
                 y_min: { type: 'number' },
                 y_max: { type: 'number' },
                 operator_confirmed_clearance: {
@@ -606,10 +606,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                     + '(move_z), or pass operator_confirmed_clearance: true only on the operator\'s '
                     + 'explicit word that this Z clears everything on the bed.');
             }
-            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-            if (!size) {
-                throw new McpToolError('Unknown machine size; cannot plan the grid.');
-            }
+            const travel = requirePlanningTravel('a bed survey', { x, y });
             // Levels: highest first, deduplicated, and every one of them at or
             // above the motion floor unless the operator has said otherwise.
             const rawLevels = Array.isArray(args.z_levels) && args.z_levels.length ? args.z_levels.map(Number) : [z];
@@ -647,21 +644,36 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             }
             const margin = Math.min(Math.max(Number(args.margin_mm) || 10, 0), 50);
 
-            // Serpentine at the current Z. Bounds are explicit (clamped to the
-            // direct-move envelope) and BOTH endpoints are always covered.
-            // Each axis is divided EVENLY into steps no larger than the pitch
-            // (operator, 2026-09-05: the old fixed pitch gave 80 mm jumps and
-            // then a 9-10 mm stub at the far edge - uneven coverage on both
-            // axes); the far reach is often the only view of its region.
-            const clampAxis = (value: number, max: number) => Math.min(Math.max(value, -25), max + 40);
-            const bounds = {
-                xMin: clampAxis(args.x_min !== undefined ? Number(args.x_min) : margin, size.x),
-                xMax: clampAxis(args.x_max !== undefined ? Number(args.x_max) : size.x - margin, size.x),
-                yMin: clampAxis(args.y_min !== undefined ? Number(args.y_min) : margin, size.y),
-                yMax: clampAxis(args.y_max !== undefined ? Number(args.y_max) : size.y - margin, size.y),
+            // Serpentine grid. The bounds default to the toolhead's travel
+            // inset by the margin, and stated bounds are clamped INTO that
+            // travel with the clipping reported - not to the garbage-beat
+            // filter's -25..size+40 (until 2026-09-21), which on the A350
+            // planned a first column at X-25 against a travel that stops at
+            // X-19 and would have aborted the approved job on its first move.
+            // BOTH endpoints are always covered: each axis is divided EVENLY
+            // into steps no larger than the pitch (operator, 2026-09-05: the
+            // old fixed pitch gave 80 mm jumps and then a 9-10 mm stub at the
+            // far edge); the far reach is often the only view of its region.
+            const limits = travel.limits;
+            const wanted = {
+                xMin: args.x_min !== undefined ? Number(args.x_min) : limits.xMin + margin,
+                xMax: args.x_max !== undefined ? Number(args.x_max) : limits.xMax - margin,
+                yMin: args.y_min !== undefined ? Number(args.y_min) : limits.yMin + margin,
+                yMax: args.y_max !== undefined ? Number(args.y_max) : limits.yMax - margin,
             };
+            if (Object.values(wanted).some((v) => !Number.isFinite(v))) {
+                throw new McpToolError('x_min / x_max / y_min / y_max must be finite machine coordinates.');
+            }
+            if (!(wanted.xMax > wanted.xMin) || !(wanted.yMax > wanted.yMin)) {
+                throw new McpToolError(`Survey bounds are empty: X ${wanted.xMin}..${wanted.xMax}, Y ${wanted.yMin}..${wanted.yMax}.`);
+            }
+            const xBand = clampBand((wanted.xMin + wanted.xMax) / 2, (wanted.xMax - wanted.xMin) / 2, limits.xMin, limits.xMax);
+            const yBand = clampBand((wanted.yMin + wanted.yMax) / 2, (wanted.yMax - wanted.yMin) / 2, limits.yMin, limits.yMax);
+            const clipped = [describeClipping('X', xBand), describeClipping('Y', yBand), ...travel.conflicts].filter(Boolean) as string[];
+            const bounds = { xMin: xBand.min, xMax: xBand.max, yMin: yBand.min, yMax: yBand.max };
             if (!(bounds.xMax > bounds.xMin) || !(bounds.yMax > bounds.yMin)) {
-                throw new McpToolError('Survey bounds are empty after clamping; check x/y min/max.');
+                throw new McpToolError(`Survey bounds lie entirely outside the toolhead travel (X ${limits.xMin}..${limits.xMax}, `
+                    + `Y ${limits.yMin}..${limits.yMax}): ${clipped.join(' ')}`);
             }
             const axisPoints = (min: number, max: number): { points: number[]; step: number } => {
                 const span = max - min;
@@ -687,6 +699,9 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch})`,
                 `; ${levels.length} pass(es) at machine Z ${levels.join(', ')} - each entered with XY stationary`,
                 `; ${pitchNote}`,
+                `; bounds X ${bounds.xMin}..${bounds.xMax}, Y ${bounds.yMin}..${bounds.yMax} within the toolhead travel `
+                    + `X ${limits.xMin}..${limits.xMax}, Y ${limits.yMin}..${limits.yMax}`,
+                ...clipped.map((line) => `; ${line}`),
                 '; one frame captured per waypoint after the move settles; frames saved to disk with a',
                 '; machine-position index. Each line is sent individually. Aborts on the first capture failure.',
                 'G90',
@@ -802,6 +817,16 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 job: jobManager.describe(job),
                 waypoints: waypoints.length,
                 grid: { max_pitch_mm: pitch, step_x_mm: xAxis.step, step_y_mm: yAxis.step, xs, ys, machine_z: z, columns: xs.length, rows: ys.length },
+                travel: {
+                    ...limits,
+                    source: {
+                        x_min: travel.ends.xMin.source,
+                        x_max: travel.ends.xMax.source,
+                        y_min: travel.ends.yMin.source,
+                        y_max: travel.ends.yMax.source,
+                    },
+                },
+                clipped,
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: 'Ask the operator to open confirm_url, check the Z clears everything on the '
                     + 'bed (rotary included), and approve. start_gcode_job then drives the whole grid '

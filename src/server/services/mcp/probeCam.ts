@@ -48,9 +48,8 @@ import {
 } from './probing';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
+import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 import DataStorage from '../../DataStorage';
-import { connectionManager } from '../machine/ConnectionManager';
 
 // run_probing_gcode (mcp/49, operator request 2026-09-07): a probing program
 // written by CAM (Fusion 360, FreeCAD, a Grbl/Marlin post, or by hand) is
@@ -211,16 +210,15 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
         warnings.push('Programmed feeds are ignored: probe cycles run the sensor-gated march (coarse F100 / fine F60), links at the traverse feed.');
     }
 
-    // Envelope and per-step validity.
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+    // Travel and per-step validity: every move and probe target inside the
+    // toolhead's real travel (machineTravel.ts), not the -25..size+40 slop.
+    const travel = requirePlanningTravel('a probing program');
     for (const step of parsed.steps) {
         if (step.kind !== 'move' && step.kind !== 'probe') {
             continue;
         }
         const t = step.target;
-        if (size && (t.x < -25 || t.x > size.x + 40 || t.y < -25 || t.y > size.y + 40)) {
-            throw new McpToolError(`line ${step.line}: target (${t.x}, ${t.y}) is outside the machine envelope.`);
-        }
+        assertWithinTravel([{ label: `line ${step.line}: target`, x: t.x, y: t.y }], travel);
         if (t.z < 0 || t.z > hopZ + 1e-9) {
             throw new McpToolError(`line ${step.line}: target Z${t.z} is outside 0..${hopZ} (the safe traverse height).`);
         }

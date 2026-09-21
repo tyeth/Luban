@@ -170,3 +170,77 @@ export function describeClipping(axis: string, band: ClampedBand): string | null
     }
     return `${axis} reach clipped to the travel: ${parts.join(' and ')} is unreachable, so it was not planned.`;
 }
+
+export interface TravelPoint {
+    x: number;
+    y: number;
+}
+
+/**
+ * Where a point lies outside the travel, or null when it is inside (float
+ * noise tolerated). One clause per axis that overshoots, with the distance,
+ * so the refusal says what to change: "X 355 is 16 mm beyond the X maximum
+ * 339" tells the caller more than "outside the envelope".
+ */
+export function outsideTravel(point: TravelPoint, limits: TravelLimits): string | null {
+    const clauses: string[] = [];
+    const check = (axis: string, value: number, min: number, max: number) => {
+        if (beyond(value, min, 'low')) {
+            clauses.push(`${axis} ${Number(value.toFixed(3))} is ${Number((min - value).toFixed(3))} mm below the ${axis} minimum ${min}`);
+        } else if (beyond(value, max, 'high')) {
+            clauses.push(`${axis} ${Number(value.toFixed(3))} is ${Number((value - max).toFixed(3))} mm beyond the ${axis} maximum ${max}`);
+        }
+    };
+    check('X', point.x, limits.xMin, limits.xMax);
+    check('Y', point.y, limits.yMin, limits.yMax);
+    return clauses.length ? clauses.join(' and ') : null;
+}
+
+/**
+ * A march clipped to less than this by the travel is refused at staging
+ * rather than planned: the toolhead is already at the end of the machine in
+ * that direction, and a half-millimetre ladder finds nothing.
+ */
+export const MIN_USEFUL_MARCH_MM = 0.5;
+
+export interface ClampedRay {
+    /** The travel the march may actually make, mm along the unit vector. */
+    travelMm: number;
+    /** How much of the requested travel lies outside the limits, mm. */
+    clippedMm: number;
+    /** Which end stopped it, for the plan and the confirm page; null when nothing was clipped. */
+    clippedBy: string | null;
+}
+
+/**
+ * Shorten a march of `travelMm` from `start` along `unit` so its far end
+ * stays inside the XY travel, and say which end it ran into. A march is a
+ * sensor-gated move that stops on contact, but nothing stops it at the end
+ * of the machine except the overtravel alarm, so its far limit is planned
+ * inside the travel - and a march that had to be shortened is reported,
+ * because a face the shortened march cannot reach is otherwise "no contact".
+ * The scalar is clamped, never a single axis: clamping per axis would change
+ * the direction.
+ */
+export function clampRay(start: TravelPoint, unit: TravelPoint, travelMm: number, limits: TravelLimits): ClampedRay {
+    let allowed = travelMm;
+    let clippedBy: string | null = null;
+    const along = (axis: string, u: number, from: number, min: number, max: number) => {
+        if (Math.abs(u) < 1e-9) {
+            return;
+        }
+        const end = u > 0 ? max : min;
+        const reach = (end - from) / u;
+        if (reach < allowed) {
+            allowed = Math.max(0, reach);
+            clippedBy = `the ${axis} ${u > 0 ? 'maximum' : 'minimum'} ${end}`;
+        }
+    };
+    along('X', unit.x, start.x, limits.xMin, limits.xMax);
+    along('Y', unit.y, start.y, limits.yMin, limits.yMax);
+    return {
+        travelMm: Number(allowed.toFixed(3)),
+        clippedMm: Number(Math.max(0, travelMm - allowed).toFixed(3)),
+        clippedBy,
+    };
+}

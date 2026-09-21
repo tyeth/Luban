@@ -19,8 +19,8 @@ import {
     knownMachinePosition,
 } from './probing';
 import { McpToolError } from './registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { MIN_USEFUL_MARCH_MM, clampRay } from './machineTravel';
+import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // Vector probing: a sensor-gated march from the CURRENT position along an
 // ARBITRARY direction (any XY heading, optionally angled downward - never
@@ -35,8 +35,10 @@ import { connectionManager } from '../machine/ConnectionManager';
 export interface ProbeVectorPlan {
     unit: { x: number; y: number; z: number };
     start: { x: number; y: number; z: number }; // machine coords at staging
-    maxTravelMm: number; // after envelope clamping
+    maxTravelMm: number; // after clamping to the toolhead travel
     requestedTravelMm: number;
+    /** Which travel end shortened the march, when one did - shown on the confirm page. */
+    travelClippedBy: string | null;
     limit: { x: number; y: number; z: number };
     coarseStepMm: number;
     fineStepMm: number;
@@ -87,28 +89,27 @@ export function planProbeVector(args: {
     const startZ = z >= traverseZ - TRAVERSE_Z_TOLERANCE_MM ? traverseZ : z;
     const start = { x, y, z: startZ };
 
-    // Clamp the travel SCALAR so the entire segment stays inside the same
-    // envelope the direct-move guards use (machine -25..size+40 for X/Y,
-    // Z never below 0) - clamping per-axis would change the direction.
-    let travel = requested;
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-    const clampAxis = (u: number, from: number, lo: number, hi: number) => {
-        if (Math.abs(u) < 1e-9) {
-            return Infinity;
+    // Clamp the travel SCALAR so the entire segment stays inside the
+    // toolhead's real XY travel (machineTravel.ts) and never below machine
+    // Z 0 - clamping per-axis would change the direction. Until 2026-09-21
+    // this used the garbage-beat filter's -25..size+40, which on an A350 let a
+    // -X march plan 6 mm past the end of the machine. What the clamp costs is
+    // carried in the plan and shown on the confirm page: a face the shortened
+    // march cannot reach would otherwise read as "no contact".
+    const ray = clampRay(start, unit, requested, requirePlanningTravel('a vector probe', { x, y }).limits);
+    let travel = ray.travelMm;
+    let clippedBy = ray.clippedBy;
+    if (unit.z < -1e-9) {
+        const toFloor = (0 - start.z) / unit.z;
+        if (toFloor < travel) {
+            travel = Number(Math.max(0, toFloor).toFixed(3));
+            clippedBy = 'machine Z 0 (the bed)';
         }
-        const bound = u > 0 ? hi : lo;
-        return (bound - from) / u;
-    };
-    if (size) {
-        travel = Math.min(travel, clampAxis(unit.x, start.x, -25, size.x + 40));
-        travel = Math.min(travel, clampAxis(unit.y, start.y, -25, size.y + 40));
     }
-    travel = Math.min(travel, clampAxis(unit.z, start.z, 0, Infinity));
-    if (!Number.isFinite(travel) || travel < 0.5) {
-        throw new McpToolError('The clamped probe travel is under 0.5 mm - already at the envelope edge '
-            + 'along this direction.');
+    if (!Number.isFinite(travel) || travel < MIN_USEFUL_MARCH_MM) {
+        throw new McpToolError(`The march, clamped to the toolhead travel, is under ${MIN_USEFUL_MARCH_MM} mm - already at `
+            + `${clippedBy || 'the travel limit'} along this direction.`);
     }
-    travel = Number(travel.toFixed(3));
 
     return {
         unit: {
@@ -119,6 +120,7 @@ export function planProbeVector(args: {
         start,
         maxTravelMm: travel,
         requestedTravelMm: requested,
+        travelClippedBy: clippedBy,
         limit: {
             x: Number((start.x + unit.x * travel).toFixed(3)),
             y: Number((start.y + unit.y * travel).toFixed(3)),
@@ -162,8 +164,8 @@ export function describeProbeVectorPlanAsGcode(plan: ProbeVectorPlan): string {
     const lines = [
         '; TOUCH PROBE VECTOR MEASUREMENT (server-driven, sensor-gated on the probe channel)',
         `; march along unit direction ${dir} from the staging position, max travel ${plan.maxTravelMm} mm${
-            plan.maxTravelMm < plan.requestedTravelMm
-                ? ` (requested ${plan.requestedTravelMm}, clamped to the machine envelope)` : ''}`,
+            plan.travelClippedBy
+                ? ` (requested ${plan.requestedTravelMm}: shortened by ${plan.travelClippedBy} - a face beyond it reads as no contact)` : ''}`,
         '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the probe feed is checked',
         '; before the next line. The march stops at first contact; running the full ladder',
         `; without contact ABORTS at (${plan.limit.x}, ${plan.limit.y}, ${plan.limit.z}).`,

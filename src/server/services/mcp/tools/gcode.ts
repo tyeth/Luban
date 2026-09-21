@@ -16,12 +16,14 @@ import { McpToolError, ToolRegistry } from '../registry';
 import { planTraverseXy } from '../traversePlan';
 import { JobFrame, TRANSPORT_REFUSAL, isPureTransport, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
+import { TRAVEL_EPSILON_MM } from '../machineTravel';
 import {
     PositionSnapshot,
     assertFreshHeartbeat,
     getMachineSizeByIdentifier,
     getPositionSnapshot,
     motionFloorZ,
+    requirePlanningTravel,
     safeTraverseZ,
 } from './machine';
 
@@ -795,12 +797,18 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (currentZ === null) {
                 throw new McpToolError('Current Z unknown; cannot describe the move to the operator.');
             }
+            // Z travel: the bed at machine 0, and at the top whichever is
+            // higher of the definition's size and the park height the machine
+            // homes to (an A350 homes at 328 against a 330 definition). Not
+            // size + 40: nothing has ever been observed up there, and a Z
+            // target past the top switch is an overtravel alarm, not a move.
             const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+            const zTop = Math.max(size ? size.z : 0, safeTraverseZ());
             for (const t of targets) {
                 const machineT = coordinateSystem === 'machine' ? t : t - position.originOffset.z;
-                if (size && (machineT < -1 || machineT > size.z + 40)) {
+                if (machineT < -TRAVEL_EPSILON_MM || machineT > zTop + TRAVEL_EPSILON_MM) {
                     throw new McpToolError(`Target ${coordinateSystem} Z ${t} (machine Z ${machineT.toFixed(1)}) `
-                        + `is outside the 0..${size.z} travel.`);
+                        + `is outside the Z travel 0..${zTop}.`);
                 }
             }
 
@@ -957,7 +965,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (mx === null || my === null || mz === null) {
                 throw new McpToolError('Current machine position unknown; cannot plan the traverse.');
             }
-            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+            const travel = requirePlanningTravel('a traverse', { x: mx, y: my });
             let plan;
             try {
                 plan = planTraverseXy({
@@ -965,7 +973,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     frame: coordinateSystem,
                     currentMachine: { x: mx, y: my, z: mz },
                     originOffset: position.originOffset,
-                    bounds: size ? { min: { x: 0, y: 0, z: 0 }, max: { x: size.x, y: size.y, z: size.z } } : null,
+                    travel: travel.limits,
                     traverseZ: safeTraverseZ(),
                     motionFloorZ: motionFloorZ(),
                     feedRate,
@@ -997,6 +1005,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     distance_mm: Number(step.distanceMm.toFixed(1)),
                 })),
                 total_distance_mm: Number(plan.totalDistanceMm.toFixed(1)),
+                travel: { ...travel.limits, conflicts: travel.conflicts },
                 confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
                 next_step: isBatch
                     ? 'Ask the operator to open confirm_url, review the DIRECT-move banner, the frame and every leg, and '

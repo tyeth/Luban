@@ -27,8 +27,8 @@ import {
     abortRaiseToTop,
 } from './probing';
 import { McpToolError } from './registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { outsideTravel } from './machineTravel';
+import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // A whole measurement CIRCUIT as ONE staged, operator-approved procedure
 // (operator-requested 2026-09-02: "I won't do separate approvals"). The
@@ -110,9 +110,10 @@ export function planProbeSequence(args: {
     }
     const staged = { x, y, z };
     const hopZ = safeTraverseZ();
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-    const inEnvelope = (px: number, py: number) => !size
-        || (px >= -25 && px <= size.x + 40 && py >= -25 && py <= size.y + 40);
+    // Every hop and every march's far limit inside the toolhead's real travel
+    // (machineTravel.ts), not the garbage-beat filter's -25..size+40.
+    const toolheadTravel = requirePlanningTravel('a probe sequence', { x, y });
+    const outside = (px: number, py: number) => outsideTravel({ x: px, y: py }, toolheadTravel.limits);
 
     // Simulate the walk so every step is anchored to concrete coordinates.
     const virtual = { ...staged };
@@ -125,8 +126,12 @@ export function planProbeSequence(args: {
         if (kind === 'hop') {
             const hx = Number(raw.x);
             const hy = Number(raw.y);
-            if (!Number.isFinite(hx) || !Number.isFinite(hy) || !inEnvelope(hx, hy)) {
-                throw new McpToolError(`${at}: hop needs finite x/y inside the machine envelope.`);
+            if (!Number.isFinite(hx) || !Number.isFinite(hy)) {
+                throw new McpToolError(`${at}: hop needs finite machine x/y.`);
+            }
+            const hopOutside = outside(hx, hy);
+            if (hopOutside) {
+                throw new McpToolError(`${at}: hop target is outside the toolhead travel: ${hopOutside}.`);
             }
             steps.push({ kind: 'hop', x: hx, y: hy });
             virtual.x = hx;
@@ -168,8 +173,13 @@ export function planProbeSequence(args: {
                 y: virtual.y + unit.y * travel,
                 z: virtual.z + unit.z * travel,
             };
-            if (!inEnvelope(limit.x, limit.y) || limit.z < 0) {
-                throw new McpToolError(`${at}: the march limit leaves the machine envelope.`);
+            const limitOutside = outside(limit.x, limit.y);
+            if (limitOutside) {
+                throw new McpToolError(`${at}: the march's far limit is outside the toolhead travel: ${limitOutside}. `
+                    + 'Shorten max_travel_mm or start the march nearer the face.');
+            }
+            if (limit.z < 0) {
+                throw new McpToolError(`${at}: the march's far limit is below machine Z 0 (the bed).`);
             }
             const onMissRaw = raw.on_miss === undefined ? 'continue' : String(raw.on_miss);
             if (onMissRaw !== 'continue' && onMissRaw !== 'abort') {

@@ -20,8 +20,7 @@ import {
 } from './probing';
 import { DESCENT_GUARD_MM } from './probeSequence';
 import { McpToolError } from './registry';
-import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './tools/machine';
-import { connectionManager } from '../machine/ConnectionManager';
+import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // Circle probing: N sensor-gated radial marches around (or inside) a
 // roughly-round vertical feature, then a least-squares circle fit.
@@ -107,7 +106,7 @@ export function planProbeCircle(args: {
         throw new McpToolError('Current machine position unknown; cannot anchor the envelope.');
     }
     const staged = { x, y, z };
-    const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+    const travel = requirePlanningTravel('a circle measurement', { x, y });
 
     let center: { x: number; y: number };
     let probeZ: number;
@@ -155,13 +154,14 @@ export function planProbeCircle(args: {
         const reach = inside ? limitRadius : startRadius;
         const sx = Number((center.x + (inside ? 0 : startRadius) * Math.cos(rad)).toFixed(3));
         const sy = Number((center.y + (inside ? 0 : startRadius) * Math.sin(rad)).toFixed(3));
-        const fx = center.x + reach * Math.cos(rad);
-        const fy = center.y + reach * Math.sin(rad);
-        if (size && (fx < -25 || fx > size.x + 40 || fy < -25 || fy > size.y + 40
-            || sx < -25 || sx > size.x + 40 || sy < -25 || sy > size.y + 40)) {
-            throw new McpToolError(`March for azimuth ${azimuth.toFixed(0)} deg falls outside the `
-                + 'machine envelope.');
-        }
+        const fx = Number((center.x + reach * Math.cos(rad)).toFixed(3));
+        const fy = Number((center.y + reach * Math.sin(rad)).toFixed(3));
+        // Both ends of every march inside the toolhead's real travel: the
+        // start it hops to and the far limit it would reach with no contact.
+        assertWithinTravel([
+            { label: `March for azimuth ${azimuth.toFixed(0)} deg, start`, x: sx, y: sy },
+            { label: `March for azimuth ${azimuth.toFixed(0)} deg, far limit`, x: fx, y: fy },
+        ], travel);
         points.push({ azimuthDeg: azimuth, startXY: { x: sx, y: sy } });
     }
 

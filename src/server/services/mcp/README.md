@@ -673,8 +673,12 @@ waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping,
   showing current Z, target, delta, feed. Every request needs a `reason`.
 - **Guards on every direct move**: machine idle, toolhead off (headStatus/headPower),
   homed-first (override `operator_confirmed_clearance` only on the operator's explicit
-  word), travel cap, build-envelope check with overtravel allowance (machine −25..+40 —
-  X home rests at −19).
+  word), travel cap, and a check against the toolhead's RESOLVED travel (`machineTravel.ts`:
+  stated `travel_*` geometry, else the machine definition widened by positions the head
+  has been observed at — X home at −19 passes because the head has been there, not
+  because of an allowance). Every planner that puts a waypoint, station or march limit in
+  XY uses the same travel (`requirePlanningTravel` / `assertWithinTravel`); a bound it has
+  to clip is reported, never swallowed (issue #140).
 - **Verified-settle contract**: motion tools block until the returned position verifiably
   matches the move (Z parsed from the executed gcode, ±0.15 mm; XY at target; home must
   leave its pre-G28 position at least once). `wait_until_moved: false` opts out and always
