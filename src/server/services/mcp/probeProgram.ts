@@ -43,6 +43,7 @@ import {
     checkProcedureStop,
     sleep,
     RECHECK_TOLERANCE_MM,
+    awaitMachineSettled,
 } from './probing';
 import {
     RefResolveError,
@@ -383,7 +384,7 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
             const swept = sweptRadius !== null && seeds.axis
                 ? `\n; swept cylinder (this stock): axis X${seeds.axis.x}, physical Z${seeds.axis.z_physical}, radius ${sweptRadius} -> the probe tip clears it with the toolhead at Z >= ${(seeds.axis.z_contact + sweptRadius).toFixed(3)}`
                 : '';
-            previews.push({ id, text: `; ROTATE STOCK: B -> ${b} deg (absolute), requires toolhead machine Z >= ${requireZ}${swept}\nG90\nG53;\nG0 B${b.toFixed(3)} F${ROTATE_FEED}; verified by M114 (B within 0.05 deg)` });
+            previews.push({ id, text: `; ROTATE STOCK: B -> ${b} deg (absolute), requires toolhead machine Z >= ${requireZ}${swept}\nG90\nG53;\nG0 B${b.toFixed(3)} F${ROTATE_FEED}\nM400; wait for the planner to drain\nM114; believed only after the turn's physical time (${Math.round(Math.abs(b - (snapshot.b ?? 180)) / ROTATE_FEED * 60)} s from B${snapshot.b ?? '?'}), then two idle heartbeats at B${b}` });
             return;
         }
 
@@ -548,6 +549,13 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
             probeFeedService.assertNoOvertravel();
             if (op.kind === 'capture') {
                 checkProcedureStop();
+                // Operator law (2026-09-21): a camera op acts on the previous
+                // op's position only once the machine confirms it - idle on
+                // two consecutive beats, at the B the program believes it is at.
+                const settledBefore = await awaitMachineSettled(`probe_program:${op.id}`, { b: currentB });
+                if (settledBefore.waitedMs > 1500) {
+                    announce(`op-${op.id}-settled`, `waited ${settledBefore.waitedMs} ms for the machine to go idle at B${currentB ?? '?'}`);
+                }
                 if (op.args.x !== null && op.args.x !== undefined && op.args.y !== null && op.args.y !== undefined) {
                     // Viewing position: re-check from the LIVE position (the
                     // staging check used the program anchor), then law 2 -
@@ -569,6 +577,10 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                 const settleMs = Number(op.args.settle_ms) || 0;
                 if (settleMs > 0) {
                     await sleep(settleMs);
+                }
+                // A view hop moved the head: confirm it, too, before the frame.
+                if (op.args.x !== null && op.args.x !== undefined) {
+                    await awaitMachineSettled(`probe_program:${op.id}:view`, { b: currentB });
                 }
                 const frame = await captureFrame();
                 const snapshot = getPositionSnapshot();
@@ -623,7 +635,7 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                 currentB = outcome.to;
                 results[op.id] = outcome;
                 report.push({ id: op.id, kind: op.kind, b: currentB, status: 'completed', resolvedRefs: resolved, startedAt: opStarted, endedAt: Date.now(), result: outcome });
-                announce(`op-${op.id}-done`, `B ${outcome.from === null ? '?' : outcome.from} -> ${outcome.to} deg`);
+                announce(`op-${op.id}-done`, `B ${outcome.from === null ? '?' : outcome.from} -> ${outcome.to} deg (${outcome.verifiedBy}, ${outcome.elapsedMs} ms to reply, ~${outcome.expectedMs} ms needed, settled after ${outcome.settleWaitMs} ms)`);
                 continue;
             }
             // Resolve references NOW against earlier results, re-plan at the
