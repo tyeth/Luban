@@ -410,11 +410,15 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
         name: 'start_gcode_job',
         description: 'Start an approved job: uploads the file to the machine through the same '
             + 'prepare/start path as "Start on Luban" (door interlock applies) and starts it. '
-            + 'Authorisation is the operator\'s click on the confirm page. EITHER pass the one-time code they '
-            + 'relay (confirm_token) OR call with wait_for_approval_ms right after staging: the call stays open '
-            + 'until they approve (then the job starts at once - nothing to copy), reject, or the wait expires '
-            + '(returns approved: false, timed_out: true - call again to keep waiting; approval is never lost). '
-            + 'The hand-off can be disabled in Settings -> MCP Server, in which case only confirm_token works.',
+            + 'Authorisation is the operator\'s click on the confirm page. ORDER MATTERS: first deliver the staging '
+            + 'result\'s confirm_url to the operator as the last line of a reply and END THE TURN (see the staging '
+            + 'result\'s `handoff`); only then wait. EITHER pass the one-time code they paste (confirm_token) OR call '
+            + 'with wait_for_approval_ms as a BACKGROUND poll after the link is out: the call stays open until they '
+            + 'approve (then the job starts at once - nothing to copy), reject, or the wait expires (returns approved: '
+            + 'false, timed_out: true - call again to keep waiting; approval is never lost - a timeout is not a reason to '
+            + 'withdraw the job or to conclude anything). Never call this with wait_for_approval_ms BEFORE the operator has '
+            + 'the link: they cannot click what they have not seen. The hand-off can be disabled in Settings -> MCP Server, '
+            + 'in which case only confirm_token works.',
         inputSchema: {
             type: 'object',
             properties: {
