@@ -200,6 +200,18 @@ export function resolveMarchParams(
 export const MAX_STATED_MACHINE_Z_MM = 400;
 /** A program's transient keep_out list. */
 export const MAX_KEEP_OUT_BOXES = 20;
+/** run_probing_gcode known_walls: measured walls the agent declares for the planning clearance check (wallClearance.ts). */
+export const MAX_KNOWN_WALLS = 40;
+/**
+ * wall_margin_mm: how much air beyond the tip radius a station start or a link
+ * path must keep from a known wall. Required whenever known_walls is given -
+ * there is no default because the right margin is the wall's measurement
+ * uncertainty, which only the agent that measured it knows. The cap keeps a
+ * typo from refusing every station of a pocket narrower than 2 x 20 mm.
+ */
+export const WALL_MARGIN_MM: Range = { min: 0, max: 20 };
+/** radial_tolerance_deg: how far off the radial a corner-arc approach may be before the page warns. Optional; no default (reported only). */
+export const RADIAL_TOLERANCE_DEG: Range = { min: 0, max: 90 };
 export const B_AXIS_DEG: Range = { min: -360, max: 360 };
 /** Largest reach of stock and clamping about the rotary axis anyone should state (the A350 bed is 350 wide). */
 export const MAX_SWEPT_RADIUS_MM = 200;

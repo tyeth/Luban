@@ -163,16 +163,77 @@ def _transform(placement, p, n):
     return placement.multVec(p), placement.Rotation.multVec(n)
 
 
+def _wall_point_clearance(wall, x, y):
+    """Signed XY clearance of a tip-centre point from a known wall's surface (positive = free side);
+    None when the point is not abreast of the wall. Mirrors wallClearance.ts pointClearance."""
+    if wall.get("kind") == "arc":
+        cx, cy = wall["center"]
+        d = math.hypot(x - cx, y - cy)
+        if wall.get("from_deg") is not None and wall.get("to_deg") is not None:
+            a = (math.degrees(math.atan2(y - cy, x - cx)) + 360.0) % 360.0
+            start = wall["from_deg"] % 360.0
+            span = (wall["to_deg"] - wall["from_deg"]) % 360.0 or 360.0
+            if (a - start) % 360.0 > span + 1e-9:
+                return None
+        return wall["radius"] - d if wall.get("material", "outside") == "outside" else d - wall["radius"]
+    ax, ay = wall["a"]
+    bx, by = wall["b"]
+    nx, ny = wall["normal"]
+    nl = math.hypot(nx, ny) or 1.0
+    tx, ty = bx - ax, by - ay
+    tl = math.hypot(tx, ty)
+    if tl > 1e-9:
+        along = ((x - ax) * tx + (y - ay) * ty) / tl
+        if along < -1e-9 or along > tl + 1e-9:
+            return None
+    return ((x - ax) * nx + (y - ay) * ny) / nl
+
+
+def wall_clearance_issues(approaches, known_walls, tip_radius, margin):
+    """Planning check (handoff 2026-09-21 s4 0a, same rule as the MCP's wallClearance.ts): every
+    station START (the approach point the head parks at before its G38.2) must keep the probe TIP -
+    a ball of ``tip_radius`` (the MEASURED tip, never a guess) - at least ``margin`` clear of every
+    known wall. ``known_walls`` is a list of dicts in the EMITTED frame:
+    ``{"name", "kind": "line", "a": (x, y), "b": (x, y), "normal": (nx, ny)}`` (normal toward the
+    FREE side) or ``{"name", "kind": "arc", "center": (x, y), "radius", "material": "outside"|"inside",
+    "from_deg", "to_deg"}``, optionally ``"z_top"`` / ``"z_bottom"``. The emitter's own links run
+    at the safe Z above the work, so only the starts are judged here; the MCP judges the links it
+    plans as well. Returns a list of (station_name, wall_name, clearance, required) tuples."""
+    required = float(tip_radius) + float(margin)
+    issues = []
+    for name, approach in approaches:
+        for wall in known_walls:
+            z_top = wall.get("z_top")
+            z_bottom = wall.get("z_bottom")
+            if z_top is not None and approach.z > z_top + 0.05:
+                continue
+            if z_bottom is not None and approach.z < z_bottom - 0.05:
+                continue
+            c = _wall_point_clearance(wall, approach.x, approach.y)
+            if c is not None and c < required - 1e-9:
+                issues.append((name, wall.get("name", "wall"), c, required))
+    return issues
+
+
 def emit_probe_program(doc, selections, out_path, frame="work", placement=None, clearance=10.0,
                        overtravel=10.0, safe_lift=15.0, feed=100, toolpath=None, tol=TOLERANCE_DEFAULT,
-                       results=None):
-    """Write the program; returns (path, lines_written, probe_count)."""
+                       results=None, known_walls=None, tip_radius=None, wall_margin=None,
+                       on_wall_violation="refuse"):
+    """Write the program; returns (path, lines_written, probe_count).
+
+    ``known_walls`` (with the MEASURED ``tip_radius`` and a ``wall_margin``) runs the same station-start
+    clearance check the MCP applies at staging (``wall_clearance_issues``): a start inside
+    tip radius + margin of a known wall raises ValueError, or prints warnings with
+    ``on_wall_violation="warn"``. Pass the walls in the emitted frame (after ``placement``)."""
     if frame not in ("work", "machine"):
         raise ValueError("frame must be 'work' or 'machine'")
     if placement is not None and frame != "machine":
         raise ValueError("a placement maps CAD to MACHINE coordinates - pass frame='machine' with it")
     if clearance <= 0 or overtravel <= 0:
         raise ValueError("clearance and overtravel must be positive (the G38 target is the travel limit)")
+    if known_walls:
+        if tip_radius is None or wall_margin is None:
+            raise ValueError("known_walls needs tip_radius (the MEASURED probe tip radius) and wall_margin - no default")
     name = toolpath or ("%s_probe" % doc.Name)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     res = dict(documentid=doc.Name, modelversion=str(getattr(doc, "LastModifiedDate", "") or "1").replace(" ", "_"),
@@ -198,6 +259,14 @@ def emit_probe_program(doc, selections, out_path, frame="work", placement=None, 
             probes.append((meta, approach, target, p_m, n_m))
     if not probes:
         raise ValueError("no probe points - check the selections")
+    if known_walls:
+        issues = wall_clearance_issues([(m["name"], a) for m, a, _t, _p, _n in probes], known_walls, tip_radius, wall_margin)
+        if issues:
+            text = "; ".join("station %s: tip centre %.3f mm from known wall %s (needs tip radius + margin = %.3f)" % (s, c, w, r)
+                             for s, w, c, r in issues)
+            if on_wall_violation != "warn":
+                raise ValueError("wall clearance: " + text + " - move the station starts (corner arcs radially from the fitted centre)")
+            App.Console.PrintWarning("wall clearance: %s\n" % text)
     safe_z = max(a.z for _m, a, _t, _p, _n in probes) + safe_lift
     lines = [
         "%",

@@ -60,12 +60,29 @@ import {
     isProcedureStopped,
     abortRaiseToTop,
 } from './probing';
-import { GPIO_SENSOR_DELAY_MS, HOP_LIFT_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
+import {
+    GPIO_SENSOR_DELAY_MS,
+    HOP_LIFT_MM,
+    RADIAL_TOLERANCE_DEG,
+    WALL_MARGIN_MM,
+    releaseTimeoutFor,
+    resolveMarchParams,
+    within,
+} from './procedureLimits';
 import { McpToolError } from './registry';
 import { probeGeometry } from './rotaryGeometry';
 import { assertWithinTravel, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 import DataStorage from '../../DataStorage';
 import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
+import {
+    KnownWall,
+    WallCheck,
+    WallSpecError,
+    checkWallClearance,
+    describeWallViolation,
+    nominalWalls,
+    normalizeKnownWalls,
+} from './wallClearance';
 
 // run_probing_gcode (mcp/49, operator request 2026-09-07): a probing program
 // written by CAM (Fusion 360, FreeCAD, a Grbl/Marlin post, or by hand) is
@@ -121,6 +138,8 @@ export interface ProbeCamPlan {
      * raise-mode descent contact AT it is a blocked station, not a collision.
      */
     topZMachine: number | null;
+    /** Planning clearance of every station start and link path from the known walls (wallClearance.ts). */
+    wallCheck: WallCheck;
     onMiss: 'abort' | 'continue';
     march: MarchParams;
     hopZ: number;
@@ -139,6 +158,9 @@ interface CamArgs {
     link_mode?: unknown;
     hop_lift_mm?: unknown;
     top_z_machine?: unknown;
+    known_walls?: unknown;
+    wall_margin_mm?: unknown;
+    radial_tolerance_deg?: unknown;
     on_miss?: unknown;
     report_format?: unknown;
     coarse_step_mm?: unknown;
@@ -282,6 +304,80 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
         }
     }
 
+    // Wall clearance at planning time (handoff 2026-09-21 §4 0a): the tip
+    // must fit at every station start and along every link path, judged
+    // against the walls the agent declares (measured - refuse) and the ones
+    // the program's own nominals describe (CAD intent - warn).
+    const tipDiameterMm = (probeGeometry() || { tipDiameter: null }).tipDiameter;
+    const toMachineXy = (p: { x: number; y: number }) => ({ x: r3(p.x - originOffset.x), y: r3(p.y - originOffset.y) });
+    let declared: KnownWall[] = [];
+    try {
+        declared = normalizeKnownWalls(args.known_walls, toMachineXy);
+    } catch (err) {
+        if (err instanceof WallSpecError) {
+            throw new McpToolError(err.message);
+        }
+        throw err;
+    }
+    let marginMm = 0;
+    if (args.wall_margin_mm !== undefined && args.wall_margin_mm !== null && args.wall_margin_mm !== '') {
+        marginMm = Number(args.wall_margin_mm);
+        if (!within(marginMm, WALL_MARGIN_MM)) {
+            throw new McpToolError(`wall_margin_mm must be ${WALL_MARGIN_MM.min}..${WALL_MARGIN_MM.max} mm (air beyond the tip radius a station start or link keeps from a known wall).`);
+        }
+    } else if (declared.length) {
+        throw new McpToolError('wall_margin_mm is required with known_walls: how much air beyond the tip radius every station start and link path must '
+            + 'keep from the declared walls (their measurement uncertainty - there is no default).');
+    }
+    if (declared.length && tipDiameterMm === null) {
+        throw new McpToolError('known_walls given but no probe tip diameter is stored, so "does the tip fit" cannot be judged - '
+            + 'set_probe_geometry probe_tip_diameter first (measured, e.g. from a post + hole pair).');
+    }
+    let radialToleranceDeg: number | null = null;
+    if (args.radial_tolerance_deg !== undefined && args.radial_tolerance_deg !== null && args.radial_tolerance_deg !== '') {
+        radialToleranceDeg = Number(args.radial_tolerance_deg);
+        if (!within(radialToleranceDeg, RADIAL_TOLERANCE_DEG)) {
+            throw new McpToolError(`radial_tolerance_deg must be ${RADIAL_TOLERANCE_DEG.min}..${RADIAL_TOLERANCE_DEG.max}.`);
+        }
+    }
+    const stationStarts: Parameters<typeof checkWallClearance>[0]['stationStarts'] = [];
+    const linkPaths: Parameters<typeof checkWallClearance>[0]['linkPaths'] = [];
+    parsed.steps.forEach((step, index) => {
+        if (step.kind === 'probe') {
+            stationStarts.push({ stepIndex: index, line: step.line, station: step.meta.name || step.meta.id || String(step.index), at: { ...step.from } });
+            return;
+        }
+        const link = linkAt(links, index);
+        if (!link || step.kind !== 'move') {
+            return;
+        }
+        const linkZ = link.style === 'raise' ? hopZ : Math.max(step.from.z, step.target.z);
+        const station = link.station ? link.station.name || link.station.id : null;
+        linkPaths.push({ line: step.line, station, from: { ...step.from, z: linkZ }, to: { ...step.target, z: linkZ } });
+    });
+    const wallCheck = checkWallClearance({
+        steps: parsed.steps,
+        stationStarts,
+        linkPaths,
+        declared,
+        nominal: nominalWalls(parsed.steps, topZMachine),
+        tipRadiusMm: tipDiameterMm === null ? null : r3(tipDiameterMm / 2),
+        marginMm,
+        radialToleranceDeg,
+        epsilonMm: TRAVERSE_Z_TOLERANCE_MM,
+    });
+    if (wallCheck.violations.length) {
+        throw new McpToolError(`Probing program refused (wall clearance, ${wallCheck.violations.length} violation(s) against the declared known_walls): `
+            + `${wallCheck.violations.slice(0, 6).map(describeWallViolation).join('; ')}${wallCheck.violations.length > 6 ? '; ...' : ''}. `
+            + 'Move the station starts (>= tip radius + margin clear of every wall, corner arcs approached radially from the fitted centre) and re-stage.');
+    }
+    for (const w of wallCheck.warnings) {
+        warnings.push(`wall clearance (nominal, not refused): ${describeWallViolation(w)}${tipDiameterMm === null ? ' [tip diameter unknown: judged with tip radius 0]' : ''}`);
+    }
+    for (const r of wallCheck.radialWarnings) {
+        warnings.push(`radial approach: line ${r.line} station "${r.station}" marches ${r.offRadialDeg} deg off the radial of arc "${r.wall}" (tolerance ${radialToleranceDeg}).`);
+    }
+
     const plan: ProbeCamPlan = {
         tool: 'run_probing_gcode',
         source,
@@ -290,6 +386,7 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
         links,
         hopLiftMm: hopLift,
         topZMachine,
+        wallCheck,
         onMiss,
         // Operator law 2026-09-05: never 2 mm; GPIO sensor floor (procedureLimits.ts).
         march: resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS }),
@@ -297,7 +394,7 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
         staged: { x, y, z },
         originOffset,
         frame,
-        tipDiameterMm: (probeGeometry() || { tipDiameter: null }).tipDiameter,
+        tipDiameterMm,
         reportFormat,
         warnings,
     };
@@ -334,6 +431,11 @@ export function describeProbeCamPlanAsGcode(plan: ProbeCamPlan): string {
         `; programmed feeds are ignored (coarse ${plan.march.coarseStepMm} mm F${COARSE_FEED}, fine ${plan.march.fineStepMm}, ${plan.march.confirmPasses} confirm pass(es), sensor ${plan.march.sensorDelayMs} ms).`,
         `; G38.2 without contact: ${plan.onMiss === 'abort' ? 'ABORTS (Grbl semantics)' : 'records no_contact and continues'}; G38.3 always records. Report: ${plan.reportFormat}.`,
         '; A BLOCKED station is a normal outcome on the report (status blocked, blockedBy = the link contact); any ABORT raises straight to the traverse height (law 8).',
+        `; WALL CLEARANCE (planning): ${plan.wallCheck.walls.filter((w) => w.source === 'declared').length} declared known_wall(s) + `
+            + `${plan.wallCheck.walls.filter((w) => w.source === 'nominal').length} wall(s) read off the program's own nominals, against every station start and link path, `
+            + `tip radius ${plan.wallCheck.tipRadiusMm === null ? 'UNKNOWN (0 used)' : plan.wallCheck.tipRadiusMm} + margin ${plan.wallCheck.marginMm} mm: `
+            + `no violation against the declared walls, ${plan.wallCheck.warnings.length} nominal warning(s)`
+            + `${plan.wallCheck.radial.length ? `; corner-arc approaches: ${plan.wallCheck.radial.map((r) => `"${r.station}" ${r.offRadialDeg} deg off radial of ${r.wall}`).join(', ')}` : ''}.`,
         ...(plan.parsed.rotations.length
             ? [`; THE STOCK WILL ROTATE: B schedule ${plan.parsed.rotations.map((b) => `${b} deg`).join(' -> ')} (absolute), each preceded by a raise to Z${plan.hopZ}.`]
             : []),

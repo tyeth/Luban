@@ -33,6 +33,22 @@ CNC probe):
   `M6`, `G28`, `G92`, `G55`–`G59`, arcs and `#` macro variables are refused with the line number
   — fix the post, do not strip lines by hand without telling the operator.
 
+**Wall clearance is checked at staging.** Declare every wall you have MEASURED (an earlier
+program's contacts, a fitted corner arc) as `known_walls` — `{kind: "line", a, b, normal}` (the
+normal points to the FREE side; the surface = tip-centre contact + tip radius along the material
+side) or `{kind: "arc", center, radius, material: "outside" | "inside", from_deg?, to_deg?}`,
+optional `z_top` / `z_bottom`, in the program's frame — with `wall_margin_mm` (required; the
+walls' measurement uncertainty, 0–20). Every station start and every link path must keep the
+tip (stored `probe_tip_diameter` / 2, refused when unset) plus the margin clear of them, or the
+program is refused naming the station, the wall and the shortfall (pass 2 of 2026-09-21 parked
+station 68 0.5 mm from a wall measured the day before). Walls the program's own `(PROBE nominal=
+normal=)` side marches describe are checked too and only WARN (CAD intent, extent unknown).
+Approach a corner arc RADIALLY from its fitted centre: each march into a known arc is reported by
+its angle off the radial, and `radial_tolerance_deg` (optional) turns a larger angle into a
+warning. Station plans: start ≥ tip radius + margin inside every wall, few points on straight
+walls, dense in corners. The FreeCAD emitter runs the same start check with
+`known_walls=` / `tip_radius=` / `wall_margin=` (`wall_clearance_issues`).
+
 Coordinates are the CAM WCS (work frame) unless `frame: "machine"`; the work origin must be live
 and reliable on the heartbeat (the tool refuses a work-frame program while the offset is
 `assumed-zero`).

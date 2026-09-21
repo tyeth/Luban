@@ -35,6 +35,7 @@ import { tests as surveyPlanTests } from './surveyPlan.test';
 import { tests as toolProtrusionTests } from './toolProtrusion.test';
 import { tests as traversePlanTests } from './traversePlan.test';
 import { tests as validatorTests } from './validator.test';
+import { tests as wallClearanceTests } from './wallClearance.test';
 
 type TestCase = [string, () => void | Promise<void>];
 
@@ -63,6 +64,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['mjpegFanout', mjpegFanoutTests],
     ['marchCore', marchCoreTests],
     ['camLinks', camLinksTests],
+    ['wallClearance', wallClearanceTests],
 ];
 
 async function main(): Promise<void> {
