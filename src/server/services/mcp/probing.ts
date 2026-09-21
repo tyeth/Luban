@@ -17,6 +17,7 @@ import {
     setTrustedOffset,
 } from './positionOfRecord';
 import { ProbeChannel, probeFeedService, resolveSensorEnabled, sensorLabel } from './probeFeed';
+import { MARCH_SEGMENT_MM, marchSegments } from './procedureLimits';
 import { McpToolError } from './registry';
 import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
 import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot, safeTraverseZ } from './tools/machine';
@@ -766,8 +767,53 @@ export async function rotateB(tool: string, targetDeg: number, requireZAtLeast: 
     throw new ProcedureAbort(`Rotation to B${target} not confirmed within ${ROTATE_TIMEOUT_MS / 1000} s (echo ${echo ? echo[1] : 'none'}).`);
 }
 
-/** Longest single Z move toward the work a procedure may issue (operator law 2026-09-05). */
+/** Longest single Z move toward the work a procedure may issue when NO contact is expected (operator law 2026-09-05). */
 export const DESCENT_SEGMENT_MM = 5;
+
+export interface MarchAdvance {
+    /** Where the march scalar ended up: `toS`, or the segment a contact stopped it at. */
+    s: number;
+    sensed: StepResult;
+    segments: number;
+}
+
+/**
+ * Advance a sensor-gated march from `fromS` to `toS` along whatever the
+ * caller's `move(s)` parametrises (a scalar along a unit vector, a single
+ * axis coordinate, a Z), in physical moves of at most MARCH_SEGMENT_MM, each
+ * settle-verified and followed by a sensor read. The caller's coarse step is
+ * the LOGICAL advance; this is where the operator law about the physical one
+ * lives (2026-09-05: a move once sent cannot be stopped, so "never 2 mm").
+ *
+ * Contact ends the advance at the segment it was sensed on, which is the
+ * position the caller records - a 2 mm coarse step that meets the surface
+ * 0.6 mm in reports 0.6 mm in, not 2. Until 2026-09-21 every planner sent
+ * its whole coarse step as one move and read the sensor once after it.
+ */
+export async function marchInSegments(
+    move: (s: number) => Promise<void>,
+    fromS: number,
+    toS: number,
+    channels: ProbeChannel | ProbeChannel[],
+    sensorDelayMs: number,
+    segmentMm: number = MARCH_SEGMENT_MM
+): Promise<MarchAdvance> {
+    const stops = marchSegments(fromS, toS, segmentMm);
+    let s = fromS;
+    let sensed: StepResult = { contact: false, reading: null };
+    let segments = 0;
+    for (const next of stops) {
+        const issuedAt = Date.now();
+        s = next;
+        segments += 1;
+        await move(s);
+        sensed = await senseAfter(channels, issuedAt, sensorDelayMs);
+        if (sensed.contact) {
+            break;
+        }
+    }
+    return { s, sensed, segments };
+}
 
 /**
  * Descend from `fromZ` to `toZ` (machine Z) in segments of at most

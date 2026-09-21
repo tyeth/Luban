@@ -13,6 +13,7 @@ import {
     assertChannelReady,
     assertMachineReadyForProcedure,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -21,7 +22,7 @@ import {
 } from './probing';
 import { McpToolError } from './registry';
 import { MIN_USEFUL_MARCH_MM, clampRay } from './machineTravel';
-import { MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
+import { MARCH_SEGMENT_MM, MARCH_TRAVEL_MM, releaseTimeoutFor, resolveMarchParams, within } from './procedureLimits';
 import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // Point probing with the spindle-mounted touch probe (normally-open, probe
@@ -133,6 +134,7 @@ export function describeProbePlanAsGcode(plan: ProbePointPlan): string {
     const word = plan.axis.toUpperCase();
     const lines = [
         '; TOUCH PROBE POINT MEASUREMENT (server-driven, sensor-gated on the probe channel)',
+        `; every move toward the work is sent as sensor-checked segments of <= ${MARCH_SEGMENT_MM} mm (the coarse step is the logical advance)`,
         '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the probe feed is checked',
         '; before the next line. The march stops at first contact; running the full ladder',
         `; without contact ABORTS at the travel limit ${word} ${plan.limitCoord.toFixed(3)}${plan.travelClippedBy
@@ -215,13 +217,16 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         // Coarse march to first contact.
         let coarseContact: number | null = null;
         while (Math.abs(current - plan.limitCoord) > 1e-9) {
-            const stepStart = Date.now();
-            current = towards(current + plan.direction * plan.coarseStepMm);
-            await move('probe:coarse', current, COARSE_FEED);
-            const sensed = await senseAfter('probe', stepStart, plan.sensorDelayMs);
-            if (sensed.contact) {
+            // The coarse step is the logical advance; the physical moves are
+            // <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+            const advance = await marchInSegments(
+                async (v) => move('probe:coarse', v, COARSE_FEED),
+                current, towards(current + plan.direction * plan.coarseStepMm), 'probe', plan.sensorDelayMs
+            );
+            current = advance.s;
+            if (advance.sensed.contact) {
                 coarseContact = current;
-                announce('coarse-contact', current, `probe "${sensed.reading?.value}"`);
+                announce('coarse-contact', current, `probe "${advance.sensed.reading?.value}"`);
                 break;
             }
         }

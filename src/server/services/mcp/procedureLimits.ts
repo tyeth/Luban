@@ -102,6 +102,38 @@ export function releaseTimeoutFor(sensorDelayMs: number, minMs: number = RELEASE
     return Math.max(sensorDelayMs * RELEASE_TIMEOUT_DELAY_FACTOR, minMs);
 }
 
+/**
+ * The PHYSICAL move: no single gcode move toward the work presses further
+ * than this before the sensor is read again (operator law 2026-09-05, job
+ * cdbc29371b97: "never 2 mm" - a move once sent cannot be stopped, so a
+ * collision is driven to the end of it). The caller's coarse step is a
+ * logical advance made of these; probing.marchInSegments enforces it for
+ * every planner, and DESCENT_SEGMENT_MM (5 mm, probing.ts) is the same rule
+ * for a descent that expects NO contact.
+ */
+export const MARCH_SEGMENT_MM = 1;
+
+/**
+ * The scalar positions a march visits on its way from `fromS` to `toS`:
+ * evenly divided into steps no longer than `segmentMm`, the end always
+ * included, nothing when there is no distance to cover. Pure, so the
+ * segmenting is unit-tested apart from the machine.
+ */
+export function marchSegments(fromS: number, toS: number, segmentMm: number = MARCH_SEGMENT_MM): number[] {
+    const distance = Math.abs(toS - fromS);
+    if (distance < 1e-9) {
+        return [];
+    }
+    const count = Math.max(1, Math.ceil(distance / segmentMm - 1e-9));
+    const direction = toS > fromS ? 1 : -1;
+    const step = distance / count;
+    const out: number[] = [];
+    for (let i = 1; i <= count; i++) {
+        out.push(i === count ? toS : Number((fromS + direction * step * i).toFixed(6)));
+    }
+    return out;
+}
+
 /** How far a single march may run before it aborts with no contact. */
 export const MARCH_TRAVEL_MM: Range = { min: 1, max: 150 };
 /** start_z_machine - floor_z_machine: the deepest a -Z search may go. */

@@ -7,6 +7,7 @@ import {
     CONFIRM_PASSES,
     FINE_STEP_MM,
     GPIO_SENSOR_DELAY_MS,
+    MARCH_SEGMENT_MM,
     RELEASE_TIMEOUT_MIN_MS,
     SENSOR_DELAY_MS,
     SURVEY_PITCH_MM,
@@ -14,6 +15,7 @@ import {
     TOOL_SETTER_RELEASE_TIMEOUT_MIN_MS,
     clampCount,
     clampTo,
+    marchSegments,
     releaseTimeoutFor,
     resolveMarchParams,
     within,
@@ -80,5 +82,21 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(releaseTimeoutFor(300), RELEASE_TIMEOUT_MIN_MS);
         assert.equal(releaseTimeoutFor(2000), 8000);
         assert.equal(releaseTimeoutFor(200, TOOL_SETTER_RELEASE_TIMEOUT_MIN_MS), TOOL_SETTER_RELEASE_TIMEOUT_MIN_MS);
+    }],
+
+    ['a coarse step is a logical advance: the physical moves that make it up are <= MARCH_SEGMENT_MM, evenly divided, end included', () => {
+        assert.equal(MARCH_SEGMENT_MM, 1);
+        // probe_circle's 2 mm radial step from s=0.
+        assert.deepEqual(marchSegments(0, 2), [1, 2]);
+        // 2.5 mm is three even segments, not two and a stub.
+        assert.deepEqual(marchSegments(0, 2.5), [0.833333, 1.666667, 2.5]);
+        // A fine step is already below the segment and goes as one move.
+        assert.deepEqual(marchSegments(3, 3.1), [3.1]);
+        // Direction follows the sign: a tool-setter descent in Z.
+        assert.deepEqual(marchSegments(250, 248), [249, 248]);
+        // Nothing to cover, nothing sent.
+        assert.deepEqual(marchSegments(5, 5), []);
+        // The end is exact, never a float-noise short of the target.
+        assert.equal(marchSegments(0.1, 1.1)[0], 1.1);
     }],
 ];

@@ -20,6 +20,7 @@ import {
     expectMachinePosition,
     knownMachinePosition,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -397,11 +398,14 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 let s = 0;
                 let coarseContactS: number | null = null;
                 while (step.maxTravelMm - s > 1e-9) {
-                    const t0 = Date.now();
-                    s = Math.min(s + plan.coarseStepMm, step.maxTravelMm);
-                    await move(`seq:coarse:${step.name}`, s, COARSE_FEED);
-                    const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
-                    if (sensed.contact) {
+                    // The coarse step is the logical advance; the physical moves
+                    // are <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+                    const advance = await marchInSegments(
+                        async (v) => move(`seq:coarse:${step.name}`, v, COARSE_FEED),
+                        s, Math.min(s + plan.coarseStepMm, step.maxTravelMm), 'probe', plan.sensorDelayMs
+                    );
+                    s = advance.s;
+                    if (advance.sensed.contact) {
                         coarseContactS = s;
                         announce(`coarse-contact-${step.name}`, `${s.toFixed(3)} mm along`);
                         break;

@@ -8,6 +8,7 @@ import {
     ProcedureAbort,
     TRAVEL_FEED,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
 } from './probing';
@@ -106,11 +107,14 @@ export async function marchToContact(
     let s = 0;
     let coarseContactS: number | null = null;
     while (maxTravelMm - s > 1e-9) {
-        const t0 = Date.now();
-        s = Math.min(s + params.coarseStepMm, maxTravelMm);
-        await move(`${tag}:coarse:${name}`, s, COARSE_FEED);
-        const sensed = await senseAfter('probe', t0, params.sensorDelayMs);
-        if (sensed.contact) {
+        // The coarse step is the logical advance; the physical moves that make
+        // it up are <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+        const advance = await marchInSegments(
+            async (v) => move(`${tag}:coarse:${name}`, v, COARSE_FEED),
+            s, Math.min(s + params.coarseStepMm, maxTravelMm), 'probe', params.sensorDelayMs
+        );
+        s = advance.s;
+        if (advance.sensed.contact) {
             coarseContactS = s;
             announce(`coarse-contact-${name}`, `${s.toFixed(3)} mm along`);
             break;

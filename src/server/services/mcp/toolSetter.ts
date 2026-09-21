@@ -16,6 +16,7 @@ import {
     assertMachineReadyForProcedure,
     descendInSegments,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -24,6 +25,7 @@ import {
     RaiseToTopPhases,
 } from './probing';
 import {
+    MARCH_SEGMENT_MM,
     MAX_BIT_LENGTH_MM,
     TOOL_SETTER_BACKOFF_MM,
     TOOL_SETTER_CENTRE_TOLERANCE_MM,
@@ -300,6 +302,7 @@ export function describePlanAsGcode(plan: ToolSetterPlan): string {
     const c = plan.config;
     const lines = [
         '; TOOL SETTER MEASUREMENT PROCEDURE (server-driven, sensor-gated)',
+        `; every move toward the setter is sent as sensor-checked segments of <= ${MARCH_SEGMENT_MM} mm (the coarse step is the logical advance)`,
         '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the toolsetter',
         '; feed is checked before the next line is issued. Descent stops at first',
         '; contact - the full ladder below only executes if the sensor stays silent,',
@@ -453,14 +456,17 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         // correctly-declared bit out of that regime).
         let coarseContactZ: number | null = null;
         while (currentZ - plan.coarseStepMm >= plan.coarseFloorZ - 1e-9) {
-            const stepStart = Date.now();
-            currentZ = Math.max(currentZ - plan.coarseStepMm, plan.coarseFloorZ);
-            await moveMachineSettled('toolsetter:coarse', { z: currentZ }, COARSE_FEED);
-            const sensed = await senseAfter(contactChannels, stepStart, plan.sensorDelayMs);
-            if (sensed.contact) {
+            // The coarse step is the logical advance; the physical moves are
+            // <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+            const advance = await marchInSegments(
+                async (v) => moveMachineSettled('toolsetter:coarse', { z: v }, COARSE_FEED),
+                currentZ, Math.max(currentZ - plan.coarseStepMm, plan.coarseFloorZ), contactChannels, plan.sensorDelayMs
+            );
+            currentZ = advance.s;
+            if (advance.sensed.contact) {
                 coarseContactZ = currentZ;
                 announce('coarse-contact', currentZ,
-                    `sensor "${sensed.reading?.value}" ABOVE the slow zone - bit longer than declared`);
+                    `sensor "${advance.sensed.reading?.value}" ABOVE the slow zone - bit longer than declared`);
                 break;
             }
         }

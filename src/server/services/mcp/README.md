@@ -370,11 +370,25 @@ the descent, so a setter hit above the start height is a collision, not a measur
 1 mm guarded final approach and the coarse/fine ladders (which do sense serially, because
 contact there is the measurement) are unchanged. Upward moves stay single.
 
-**Coarse press and the slow zone (operator, 2026-09-05, job d8f6ec1b5c11).** A coarse step is
-executed whole by the controller before the runner sees the probe, so wherever the surface
-is found by a coarse step the probe is pressed past contact by up to a FULL coarse step
-(0.4 mm at station 1 with 2 mm steps; worst case the whole step). `coarse_step_mm` is
-therefore also the worst-case press. From station 2 the runner knows the expected contact
+**The coarse step is a logical advance; the physical move is a segment (2026-09-21, after
+#146).** Until then every planner sent its whole coarse step as one `G1` and read the probe
+once after it, so the worst-case press was a full coarse step. Now `probing.marchInSegments`
+issues every move TOWARD the work as settle-verified segments of **≤ `MARCH_SEGMENT_MM`
+(1 mm)**, each followed by its own `senseAfter` window, and contact ends the advance at the
+segment it was sensed on (a 2 mm step that meets the surface 0.6 mm in reports 0.6 mm in).
+`coarse_step_mm` is how far the ladder advances between verdicts when nothing is found; the
+press is bounded by the segment, whatever the step. This is what the "never 2 mm" law of
+2026-09-05 is about, and why `probe_circle` may keep its 2 mm radial step. Every coarse
+ladder (marchToContact for outline / CAM programs, probe_point, probe_vector,
+probe_sequence, probe_circle, the surface scans, the tool setter's coarse descent) goes
+through it; retreats move away from the work and stay whole.
+
+**Coarse press and the slow zone (operator, 2026-09-05, job d8f6ec1b5c11).** Before the
+segmenting above, a coarse step was executed whole by the controller before the runner saw
+the probe, so wherever the surface was found the probe was pressed past contact by up to a
+FULL coarse step (0.4 mm at station 1 with 2 mm steps; worst case the whole step), and
+`coarse_step_mm` was also the worst-case press. The slow zone was the answer for the
+surface scans and still applies (it saves time as much as press): From station 2 the runner knows the expected contact
 (the previous station's Z), so — like `run_tool_setter`'s `slow_zone_mm` — coarse steps now
 stop `slow_zone_mm` (default 1, min 0.3) above it and fine steps take over, down to
 `slow_zone + 2 × coarse` below it (coarse resumes lower, so a pocket edge costs seconds).

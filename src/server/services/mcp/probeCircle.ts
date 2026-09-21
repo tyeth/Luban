@@ -13,6 +13,7 @@ import {
     assertMachineReadyForProcedure,
     descendInSegments,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -26,6 +27,7 @@ import {
     CIRCLE_POINTS,
     CIRCLE_PROBE_DEPTH_MM,
     CIRCLE_RESIDUAL_WARN_MM,
+    MARCH_SEGMENT_MM,
     MAX_CIRCLE_DIAMETER_MM,
     MAX_STATED_MACHINE_Z_MM,
     MIN_RADIAL_APPROACH_MM,
@@ -221,6 +223,7 @@ export function describeProbeCirclePlanAsGcode(plan: ProbeCirclePlan): string {
                 + `hops between points at the safe traverse height Z ${plan.hopZ} (motion law 2)`,
         ];
     lines.push(
+        `; every move toward the work is sent as sensor-checked segments of <= ${MARCH_SEGMENT_MM} mm (the coarse step is the logical advance)`,
         '; EVERY LINE IS SENT INDIVIDUALLY and settle-verified; the probe feed is checked after each',
         '; march step. A probe touch during a hop or descent latches the CRASH alarm.',
         '; overtravel feed trips -> job stop + connection close + latched alarm',
@@ -390,11 +393,14 @@ export async function runProbeCircleProcedure(plan: ProbeCirclePlan): Promise<ob
             let s = 0;
             let coarseContactS: number | null = null;
             while (travelBudget - s > 1e-9) {
-                const stepStart = Date.now();
-                s = Math.min(s + plan.coarseStepMm, travelBudget);
-                await moveMachineSettled(`circle:coarse:${label}`, radialXY(rad, radiusAt(s)), COARSE_FEED);
-                const sensed = await senseAfter('probe', stepStart, plan.sensorDelayMs);
-                if (sensed.contact) {
+                // A 2 mm radial coarse step is a logical advance: the physical
+                // moves are <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
+                const advance = await marchInSegments(
+                    async (v) => moveMachineSettled(`circle:coarse:${label}`, radialXY(rad, radiusAt(v)), COARSE_FEED),
+                    s, Math.min(s + plan.coarseStepMm, travelBudget), 'probe', plan.sensorDelayMs
+                );
+                s = advance.s;
+                if (advance.sensed.contact) {
                     coarseContactS = s;
                     announce(`coarse-contact-${label}`, `radius ${radiusAt(s).toFixed(3)}`);
                     break;

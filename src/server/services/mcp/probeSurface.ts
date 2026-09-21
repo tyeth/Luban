@@ -23,6 +23,7 @@ import {
     expectMachinePosition,
     knownMachinePosition,
     moveMachineSettled,
+    marchInSegments,
     senseAfter,
     senseReleaseAfter,
     isProcedureAbort,
@@ -552,7 +553,6 @@ async function marchDownZ(
     let coarseContactS: number | null = null;
     let fineContactS: number | null = null;
     while (travel - s > 1e-9) {
-        const t0 = Date.now();
         const fine = inZone(s);
         let next: number;
         if (fine) {
@@ -563,9 +563,15 @@ async function marchDownZ(
                 next = zone.topS; // a coarse step never crosses into the slow zone
             }
         }
-        s = next;
-        await move(fine ? `${tag}:fine` : `${tag}:coarse`, s, fine ? FINE_FEED : COARSE_FEED);
-        const sensed = await senseAfter('probe', t0, plan.sensorDelayMs);
+        // The step is the logical advance; the physical moves are
+        // <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts). A fine step
+        // is already below that and goes as one.
+        const advance = await marchInSegments(
+            async (v) => move(fine ? `${tag}:fine` : `${tag}:coarse`, v, fine ? FINE_FEED : COARSE_FEED),
+            s, next, 'probe', plan.sensorDelayMs
+        );
+        s = advance.s;
+        const sensed = advance.sensed;
         if (sensed.contact) {
             if (fine) {
                 fineContactS = s;
