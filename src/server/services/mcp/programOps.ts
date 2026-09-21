@@ -15,7 +15,7 @@
 
 import { Bounded, CAPTURE_SETTLE_MS, clampTo } from './procedureLimits';
 
-export const PROGRAM_OP_KINDS = ['rotate_b', 'surface_path', 'surface_grid', 'sequence', 'stock_outline', 'capture', 'home'] as const;
+export const PROGRAM_OP_KINDS = ['rotate_b', 'surface_path', 'surface_grid', 'sequence', 'stock_outline', 'wall_follow', 'capture', 'home'] as const;
 export type ProgramOpKindName = typeof PROGRAM_OP_KINDS[number];
 
 export function isProgramOpKind(kind: unknown): kind is ProgramOpKindName {
