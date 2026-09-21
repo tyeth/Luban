@@ -56,8 +56,16 @@ and reliable on the heartbeat (the tool refuses a work-frame program while the o
 Metadata: put `(PROBE id=.. name=.. group=.. role=.. nominal=x,y,z normal=i,j,k tol=u,l offset=..)`
 before a cycle so the report carries nominals, normals, tolerances and the surface offset; a
 `(RESULTS documentid=.. modelversion=.. toolpathid=1.00001 toolpath=NAME)` comment fills the
-Fusion results envelope. Deviations are of the SURFACE (tip centre minus one tip radius along the
-normal) and need `set_probe_geometry`'s tip diameter.
+Fusion results envelope.
+
+**The tip convention (one, everywhere).** A recorded contact is the tip REFERENCE point: the
+stylus ball's CENTRE in X/Y (the toolhead XY) and its BOTTOM in Z — `probe_effective_length` is
+measured on the tool setter to the tip bottom, so a −Z contact's Z already is the surface. The
+SURFACE compared with a nominal is `contact + (0, 0, r) − r·normal`: no correction on a −Z march,
+one tip radius on a side march. Nominals (CAD, the emitter) are surface points in the same frame.
+`report.tipConvention` spells this out; deviations need `set_probe_geometry`'s tip diameter and
+are null without it. (Before #175 the radius was taken off −Z contacts too, and pass 1 of the
+pocket read every top 1.25 mm low.)
 
 Reports: `reportText` in `report_format` — `fusion` (default; Fusion "inspection results"
 G800/G801 text for Inspect Surface points), `renishaw` (the Inspection Plus print-out Fusion

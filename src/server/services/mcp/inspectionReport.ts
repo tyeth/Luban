@@ -69,6 +69,8 @@ export interface InspectionReport {
     endedAt: number;
     frame: { originOffset: Xyz; convention: string };
     tipDiameterMm: number | null;
+    /** TIP_CONVENTION, spelled out so a reader of the JSON knows what `contactWork` and the deviations mean. Absent on reports before #175. */
+    tipConvention?: string;
     /** Program-level results metadata from a (RESULTS ...) comment, for the Fusion envelope. */
     results: ResultsMeta;
     probes: ProbeResultRecord[];
@@ -92,6 +94,36 @@ export interface InspectionReport {
 }
 
 const f3 = (v: number) => v.toFixed(3);
+
+/**
+ * THE tip convention (issue #175, handoff 2026-09-21 §4 items 3-4). A recorded
+ * contact is the tip REFERENCE point: the stylus ball's CENTRE in X and Y (the
+ * toolhead XY) and its BOTTOM in Z - because probe_effective_length is
+ * measured on the tool setter to the tip's bottom, so a -Z contact's Z already
+ * IS the surface (physical = toolhead Z - probe length; in the work frame the
+ * operator's Z0 was touched off the same way). The surface point a contact
+ * measured is therefore the ball centre (reference + r up) pushed one radius
+ * back along the outward normal:
+ *
+ *     surface = reference + (0, 0, r) - r * n
+ *
+ * -Z march (n = 0,0,1): surface = reference - no correction (the old code
+ * subtracted r here and read every top 1.25 mm low). Side march (n
+ * horizontal): the familiar one-radius push, at the ball-centre height.
+ * Nominals from CAD are SURFACE points in the same frame.
+ */
+export const TIP_CONVENTION = 'contact = tip reference point (stylus-centre XY, stylus-BOTTOM Z: the effective length is measured to the tip bottom); '
+    + 'surface = contact + (0,0,r) - r*normal; nominals are surface points';
+
+export function surfaceFromContact(contact: Xyz, normal: Xyz, tipRadiusMm: number): Xyz {
+    const len = Math.hypot(normal.x, normal.y, normal.z) || 1;
+    const n = { x: normal.x / len, y: normal.y / len, z: normal.z / len };
+    return {
+        x: contact.x - n.x * tipRadiusMm,
+        y: contact.y - n.y * tipRadiusMm,
+        z: contact.z + tipRadiusMm - n.z * tipRadiusMm,
+    };
+}
 
 function normalOf(p: ProbeResultRecord): Xyz {
     if (p.meta.normal) {
@@ -166,7 +198,9 @@ export function renderFusion(report: InspectionReport): string {
             lines.push(`G800 N${p.index} X${f4(nom.x)} Y${f4(nom.y)} Z${f4(nom.z)} I${f6(n.x)} J${f6(n.y)} K${f6(n.z)} `
                 + `O${f4(p.meta.surfaceOffsetMm ?? 0)} U${f4(p.meta.upperTolMm ?? 0)} L${f4(p.meta.lowerTolMm ?? 0)}`);
             if (p.contactWork) {
-                lines.push(`G801 N${p.index} X${f4(p.contactWork.x)} Y${f4(p.contactWork.y)} Z${f4(p.contactWork.z)} R${f4(r)}`);
+                // Fusion wants the stylus CENTRE and subtracts R along the normal
+                // itself: the recorded Z is the tip bottom, so the centre is r up.
+                lines.push(`G801 N${p.index} X${f4(p.contactWork.x)} Y${f4(p.contactWork.y)} Z${f4(p.contactWork.z + r)} R${f4(r)}`);
             }
         }
     }
@@ -213,7 +247,7 @@ function surfacePointOf(p: ProbeResultRecord, offset: Xyz, tipRadius: number): S
     const nominal = p.meta.nominal ? nominalWorkOf(p, offset) : null;
     return {
         record: p,
-        surface: { x: p.contactWork.x - n.x * tipRadius, y: p.contactWork.y - n.y * tipRadius, z: p.contactWork.z - n.z * tipRadius },
+        surface: surfaceFromContact(p.contactWork, n, tipRadius),
         normal: n,
         nominal,
     };
@@ -440,10 +474,12 @@ export function reportExtension(format: ReportFormat): string {
 
 /**
  * Deviation of the measured SURFACE from the nominal along the outward
- * surface normal, with the tolerance verdict. `contactWork` is the tip-centre
- * position; the surface point is one tip radius back along the normal (the
- * review of 2026-09-07 found the raw tip centre being compared, a bias of one
- * stylus radius). `lowerTol` is signed (<= 0) as Fusion configures it.
+ * surface normal, with the tolerance verdict. `contactWork` is the tip
+ * REFERENCE point (TIP_CONVENTION: centre XY, bottom Z); the surface is
+ * surfaceFromContact. The review of 2026-09-07 found the raw contact being
+ * compared (a bias of one radius on side marches); the pass-1 report of
+ * 2026-09-21 found the radius taken off -Z contacts too, which read every top
+ * a radius low (issue #175). `lowerTol` is signed (<= 0) as Fusion configures it.
  */
 export function deviationAlongNormal(
     contactWork: Xyz,
@@ -455,7 +491,7 @@ export function deviationAlongNormal(
 ): { deviationMm: number; withinTolerance: boolean | null } {
     const len = Math.hypot(normal.x, normal.y, normal.z) || 1;
     const n = { x: normal.x / len, y: normal.y / len, z: normal.z / len };
-    const surface = { x: contactWork.x - n.x * tipRadiusMm, y: contactWork.y - n.y * tipRadiusMm, z: contactWork.z - n.z * tipRadiusMm };
+    const surface = surfaceFromContact(contactWork, n, tipRadiusMm);
     const d = (surface.x - nominalWork.x) * n.x + (surface.y - nominalWork.y) * n.y + (surface.z - nominalWork.z) * n.z;
     const deviationMm = Number(d.toFixed(3));
     if (upperTol === undefined && lowerTol === undefined) {
