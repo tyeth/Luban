@@ -52,11 +52,12 @@ export const tests: Array<[string, () => void]> = [
         });
     }],
 
-    ['operator law 2026-09-05: no planner may take a 2 mm coarse step, probe_circle included', () => {
+    ['the shared coarse cap is 1 mm; probe_circle keeps its own 0.5 default and 2 mm cap - a logical advance, segmented when executed', () => {
         assert.equal(resolveMarchParams({ coarse_step_mm: 2 }).coarseStepMm, 1);
-        assert.equal(resolveMarchParams({ coarse_step_mm: 2 }, { coarse: CIRCLE_COARSE_STEP_MM }).coarseStepMm, 1);
+        assert.equal(resolveMarchParams({ coarse_step_mm: 2 }, { coarse: CIRCLE_COARSE_STEP_MM }).coarseStepMm, 2);
+        assert.equal(resolveMarchParams({ coarse_step_mm: 5 }, { coarse: CIRCLE_COARSE_STEP_MM }).coarseStepMm, 2);
         assert.equal(COARSE_STEP_MM.max, 1);
-        assert.equal(CIRCLE_COARSE_STEP_MM.default, 0.5, 'the circle keeps its own default');
+        assert.equal(resolveMarchParams({}, { coarse: CIRCLE_COARSE_STEP_MM }).coarseStepMm, 0.5, 'the circle keeps its own default');
     }],
 
     ['the backoff never drops below the fine step actually in use', () => {

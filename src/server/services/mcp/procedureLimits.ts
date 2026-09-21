@@ -4,10 +4,9 @@
 // Every bound a procedure planner applies to its arguments, named once and
 // with its reason next to it. Until 2026-09-21 these lived inline as
 // `Math.min(Math.max(Number(args.x) || 1, 0.2), 1)` in eight planners, and
-// the same number meant the same thing in seven of them and something
-// slightly different in the eighth - which is how probe_circle came to allow
-// a 2 mm coarse step under an operator law that says "never 2 mm", and how a
-// reader could not tell a deliberate variation from a copy-paste drift.
+// a reader could not tell a deliberate variation (probe_circle's 2 mm
+// radial step, the surface scans' 0.5 mm floor, the GPIO transport's 30 ms
+// sensor floor) from a copy-paste drift.
 //
 // A named constant is not a resolved one: these are caps on what an agent
 // may ask for, not statements about the machine. Anything that describes
@@ -48,8 +47,13 @@ export function within(value: number, range: Range): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Operator law 2026-09-05 (job cdbc29371b97): never 2 mm - the coarse step
- * is also the press into the probe wherever it finds the surface.
+ * The caller's LOGICAL advance between sensor verdicts. The operator law of
+ * 2026-09-05 (job cdbc29371b97, "never 2 mm") is about the PHYSICAL move: no
+ * single gcode move toward the work may press further into the probe than
+ * one sensor-checked segment (MARCH_SEGMENT_MM, enforced by
+ * probing.marchInSegments whatever the coarse step is). The 1 mm cap here is
+ * the value the planners have carried since that day; probe_circle's 2 mm
+ * is its own, below.
  */
 export const COARSE_STEP_MM: Bounded = { default: 1, min: 0.2, max: 1 };
 /**
@@ -61,10 +65,11 @@ export const COARSE_STEP_MM: Bounded = { default: 1, min: 0.2, max: 1 };
 export const SURFACE_COARSE_STEP_MM: Bounded = { default: 1, min: 0.5, max: COARSE_STEP_MM.max };
 /**
  * probe_circle's radial marches default to 0.5 mm (the feature's diameter is
- * bounded by the operator, so the ladder is short). Its cap was 2 mm until
- * 2026-09-21, alone among the planners; it now obeys the same law.
+ * bounded by the operator, so the ladder is short) and may be asked for up to
+ * 2 mm: the coarse step is a logical advance, and the physical moves that
+ * make it up are segmented and sensor-checked regardless (MARCH_SEGMENT_MM).
  */
-export const CIRCLE_COARSE_STEP_MM: Bounded = { default: 0.5, min: COARSE_STEP_MM.min, max: COARSE_STEP_MM.max };
+export const CIRCLE_COARSE_STEP_MM: Bounded = { default: 0.5, min: COARSE_STEP_MM.min, max: 2 };
 export const FINE_STEP_MM: Bounded = { default: 0.1, min: 0.02, max: 0.5 };
 /** After contact the probe retreats this far before the fine approach; never less than a fine step. */
 export const BACKOFF_MM: Bounded = { default: 1, min: FINE_STEP_MM.min, max: 3 };

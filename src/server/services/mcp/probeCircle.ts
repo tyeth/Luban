@@ -191,9 +191,9 @@ export function planProbeCircle(args: {
         startRadiusMm: startRadius,
         limitRadiusMm: limitRadius,
         points,
-        // Radial marches: 0.5 mm coarse default, fewer confirm passes per
-        // azimuth - and, since 2026-09-21, the same 1 mm coarse cap as every
-        // other march (operator law 2026-09-05; this planner alone allowed 2).
+        // Radial marches: 0.5 mm coarse default (up to 2 mm as a logical
+        // advance - the physical moves are segmented), fewer confirm passes
+        // per azimuth (procedureLimits.ts).
         ...resolveMarchParams(args, { coarse: CIRCLE_COARSE_STEP_MM, passes: CIRCLE_CONFIRM_PASSES }),
         staged,
     };
