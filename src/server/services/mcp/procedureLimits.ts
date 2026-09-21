@@ -190,6 +190,14 @@ export const MAX_KEEP_OUT_BOXES = 20;
 export const B_AXIS_DEG: Range = { min: -360, max: 360 };
 /** Largest reach of stock and clamping about the rotary axis anyone should state (the A350 bed is 350 wide). */
 export const MAX_SWEPT_RADIUS_MM = 200;
+
+/**
+ * probe_program `capture` op: how long to let the platform and rotary stop
+ * ringing after the previous op before the frame is taken. rotate_b returns
+ * on the M114 echo or an idle heartbeat, so the default is a short damping
+ * wait, not a synchronisation. Not a clearance: nothing moves.
+ */
+export const CAPTURE_SETTLE_MS: Bounded = { default: 500, min: 0, max: 5000 };
 /** A dwell in a probing program is capped so a mistyped P cannot park the job. */
 export const MAX_DWELL_S = 60;
 /** A stated bit protrusion above this is not a bit. */
