@@ -41,7 +41,6 @@ import {
     getPositionSnapshot,
     motionFloorZ,
     requirePlanningTravel,
-    motionFloorZ,
     safeTraverseZ,
 } from './machine';
 import { validateStagedEnvelope } from './staging';

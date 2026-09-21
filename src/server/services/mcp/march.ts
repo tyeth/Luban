@@ -1,5 +1,14 @@
 import { mcpBroadcast } from './index';
-import { releaseTimeoutFor } from './procedureLimits';
+import {
+    DescentIo,
+    LinkDescentResult,
+    SteppedBlock,
+    SteppedIo,
+    SteppedTraverseResult,
+    linkDescentCore,
+    steppedTraverseCore,
+} from './marchCore';
+import { GPIO_SENSOR_DELAY_MS, releaseTimeoutFor } from './procedureLimits';
 import { probeFeedService } from './probeFeed';
 import {
     COARSE_FEED,
@@ -7,11 +16,13 @@ import {
     MAX_RETREAT_MM,
     ProcedureAbort,
     TRAVEL_FEED,
+    descendInSegments,
     moveMachineSettled,
     marchInSegments,
     senseAfter,
     senseReleaseAfter,
 } from './probing';
+import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 
 // Shared sensor-gated motion primitives (mcp/48, operator request 2026-09-06):
 //
@@ -25,14 +36,19 @@ import {
 //    TOUCH-PROBING move: 1 mm steps with the probe channel expected, and a
 //    contact means "the surface is closer here" - back off one step, retreat
 //    `liftMm` along the retreat direction (up, for a top; away from the face,
-//    for a side), continue. The result is a step profile of the surface
-//    between the points (gentle for a slope, one big lift for the wall of a
-//    hole, one bump for a projection on a side) instead of the fixed "last
-//    contact + N mm" clearance whose only answer to a contact was to abort.
-//    Retreats are capped: for a top, at the traverse height, above which a
-//    plain move finishes (law 2); for a side, at the approved start line,
-//    where a further contact is a fault (something stands where the operator
-//    approved empty space).
+//    for a side; back along the path, in a pocket), continue. The result is a
+//    step profile of the surface between the points (gentle for a slope, one
+//    big lift for the wall of a hole, one bump for a projection on a side)
+//    instead of the fixed "last contact + N mm" clearance whose only answer
+//    to a contact was to abort. Retreats are capped: for a top, at the
+//    traverse height, above which a plain move finishes (law 2); for a side,
+//    at the approved start line, where a further contact is a fault
+//    (something stands where the operator approved empty space); in a
+//    pocket (steppedTraverseWall, issue #167) the FIRST contact ends the
+//    link as BLOCKED after one retreat along the path just travelled.
+//
+//  The algorithms live in marchCore.ts against a small IO interface so they
+//  are unit-tested on a fake machine; this file binds them to the engine.
 
 export type Xyz = { x: number; y: number; z: number };
 
@@ -192,8 +208,24 @@ export async function retreatAlong(tag: string, name: string, start: Xyz, unit: 
     await moveMachineSettled(`${tag}:retreat:${name}`, wordsAlong(start, unit, s), TRAVEL_FEED);
 }
 
-export const STEPPED_HOP_STEP_MM = 1;
-export const STEPPED_HOP_FEED = 300;
+export { STEPPED_HOP_STEP_MM, STEPPED_HOP_FEED } from './marchCore';
+export type { SteppedBlock, SteppedTraverseResult } from './marchCore';
+
+/** The real machine behind the pure traverse / descent cores (marchCore.ts). */
+function machineIo(sensorDelayMs: number = GPIO_SENSOR_DELAY_MS.default): SteppedIo & DescentIo {
+    return {
+        move: async (tool, words, feed) => moveMachineSettled(tool, words, feed),
+        moveZ: async (tool, z, feed) => moveMachineSettled(tool, { z }, feed),
+        descendFast: async (tool, fromZ, toZ) => {
+            await descendInSegments(tool, fromZ, toZ, 'probe', sensorDelayMs);
+        },
+        sense: async (t0, delayMs) => (await senseAfter('probe', t0, delayMs)).contact,
+        senseRelease: async (t0, timeoutMs) => (await senseReleaseAfter('probe', t0, timeoutMs)).contact,
+        setExpectedContact: () => probeFeedService.setExpectedContact(['probe']),
+        clearExpectedContact: () => probeFeedService.clearExpectedContact(),
+        now: () => Date.now(),
+    };
+}
 
 export interface SteppedTraverseParams {
     /** Unit vector of the retreat on contact: (0,0,1) over a top, away from the face along a side. */
@@ -204,22 +236,17 @@ export interface SteppedTraverseParams {
     maxLiftTotalMm: number;
     /**
      * At the cap: 'plain-move' finishes with one plain move (law 2, at the
-     * traverse height); 'stop-lifting' keeps stepping and a further contact is a fault.
+     * traverse height); 'stop-lifting' keeps stepping and a further contact is
+     * a fault; 'block' ends the traverse as blocked (marchCore.ts).
      */
-    onMax: 'plain-move' | 'stop-lifting';
+    onMax: 'plain-move' | 'stop-lifting' | 'block';
+    /** 'retry' (default, a top) or 'block' (a wall: the first contact ends the link) - see marchCore.ts. */
+    onContact?: 'retry' | 'block';
+    /** Never retreat behind the traverse start (a reverse-vector retreat). */
+    capRetreatAtStart?: boolean;
     sensorDelayMs: number;
     /** Give up after this many lifts on one traverse (default 60). */
     maxLifts?: number;
-}
-
-export interface SteppedTraverseResult {
-    /** Where the toolhead arrived: `to` displaced by the total retreat along retreatUnit. */
-    position: Xyz;
-    /** Total retreat from the start plane (mm). */
-    liftTotalMm: number;
-    lifts: { x: number; y: number; z: number; liftMm: number }[];
-    steps: number;
-    toppedOut: boolean;
 }
 
 /**
@@ -227,7 +254,7 @@ export interface SteppedTraverseResult {
  * full machine points; the traverse direction is `to - from`. The
  * expected-contact set includes 'probe' while it runs and is cleared on
  * return. Returns the arrival position, which lies on the line through `to`
- * along retreatUnit.
+ * along retreatUnit (or the back-off point on the path when `blocked`).
  */
 export async function steppedTraverse(
     tag: string,
@@ -237,96 +264,11 @@ export async function steppedTraverse(
     params: SteppedTraverseParams,
     announce: Announce
 ): Promise<SteppedTraverseResult> {
-    const d = { x: to.x - from.x, y: to.y - from.y, z: to.z - from.z };
-    const length = Math.hypot(d.x, d.y, d.z);
-    const lifts: SteppedTraverseResult['lifts'] = [];
-    let liftTotal = 0;
-    let steps = 0;
-    if (length < 1e-9) {
-        return { position: { ...to }, liftTotalMm: 0, lifts, steps, toppedOut: false };
-    }
-    const u = { x: d.x / length, y: d.y / length, z: d.z / length };
-    const ru = params.retreatUnit;
-    const at = (s: number): Xyz => ({
-        x: r3(from.x + u.x * s + ru.x * liftTotal),
-        y: r3(from.y + u.y * s + ru.y * liftTotal),
-        z: r3(from.z + u.z * s + ru.z * liftTotal),
-    });
-    const words = (p: Xyz) => {
-        const w: { x?: number; y?: number; z?: number } = {};
-        if (Math.abs(u.x) > 1e-9 || Math.abs(ru.x) > 1e-9) {
-            w.x = p.x;
-        }
-        if (Math.abs(u.y) > 1e-9 || Math.abs(ru.y) > 1e-9) {
-            w.y = p.y;
-        }
-        if (Math.abs(u.z) > 1e-9 || Math.abs(ru.z) > 1e-9) {
-            w.z = p.z;
-        }
-        return w;
-    };
-    const maxLifts = params.maxLifts ?? 60;
-    let liftingStopped = false;
-    probeFeedService.setExpectedContact(['probe']);
-    try {
-        let s = 0;
-        while (length - s > 1e-9) {
-            const next = Math.min(s + STEPPED_HOP_STEP_MM, length);
-            const p = at(next);
-            const t0 = Date.now();
-            await moveMachineSettled(`${tag}:hop:${name}`, words(p), STEPPED_HOP_FEED);
-            steps += 1;
-            const sensed = await senseAfter('probe', t0, params.sensorDelayMs);
-            if (!sensed.contact) {
-                s = next;
-                continue;
-            }
-            // The surface is closer here: back off one step, wait for the
-            // release, retreat, try the same step again.
-            const back = at(s);
-            const t1 = Date.now();
-            await moveMachineSettled(`${tag}:hop-back:${name}`, words(back), STEPPED_HOP_FEED);
-            const released = await senseReleaseAfter('probe', t1, releaseTimeoutFor(params.sensorDelayMs));
-            if (released.contact) {
-                throw new ProcedureAbort(`Stepped traverse "${name}": probe still triggered after backing off ${STEPPED_HOP_STEP_MM} mm `
-                    + `at (${back.x}, ${back.y}, ${back.z}).`);
-            }
-            if (liftingStopped) {
-                throw new ProcedureAbort(`Stepped traverse "${name}": contact at (${p.x}, ${p.y}, ${p.z}) with the retreat already at its cap `
-                    + `${params.maxLiftTotalMm} mm - something stands where the approved plan has empty space.`);
-            }
-            if (lifts.length >= maxLifts) {
-                throw new ProcedureAbort(`Stepped traverse "${name}": ${maxLifts} retreats without clearing the surface - stopping.`);
-            }
-            const lift = Math.min(params.liftMm, params.maxLiftTotalMm - liftTotal);
-            if (lift <= 1e-9) {
-                liftingStopped = true;
-                if (params.onMax === 'plain-move') {
-                    probeFeedService.clearExpectedContact();
-                    await moveMachineSettled(`${tag}:hop-top:${name}`, words(at(length)), TRAVEL_FEED);
-                    return { position: at(length), liftTotalMm: r3(liftTotal), lifts, steps, toppedOut: true };
-                }
-                throw new ProcedureAbort(`Stepped traverse "${name}": contact at (${p.x}, ${p.y}, ${p.z}) with no retreat left (cap ${params.maxLiftTotalMm} mm).`);
-            }
-            liftTotal = r3(liftTotal + lift);
-            lifts.push({ x: p.x, y: p.y, z: p.z, liftMm: r3(lift) });
-            const lifted = at(s);
-            announce(`hop-lift-${name}`, `surface closer at (${p.x}, ${p.y}, ${p.z}): retreat ${r3(lift)} mm (total ${liftTotal})`);
-            await moveMachineSettled(`${tag}:hop-lift:${name}`, words(lifted), TRAVEL_FEED);
-            if (liftTotal >= params.maxLiftTotalMm - 1e-9) {
-                if (params.onMax === 'plain-move') {
-                    // At the traverse height nothing can be in the way (law 2).
-                    probeFeedService.clearExpectedContact();
-                    await moveMachineSettled(`${tag}:hop-top:${name}`, words(at(length)), TRAVEL_FEED);
-                    return { position: at(length), liftTotalMm: liftTotal, lifts, steps, toppedOut: true };
-                }
-                liftingStopped = true;
-            }
-        }
-        return { position: at(length), liftTotalMm: liftTotal, lifts, steps, toppedOut: liftingStopped };
-    } finally {
-        probeFeedService.clearExpectedContact();
-    }
+    return steppedTraverseCore(machineIo(params.sensorDelayMs), tag, name, from, to, {
+        ...params,
+        releaseTimeoutMs: releaseTimeoutFor(params.sensorDelayMs),
+        travelFeed: TRAVEL_FEED,
+    }, announce);
 }
 
 /** Convenience for travel over a top: horizontal from -> to at toolhead Z `z`, lifting toward the traverse height on contact. */
@@ -336,15 +278,75 @@ export async function steppedTraverseZ(
     from: { x: number; y: number },
     to: { x: number; y: number },
     z: number,
-    params: { liftMm: number; maxZ: number; sensorDelayMs: number },
+    params: { liftMm: number; maxZ: number; sensorDelayMs: number; onMax?: 'plain-move' | 'block' },
     announce: Announce
-): Promise<{ z: number; lifts: SteppedTraverseResult['lifts']; steps: number; toppedOut: boolean }> {
+): Promise<{ z: number; position: Xyz; lifts: SteppedTraverseResult['lifts']; steps: number; toppedOut: boolean; blocked: SteppedBlock | null }> {
     const result = await steppedTraverse(tag, name, { x: from.x, y: from.y, z }, { x: to.x, y: to.y, z }, {
         retreatUnit: { x: 0, y: 0, z: 1 },
         liftMm: params.liftMm,
         maxLiftTotalMm: Math.max(0, r3(params.maxZ - z)),
-        onMax: 'plain-move',
+        onMax: params.onMax || 'plain-move',
         sensorDelayMs: params.sensorDelayMs,
     }, announce);
-    return { z: result.position.z, lifts: result.lifts, steps: result.steps, toppedOut: result.toppedOut };
+    return { z: result.position.z, position: result.position, lifts: result.lifts, steps: result.steps, toppedOut: result.toppedOut, blocked: result.blocked };
+}
+
+/**
+ * Travel along a WALL (inside a pocket, along a boss): horizontal from -> to
+ * at toolhead Z `z` as a stepped traverse whose retreat on contact is the
+ * REVERSE travel vector - the path just travelled is the only direction
+ * proven clear - and which ends BLOCKED on the first contact (issue #167).
+ * Never lifts in Z. `retreatMm` is the retreat beyond the 1 mm back-off,
+ * capped so the head never goes behind `from`.
+ */
+export async function steppedTraverseWall(
+    tag: string,
+    name: string,
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    z: number,
+    params: { retreatMm: number; sensorDelayMs: number },
+    announce: Announce
+): Promise<SteppedTraverseResult> {
+    const d = { x: to.x - from.x, y: to.y - from.y };
+    const len = Math.hypot(d.x, d.y);
+    if (len < 1e-9) {
+        return { position: { x: to.x, y: to.y, z }, liftTotalMm: 0, lifts: [], steps: 0, toppedOut: false, blocked: null };
+    }
+    return steppedTraverse(tag, name, { x: from.x, y: from.y, z }, { x: to.x, y: to.y, z }, {
+        retreatUnit: { x: r3(-d.x / len), y: r3(-d.y / len), z: 0 },
+        liftMm: params.retreatMm,
+        maxLiftTotalMm: params.retreatMm,
+        onMax: 'block',
+        onContact: 'block',
+        capRetreatAtStart: true,
+        sensorDelayMs: params.sensorDelayMs,
+    }, announce);
+}
+
+/**
+ * A link's guarded descent (marchCore.linkDescentCore on the real machine):
+ * fast <= 5 mm segments to `guardMm` above the target, then 1 mm
+ * sensor-checked steps at the coarse feed. `judge` says what a contact means
+ * (camLinks.judgeLinkDescentContact); `mayBlock` whether it can ever say
+ * 'block' - only then is the contact sensed serially instead of latched.
+ */
+export async function linkDescent(
+    tag: string,
+    label: string,
+    fromZ: number,
+    toZ: number,
+    params: { sensorDelayMs: number; guardMm: number; judge: (contactZ: number) => 'abort' | 'block'; mayBlock: boolean },
+    announce: Announce
+): Promise<LinkDescentResult> {
+    return linkDescentCore(machineIo(params.sensorDelayMs), tag, label, fromZ, toZ, {
+        guardMm: params.guardMm,
+        sensorDelayMs: params.sensorDelayMs,
+        releaseTimeoutMs: releaseTimeoutFor(params.sensorDelayMs),
+        guardFeed: COARSE_FEED,
+        travelFeed: TRAVEL_FEED,
+        onContact: params.judge,
+        mayBlock: params.mayBlock,
+        toleranceMm: TRAVERSE_Z_TOLERANCE_MM,
+    }, announce);
 }

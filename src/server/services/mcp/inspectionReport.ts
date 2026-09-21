@@ -11,7 +11,10 @@
 //   U upper tol, L lower tol SIGNED) and G801 (measured TIP-CENTRE XYZ, R =
 //   stylus radius - Fusion subtracts R along the normal itself), then END.
 
+import { LinkContactRecord } from './camLinks';
 import { ProbeMeta, ProbeMode, ResultsMeta, Xyz } from './probeGcode';
+
+export type { LinkContactRecord } from './camLinks';
 
 export type ReportFormat = 'json' | 'fusion' | 'renishaw' | 'csv' | 'grbl';
 
@@ -25,7 +28,13 @@ export interface ProbeResultRecord {
     mode: ProbeMode;
     /** Rotary B angle the cycle ran at (3+2 station), null when unknown / not a 4-axis machine. */
     bDeg: number | null;
-    status: 'contact' | 'no_contact' | 'released' | 'not_released';
+    /**
+     * blocked: the cycle was never run because the LINK to its start touched
+     * a wall or the descent at its start touched the top (issue #167) -
+     * `blockedBy` is that link contact. A normal outcome, not a fault.
+     */
+    status: 'contact' | 'no_contact' | 'released' | 'not_released' | 'blocked';
+    blockedBy?: LinkContactRecord;
     /** Where the cycle started and where it was programmed to stop (machine). */
     startMachine: Xyz;
     targetMachine: Xyz;
@@ -63,10 +72,19 @@ export interface InspectionReport {
     /** Program-level results metadata from a (RESULTS ...) comment, for the Fusion envelope. */
     results: ResultsMeta;
     probes: ProbeResultRecord[];
+    /**
+     * Touches made by LINKS between stations (a wall met by a stepped link, a
+     * top met by a descent) - wall points in their own right, with the travel
+     * direction; every one that blocked a station is also on that station's
+     * record as `blockedBy`. Absent on reports written before issue #167.
+     */
+    linkContacts?: LinkContactRecord[];
     summary: {
         total: number;
         contacts: number;
         misses: number;
+        /** Stations skipped because their link or descent met material (issue #167). */
+        blocked?: number;
         outOfTolerance: number;
         maxAbsDeviationMm: number | null;
     };
@@ -279,7 +297,13 @@ export function renderRenishaw(report: InspectionReport): string {
         const points = records.map((p) => surfacePointOf(p, offset, r)).filter((sp): sp is SurfacePoint => sp !== null);
         const missed = records.filter((p) => !p.contactWork);
         for (const m of missed) {
-            lines.push(`(MISSED ${m.meta.role || m.name || m.id}: no contact within ${f4(m.maxTravelMm)} mm)`);
+            if (m.status === 'blocked') {
+                const at = m.blockedBy ? m.blockedBy.contactWork : null;
+                lines.push(`(BLOCKED ${m.meta.role || m.name || m.id}: the link to this station met material`
+                    + `${at ? ` at (${f4(at.x)}, ${f4(at.y)}, ${f4(at.z)})` : ''} - station skipped)`);
+            } else {
+                lines.push(`(MISSED ${m.meta.role || m.name || m.id}: no contact within ${f4(m.maxTravelMm)} mm)`);
+            }
         }
         const byRole = (role: string) => points.find((sp) => sp.record.meta.role === role);
         const feature = firstDefined(records.map((p) => p.meta.feature));
@@ -365,6 +389,19 @@ export function renderCsv(report: InspectionReport): string {
             cell(p.travelMm), f3(p.maxTravelMm), cell(p.shortOfTargetMm), cell(p.spreadMm),
             cell(nom?.x), cell(nom?.y), cell(nom?.z), cell(p.deviationMm),
             p.withinTolerance === null ? '' : String(p.withinTolerance),
+        ].join(','));
+    }
+    // Link contacts follow as their own rows: wall points with the travel
+    // direction, keyed by the line of the link and the station they were
+    // heading for (issue #167 - until then they lived only in phase notes).
+    for (const c of report.linkContacts || []) {
+        rows.push([
+            '', `link_L${c.line}`, `link_contact_${c.kind}`, '', c.outcome, c.bDeg === null ? '' : c.bDeg, c.line, `link:${c.kind}`, c.outcome,
+            f3(c.contactMachine.x), f3(c.contactMachine.y), f3(c.contactMachine.z),
+            f3(c.contactWork.x), f3(c.contactWork.y), f3(c.contactWork.z),
+            '', '', '', '',
+            f3(c.direction.x), f3(c.direction.y), f3(c.direction.z), '',
+            c.towardStation ? `toward ${c.towardStation.name || c.towardStation.id}` : '',
         ].join(','));
     }
     return `${rows.join('\n')}\n`;

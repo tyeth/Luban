@@ -16,7 +16,13 @@ export function registerCamTools(registry: ToolRegistry, getConfirmBaseUrl: () =
             + 'cycle): G38.2/G38.3 -> a coarse/fine/confirm march toward the programmed target (the travel limit), retreating '
             + 'to the cycle start; G38.4/G38.5 -> coarse steps until the probe releases, then on to the target; G0/G1 links '
             + '-> law 2 (link_mode "raise": XY at the safe traverse height with guarded segmented descents; "stepped": a '
-            + 'touch-probing traverse at the programmed height that lifts hop_lift_mm on contact); a bare G0 B<angle> line -> '
+            + 'touch-probing traverse at the programmed height - over a TOP a contact lifts hop_lift_mm (+Z) and retries, but '
+            + 'heading for a SIDE-MARCH station (a pocket wall) a contact is a WALL: back off 1 mm, retreat hop_lift_mm along '
+            + 'the path just travelled (never +Z), record it as a link_contact wall point, mark that station BLOCKED and '
+            + 'continue; "wall" forces the wall behaviour on every link). A contact during the guarded descent at a stepped '
+            + 'link\'s destination is a BLOCKED station too (lift back to the link height, continue), never a crash; a '
+            + 'blocked station is a normal report outcome (status blocked, blockedBy). top_z_machine (a MEASURED top) caps '
+            + 'stepped +Z lifts at the top and makes a raise-mode descent contact AT the top a blocked station. a bare G0 B<angle> line -> '
             + 'a 3+2 station (raise to the traverse height, then the verified rotation; B with XYZ, incremental B and A/C '
             + 'refused); G4 dwells; G90/G91, G53, G20/G21 honoured; programmed feeds ignored. Refused: M3/M4 (spindle with '
             + 'the probe fitted), M0/M1, M6, G28, G92/G55-G59, arcs, macro variables. Coordinates are the CAM WCS (work frame) '
@@ -37,8 +43,20 @@ export function registerCamTools(registry: ToolRegistry, getConfirmBaseUrl: () =
                 gcode: { type: 'string', description: 'The probing program text.' },
                 source: { type: 'string', description: 'Name of the program / CAM operation, for the report and the operator.' },
                 frame: { type: 'string', enum: ['work', 'machine'], description: 'Coordinate frame of the program: work (CAM WCS, default) or machine.' },
-                link_mode: { type: 'string', enum: ['raise', 'stepped'], description: 'How XY links run: "raise" (default, law 2 traverse height) or "stepped" (touch-probing traverse at the programmed height).' },
-                hop_lift_mm: { type: 'number', description: 'stepped link_mode: lift per contact, default 2 (0.5-10).' },
+                link_mode: {
+                    type: 'string',
+                    enum: ['raise', 'stepped', 'wall'],
+                    description: 'How XY links run: "raise" (default, law 2 traverse height); "stepped" (touch-probing traverse at the programmed '
+                        + 'height: +Z lift-and-retry toward a top station, wall-aware toward a side-march station); "wall" (every link wall-aware: '
+                        + 'a contact retreats along the path and blocks the station).',
+                },
+                hop_lift_mm: { type: 'number', description: 'stepped/wall link_mode: lift (+Z, top) or retreat along the path (wall) per contact, default 2 (0.5-10).' },
+                top_z_machine: {
+                    type: 'number',
+                    description: 'Optional MEASURED toolhead machine Z of the top surface the stations sit in (never a guess). A stepped +Z lift '
+                        + 'that would rise above it marks the station blocked instead (the link would leave the pocket); a raise-mode descent '
+                        + 'contact within one guarded step of it is a blocked station, not a collision.',
+                },
                 on_miss: { type: 'string', enum: ['abort', 'continue'], description: 'G38.2 without contact: abort (default, Grbl semantics) or record no_contact and continue.' },
                 report_format: { type: 'string', enum: REPORT_FORMATS, description: 'Primary report rendering, default fusion (Inspect Surface G800/G801); renishaw for Probe WCS / Probe Geometry features. JSON is always stored too.' },
                 coarse_step_mm: { type: 'number', description: 'Coarse step, default 1 (0.2-1; never larger).' },

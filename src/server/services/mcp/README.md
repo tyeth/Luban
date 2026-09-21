@@ -600,7 +600,11 @@ programmed target (the travel limit; retreat to the cycle start; G38.2 without c
 per Grbl unless `on_miss: "continue"`); `G38.4`/`G38.5` become a probe-away (coarse steps until
 the probe releases, then on to the target); `G0`/`G1` links follow law 2 (`link_mode: "raise"`:
 traverse at the safe height and guarded segmented descent to the programmed Z; `"stepped"`: a
-touch-probing traverse at the programmed height that lifts on contact); `G4` dwells; `G90/G91`,
+touch-probing traverse at the programmed height that lifts +Z on contact toward a top station and, toward a
+side-march station or with `"wall"`, retreats along the path just travelled, records the touch as a
+`link_contact` and marks the station `blocked` — issue #167, `camLinks.ts` / `marchCore.ts`; a contact during
+the guarded descent at such a destination is a blocked station too, and `top_z_machine` caps +Z lifts at a
+MEASURED top); `G4` dwells; `G90/G91`,
 `G53`, `G20/G21` honoured; programmed feeds ignored. Refused at staging with the line number:
 `M3/M4` (spindle with the probe fitted), `M0/M1`, `M6`, `G28`, `G92`/`G55-59`, arcs, macro
 variables. Coordinates are the CAM's WCS (work frame) unless `frame: "machine"` or `G53`. Probe

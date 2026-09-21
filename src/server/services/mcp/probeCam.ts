@@ -3,6 +3,19 @@
 import * as fs from 'fs-extra';
 import path from 'path';
 
+import {
+    CamLink,
+    LINK_MODES,
+    LinkContactRecord,
+    LinkMode,
+    blockedStationSpan,
+    classifyCamLinks,
+    describeLinkStyle,
+    judgeLinkDescentContact,
+    linkAt,
+    linkDescentMayBlock,
+    topLinkLiftCap,
+} from './camLinks';
 import { MotionSegment, checkMotion, describeViolations } from './envelopeChecks';
 import {
     InspectionReport,
@@ -16,10 +29,13 @@ import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import {
     MarchParams,
+    SteppedBlock,
     Xyz,
+    linkDescent,
     makeAnnounce,
     marchToContact,
     retreatAlong,
+    steppedTraverseWall,
     steppedTraverseZ,
 } from './march';
 import { probeFeedService } from './probeFeed';
@@ -34,12 +50,10 @@ import {
     TRAVEL_FEED,
     assertChannelReady,
     assertMachineReadyForProcedure,
-    descendInSegments,
     expectMachinePosition,
     knownMachinePosition,
     moveMachineSettled,
     rotateB,
-    senseAfter,
     senseReleaseAfter,
     sleep,
     isProcedureAbort,
@@ -70,9 +84,15 @@ import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 //   G0 / G1 links   -> law 2: XY travel at the safe traverse height (raise,
 //                      traverse, guarded segmented descent to the programmed
 //                      Z) - link_mode "raise", the default - or a stepped
-//                      touch-probing traverse at the programmed height that
-//                      lifts on contact (link_mode "stepped"). A pure Z drop
-//                      is a guarded segmented descent, a pure Z rise a move.
+//                      touch-probing traverse at the programmed height
+//                      (link_mode "stepped" / "wall", camLinks.ts): over a TOP
+//                      a contact lifts +Z and retries; heading for a WALL
+//                      station a contact retreats along the path just
+//                      travelled, is recorded as a link_contact, and the
+//                      station is BLOCKED - the run continues (issue #167).
+//                      A pure Z drop is a guarded segmented descent whose
+//                      contact at a stepped link's destination is likewise a
+//                      blocked station; a pure Z rise a move.
 //   G0 B<angle>     -> a 3+2 station: the head is raised to the safe traverse
 //                      height first (inserted here, law 2, enumerated on the
 //                      page), then rotate_b's absolute rotation on the direct
@@ -85,14 +105,22 @@ import { TRAVERSE_Z_TOLERANCE_MM } from './traversePlan';
 // frame: "machine" or a G53 line. The result is an inspection report the CAM
 // can read back (Fusion G800/G801 text, CSV, Grbl [PRB:], JSON).
 
-export type LinkMode = 'raise' | 'stepped';
+export type { LinkMode } from './camLinks';
 
 export interface ProbeCamPlan {
     tool: 'run_probing_gcode';
     source: string;
     parsed: ParsedProbeGcode;
     linkMode: LinkMode;
+    /** Per XY link: the behaviour it gets and the station it heads for (camLinks.ts). */
+    links: CamLink[];
     hopLiftMm: number;
+    /**
+     * Operator-stated toolhead Z of the top surface the stations are cut into
+     * (machine), or null. A top-style stepped lift never rises above it, and a
+     * raise-mode descent contact AT it is a blocked station, not a collision.
+     */
+    topZMachine: number | null;
     onMiss: 'abort' | 'continue';
     march: MarchParams;
     hopZ: number;
@@ -110,6 +138,7 @@ interface CamArgs {
     frame?: unknown;
     link_mode?: unknown;
     hop_lift_mm?: unknown;
+    top_z_machine?: unknown;
     on_miss?: unknown;
     report_format?: unknown;
     coarse_step_mm?: unknown;
@@ -132,7 +161,7 @@ function unitOf(from: Xyz, to: Xyz): { unit: Xyz; length: number } {
 /** Motion list for the keep-out check, following the link policy. */
 export function camMotion(plan: ProbeCamPlan): MotionSegment[] {
     const out: MotionSegment[] = [];
-    for (const step of plan.parsed.steps) {
+    plan.parsed.steps.forEach((step, index) => {
         if (step.kind === 'probe') {
             out.push({ kind: 'march', what: `line ${step.line} ${step.mode}`, from: step.from, to: step.target });
         } else if (step.kind === 'move') {
@@ -141,9 +170,10 @@ export function camMotion(plan: ProbeCamPlan): MotionSegment[] {
                 if (step.target.z < step.from.z) {
                     out.push({ kind: 'column', what: `line ${step.line} descent`, from: step.from, to: step.target });
                 }
-                continue;
+                return;
             }
-            if (plan.linkMode === 'raise') {
+            const link = linkAt(plan.links, index);
+            if (!link || link.style === 'raise') {
                 out.push({ kind: 'hop', what: `line ${step.line} traverse`, from: { ...step.from, z: plan.hopZ }, to: { ...step.target, z: plan.hopZ } });
                 out.push({ kind: 'column', what: `line ${step.line} descent`, from: { ...step.target, z: plan.hopZ }, to: step.target });
             } else {
@@ -154,7 +184,7 @@ export function camMotion(plan: ProbeCamPlan): MotionSegment[] {
                 }
             }
         }
-    }
+    });
     return out;
 }
 
@@ -165,10 +195,11 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
     }
     const source = String(args.source || 'probing program').trim().slice(0, 80);
     const frame = args.frame === 'machine' ? 'machine' : 'work';
-    const linkMode: LinkMode = args.link_mode === 'stepped' ? 'stepped' : 'raise';
-    if (args.link_mode !== undefined && args.link_mode !== 'raise' && args.link_mode !== 'stepped') {
-        throw new McpToolError('link_mode must be "raise" (XY at the traverse height, default) or "stepped" (touch-probing traverse at the programmed height).');
+    if (args.link_mode !== undefined && !LINK_MODES.includes(args.link_mode as LinkMode)) {
+        throw new McpToolError('link_mode must be "raise" (XY at the traverse height, default), "stepped" (touch-probing traverse at the programmed '
+            + 'height; wall-aware when the station ahead is a side march) or "wall" (every stepped link wall-aware).');
     }
+    const linkMode: LinkMode = args.link_mode === undefined ? 'raise' : (args.link_mode as LinkMode);
     const onMiss = args.on_miss === 'continue' ? 'continue' : 'abort';
     const reportFormat = (args.report_format === undefined ? 'fusion' : String(args.report_format)) as ReportFormat;
     if (!['json', 'fusion', 'renishaw', 'csv', 'grbl'].includes(reportFormat)) {
@@ -190,6 +221,13 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
     }
     const originOffset = frame === 'machine' ? { x: 0, y: 0, z: 0 } : { ...snapshot.originOffset };
     const hopZ = safeTraverseZ();
+    let topZMachine: number | null = null;
+    if (args.top_z_machine !== undefined && args.top_z_machine !== null && args.top_z_machine !== '') {
+        topZMachine = Number(args.top_z_machine);
+        if (!within(topZMachine, { min: 0, max: hopZ })) {
+            throw new McpToolError(`top_z_machine must be a MEASURED toolhead machine Z of the top surface, 0..${hopZ} (the traverse height).`);
+        }
+    }
 
     let parsed: ParsedProbeGcode;
     try {
@@ -234,13 +272,24 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
             }
         }
     }
+    const links = classifyCamLinks(parsed.steps, linkMode);
+    if (topZMachine !== null) {
+        const lowestLink = links
+            .filter((l) => l.style === 'top')
+            .map((l) => { const st = parsed.steps[l.stepIndex]; return st.kind === 'move' ? Math.max(st.from.z, st.target.z) : hopZ; });
+        if (lowestLink.some((lz) => lz > topZMachine + TRAVERSE_Z_TOLERANCE_MM)) {
+            warnings.push(`top_z_machine ${topZMachine}: some stepped links run ABOVE the stated top - a contact on them has no lift room and marks the station blocked at once.`);
+        }
+    }
 
     const plan: ProbeCamPlan = {
         tool: 'run_probing_gcode',
         source,
         parsed,
         linkMode,
+        links,
         hopLiftMm: hopLift,
+        topZMachine,
         onMiss,
         // Operator law 2026-09-05: never 2 mm; GPIO sensor floor (procedureLimits.ts).
         march: resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS }),
@@ -260,16 +309,31 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
     return plan;
 }
 
+function stationLabel(link: CamLink | null): string {
+    return link && link.station ? `"${link.station.name || link.station.id}"` : 'the next station';
+}
+
 export function describeProbeCamPlanAsGcode(plan: ProbeCamPlan): string {
+    const wallLinks = plan.links.filter((l) => l.style === 'wall').length;
+    const topLinks = plan.links.filter((l) => l.style === 'top').length;
+    const linkPolicy = plan.linkMode === 'raise'
+        ? `XY at the traverse height Z${plan.hopZ}, guarded segmented descents`
+        : `stepped touch-probing traverses at the programmed height: ${topLinks} over a top (lift ${plan.hopLiftMm} mm +Z on contact and retry), `
+            + `${wallLinks} heading for a wall station (a contact = a wall: back off 1 mm, retreat ${plan.hopLiftMm} mm along the path just travelled - never +Z - `
+            + 'record it as link_contact, mark that station BLOCKED, continue). A contact during the guarded descent at a stepped link\'s destination is a '
+            + 'BLOCKED station too: lift straight back to the link height, continue';
     const lines = [
         `; CAM PROBING PROGRAM "${plan.source}": ${plan.parsed.lineCount} lines, ${plan.parsed.probeCount} probe cycle(s), ${plan.frame} frame`
             + `${plan.frame === 'work' ? ` (work origin at machine ${-plan.originOffset.x}, ${-plan.originOffset.y}, ${-plan.originOffset.z})` : ''}`,
         '; The program is TRANSLATED, never sent raw: every G38.x becomes a sensor-gated march to its target (the travel limit),',
-        `; links follow law 2 (${plan.linkMode === 'raise'
-            ? `XY at the traverse height Z${plan.hopZ}, guarded segmented descents`
-            : `stepped touch-probing traverse at the programmed height, lifting ${plan.hopLiftMm} mm on contact, descents guarded`}),`,
+        `; links follow law 2 (link_mode ${plan.linkMode}: ${linkPolicy}),`,
+        ...(plan.topZMachine !== null
+            ? [`; top_z_machine Z${plan.topZMachine} (operator-stated top): a stepped +Z lift never rises above it (a lift that would = station BLOCKED); `
+                + 'a raise-mode descent contact AT the top (within one 1 mm guarded step) = station BLOCKED, not a collision.']
+            : []),
         `; programmed feeds are ignored (coarse ${plan.march.coarseStepMm} mm F${COARSE_FEED}, fine ${plan.march.fineStepMm}, ${plan.march.confirmPasses} confirm pass(es), sensor ${plan.march.sensorDelayMs} ms).`,
         `; G38.2 without contact: ${plan.onMiss === 'abort' ? 'ABORTS (Grbl semantics)' : 'records no_contact and continues'}; G38.3 always records. Report: ${plan.reportFormat}.`,
+        '; A BLOCKED station is a normal outcome on the report (status blocked, blockedBy = the link contact); any ABORT raises straight to the traverse height (law 8).',
         ...(plan.parsed.rotations.length
             ? [`; THE STOCK WILL ROTATE: B schedule ${plan.parsed.rotations.map((b) => `${b} deg`).join(' -> ')} (absolute), each preceded by a raise to Z${plan.hopZ}.`]
             : []),
@@ -278,7 +342,7 @@ export function describeProbeCamPlanAsGcode(plan: ProbeCamPlan): string {
         'G90',
         'G53;',
     ];
-    for (const step of plan.parsed.steps) {
+    plan.parsed.steps.forEach((step, index) => {
         if (step.kind === 'note') {
             lines.push(`; L${step.line} (${step.text})`);
         } else if (step.kind === 'dwell') {
@@ -290,26 +354,38 @@ export function describeProbeCamPlanAsGcode(plan: ProbeCamPlan): string {
         } else if (step.kind === 'move') {
             const xyMoves = step.from.x !== step.target.x || step.from.y !== step.target.y;
             lines.push(`; L${step.line} ${step.source}`);
+            const link = linkAt(plan.links, index);
+            const descentNote = (style: CamLink['style']) => {
+                if (style === 'raise') {
+                    return plan.topZMachine === null
+                        ? 'contact aborts'
+                        : `contact aborts, except AT the stated top Z${plan.topZMachine} = station ${stationLabel(link)} BLOCKED`;
+                }
+                return `a contact = station ${stationLabel(link)} BLOCKED: lift straight back to the link height, continue`;
+            };
             if (!xyMoves) {
                 if (step.target.z > step.from.z) {
                     lines.push(`G1 Z${step.target.z.toFixed(3)} F${TRAVEL_FEED}; rise`);
                 } else if (step.target.z < step.from.z) {
-                    lines.push(`G1 Z${step.target.z.toFixed(3)} F${COARSE_FEED}; descend in <= ${DESCENT_SEGMENT_MM} mm segments, last ${DESCENT_GUARD_MM} mm in guarded 1 mm steps (contact aborts)`);
+                    const prev = plan.links.filter((l) => l.stepIndex < index).pop() || null;
+                    lines.push(`G1 Z${step.target.z.toFixed(3)} F${COARSE_FEED}; descend in <= ${DESCENT_SEGMENT_MM} mm segments, last ${DESCENT_GUARD_MM} mm in guarded 1 mm steps `
+                        + `(${descentNote(prev ? prev.style : 'raise')})`);
                 }
-            } else if (plan.linkMode === 'raise') {
+            } else if (!link || link.style === 'raise') {
                 lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to the traverse height (law 2)`);
                 lines.push(`G1 X${step.target.x.toFixed(3)} Y${step.target.y.toFixed(3)} F${TRAVEL_FEED}; traverse (crash guard armed)`);
                 if (step.target.z < plan.hopZ) {
-                    lines.push(`G1 Z${step.target.z.toFixed(3)} F${COARSE_FEED}; descend in segments, guarded last ${DESCENT_GUARD_MM} mm`);
+                    lines.push(`G1 Z${step.target.z.toFixed(3)} F${COARSE_FEED}; descend in segments, guarded last ${DESCENT_GUARD_MM} mm (${descentNote('raise')})`);
                 }
             } else {
                 const linkZ = Math.max(step.from.z, step.target.z);
                 if (linkZ > step.from.z) {
                     lines.push(`G1 Z${linkZ.toFixed(3)} F${TRAVEL_FEED}; rise to the link height`);
                 }
-                lines.push(`G1 X${step.target.x.toFixed(3)} Y${step.target.y.toFixed(3)} F300; stepped touch-probing traverse at Z${linkZ} (1 mm steps, lifts ${plan.hopLiftMm} mm on contact)`);
+                lines.push(`G1 X${step.target.x.toFixed(3)} Y${step.target.y.toFixed(3)} F300; ${link.style.toUpperCase()} link toward station ${stationLabel(link)} at Z${linkZ}: `
+                    + `${describeLinkStyle(link.style, plan.hopLiftMm, plan.hopZ, plan.topZMachine)} [${link.reason}]`);
                 if (step.target.z < linkZ) {
-                    lines.push(`G1 Z${step.target.z.toFixed(3)} F${COARSE_FEED}; descend in segments, guarded last ${DESCENT_GUARD_MM} mm`);
+                    lines.push(`G1 Z${step.target.z.toFixed(3)} F${COARSE_FEED}; descend in segments, guarded last ${DESCENT_GUARD_MM} mm (${descentNote(link.style)})`);
                 }
             }
         } else {
@@ -319,7 +395,7 @@ export function describeProbeCamPlanAsGcode(plan: ProbeCamPlan): string {
             lines.push(`G1 X${step.target.x.toFixed(3)} Y${step.target.y.toFixed(3)} Z${step.target.z.toFixed(3)} F${COARSE_FEED}; ${step.mode} march up to ${length} mm - `
                 + `${step.mode === 'G38.4' || step.mode === 'G38.5' ? 'coarse steps until the probe RELEASES, then on to the target' : `${plan.march.coarseStepMm} mm steps to contact, release, fine, confirm; retreat to (${step.from.x}, ${step.from.y}, ${step.from.z})`}`);
         }
-    }
+    });
     lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; finish at the safe traverse height (also on any abort)`);
     lines.push('G54;');
     return lines.join('\n');
@@ -352,6 +428,23 @@ export function writeReportFiles(report: InspectionReport, formats: ReportFormat
     return files;
 }
 
+type RecordBase = Omit<ProbeResultRecord, 'status' | 'contactMachine' | 'contactWork' | 'travelMm' | 'shortOfTargetMm' | 'spreadMm' | 'deviationMm' | 'withinTolerance'>;
+
+function emptyRecord(base: RecordBase, status: ProbeResultRecord['status'], blockedBy?: LinkContactRecord): ProbeResultRecord {
+    return {
+        ...base,
+        status,
+        blockedBy,
+        contactMachine: null,
+        contactWork: null,
+        travelMm: null,
+        shortOfTargetMm: null,
+        spreadMm: null,
+        deviationMm: null,
+        withinTolerance: null,
+    };
+}
+
 export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | null): Promise<ProbeCamResult> {
     assertMachineReadyForProcedure();
     assertChannelReady('probe', 'CAM probing program');
@@ -359,6 +452,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
     const announce = makeAnnounce(plan.tool, phases);
     const tag = 'cam';
     const records: ProbeResultRecord[] = [];
+    const linkContacts: LinkContactRecord[] = [];
     const startedAt = Date.now();
     const offset = plan.originOffset;
     const toWork = (p: Xyz): Xyz => ({ x: r3(p.x + offset.x), y: r3(p.y + offset.y), z: r3(p.z + offset.z) });
@@ -366,6 +460,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
     const build = (aborted: string | null): ProbeCamResult => {
         const contacts = records.filter((r) => r.status === 'contact' || r.status === 'released').length;
         const misses = records.filter((r) => r.status === 'no_contact' || r.status === 'not_released').length;
+        const blocked = records.filter((r) => r.status === 'blocked').length;
         const devs = records.map((r) => r.deviationMm).filter((d): d is number => d !== null);
         const report: InspectionReport = {
             source: plan.source,
@@ -376,10 +471,12 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
             tipDiameterMm: plan.tipDiameterMm,
             results: plan.parsed.results,
             probes: records,
+            linkContacts,
             summary: {
                 total: plan.parsed.probeCount,
                 contacts,
                 misses,
+                blocked,
                 outOfTolerance: records.filter((r) => r.withinTolerance === false).length,
                 maxAbsDeviationMm: devs.length ? r3(Math.max(...devs.map((d) => Math.abs(d)))) : null,
             },
@@ -399,6 +496,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
             files,
             phases,
             note: `${aborted ? 'ABORTED. ' : ''}${contacts}/${plan.parsed.probeCount} probe cycle(s) made contact`
+                + `${blocked ? `, ${blocked} station(s) BLOCKED by a link contact (${linkContacts.length} link contact(s) recorded as wall points)` : ''}`
                 + `${report.summary.outOfTolerance ? `, ${report.summary.outOfTolerance} out of tolerance` : ''}`
                 + `${report.summary.maxAbsDeviationMm !== null ? `, max |deviation| ${report.summary.maxAbsDeviationMm} mm` : ''}. `
                 + `Report (${plan.reportFormat}) in reportText and on disk under mcp-inspection/.`,
@@ -406,7 +504,14 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
         };
     };
 
-    const guardedDescent = async (label: string, toZ: number) => {
+    /**
+     * The descent to a programmed Z at the end of a link (or a pure Z drop):
+     * fast segments, then 1 mm guarded steps (march.linkDescent). What a
+     * contact means depends on the link that brought the head here
+     * (camLinks.judgeLinkDescentContact). Returns the Z the head is at and
+     * whether the station was blocked.
+     */
+    const guardedDescent = async (label: string, toZ: number, link: CamLink | null): Promise<{ z: number; blocked: boolean; contactZ: number | null }> => {
         const known = knownMachinePosition();
         const zNow = known.position.z;
         if (zNow === null) {
@@ -415,21 +520,13 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
         if (zNow < toZ - RECHECK_TOLERANCE_MM) {
             throw new ProcedureAbort(`${label}: the toolhead is at Z${zNow} (${known.source}), BELOW the descent target Z${toZ} - a descent never rises.`);
         }
-        const guardTop = toZ + DESCENT_GUARD_MM;
-        probeFeedService.clearExpectedContact();
-        if (zNow > guardTop + TRAVERSE_Z_TOLERANCE_MM) {
-            await descendInSegments(`${tag}:descend:${label}`, zNow, guardTop, 'probe', plan.march.sensorDelayMs);
-        }
-        let gz = Math.min(Math.max(zNow, toZ), guardTop);
-        while (gz - toZ > 1e-9) {
-            const t0 = Date.now();
-            gz = Math.max(gz - 1, toZ);
-            await moveMachineSettled(`${tag}:descend-guard:${label}`, { z: gz }, COARSE_FEED);
-            const sensed = await senseAfter('probe', t0, plan.march.sensorDelayMs);
-            if (sensed.contact) {
-                throw new ProcedureAbort(`UNEXPECTED CONTACT at Z${gz.toFixed(3)} during the guarded descent (${label}) - something is where the program says nothing is. Machine held.`);
-            }
-        }
+        const style = link ? link.style : 'raise';
+        return linkDescent(tag, label, zNow, toZ, {
+            sensorDelayMs: plan.march.sensorDelayMs,
+            guardMm: DESCENT_GUARD_MM,
+            judge: (contactZ) => judgeLinkDescentContact(style, plan.topZMachine, contactZ),
+            mayBlock: linkDescentMayBlock(style, plan.topZMachine),
+        }, announce);
     };
 
     try {
@@ -438,10 +535,67 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
         ));
         let current: Xyz = { ...plan.staged };
         let currentB: number | null = getPositionSnapshot().b;
+        // A blocked link: the step index of the station it was heading for
+        // (its probe records `blocked` when reached), the steps skipped on
+        // the way, and the contact that blocked it. Held in an object so the
+        // closures below can set it without TypeScript narrowing it to null.
+        const blockedState: { pending: { stationIndex: number | null; skip: Set<number>; by: LinkContactRecord } | null } = { pending: null };
 
-        for (const step of plan.parsed.steps) {
+        const recordLinkContact = (
+            line: number,
+            link: CamLink | null,
+            kind: LinkContactRecord['kind'],
+            outcome: LinkContactRecord['outcome'],
+            contact: Xyz,
+            direction: Xyz,
+            retreat: { unit: Xyz; mm: number }
+        ): LinkContactRecord => {
+            const rec: LinkContactRecord = {
+                line,
+                kind,
+                outcome,
+                contactMachine: { ...contact },
+                contactWork: toWork(contact),
+                direction: { x: r3(direction.x), y: r3(direction.y), z: r3(direction.z) },
+                retreat: { unit: { x: r3(retreat.unit.x), y: r3(retreat.unit.y), z: r3(retreat.unit.z) }, mm: r3(retreat.mm) },
+                towardStation: link && link.station
+                    ? { probeIndex: link.station.probeIndex, id: link.station.id, name: link.station.name, line: link.station.line }
+                    : null,
+                bDeg: currentB,
+            };
+            linkContacts.push(rec);
+            announce(`L${line}-link-contact`, `${kind} contact at (${contact.x}, ${contact.y}, ${contact.z}) heading `
+                + `${rec.towardStation ? `for station "${rec.towardStation.name || rec.towardStation.id}"` : 'on'} - ${outcome}`);
+            return rec;
+        };
+
+        const blockStation = (stepIndex: number, link: CamLink | null, by: LinkContactRecord): void => {
+            const span = blockedStationSpan(plan.parsed.steps, stepIndex);
+            blockedState.pending = { stationIndex: span.stationIndex, skip: new Set(span.skip), by };
+            announce(`L${plan.parsed.steps[stepIndex].line}-blocked`, span.stationIndex === null
+                ? 'link blocked; no station follows before a rotation / the end - continuing from here'
+                : `station ${stationLabel(link)} BLOCKED - ${span.skip.length} approach step(s) skipped, the run continues from (${current.x}, ${current.y}, ${current.z})`);
+        };
+
+        /** A link descent that met material: record the contact (straight down, lifted straight back) and block the station. */
+        const blockOnDescent = (stepIndex: number, link: CamLink | null, descent: { z: number; blocked: boolean; contactZ: number | null }): void => {
+            if (!descent.blocked || descent.contactZ === null) {
+                return;
+            }
+            const contact = { x: current.x, y: current.y, z: descent.contactZ };
+            const retreat = { unit: { x: 0, y: 0, z: 1 }, mm: r3(descent.z - descent.contactZ) };
+            const by = recordLinkContact(plan.parsed.steps[stepIndex].line, link, 'descent', 'blocked', contact, { x: 0, y: 0, z: -1 }, retreat);
+            blockStation(stepIndex, link, by);
+        };
+
+        for (let index = 0; index < plan.parsed.steps.length; index++) {
+            const step = plan.parsed.steps[index];
             if (step.kind === 'note') {
                 announce(`L${step.line}`, step.text);
+                continue;
+            }
+            if (blockedState.pending && blockedState.pending.skip.has(index)) {
+                announce(`L${step.line}-skipped`, 'approach to a blocked station');
                 continue;
             }
             if (step.kind === 'dwell') {
@@ -451,6 +605,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
             }
             const label = `L${step.line}`;
             if (step.kind === 'rotate') {
+                blockedState.pending = null;
                 probeFeedService.clearExpectedContact();
                 if (current.z < plan.hopZ - TRAVERSE_Z_TOLERANCE_MM) {
                     await moveMachineSettled(`${tag}:raise:${label}`, { z: plan.hopZ }, TRAVEL_FEED);
@@ -464,34 +619,67 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
             await expectMachinePosition(current, label, (m) => new ProcedureAbort(m));
             if (step.kind === 'move') {
                 const xyMoves = step.from.x !== step.target.x || step.from.y !== step.target.y;
+                const link = linkAt(plan.links, index);
                 probeFeedService.clearExpectedContact();
                 if (!xyMoves) {
                     if (step.target.z > current.z + 1e-9) {
                         await moveMachineSettled(`${tag}:rise:${label}`, { z: step.target.z }, TRAVEL_FEED);
+                        current = { ...current, z: step.target.z };
                     } else if (step.target.z < current.z - 1e-9) {
-                        await guardedDescent(label, step.target.z);
+                        const prev = plan.links.filter((l) => l.stepIndex < index).pop() || null;
+                        const descent = await guardedDescent(label, step.target.z, prev);
+                        current = { ...current, z: descent.z };
+                        blockOnDescent(index, prev, descent);
                     }
-                } else if (plan.linkMode === 'raise') {
+                } else if (!link || link.style === 'raise') {
                     if (current.z < plan.hopZ - TRAVERSE_Z_TOLERANCE_MM) {
                         await moveMachineSettled(`${tag}:raise:${label}`, { z: plan.hopZ }, TRAVEL_FEED);
                     }
                     await moveMachineSettled(`${tag}:traverse:${label}`, { x: step.target.x, y: step.target.y }, TRAVEL_FEED);
+                    current = { x: step.target.x, y: step.target.y, z: plan.hopZ };
                     if (step.target.z < plan.hopZ - 1e-9) {
-                        await guardedDescent(label, step.target.z);
+                        const descent = await guardedDescent(label, step.target.z, link);
+                        current = { ...current, z: descent.z };
+                        blockOnDescent(index, link, descent);
                     }
                 } else {
                     const linkZ = Math.max(current.z, step.target.z);
                     if (linkZ > current.z + 1e-9) {
                         await moveMachineSettled(`${tag}:rise:${label}`, { z: linkZ }, TRAVEL_FEED);
+                        current = { ...current, z: linkZ };
                     }
-                    const traverse = await steppedTraverseZ(tag, label, current, step.target, linkZ, {
-                        liftMm: plan.hopLiftMm, maxZ: plan.hopZ, sensorDelayMs: plan.march.sensorDelayMs,
-                    }, announce);
-                    if (step.target.z < traverse.z - 1e-9) {
-                        await guardedDescent(label, step.target.z);
+                    let blocked: SteppedBlock | null = null;
+                    const linkFrom: Xyz = { ...current };
+                    if (link.style === 'wall') {
+                        const traverse = await steppedTraverseWall(tag, label, linkFrom, step.target, linkZ, {
+                            retreatMm: plan.hopLiftMm, sensorDelayMs: plan.march.sensorDelayMs,
+                        }, announce);
+                        current = { ...traverse.position };
+                        blocked = traverse.blocked;
+                    } else {
+                        const cap = topLinkLiftCap(linkZ, plan.hopZ, plan.topZMachine);
+                        const traverse = await steppedTraverseZ(tag, label, linkFrom, step.target, linkZ, {
+                            liftMm: plan.hopLiftMm, maxZ: linkZ + cap.maxLiftTotalMm, sensorDelayMs: plan.march.sensorDelayMs, onMax: cap.onMax,
+                        }, announce);
+                        current = { ...traverse.position };
+                        blocked = traverse.blocked;
+                        // Every +Z lift that went on is data too: the surface rose there.
+                        const { unit } = unitOf({ x: linkFrom.x, y: linkFrom.y, z: linkZ }, { x: step.target.x, y: step.target.y, z: linkZ });
+                        for (const l of traverse.lifts) {
+                            if (!blocked || l.x !== blocked.contact.x || l.y !== blocked.contact.y || l.z !== blocked.contact.z) {
+                                recordLinkContact(step.line, link, 'top', 'lifted', { x: l.x, y: l.y, z: l.z }, unit, { unit: { x: 0, y: 0, z: 1 }, mm: l.liftMm });
+                            }
+                        }
+                    }
+                    if (blocked) {
+                        const by = recordLinkContact(step.line, link, link.style, 'blocked', blocked.contact, blocked.travelUnit, { unit: blocked.retreatUnit, mm: blocked.retreatMm });
+                        blockStation(index, link, by);
+                    } else if (step.target.z < current.z - 1e-9) {
+                        const descent = await guardedDescent(label, step.target.z, link);
+                        current = { ...current, z: descent.z };
+                        blockOnDescent(index, link, descent);
                     }
                 }
-                current = { ...step.target };
                 announce(`${label}-at`, `(${current.x}, ${current.y}, ${current.z})`);
                 continue;
             }
@@ -500,7 +688,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
             const { unit, length } = unitOf(step.from, step.target);
             const id = step.meta.id || String(step.index);
             const name = step.meta.name || null;
-            const base: Omit<ProbeResultRecord, 'status' | 'contactMachine' | 'contactWork' | 'travelMm' | 'shortOfTargetMm' | 'spreadMm' | 'deviationMm' | 'withinTolerance'> = {
+            const base: RecordBase = {
                 index: step.index,
                 id,
                 name,
@@ -513,6 +701,16 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
                 maxTravelMm: length,
                 meta: step.meta,
             };
+            const pending = blockedState.pending;
+            blockedState.pending = null;
+            if (pending && pending.stationIndex === index) {
+                // The link (or descent) to this station met material: the
+                // station is blocked, not measured - a normal outcome.
+                records.push(emptyRecord(base, 'blocked', pending.by));
+                announce(`${label}-blocked`, `station "${name || id}" not probed: ${pending.by.kind} link contact at `
+                    + `(${pending.by.contactMachine.x}, ${pending.by.contactMachine.y}, ${pending.by.contactMachine.z})`);
+                continue;
+            }
             if (step.mode === 'G38.2' || step.mode === 'G38.3') {
                 probeFeedService.setExpectedContact(['probe']);
                 const contact = await marchToContact(tag, `${label}-${id}`, current, unit, length, plan.march, announce);
@@ -544,7 +742,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
                         withinTolerance,
                     });
                 } else {
-                    records.push({ ...base, status: 'no_contact', contactMachine: null, contactWork: null, travelMm: null, shortOfTargetMm: null, spreadMm: null, deviationMm: null, withinTolerance: null });
+                    records.push(emptyRecord(base, 'no_contact'));
                     announce(`${label}-no-contact`, `${step.mode}: nothing within ${length} mm`);
                     if (step.mode === 'G38.2' && plan.onMiss === 'abort') {
                         await retreatAlong(tag, `${label}-${id}`, current, unit, 0);
@@ -578,7 +776,7 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
                 }
             }
             if (releasedAt === null) {
-                records.push({ ...base, status: 'not_released', contactMachine: null, contactWork: null, travelMm: null, shortOfTargetMm: null, spreadMm: null, deviationMm: null, withinTolerance: null });
+                records.push(emptyRecord(base, 'not_released'));
                 probeFeedService.clearExpectedContact();
                 if (step.mode === 'G38.4') {
                     throw new ProcedureAbort(`${label}: G38.4 reached its target without the probe releasing.`);
@@ -605,6 +803,8 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
         const isTrip = !!probeFeedService.getTrip();
         if (!isTrip) {
             try {
+                // Law 8: straight up to the traverse height. Held only while the
+                // probe still reads contact (lifting would drag the tip).
                 await abortRaiseToTop(tag, (phase, z, note) => announce(phase, z === null ? note : `Z${z} - ${note}`), { holdIfTriggered: 'probe' });
             } catch (retreatErr) {
                 // Logged by the activity stream.
