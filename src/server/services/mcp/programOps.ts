@@ -32,17 +32,36 @@ export interface CaptureOpArgs {
     settle_ms: number;
     /** Free text the agent attaches to the frame (what it expects to see). */
     label: string | null;
+    /**
+     * Where to look FROM: a machine XY the head hops to at the traverse height
+     * before the frame (law 2: raise, then XY), checked against travel and
+     * every obstacle box exactly like a sequence hop. null = capture where the
+     * previous op left the head. A plain hop-only sequence is refused ("pure
+     * motion"), so this is the one way a program positions the camera.
+     */
+    view: { x: number; y: number } | null;
 }
 
 /** Normalise a `capture` op's arguments; every other key is refused so a typo cannot pass silently. */
 export function captureOpArgs(raw: { [key: string]: unknown }, where: string): CaptureOpArgs {
-    const allowed = ['settle_ms', 'label'];
+    const allowed = ['settle_ms', 'label', 'x', 'y'];
     const unknown = Object.keys(raw).filter((k) => !allowed.includes(k));
     if (unknown.length) {
-        throw new Error(`${where} (capture): unknown argument(s) ${unknown.join(', ')} - a capture takes settle_ms and label only (it has no position: it looks from wherever the previous op ended).`);
+        throw new Error(`${where} (capture): unknown argument(s) ${unknown.join(', ')} - a capture takes settle_ms, label and an optional viewing position x/y (machine, hopped to at the traverse height).`);
     }
     const label = raw.label === undefined || raw.label === null ? null : String(raw.label).trim().slice(0, 120) || null;
-    return { settle_ms: clampTo(raw.settle_ms, CAPTURE_SETTLE_MS as Bounded), label };
+    const hasX = raw.x !== undefined && raw.x !== null;
+    const hasY = raw.y !== undefined && raw.y !== null;
+    let view: { x: number; y: number } | null = null;
+    if (hasX || hasY) {
+        const x = Number(raw.x);
+        const y = Number(raw.y);
+        if (!hasX || !hasY || !Number.isFinite(x) || !Number.isFinite(y)) {
+            throw new Error(`${where} (capture): a viewing position needs BOTH x and y (finite machine coordinates); omit both to capture where the head is.`);
+        }
+        view = { x, y };
+    }
+    return { settle_ms: clampTo(raw.settle_ms, CAPTURE_SETTLE_MS as Bounded), label, view };
 }
 
 /**

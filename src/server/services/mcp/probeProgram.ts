@@ -3,7 +3,10 @@
 // probe_program arguments verbatim).
 import fs from 'fs';
 
-import { KeepOutError, ObstacleBox, insideSweptCylinder, normalizeKeepOut } from './envelopeChecks';
+import { KeepOutError, ObstacleBox, checkMotion, describeViolations, insideSweptCylinder, normalizeKeepOut, sequenceMotion } from './envelopeChecks';
+import { clearanceOptions } from './clearanceContext';
+import { landmarkStore } from './landmarks';
+import { outsideTravel } from './machineTravel';
 import { ExpandedGroup, GroupExpandError, expandProgramGroups } from './programGroups';
 import { mcpBroadcast } from './index';
 import { probeFeedService } from './probeFeed';
@@ -66,7 +69,7 @@ import { McpToolError } from './registry';
 import { AxisNamespace, missingGeometryNote, programSeedNamespaces } from './rotaryGeometry';
 import { deriveStockSection } from './stockGeometry';
 import { homeMachine } from './tools/camera';
-import { getPositionSnapshot, safeTraverseZ } from './tools/machine';
+import { getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 // A composite probing PROGRAM: an ordered list of operations - rotate the
 // rotary axis, top-surface scans (path / grid), probe sequences (side and
@@ -127,6 +130,36 @@ export interface ProbeProgramPlan {
 }
 
 const MAX_OPS = 80;
+/** Extra events for a capture that hops to a viewing position (raise + hop, each settle-verified). */
+const CAPTURE_VIEW_EVENT_BUDGET = 20;
+
+/**
+ * A capture's viewing hop is a sequence hop in every respect: inside the
+ * toolhead travel, at the traverse height, and refused (law 4) when the
+ * segment crosses an obstacle box below the Z it demands. Throws Error with
+ * the operator-facing text; callers wrap it.
+ */
+function checkCaptureView(
+    view: { x: number; y: number },
+    from: { x: number; y: number; z: number },
+    hopZ: number,
+    keepOut: ObstacleBox[],
+    where: string
+): void {
+    const travel = requirePlanningTravel('a program capture view', { x: from.x, y: from.y });
+    const off = outsideTravel({ x: view.x, y: view.y }, travel.limits);
+    if (off) {
+        throw new Error(`${where} (capture): viewing position is outside the toolhead travel: ${off}.`);
+    }
+    const violations = checkMotion(
+        sequenceMotion({ hopZ, staged: from, steps: [{ kind: 'hop', x: view.x, y: view.y }] }),
+        [...landmarkStore.obstacleBoxes(), ...keepOut],
+        { traverseZ: hopZ, ...clearanceOptions() }
+    );
+    if (violations.length) {
+        throw new Error(`${where} (capture): viewing hop refused (law 4, landmarks are obstacles): ${describeViolations(violations)}.`);
+    }
+}
 
 /** Job-event estimate per op (measured: 763 events for an 8-station path; a sequence probe ~60). */
 function eventBudgetFor(sub: SubPlan | { kind: 'rotate_b' }): number {
@@ -273,13 +306,33 @@ export function planProbeProgram(args: { name?: unknown; ops?: unknown; keep_out
             } catch (err) {
                 throw new McpToolError((err as Error).message);
             }
+            if (capture.view) {
+                // Law 2 and law 4 at staging, from the program's anchor (each
+                // op ends raised, so the anchor XY is the worst case only for
+                // op 1; the runner re-checks from the live position).
+                try {
+                    checkCaptureView(capture.view, { x, y, z }, hopZ, keepOut, where);
+                } catch (err) {
+                    throw new McpToolError((err as Error).message);
+                }
+            }
             captures.push(id);
-            eventBudget += CAPTURE_EVENT_BUDGET;
-            ops.push({ id, kind, args: { settle_ms: capture.settle_ms, label: capture.label }, on_fail: onFail, refs: [] });
+            eventBudget += CAPTURE_EVENT_BUDGET + (capture.view ? CAPTURE_VIEW_EVENT_BUDGET : 0);
+            ops.push({
+                id,
+                kind,
+                args: { settle_ms: capture.settle_ms, label: capture.label, x: capture.view?.x ?? null, y: capture.view?.y ?? null },
+                on_fail: onFail,
+                refs: [],
+            });
+            const viewText = capture.view
+                ? `; VIEW FROM machine (${capture.view.x}, ${capture.view.y}): raise to Z${hopZ} first (law 2), hop there at Z${hopZ} (checked against the travel and every obstacle box like a sequence hop),\n`
+                : '; NO MOTION - the frame is taken from wherever the previous op left the head.\n';
             previews.push({
                 id,
-                text: `; CAPTURE FRAME${capture.label ? ` "${capture.label}"` : ''}: NO MOTION - wait ${capture.settle_ms} ms for the platform/rotary to settle, `
-                    + 'then one frame from the selected camera, stamped with the machine position and B, saved on the job record (result.file; view with get_frame).',
+                text: `; CAPTURE FRAME${capture.label ? ` "${capture.label}"` : ''}:\n${viewText}`
+                    + `; wait ${capture.settle_ms} ms for the platform/rotary to settle, then one frame from the selected camera, stamped with the machine position and B, `
+                    + 'saved on the job record (result.file; view with get_frame).',
             });
             return;
         }
@@ -493,9 +546,25 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
         try {
             probeFeedService.assertNoOvertravel();
             if (op.kind === 'capture') {
-                // No motion. The head is wherever the previous op ended (raised,
-                // or at the staged position for a first op); the frame says so.
                 checkProcedureStop();
+                if (op.args.x !== null && op.args.x !== undefined && op.args.y !== null && op.args.y !== undefined) {
+                    // Viewing position: re-check from the LIVE position (the
+                    // staging check used the program anchor), then law 2 -
+                    // raise to the traverse height, hop, never the reverse.
+                    const view = { x: Number(op.args.x), y: Number(op.args.y) };
+                    const known = knownMachinePosition();
+                    const { x: kx, y: ky, z: kz } = known.position;
+                    if (kx === null || ky === null || kz === null) {
+                        throw new ProcedureAbort('Capture view refused: the machine position is unknown.');
+                    }
+                    checkCaptureView(view, { x: kx, y: ky, z: kz }, plan.hopZ, plan.keepOut, `op "${op.id}"`);
+                    probeFeedService.clearExpectedContact();
+                    if (kz < plan.hopZ - 0.5) {
+                        await moveMachineSettled(`probe_program:${op.id}:raise`, { z: plan.hopZ }, TRAVEL_FEED);
+                    }
+                    await moveMachineSettled(`probe_program:${op.id}:view`, { x: view.x, y: view.y }, TRAVEL_FEED);
+                    announce(`op-${op.id}-view`, `at machine (${view.x}, ${view.y}) Z${plan.hopZ}`);
+                }
                 const settleMs = Number(op.args.settle_ms) || 0;
                 if (settleMs > 0) {
                     await sleep(settleMs);
@@ -508,6 +577,7 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                     frameId: frame.frameId,
                     file,
                     label: op.args.label ?? null,
+                    view: op.args.x === null || op.args.x === undefined ? null : { x: Number(op.args.x), y: Number(op.args.y) },
                     capturedAt: frame.capturedAt,
                     device: frame.device,
                     provider: frame.provider,
@@ -516,7 +586,7 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                     machine: snapshot.machine,
                     reliability: snapshot.reliability,
                     b: snapshot.b,
-                    note: 'No motion. View with get_frame {frame_id} (last 12 cached) or get_frame {file}. A frame finds things, it clears nothing.',
+                    note: 'View with get_frame {frame_id} (last 12 cached) or get_frame {file}. A frame finds things, it clears nothing.',
                 };
                 results[op.id] = outcome;
                 report.push({ id: op.id, kind: op.kind, b: currentB, status: 'completed', resolvedRefs: resolved, startedAt: opStarted, endedAt: Date.now(), result: outcome });

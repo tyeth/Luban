@@ -29,11 +29,14 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(groupableOpKind('group'), false);
     }],
 
-    ['capture takes settle_ms (clamped to CAPTURE_SETTLE_MS) and a label, nothing else', () => {
-        assert.deepEqual(captureOpArgs({}, 'ops[1]'), { settle_ms: CAPTURE_SETTLE_MS.default, label: null });
-        assert.deepEqual(captureOpArgs({ settle_ms: 99999, label: ' B180 view ' }, 'ops[1]'), { settle_ms: CAPTURE_SETTLE_MS.max, label: 'B180 view' });
+    ['capture takes settle_ms (clamped to CAPTURE_SETTLE_MS), a label and an optional viewing x/y, nothing else', () => {
+        assert.deepEqual(captureOpArgs({}, 'ops[1]'), { settle_ms: CAPTURE_SETTLE_MS.default, label: null, view: null });
+        assert.deepEqual(captureOpArgs({ settle_ms: 99999, label: ' B180 view ' }, 'ops[1]'), { settle_ms: CAPTURE_SETTLE_MS.max, label: 'B180 view', view: null });
         assert.equal(captureOpArgs({ settle_ms: 1200 }, 'ops[1]').settle_ms, 1200);
-        assert.throws(() => captureOpArgs({ x: 140, y: 200 }, 'ops[1]'), /unknown argument\(s\) x, y/);
+        assert.deepEqual(captureOpArgs({ x: 140, y: '200' }, 'ops[1]').view, { x: 140, y: 200 });
+        assert.throws(() => captureOpArgs({ x: 140 }, 'ops[1]'), /BOTH x and y/);
+        assert.throws(() => captureOpArgs({ x: 140, y: 'abc' }, 'ops[1]'), /BOTH x and y/);
+        assert.throws(() => captureOpArgs({ z: 300 }, 'ops[1]'), /unknown argument\(s\) z/);
     }],
 
     ['a home op anywhere but last is refused, naming its index and what follows', () => {
@@ -44,10 +47,12 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(homeOrderError(['sequence', 'home', 'home']));
     }],
 
-    ['the look-rotate-look program is one approval: hop, capture, rotate, capture, home', () => {
+    ['the look-rotate-look program is one approval: capture from (x, y), rotate, capture, home', () => {
         // The exact shape the operator asked for on 2026-09-21; every kind exists and the order is legal.
-        const kinds = ['sequence', 'capture', 'rotate_b', 'capture', 'home'];
+        // The transit is the first capture's viewing position: a hop-only sequence is refused as pure motion.
+        const kinds = ['capture', 'rotate_b', 'capture', 'home'];
         assert.ok(kinds.every(isProgramOpKind));
+        assert.deepEqual(captureOpArgs({ x: 140, y: 200, label: 'B0' }, 'ops[0]').view, { x: 140, y: 200 });
         assert.equal(homeOrderError(kinds), null);
         assert.ok(CAPTURE_EVENT_BUDGET < HOME_EVENT_BUDGET);
     }],
