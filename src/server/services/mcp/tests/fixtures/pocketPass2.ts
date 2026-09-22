@@ -68,7 +68,10 @@ export const LOBE_MX_RUN = [
     { x: 161.2, y: 145.85 },
 ];
 
-/** The chuck-end +X corner from the same job, model frame: a straight long wall, then the wall curves gently (r ~9) and finally tightly (the last four points fit r 3.86, max resid 0.05). */
+/**
+ * The chuck-end +X corner from the same job, model frame: a straight long wall, then the wall
+ * curves gently (r ~9) and finally tightly (the last four points fit r 3.86, max resid 0.05).
+ */
 export const CHUCK_PX_CORNER_RUN = [
     { x: -46.3, y: -28.35 }, { x: -47.3, y: -28.35 }, { x: -48.3, y: -28.35 }, { x: -49.3, y: -28.35 },
     { x: -50.3, y: -28.25 }, { x: -51.3, y: -28.12 }, { x: -52.3, y: -27.82 }, { x: -53.3, y: -27.38 }, { x: -54.3, y: -26.22 },

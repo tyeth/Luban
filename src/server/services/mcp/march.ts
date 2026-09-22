@@ -151,7 +151,13 @@ export async function marchToContact(
         }
     }
     if (!released) {
-        throw new ProcedureAbort(`March "${name}": still triggered ${MAX_RETREAT_MM} mm back - stuck probe or feed fault.`);
+        // Say what was actually done (T8, job 8088e3a6aff5: a 0.1 mm retreat
+        // to the march start was reported as "5 mm back - stuck probe").
+        const retreated = r3(coarseContactS - s);
+        const atStart = s <= 1e-9;
+        throw new ProcedureAbort(`March "${name}": still triggered after retreating ${retreated} mm from the coarse contact`
+            + `${atStart ? ' back to the march start (the last point known free)' : ` (cap ${MAX_RETREAT_MM} mm)`}`
+            + ` - ${atStart ? 'the start itself now reads contact: a rub on the surface beside the march, a stuck probe or a feed fault' : 'stuck probe or feed fault'}.`);
     }
     let fineContactS: number | null = null;
     while (maxTravelMm - s > 1e-9) {
