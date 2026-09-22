@@ -116,6 +116,24 @@ export function releaseTimeoutFor(sensorDelayMs: number, minMs: number = RELEASE
 }
 
 /**
+ * The perimeter crawl's standoff retreat (#183): after a fine retreat step
+ * SHORT of the last point known free, a probe still reading contact is
+ * answered by the next step back, so the release is awaited only this long.
+ * T8 rerun (job d677bd88d31a, GPIO, sensor_delay 50): 830 releases all read
+ * within 303 ms of the retreat settling (the feed polls at 100 ms); 30 waits
+ * of the full 3.5 s timeout (105 s) were steps where the tip was still in the
+ * wall and the next step released it at once. 500 ms covers the slowest
+ * observed release with margin; a release read later only makes the standoff
+ * one step longer. The step past the last point known free keeps the full
+ * releaseTimeoutFor - that answer is a fault.
+ */
+export const STANDOFF_RELEASE_WINDOW_MIN_MS = 500;
+
+export function standoffReleaseWindowFor(sensorDelayMs: number): number {
+    return Math.min(releaseTimeoutFor(sensorDelayMs), Math.max(sensorDelayMs, STANDOFF_RELEASE_WINDOW_MIN_MS));
+}
+
+/**
  * The PHYSICAL move: no single gcode move toward the work presses further
  * than this before the sensor is read again (operator law 2026-09-05, job
  * cdbc29371b97: "never 2 mm" - a move once sent cannot be stopped, so a

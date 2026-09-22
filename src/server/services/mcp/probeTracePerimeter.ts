@@ -5,11 +5,11 @@ import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import { MarchParams, Xyz, makeAnnounce, marchToContact, retreatAlong } from './march';
 import { STEPPED_HOP_FEED } from './marchCore';
+import { PerimeterCorner, PerimeterSegment, TraceAnalysis, TraceLengths, analyseTrace } from './perimeterAnalysis';
 import {
     CONFIRM_AT_VALUES,
     ConfirmAt,
-    PerimeterCorner,
-    PerimeterSegment,
+    ReleasePatience,
     TraceBounds,
     TraceIo,
     TraceParams,
@@ -18,7 +18,6 @@ import {
     emptyTraceCounts,
     estimateTraceTime,
     insideBounds,
-    segmentPerimeter,
     tracePerimeter,
 } from './perimeterTrace';
 import { probeFeedService } from './probeFeed';
@@ -59,6 +58,7 @@ import {
     clampTo,
     releaseTimeoutFor,
     resolveMarchParams,
+    standoffReleaseWindowFor,
     within,
 } from './procedureLimits';
 import { McpToolError } from './registry';
@@ -320,15 +320,19 @@ export function describeProbeTracePlanAsGcode(plan: ProbeTracePlan): string {
         `; BOUNDS the tip centre never leaves: X ${b.x0}..${b.x1} Y ${b.y0}..${b.y1}${p.keepOut.length ? `; keep-out: ${p.keepOut.map((k) => k.name).join(', ')}` : ''}. `
             + `Budget: ${p.maxPerimeterMm} mm of perimeter, ${p.maxSteps} steps. Closure = heading turned 360 deg and back within ${p.coarseStepMm} mm of the first wall point.`,
         `; STANDOFF: after every contact the tip retreats along the inward normal one ${p.fineStepMm} mm step at a time until the probe reads RELEASED, then one more`
-            + ' (T8: parking one step off the contact left the tip 0.05 mm inside a wavy wooden wall and the next advance rubbed). A contact on an advance whose',
+            + ' (T8: parking one step off the contact left the tip 0.05 mm inside a wavy wooden wall and the next advance rubbed). Each retreat step short of the',
+        `;   last point known free waits at most ${standoffReleaseWindowFor(plan.confirmMarch.sensorDelayMs)} ms for the release (then steps again); the step past it `
+            + `waits the full ${releaseTimeoutFor(plan.confirmMarch.sensorDelayMs)} ms release timeout and a probe still triggered there ABORTS. A contact on an advance whose`,
         ';   retreat does not release is a RUB, not a block: the standoff is repaired and the crawl goes on; a confirm cycle that ends stuck is skipped, not a fault.',
         `; CONFIRM CYCLES (lift-and-retest, ${plan.confirmMarch.confirmPasses} pass(es)) only at: ${plan.confirmAt.join(', ')}${p.accuracyEveryMm ? ` (every ${p.accuracyEveryMm} mm)` : ''}`
             + ` - expected about ${e.confirmCycles} (1 first wall + ~1 per corner${p.accuracyEveryMm ? ' + accuracy points' : ''}); every other contact is one sensed ${p.fineStepMm} mm bump.`,
         `; TIME (measured T8, GPIO, sensor ${plan.confirmMarch.sensorDelayMs} ms: a crawl cycle = advance + bump + retreat = 0.9 s -> 9 s/mm at 0.1 mm, 0.93 s/mm at 1 mm; ~10 s per confirm cycle):`,
         `;   ${e.bestCycles}..${e.worstCycles} crawl cycles = ${e.bestMinutes}..${e.worstMinutes} min for the full budget (best: coarse on every straight; worst: fine everywhere),`
             + ` plus ~${e.approachSeconds} s for the first-wall march at ${plan.firstMarch.coarseStepMm} mm coarse steps. Job events exceed the buffer on a long crawl; result.trace is never trimmed.`,
-        `; RESULT: ordered perimeter points (tip-centre${plan.tipDiameterMm === null ? '; no tip diameter stored, so no surface points' : ` and surface = + ${r3(plan.tipDiameterMm / 2)} mm into the material`}), `
-            + 'line / arc segments with residuals, corners with radius and centre, closure, length, counts, timing.',
+        `; RESULT: ordered perimeter points (tip-centre${plan.tipDiameterMm === null ? '; no tip diameter stored, so no surface points' : ` and surface = + ${r3(plan.tipDiameterMm / 2)} mm into the material`}`
+            + ' along the normal of the local wall - a line through the neighbouring contacts), straight walls (collinear runs merged) with residuals and surface lines,',
+        ';   corners fitted only to the points off BOTH walls (radius, centre, residuals) - or, where no single circle fits, an IRREGULAR lobe as a polyline and',
+        ';   line / arc pieces with no radius - closure, tip-centre AND surface perimeter lengths, counts, timing.',
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)}) - re-verified before motion`,
         'G90',
         'G53;',
@@ -347,9 +351,13 @@ export function describeProbeTracePlanAsGcode(plan: ProbeTracePlan): string {
 export interface TraceProcedureResult {
     tool: 'probe_trace_perimeter';
     zMachine: number;
+    /** The crawl's result; each perimeter point's normal and surface come from the local wall geometry (#183), not the crawl heading. */
     trace: TraceResult;
     segments: PerimeterSegment[];
     corners: PerimeterCorner[];
+    /** Tip-centre and surface perimeter lengths. */
+    lengths: TraceLengths;
+    normals: TraceAnalysis['normals'] | null;
     tipDiameterMm: number | null;
     timing: { totalMs: number; perStepMs: number | null; confirmCycles: number };
     /**
@@ -376,10 +384,22 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
     let endState: TraceProcedureResult['endState'] = { parked: false, heldAt: null, recovery: null };
 
     const build = (aborted: boolean): TraceProcedureResult => {
-        const pts = trace ? trace.perimeter.map((pt) => pt.tipCentre) : [];
-        const seg = pts.length >= 3
-            ? segmentPerimeter(pts, plan.lineToleranceMm * 1.5, 4, plan.params.tipRadiusMm, plan.params.coarseStepMm * 4)
-            : { segments: [], corners: [] };
+        const analysis = trace ? analyseTrace(trace, {
+            wallSide: plan.params.wallSide,
+            tipRadiusMm: plan.params.tipRadiusMm,
+            fineStepMm: plan.params.fineStepMm,
+            coarseStepMm: plan.params.coarseStepMm,
+            turnStepDeg: plan.params.turnStepDeg,
+            lineToleranceMm: plan.lineToleranceMm,
+        }) : null;
+        const seg = analysis || { segments: [], corners: [] };
+        const lengths: TraceLengths = analysis ? analysis.lengths : { tipCentreMm: 0, surfaceMm: null, surfaceFromTurnMm: null };
+        const describeCorner = (c: PerimeterCorner) => {
+            if (c.shape === 'irregular') {
+                return `irregular (${c.pieces ? c.pieces.length : 0} pieces, one-circle rms ${c.singleArc ? c.singleArc.rmsResidualMm.toFixed(2) : '?'})`;
+            }
+            return c.radiusTipCentreMm === null ? c.shape : c.radiusTipCentreMm.toFixed(2);
+        };
         const totalMs = Date.now() - startedAt;
         const steps = trace ? trace.counts.fineSteps + trace.counts.coarseSteps + trace.counts.bumps : 0;
         return {
@@ -388,7 +408,7 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
             // `trace` is the crawl's own result - complete, or the partial one an
             // abort carried (T8 lost 67 contacts here). The empty shape below is
             // only for an abort before the crawl started (the approach).
-            trace: trace || {
+            trace: trace && analysis ? { ...trace, perimeter: analysis.perimeter } : {
                 perimeter: [],
                 closed: false,
                 ending: { kind: 'aborted', note: 'aborted before the crawl started (approach or first-wall march)' },
@@ -401,13 +421,16 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
             },
             segments: seg.segments,
             corners: seg.corners,
+            lengths,
+            normals: analysis ? analysis.normals : null,
             tipDiameterMm: plan.tipDiameterMm,
             timing: { totalMs, perStepMs: steps ? Math.round(totalMs / steps) : null, confirmCycles: trace ? trace.counts.confirms : 0 },
             endState,
             phases,
-            note: `${aborted ? 'ABORTED. ' : ''}${trace ? `${trace.ending.kind.toUpperCase()}: ${trace.ending.note}. ${trace.perimeter.length} perimeter point(s) over ${trace.lengthMm} mm; `
+            note: `${aborted ? 'ABORTED. ' : ''}${trace ? `${trace.ending.kind.toUpperCase()}: ${trace.ending.note}. ${trace.perimeter.length} perimeter point(s) over ${trace.lengthMm} mm `
+                + `tip-centre${lengths.surfaceMm === null ? '' : ` / ${lengths.surfaceMm} mm surface`}; `
                 + `${seg.segments.filter((s) => s.kind === 'line').length} straight wall(s), ${seg.corners.length} corner(s)`
-                + `${seg.corners.length ? ` (tip-centre radii ${seg.corners.map((c) => (c.radiusTipCentreMm === null ? '?' : c.radiusTipCentreMm.toFixed(2))).join(', ')})` : ''}; `
+                + `${seg.corners.length ? ` (tip-centre radii ${seg.corners.map(describeCorner).join(', ')})` : ''}; `
                 + `${trace.counts.confirms} confirm cycle(s), ${trace.counts.turns} turn(s), ${Math.round(totalMs / 1000)} s` : `${partialPoints} point(s) before the abort`}. `
                 + `Contacts are tip-centre at toolhead Z${z}${plan.tipDiameterMm === null ? '; no tip diameter stored' : `; surface = + ${r3(plan.tipDiameterMm / 2)} mm into the material`}.`
                 + `${aborted && !endState.parked ? ` THE HEAD IS NOT PARKED. ${endState.recovery || ''}` : ''}`,
@@ -459,8 +482,10 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
         move: async (p: Xy) => {
             await moveMachineSettled(`${tag}:retreat`, { x: p.x, y: p.y }, TRAVEL_FEED);
         },
-        released: async () => {
-            const sensed = await senseReleaseAfter('probe', Date.now(), releaseTimeoutFor(plan.confirmMarch.sensorDelayMs));
+        released: async (patience: ReleasePatience) => {
+            // Returns the moment the release is read; the patience only bounds the wait on a probe still in contact.
+            const waitMs = patience === 'window' ? standoffReleaseWindowFor(plan.confirmMarch.sensorDelayMs) : releaseTimeoutFor(plan.confirmMarch.sensorDelayMs);
+            const sensed = await senseReleaseAfter('probe', Date.now(), waitMs);
             return !sensed.contact;
         },
         march: async (from: Xy, unit: Xy, travelMm: number) => {
