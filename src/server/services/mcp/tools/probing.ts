@@ -20,6 +20,7 @@ import {
 import { describeProbeOutlinePlanAsGcode, planProbeOutline, runProbeOutlineProcedure } from '../probeOutline';
 import { describeProbeWallFollowPlanAsGcode, planProbeWallFollow, runProbeWallFollowProcedure } from '../probeWallFollow';
 import { describeProbeCornerPlanAsGcode, planProbeCorner, runProbeCornerProcedure } from '../probeCorner';
+import { describeProbeTracePlanAsGcode, planProbeTracePerimeter, runProbeTracePerimeterProcedure } from '../probeTracePerimeter';
 import { describeProbeProgramAsGcode, planProbeProgram, runProbeProgramProcedure } from '../probeProgram';
 import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedure } from '../probeVector';
 import { probeFeedService } from '../probeFeed';
@@ -1110,10 +1111,117 @@ ${describeProbeCornerPlanAsGcode(plan)}`;
     });
 
     registry.register({
+        name: 'probe_trace_perimeter',
+        description: 'Stage ONE approved procedure that traces the whole INTERNAL PERIMETER of a pocket of UNKNOWN shape from one point '
+            + 'known to be inside it (operator spec 2026-09-22). Law 2 to start_x/start_y (raise, hop, guarded descent to z_machine - a '
+            + 'MEASURED top minus a depth), a sensor-gated march along dir_x/dir_y (default +X) to the first wall, then a CRAWL with the '
+            + 'probe expected on every move and the wall on wall_side (default right = counter-clockwise inside): step fine_step_mm '
+            + '(default 0.1) along the wall, bump toward it until contact (each contact is a perimeter point; the head backs off the '
+            + 'one 0.1 mm step that touched - no retreat wastage); a BLOCKED step retreats exactly the step attempted and turns '
+            + 'turn_step_deg AWAY from the wall (internal corners, inward curves at 0.1 mm resolution; a full 360 of blocked steps '
+            + 'aborts); a wall that falls away for bump_cap_steps turns TOWARD it (outward curves, external corners); on a run proven '
+            + 'straight (last straight_points contacts within line_tolerance_mm of a line) the step becomes coarse_step_mm (default 1) '
+            + 'and the heading is aligned to the fitted wall; closure = heading turned 360 and back within a coarse step of the first '
+            + 'wall point; otherwise it stops with the partial perimeter on max_perimeter_mm (REQUIRED budget, law 3), max_steps, the '
+            + 'REQUIRED bounds {x0,y0,x1,y1} the tip centre never leaves (the pocket\'s outer extent plus a margin for the bump into the '
+            + 'wall), or a keep-out. Lift-and-retest CONFIRM cycles run only where they buy accuracy (confirm_at, default '
+            + '["first","turns","unexpected"]: the first wall, after a major direction change, an unexpected contact after a straight '
+            + 'run; add "every" with accuracy_every_mm for accuracy points) - a routine bump is one sensed contact. Result: perimeter '
+            + '(ordered tip-centre points with surface = + tip radius into the material, normal, step kind, confirmed flag), segments '
+            + '(lines / arcs with residuals), corners (radius tip-centre + physical, centre, interior angle), closed, lengthMm, counts, '
+            + 'timing. The confirm page states the step count and time estimate (~0.3 s per sensor-checked step on GPIO). Also '
+            + 'probe_program op kind "trace". The same crawl with the normal flipped traces a boss / the outer stock outline (not yet exposed).',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                start_x: { type: 'number', description: 'REQUIRED machine X of a point KNOWN to be inside the pocket (operator / camera).' },
+                start_y: { type: 'number', description: 'REQUIRED machine Y of that point.' },
+                z_machine: { type: 'number', description: 'REQUIRED toolhead machine Z of the crawl: a MEASURED top minus a depth, never a guess.' },
+                dir_x: { type: 'number', description: 'First march direction toward a wall, X component (default 1).' },
+                dir_y: { type: 'number', description: 'First march direction, Y component (default 0).' },
+                max_travel_mm: { type: 'number', description: 'REQUIRED travel of the first march before it aborts with no wall (1-150).' },
+                fine_step_mm: { type: 'number', description: 'Step along the wall and bump toward it, default 0.1 (0.05-1).' },
+                coarse_step_mm: { type: 'number', description: 'Step on a run proven straight, default 1 (up to 5; never below the fine step).' },
+                turn_step_deg: { type: 'number', description: 'Heading change per blocked step / fallen-away wall, default 10 (2-45).' },
+                bump_mm: { type: 'number', description: 'Back-off from the first wall before the crawl, default = fine_step_mm.' },
+                bump_cap_steps: { type: 'number', description: 'Fine steps toward the wall before it counts as fallen away, default 3 (1-10).' },
+                line_tolerance_mm: { type: 'number', description: 'Largest residual for a run to count as straight, default = fine_step_mm (0.02-5).' },
+                straight_points: { type: 'number', description: 'Contacts the straightness line is fitted over, default 6 (3-20); the window spans that many coarse steps.' },
+                max_perimeter_mm: { type: 'number', description: 'REQUIRED perimeter budget (1-1400), law 3: the crawl stops here with the partial result.' },
+                max_steps: { type: 'number', description: 'Step budget, default 20000 (10-100000).' },
+                bounds: {
+                    type: 'object',
+                    properties: { x0: { type: 'number' }, y0: { type: 'number' }, x1: { type: 'number' }, y1: { type: 'number' } },
+                    required: ['x0', 'y0', 'x1', 'y1'],
+                    additionalProperties: false,
+                    description: 'REQUIRED machine XY box the tip centre never leaves: the pocket\'s outer extent as estimated PLUS a margin of at least one step for the bump into the wall.',
+                },
+                wall_side: { type: 'string', enum: ['right', 'left'], description: 'Which side the wall is kept on while crawling, default right (counter-clockwise round the inside).' },
+                confirm_at: {
+                    type: 'array',
+                    items: { type: 'string', enum: ['first', 'turns', 'unexpected', 'every'] },
+                    description: 'Where lift-and-retest confirm cycles run, default ["first","turns","unexpected"]; "every" needs accuracy_every_mm.',
+                },
+                accuracy_every_mm: { type: 'number', description: 'With confirm_at "every": an accuracy confirm cycle each this many mm of perimeter (1-1400).' },
+                major_turn_deg: { type: 'number', description: 'Accumulated turn since the last confirm that counts as a major direction change, default 45 (5-180).' },
+                expected_corners: { type: 'number', description: 'For the time / confirm-cycle estimate only, default 4.' },
+                fine_step_march_mm: { type: 'number', description: 'Ignored (reserved).' },
+                backoff_mm: { type: 'number', description: 'Confirm-cycle lift, default 1.' },
+                sensor_delay_ms: { type: 'number', description: 'Contact-check window per step, default 300, floor 30 (GPIO: 50 - use it, every step pays it).' },
+                confirm_passes: { type: 'number', description: 'Lift-and-retest cycles per confirmed contact, default 3 (1-10).' },
+                reason: { type: 'string', description: 'Shown to the operator: which pocket, and why.' },
+            },
+            required: ['start_x', 'start_y', 'z_machine', 'max_travel_mm', 'max_perimeter_mm', 'bounds', 'reason'],
+            additionalProperties: false,
+        },
+        handler: async (args: { [key: string]: unknown }) => {
+            const reason = String(args.reason || '').trim();
+            if (!reason) {
+                throw new McpToolError('reason is required; it is shown to the operator.');
+            }
+            probeFeedService.assertNoOvertravel();
+            const plan = planProbeTracePerimeter(args as Parameters<typeof planProbeTracePerimeter>[0]);
+            const envelope = `; reason: ${reason}
+${describeProbeTracePlanAsGcode(plan)}`;
+            const validation = validateStagedEnvelope(envelope, 'probe_trace_perimeter');
+            const job = jobManager.submit(
+                envelope,
+                `perimeter-trace <=${plan.params.maxPerimeterMm}mm at Z${plan.zMachine} - ${reason.slice(0, 40)}`,
+                'cnc',
+                validation,
+                'procedure'
+            );
+            job.runner = async () => runProbeTracePerimeterProcedure(plan);
+            return {
+                job: jobManager.describe(job),
+                plan: {
+                    start: plan.start,
+                    dir: plan.dir,
+                    zMachine: plan.zMachine,
+                    bounds: plan.params.bounds,
+                    maxPerimeterMm: plan.params.maxPerimeterMm,
+                    fineStepMm: plan.params.fineStepMm,
+                    coarseStepMm: plan.params.coarseStepMm,
+                    turnStepDeg: plan.params.turnStepDeg,
+                    wallSide: plan.params.wallSide,
+                    confirmAt: plan.confirmAt,
+                    estimate: plan.estimate,
+                    hopZ: plan.hopZ,
+                    staged: plan.staged,
+                },
+                confirm_url: `${getConfirmBaseUrl()}/confirm/${job.id}`,
+                next_step: 'Ask the operator to open confirm_url and review the start, the bounds, the budget and the time estimate, then start '
+                    + 'with start_gcode_job wait_for_approval_ms and long-poll get_gcode_job_status. The result carries the ordered '
+                    + 'perimeter, segments and corners; a long crawl exceeds the job event buffer but result.perimeter is never trimmed.',
+            };
+        },
+    });
+
+    registry.register({
         name: 'probe_program',
         description: 'Stage a COMPOSITE probing program for ONE human approval: an ordered list of operations - '
             + 'rotate_b (turn the rotary axis to an absolute B, toolhead at/above the traverse height), '
-            + 'surface_path, surface_grid, sequence, stock_outline, wall_follow and corner (the same arguments as the standalone tools), '
+            + 'surface_path, surface_grid, sequence, stock_outline, wall_follow, corner and trace (the same arguments as the standalone tools), '
             + 'capture (one camera frame, stamped with position and B, saved on the job record - view it afterwards with '
             + 'get_frame; give it x/y and it first hops there at the traverse height like a sequence hop, else no motion) '
             + 'and home (machine home, LAST op only; '
@@ -1147,7 +1255,7 @@ ${describeProbeCornerPlanAsGcode(plan)}`;
                         + 'capture {x?, y?, settle_ms? (default 500, max 5000), label?} - a frame; with x/y (machine) it raises and hops '
                         + 'there first (travel + obstacle checked), without them no motion; '
                         + 'home {} - G53;G28;G54, every axis to its switches AND B to 0, allowed only as the last op; '
-                        + 'surface_path / surface_grid / sequence / stock_outline / wall_follow / corner: the standalone tool arguments, where ANY number (start_z_machine, '
+                        + 'surface_path / surface_grid / sequence / stock_outline / wall_follow / corner / trace: the standalone tool arguments, where ANY number (start_z_machine, '
                         + 'expected_z_machine, floor_z_machine, start_x/end_x, sequence hop x/y and descend z, expected_profile.circle.*) '
                         + 'may be a reference; group {id, for_b: [0, 90, 180, 270], ops: [...]} = the inner ops run once per angle '
                         + `after a rotate_b to it, with the token "${'$'}{b}" in any string replaced by the angle and inner ids without it `

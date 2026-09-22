@@ -40,6 +40,7 @@ Which second op:
 | where a block is and how big | `stock_outline` | needs an estimated centre and size |
 | a VERTICAL wall at N points (pocket side, boss face), a corner's shape | `wall_follow` | march, back off 2 mm, step along, march again — no retreat to the start line |
 | the RADIUS of an internal corner between two fitted walls | `corner` | bisector march, then radial marches from the fitted centre; needs `radius_max_mm` |
+| the whole perimeter of a pocket of UNKNOWN shape | `trace` (`probe_trace_perimeter`) | 0.1 mm crawl from a point inside; needs `bounds` + `max_perimeter_mm` |
 | a VERTICAL post/boss/hole diameter and centre | `probe_circle` | vertical-axis features only — a cylinder lying along Y is a `surface_path` across it |
 | edges of stock of estimated size | `sequence` side marches | start outside the largest size; long travel is cheap |
 
@@ -132,7 +133,7 @@ Ops: `rotate_b` (absolute B; refused unless the head is at/above the traverse he
 PHYSICALLY finished - `M400`, the rotation's wall-clock time at F600 = 10 deg/s, then two idle
 heartbeats at the target B - because the controller's "ok" and M114 report the buffered target
 the instant a B move is queued, seen on hardware 2026-09-21), `surface_path`, `surface_grid`,
-`sequence`, `stock_outline`, `wall_follow`, `corner`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
+`sequence`, `stock_outline`, `wall_follow`, `corner`, `trace`, `capture {x?, y?, settle_ms?, label?}` (one frame stamped with
 position and B, saved on the job record — read it back with `get_frame {frame_id}` or
 `get_frame {file}`; with `x/y` it first raises and hops there at 328, travel- and
 obstacle-checked like a sequence hop — a hop-only `sequence` is refused as pure motion, so this
@@ -205,6 +206,25 @@ centre between — every station and link on proven ground. Result: `fit` (tip-c
 per-point residuals — plate (6)'s lobes fit with rms ~0.5 mm, which is the honest answer, not a
 fault), `radiusPhysicalMm` (+ tip radius for an internal corner). External (boss) corners are not
 planned yet — measure them as a `wall_follow` around the corner and read `segments`.
+
+**Unknown pocket: `probe_trace_perimeter`** (op kind `trace`; operator spec 2026-09-22). Give
+`start_x/start_y` (a point KNOWN to be inside — operator or camera), `z_machine` (a MEASURED top minus
+the depth), `dir_x/dir_y` (first march, default +X), `max_travel_mm`, the REQUIRED `bounds`
+`{x0,y0,x1,y1}` the tip centre never leaves (the pocket's estimated outer extent PLUS at least one
+step of margin for the bump into the wall — a bound on the wall itself stops the crawl at the first
+bump) and the REQUIRED `max_perimeter_mm` budget (law 3); `keep_out` volumes apply. The crawl keeps
+the wall on `wall_side` (default right = counter-clockwise inside), steps `fine_step_mm` (0.1) along
+it and bumps 0.1 toward it until contact — each contact is a perimeter point, the head backs off only
+the step that touched; a blocked step retreats exactly that step and turns `turn_step_deg` away from
+the wall (corners at 0.1 mm resolution), a wall that falls away turns toward it; runs proven straight
+go at `coarse_step_mm` (1) with the heading aligned to the fitted wall. Confirm cycles run ONLY at
+`confirm_at` (default first / turns / unexpected; add `every` + `accuracy_every_mm` for accuracy
+points) — a routine bump is one sensed contact, which is what makes 0.1 mm affordable. Budget the
+time from the confirm page (~0.3 s per sensor-checked step on GPIO: a 330 mm pocket is ~35 min at
+0.1 everywhere, ~5 min with coarse straights). Result: ordered `perimeter` (tip-centre + `surface`
+one tip radius into the material, normal, step kind, confirmed), `segments` (lines / arcs with
+residuals), `corners` (radius, centre, interior angle), `closed`, `ending`, `counts`, `timing`. A
+long crawl overflows the job event buffer; `result.perimeter` is never trimmed.
 
 Hardware test order for a new program: B0 half without rotations, then one rotation, then the
 whole program — and compare `derived` with the operator's calipers.
