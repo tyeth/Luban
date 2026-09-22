@@ -295,6 +295,36 @@ export const WALL_STANDOFF_MM: Bounded = { default: 2, min: HOP_LIFT_MM.min, max
 export const WALL_LINE_TOLERANCE_MM: Range = { min: FINE_STEP_MM.min, max: 5 };
 
 // ---------------------------------------------------------------------------
+// probe_trace_perimeter (operator spec 2026-09-22)
+// ---------------------------------------------------------------------------
+
+/** The crawl's step along the wall and its bump toward it: the operator's 0.1 mm; a step under the smallest fine step is noise, above 1 mm is not a crawl. */
+export const TRACE_FINE_STEP_MM: Bounded = { default: 0.1, min: 0.05, max: 1 };
+/**
+ * The step used only on a run already proven straight (the running line's
+ * residuals under line_tolerance). Capped at 5 - a coarse step is a plain
+ * sensor-checked move, and the operator's cap for a move that expects no
+ * contact is 5 mm (DESCENT_SEGMENT_MM in probing.ts, a server module this
+ * pure file cannot import - the value is repeated here on purpose); the
+ * whole segment is sensed.
+ */
+export const TRACE_COARSE_STEP_MM: Bounded = { default: 1, min: TRACE_FINE_STEP_MM.min, max: 5 };
+/** How far the tangent turns per failed step / per fallen-away wall. 2 deg resolves a large radius; 45 is a corner in one turn. */
+export const TRACE_TURN_STEP_DEG: Bounded = { default: 10, min: 2, max: 45 };
+/** Fine steps toward the wall before it counts as fallen away (an outward curve): the operator's "a few". */
+export const TRACE_BUMP_CAP_STEPS: Bounded = { default: 3, min: 1, max: 10 };
+/** Contacts the straightness line is fitted over before a coarse step is allowed. */
+export const TRACE_STRAIGHT_POINTS: Bounded = { default: 6, min: 3, max: 20 };
+/** Accumulated turn since the last confirm cycle that counts as a major direction change (a quarter turn = an internal corner). */
+export const TRACE_MAJOR_TURN_DEG: Bounded = { default: 45, min: 5, max: 180 };
+/** Crawl steps per approval: a time / event budget, not a safety line (a 330 mm pocket at 0.1 is ~7000 steps). */
+export const TRACE_MAX_STEPS: Bounded = { default: 20000, min: 10, max: 100000 };
+/** max_perimeter_mm is REQUIRED (law 3); the A350 bed's own perimeter bounds it. */
+export const TRACE_MAX_PERIMETER_MM: Range = { min: 1, max: 1400 };
+/** accuracy_every_mm: how often an accuracy confirm cycle is inserted. */
+export const TRACE_ACCURACY_EVERY_MM: Range = { min: 1, max: 1400 };
+
+// ---------------------------------------------------------------------------
 // probe_corner
 // ---------------------------------------------------------------------------
 
