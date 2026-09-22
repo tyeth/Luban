@@ -15,6 +15,7 @@ import {
     TraceParams,
     TraceResult,
     WallSide,
+    emptyTraceCounts,
     estimateTraceTime,
     insideBounds,
     segmentPerimeter,
@@ -36,6 +37,7 @@ import {
     knownMachinePosition,
     moveMachineSettled,
     senseAfter,
+    senseReleaseAfter,
     isProcedureAbort,
     isProcedureStopped,
     abortRaiseToTop,
@@ -55,6 +57,7 @@ import {
     WALL_LINE_TOLERANCE_MM,
     clampCount,
     clampTo,
+    releaseTimeoutFor,
     resolveMarchParams,
     within,
 } from './procedureLimits';
@@ -91,7 +94,10 @@ export interface ProbeTracePlan {
     zMachine: number;
     params: TraceParams;
     lineToleranceMm: number;
-    march: MarchParams;
+    /** The first-wall march: the normal coarse (1 mm) / release / fine / confirm march. T8 crawled the 27 mm approach at 0.1 mm (90 s). */
+    firstMarch: MarchParams;
+    /** The confirm cycles: the same march with the coarse step = the fine step, over a few fine steps of travel. */
+    confirmMarch: MarchParams;
     hopZ: number;
     staged: Xyz;
     tipDiameterMm: number | null;
@@ -250,7 +256,8 @@ export function planProbeTracePerimeter(args: TraceArgs, extraObstacles: Obstacl
         .map((b) => ({ name: b.name, x0: b.machine.x0, y0: b.machine.y0, x1: b.machine.x1, y1: b.machine.y1 }));
     const geometry = probeGeometry();
     const tipDiameterMm = geometry ? geometry.tipDiameter : null;
-    const march = resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS, coarse: { default: fineStep, min: fineStep, max: fineStep } });
+    const firstMarch = resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS });
+    const confirmMarch = resolveMarchParams(args, { delay: GPIO_SENSOR_DELAY_MS, coarse: { default: fineStep, min: fineStep, max: fineStep } });
     const params: TraceParams = {
         fineStepMm: fineStep,
         coarseStepMm: coarseStep,
@@ -278,12 +285,18 @@ export function planProbeTracePerimeter(args: TraceArgs, extraObstacles: Obstacl
         zMachine: r3(zMachine),
         params,
         lineToleranceMm: lineTol,
-        march,
+        firstMarch,
+        confirmMarch,
         hopZ,
         staged: { x, y, z },
         tipDiameterMm,
         estimate: estimateTraceTime({
-            maxPerimeterMm: maxPerimeter, fineStepMm: fineStep, coarseStepMm: coarseStep, accuracyEveryMm: accuracyEvery, expectedCorners,
+            maxPerimeterMm: maxPerimeter,
+            fineStepMm: fineStep,
+            coarseStepMm: coarseStep,
+            accuracyEveryMm: accuracyEvery,
+            expectedCorners,
+            maxTravelMm: maxTravel,
         }),
         confirmAt,
     };
@@ -306,10 +319,14 @@ export function describeProbeTracePlanAsGcode(plan: ProbeTracePlan): string {
         `; a wall that falls away for ${p.bumpCapSteps} bumps turns it ${p.turnStepDeg} deg TOWARD the wall (outward curves). A full 360 deg of blocked steps ABORTS.`,
         `; BOUNDS the tip centre never leaves: X ${b.x0}..${b.x1} Y ${b.y0}..${b.y1}${p.keepOut.length ? `; keep-out: ${p.keepOut.map((k) => k.name).join(', ')}` : ''}. `
             + `Budget: ${p.maxPerimeterMm} mm of perimeter, ${p.maxSteps} steps. Closure = heading turned 360 deg and back within ${p.coarseStepMm} mm of the first wall point.`,
-        `; CONFIRM CYCLES (lift-and-retest, ${plan.march.confirmPasses} pass(es)) only at: ${plan.confirmAt.join(', ')}${p.accuracyEveryMm ? ` (every ${p.accuracyEveryMm} mm)` : ''}`
-            + ` - expected about ${e.confirmCycles} (1 first wall + ~1 per corner${p.accuracyEveryMm ? ' + accuracy points' : ''}); every other contact is one sensed 0.1 mm bump.`,
-        `; TIME: ${e.bestSteps}..${e.worstSteps} sensor-checked steps at ~0.3 s each (GPIO, 2026-09-22) = ${e.bestMinutes}..${e.worstMinutes} min for the full budget`
-            + ' (best: coarse on every straight; worst: fine everywhere). Job events will exceed the buffer on a long crawl; result.perimeter is never trimmed.',
+        `; STANDOFF: after every contact the tip retreats along the inward normal one ${p.fineStepMm} mm step at a time until the probe reads RELEASED, then one more`
+            + ' (T8: parking one step off the contact left the tip 0.05 mm inside a wavy wooden wall and the next advance rubbed). A contact on an advance whose',
+        ';   retreat does not release is a RUB, not a block: the standoff is repaired and the crawl goes on; a confirm cycle that ends stuck is skipped, not a fault.',
+        `; CONFIRM CYCLES (lift-and-retest, ${plan.confirmMarch.confirmPasses} pass(es)) only at: ${plan.confirmAt.join(', ')}${p.accuracyEveryMm ? ` (every ${p.accuracyEveryMm} mm)` : ''}`
+            + ` - expected about ${e.confirmCycles} (1 first wall + ~1 per corner${p.accuracyEveryMm ? ' + accuracy points' : ''}); every other contact is one sensed ${p.fineStepMm} mm bump.`,
+        `; TIME (measured T8, GPIO, sensor ${plan.confirmMarch.sensorDelayMs} ms: a crawl cycle = advance + bump + retreat = 0.9 s -> 9 s/mm at 0.1 mm, 0.93 s/mm at 1 mm; ~10 s per confirm cycle):`,
+        `;   ${e.bestCycles}..${e.worstCycles} crawl cycles = ${e.bestMinutes}..${e.worstMinutes} min for the full budget (best: coarse on every straight; worst: fine everywhere),`
+            + ` plus ~${e.approachSeconds} s for the first-wall march at ${plan.firstMarch.coarseStepMm} mm coarse steps. Job events exceed the buffer on a long crawl; result.trace is never trimmed.`,
         `; RESULT: ordered perimeter points (tip-centre${plan.tipDiameterMm === null ? '; no tip diameter stored, so no surface points' : ` and surface = + ${r3(plan.tipDiameterMm / 2)} mm into the material`}), `
             + 'line / arc segments with residuals, corners with radius and centre, closure, length, counts, timing.',
         `; anchored at machine (${plan.staged.x.toFixed(2)}, ${plan.staged.y.toFixed(2)}, ${plan.staged.z.toFixed(2)}) - re-verified before motion`,
@@ -335,6 +352,12 @@ export interface TraceProcedureResult {
     corners: PerimeterCorner[];
     tipDiameterMm: number | null;
     timing: { totalMs: number; perStepMs: number | null; confirmCycles: number };
+    /**
+     * Where the head was left. `parked` = raised to the traverse height;
+     * otherwise the abort HELD (law 8: the probe still read contact) and
+     * `recovery` says exactly what the operator's first motion is.
+     */
+    endState: { parked: boolean; heldAt: Xyz | null; recovery: string | null };
     phases: { phase: string; note?: string }[];
     note: string;
     aborted?: boolean;
@@ -350,6 +373,7 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
     const startedAt = Date.now();
     let trace: TraceResult | null = null;
     let partialPoints = 0;
+    let endState: TraceProcedureResult['endState'] = { parked: false, heldAt: null, recovery: null };
 
     const build = (aborted: boolean): TraceProcedureResult => {
         const pts = trace ? trace.perimeter.map((pt) => pt.tipCentre) : [];
@@ -361,26 +385,32 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
         return {
             tool: plan.tool,
             zMachine: z,
+            // `trace` is the crawl's own result - complete, or the partial one an
+            // abort carried (T8 lost 67 contacts here). The empty shape below is
+            // only for an abort before the crawl started (the approach).
             trace: trace || {
                 perimeter: [],
                 closed: false,
-                ending: { kind: 'budget', note: 'aborted before the first wall' },
+                ending: { kind: 'aborted', note: 'aborted before the crawl started (approach or first-wall march)' },
                 lengthMm: 0,
                 headingTurnDeg: 0,
-                counts: { fineSteps: 0, coarseSteps: 0, bumps: 0, turns: 0, retreats: 0, confirms: 0, tangentContacts: 0 },
+                counts: emptyTraceCounts(),
                 position: plan.start,
-                firstWall: { point: plan.start, spreadMm: 0 },
+                firstWall: null,
+                standoffMm: 0,
             },
             segments: seg.segments,
             corners: seg.corners,
             tipDiameterMm: plan.tipDiameterMm,
             timing: { totalMs, perStepMs: steps ? Math.round(totalMs / steps) : null, confirmCycles: trace ? trace.counts.confirms : 0 },
+            endState,
             phases,
             note: `${aborted ? 'ABORTED. ' : ''}${trace ? `${trace.ending.kind.toUpperCase()}: ${trace.ending.note}. ${trace.perimeter.length} perimeter point(s) over ${trace.lengthMm} mm; `
                 + `${seg.segments.filter((s) => s.kind === 'line').length} straight wall(s), ${seg.corners.length} corner(s)`
                 + `${seg.corners.length ? ` (tip-centre radii ${seg.corners.map((c) => (c.radiusTipCentreMm === null ? '?' : c.radiusTipCentreMm.toFixed(2))).join(', ')})` : ''}; `
                 + `${trace.counts.confirms} confirm cycle(s), ${trace.counts.turns} turn(s), ${Math.round(totalMs / 1000)} s` : `${partialPoints} point(s) before the abort`}. `
-                + `Contacts are tip-centre at toolhead Z${z}${plan.tipDiameterMm === null ? '; no tip diameter stored' : `; surface = + ${r3(plan.tipDiameterMm / 2)} mm into the material`}.`,
+                + `Contacts are tip-centre at toolhead Z${z}${plan.tipDiameterMm === null ? '; no tip diameter stored' : `; surface = + ${r3(plan.tipDiameterMm / 2)} mm into the material`}.`
+                + `${aborted && !endState.parked ? ` THE HEAD IS NOT PARKED. ${endState.recovery || ''}` : ''}`,
             aborted: aborted || undefined,
         };
     };
@@ -397,14 +427,14 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
         const guardTop = toZ + DESCENT_GUARD_MM;
         probeFeedService.clearExpectedContact();
         if (zNow > guardTop + TRAVERSE_Z_TOLERANCE_MM) {
-            await descendInSegments(`${tag}:descend:${label}`, zNow, guardTop, 'probe', plan.march.sensorDelayMs);
+            await descendInSegments(`${tag}:descend:${label}`, zNow, guardTop, 'probe', plan.firstMarch.sensorDelayMs);
         }
         let gz = Math.min(Math.max(zNow, toZ), guardTop);
         while (gz - toZ > 1e-9) {
             const t0 = Date.now();
             gz = Math.max(gz - 1, toZ);
             await moveMachineSettled(`${tag}:descend-guard:${label}`, { z: gz }, COARSE_FEED);
-            const sensed = await senseAfter('probe', t0, plan.march.sensorDelayMs);
+            const sensed = await senseAfter('probe', t0, plan.firstMarch.sensorDelayMs);
             if (sensed.contact) {
                 throw new ProcedureAbort(`UNEXPECTED CONTACT at Z${gz.toFixed(3)} during the guarded descent at "${label}": the start is not over free space at z_machine. Machine held.`);
             }
@@ -420,7 +450,7 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
             stepCount += 1;
             const t0 = Date.now();
             await moveMachineSettled(`${tag}:step`, { x: p.x, y: p.y }, STEPPED_HOP_FEED);
-            const sensed = await senseAfter('probe', t0, plan.march.sensorDelayMs);
+            const sensed = await senseAfter('probe', t0, plan.confirmMarch.sensorDelayMs);
             if (sensed.contact) {
                 partialPoints += 1;
             }
@@ -429,8 +459,13 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
         move: async (p: Xy) => {
             await moveMachineSettled(`${tag}:retreat`, { x: p.x, y: p.y }, TRAVEL_FEED);
         },
+        released: async () => {
+            const sensed = await senseReleaseAfter('probe', Date.now(), releaseTimeoutFor(plan.confirmMarch.sensorDelayMs));
+            return !sensed.contact;
+        },
         march: async (from: Xy, unit: Xy, travelMm: number) => {
-            const contact = await marchToContact(tag, 'first-wall', { x: from.x, y: from.y, z }, { x: unit.x, y: unit.y, z: 0 }, travelMm, plan.march, announce);
+            // The normal coarse (1 mm) march: fine steps belong to the crawl only.
+            const contact = await marchToContact(tag, 'first-wall', { x: from.x, y: from.y, z }, { x: unit.x, y: unit.y, z: 0 }, travelMm, plan.firstMarch, announce);
             if (!contact) {
                 await retreatAlong(tag, 'first-wall', { x: from.x, y: from.y, z }, { x: unit.x, y: unit.y, z: 0 }, 0);
                 return null;
@@ -438,8 +473,21 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
             return { point: { x: contact.point.x, y: contact.point.y }, spreadMm: contact.spreadMm };
         },
         confirm: async (from: Xy, unit: Xy, travelMm: number) => {
-            const contact = await marchToContact(tag, `confirm-${stepCount}`, { x: from.x, y: from.y, z }, { x: unit.x, y: unit.y, z: 0 }, travelMm, plan.march, () => undefined);
-            return contact ? { point: { x: contact.point.x, y: contact.point.y }, spreadMm: contact.spreadMm } : null;
+            try {
+                const contact = await marchToContact(tag, `confirm-${stepCount}`, { x: from.x, y: from.y, z }, { x: unit.x, y: unit.y, z: 0 }, travelMm,
+                    plan.confirmMarch, () => undefined);
+                return contact ? { point: { x: contact.point.x, y: contact.point.y }, spreadMm: contact.spreadMm } : null;
+            } catch (err) {
+                // The march's release loop retreated to `from` and the probe still
+                // read contact: in a crawl that is a rub on the wall beside the
+                // march (T8), which the core answers by retreating along the
+                // normal - not a fault yet. Anything else is a fault.
+                if (isProcedureAbort(err) && !err.procedureStopped && /still triggered/.test(err.message)) {
+                    announce('confirm-stuck', err.message);
+                    return { stuck: true };
+                }
+                throw err;
+            }
         },
     };
 
@@ -464,21 +512,46 @@ export async function runProbeTracePerimeterProcedure(plan: ProbeTracePlan): Pro
         trace = await tracePerimeter(io, plan.start, plan.dir, plan.maxTravelMm, plan.params, sparse);
         probeFeedService.clearExpectedContact();
         await moveMachineSettled(`${tag}:final-raise`, { z: plan.hopZ }, TRAVEL_FEED);
+        endState = { parked: true, heldAt: null, recovery: null };
         const result = build(false);
         announce('trace-complete', result.note);
         return result;
     } catch (err) {
+        // The crawl attaches its partial result to the abort (T8, job
+        // 8088e3a6aff5: 67 contacts and the measured first wall were lost).
+        const carried = (err as { partial?: unknown }).partial as TraceResult | undefined;
+        if (carried && Array.isArray(carried.perimeter)) {
+            trace = carried;
+        }
         const isTrip = !!probeFeedService.getTrip();
+        let heldNote: string | null = null;
         if (!isTrip) {
             try {
-                await abortRaiseToTop(tag, (phase, zz, note) => announce(phase, zz === null ? note : `Z${zz} - ${note}`), { holdIfTriggered: 'probe' });
+                const outcome = await abortRaiseToTop(tag, (phase, zz, note) => announce(phase, zz === null ? note : `Z${zz} - ${note}`), { holdIfTriggered: 'probe' });
+                if (outcome.action === 'raised' || outcome.action === 'skipped') {
+                    endState = { parked: true, heldAt: null, recovery: null };
+                } else {
+                    const known = knownMachinePosition().position;
+                    const at = known.x === null || known.y === null || known.z === null ? null : { x: known.x, y: known.y, z: known.z };
+                    const where = at ? `${at.x}, ${at.y}, ${at.z}` : 'unknown';
+                    heldNote = outcome.action === 'held'
+                        ? `HELD at machine (${where}) with the probe still reading contact - the head is NOT parked. `
+                            + `The tip is at most one fine step (${plan.params.fineStepMm} mm) into the wall along the crawl normal. Recovery: move_z to the traverse `
+                            + `height Z${plan.hopZ} (coordinate_system machine) - a straight lift cannot drag it more than that - then re-prove position before anything else.`
+                        : `NOT parked at machine (${where}): ${outcome.note}. Recovery: raise Z first (move_z to Z${plan.hopZ}, coordinate_system machine) before any XY.`;
+                    endState = { parked: false, heldAt: at, recovery: heldNote };
+                }
             } catch (retreatErr) {
                 // Logged by the activity stream.
             }
+        } else {
+            endState = { parked: false, heldAt: null, recovery: 'A safety alarm is latched and the connection is closing: the operator clears the alarm, reconnects, raises Z first.' };
         }
         if (isProcedureAbort(err)) {
             const Ctor = isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
-            throw new Ctor(`Perimeter trace aborted: ${err.message} ${partialPoints} contact(s) so far are on the job record.`, build(true));
+            const kept = trace ? trace.perimeter.length : partialPoints;
+            throw new Ctor(`Perimeter trace aborted: ${err.message} ${kept} perimeter point(s) so far are in result.trace on the job record.${heldNote ? ` ${heldNote}` : ''}`,
+                build(true));
         }
         throw err;
     } finally {

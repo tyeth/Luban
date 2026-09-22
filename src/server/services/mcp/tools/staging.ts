@@ -1,7 +1,7 @@
 import { connectionManager } from '../../machine/ConnectionManager';
 import { McpToolError } from '../registry';
 import { FrameResolutionContext, GcodeValidationReport, JobFrame, resolveJobFrame, validateGcode } from '../validator';
-import { getMachineSizeByIdentifier, getPositionSnapshot } from './machine';
+import { getMachineSizeByIdentifier, getPositionSnapshot, safeTraverseZ } from './machine';
 
 /**
  * Live context for resolveJobFrame(): the work-origin Z offset the position
@@ -16,7 +16,12 @@ export function stagingFrameContext(frameArgument: JobFrame | null): FrameResolu
     let machineZMax: number | null = null;
     try {
         const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-        machineZMax = size ? size.z : null;
+        // The definition's size.z (325 on the A350) is below the park / home
+        // height (328) every procedure hops at, so every staged procedure was
+        // warned "Z .. 328 is outside the 0 .. 325 travel" (issue #178). The
+        // traverse height is a Z the toolhead demonstrably reaches - home is
+        // there - so it is the least the Z travel extends to.
+        machineZMax = size ? Math.max(size.z, safeTraverseZ()) : null;
         const position = getPositionSnapshot();
         originOffsetZ = position.originOffset.z;
         offsetReliable = position.originOffsetSource === 'heartbeat' && position.warnings.length === 0;

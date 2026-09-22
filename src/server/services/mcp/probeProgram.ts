@@ -203,7 +203,7 @@ function eventBudgetFor(sub: SubPlan | { kind: 'rotate_b' }): number {
     }
     if (sub.kind === 'trace') {
         // Every crawl step is a send: the worst-case step count of the estimate plus the confirm cycles.
-        return 100 + sub.plan.estimate.worstSteps + sub.plan.estimate.confirmCycles * 60;
+        return 100 + sub.plan.estimate.worstCycles * 3 + sub.plan.estimate.confirmCycles * 60;
     }
     return 40 + sub.plan.stations.length * 120;
 }

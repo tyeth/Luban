@@ -214,17 +214,24 @@ the depth), `dir_x/dir_y` (first march, default +X), `max_travel_mm`, the REQUIR
 step of margin for the bump into the wall — a bound on the wall itself stops the crawl at the first
 bump) and the REQUIRED `max_perimeter_mm` budget (law 3); `keep_out` volumes apply. The crawl keeps
 the wall on `wall_side` (default right = counter-clockwise inside), steps `fine_step_mm` (0.1) along
-it and bumps 0.1 toward it until contact — each contact is a perimeter point, the head backs off only
-the step that touched; a blocked step retreats exactly that step and turns `turn_step_deg` away from
-the wall (corners at 0.1 mm resolution), a wall that falls away turns toward it; runs proven straight
-go at `coarse_step_mm` (1) with the heading aligned to the fitted wall. Confirm cycles run ONLY at
-`confirm_at` (default first / turns / unexpected; add `every` + `accuracy_every_mm` for accuracy
-points) — a routine bump is one sensed contact, which is what makes 0.1 mm affordable. Budget the
-time from the confirm page (~0.3 s per sensor-checked step on GPIO: a 330 mm pocket is ~35 min at
-0.1 everywhere, ~5 min with coarse straights). Result: ordered `perimeter` (tip-centre + `surface`
-one tip radius into the material, normal, step kind, confirmed), `segments` (lines / arcs with
-residuals), `corners` (radius, centre, interior angle), `closed`, `ending`, `counts`, `timing`. A
-long crawl overflows the job event buffer; `result.perimeter` is never trimmed.
+it and bumps 0.1 toward it until contact — each contact is a perimeter point; after EVERY contact
+the tip retreats along the inward normal one fine step at a time until the probe reads RELEASED, then
+one more (the release-verified standoff — T8 on 2026-09-22 parked one step off the contact, 0.05 mm
+inside a wavy wooden wall, and the next advance rubbed). A blocked step retreats exactly that step; if
+the probe releases there it is a corner (turn `turn_step_deg` away from the wall), if not it is a RUB
+(the wall came to the tip: the standoff is repaired and the crawl goes on). A wall that falls away
+turns the heading toward it; runs proven straight go at `coarse_step_mm` (1) with the heading aligned
+to the fitted wall. Confirm cycles run ONLY at `confirm_at` (default first / turns / unexpected; add
+`every` + `accuracy_every_mm` for accuracy points); one that ends with the probe still triggered is
+skipped as a rub, not reported as a stuck probe. The first wall is found with the normal 1 mm coarse
+march; fine steps belong to the crawl. Time (measured T8): a crawl cycle is 0.9 s — 9 s/mm at 0.1 mm,
+0.93 s/mm at 1 mm — so a 330 mm pocket is ~50 min at 0.1 everywhere and ~6 min with coarse straights;
+the confirm page states the figure. Result: ordered `perimeter` (tip-centre + `surface` one tip radius
+into the material, normal, step kind incl. `rub`, confirmed), `segments`, `corners`, `closed`,
+`ending` (incl. `aborted`), `counts` (rubs, releaseSteps, confirmsSkipped), `standoffMm`, `timing`,
+`endState` (parked, or HELD with the exact recovery). On ANY abort `result.trace` carries the partial
+perimeter, the measured first wall and the counts — never an empty result. A long crawl overflows the
+job event buffer; `result.trace` is never trimmed.
 
 Hardware test order for a new program: B0 half without rotations, then one rotation, then the
 whole program — and compare `derived` with the operator's calipers.
