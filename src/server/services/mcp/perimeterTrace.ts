@@ -42,7 +42,6 @@
 // Pure: no server imports. The runner (probeTracePerimeter.ts) binds the IO
 // to the engine; tests run it on a synthetic pocket (tests/perimeterTrace.test.ts).
 
-import { CircleFit, fitCircle } from './cornerFit';
 import { ProcedureAbort, isProcedureAbort } from './procedureAbort';
 import { WallLineFit, Xy, fitWallLine } from './wallFollow';
 
@@ -75,9 +74,25 @@ export interface TraceIo {
      * crawl retreats along the normal and carries on unconfirmed).
      */
     confirm(from: Xy, unit: Xy, travelMm: number): Promise<ConfirmOutcome>;
-    /** Wait out the release window: true when the probe reads RELEASED where the head stands. */
-    released(): Promise<boolean>;
+    /**
+     * True when the probe reads RELEASED where the head stands. Returns the
+     * moment the release is read either way; `patience` is only how long a
+     * probe still reading contact is waited on before answering false:
+     * 'window' = the short standoff window (the crawl will step further back
+     * anyway), 'timeout' = the full release timeout (the answer decides a
+     * fault or a rub).
+     */
+    released(patience: ReleasePatience): Promise<boolean>;
 }
+
+/**
+ * #183 (T8 rerun, job d677bd88d31a): every standoff retreat step waited the
+ * full 3.5 s release timeout while the tip was still in the wall - 30 waits,
+ * 105 s - although the next 0.1 mm step released it at once. Steps short of
+ * the last point known free now wait only the window; the full timeout still
+ * guards the step past it (the stuck-probe fault) and the rub test.
+ */
+export type ReleasePatience = 'window' | 'timeout';
 
 export type ConfirmOutcome = { point: Xy; spreadMm: number } | { stuck: true } | null;
 
@@ -121,9 +136,14 @@ export interface TracePoint {
     index: number;
     /** Tip-centre contact (machine XY at the crawl Z). */
     tipCentre: Xy;
-    /** tipCentre + tip radius INTO the material; null without a stored tip. */
+    /** tipCentre + tip radius INTO the material along `normal`; null without a stored tip. */
     surface: Xy | null;
-    /** Unit normal INTO the material at the contact. */
+    /**
+     * Unit normal INTO the material at the contact. The crawl records its
+     * heading's normal (which trails the wall after a corner); the reported
+     * result carries the local-geometry normal instead (perimeterAnalysis.ts
+     * refineNormals, #183).
+     */
     normal: Xy;
     kind: TracePointKind;
     /** True when a lift-and-retest cycle refined this point (spreadMm then holds its spread). */
@@ -324,7 +344,10 @@ export async function tracePerimeter(
             await io.move(pos);
             counts.retreats += 1;
             counts.releaseSteps += 1;
-            if (await io.released()) {
+            // Short of the cap a probe still in contact is answered by the
+            // next step back, not by waiting; AT the cap the answer is a
+            // fault, so it gets the full release timeout.
+            if (await io.released(k < cap ? 'window' : 'timeout')) {
                 pos = { x: r3(from.x - n.x * p.fineStepMm * (k + 1)), y: r3(from.y - n.y * p.fineStepMm * (k + 1)) };
                 await io.move(pos);
                 counts.retreats += 1;
@@ -424,7 +447,7 @@ export async function tracePerimeter(
                 const before = pos;
                 await io.move(before);
                 counts.retreats += 1;
-                if (!(await io.released())) {
+                if (!(await io.released('timeout'))) {
                     counts.rubs += 1;
                     record(q, n, 'rub', false, null, stepMm);
                     await standOff(before, standoffSteps + p.bumpCapSteps, 'rub along the wall');
@@ -571,149 +594,11 @@ export async function tracePerimeter(
 
 // ---------------------------------------------------------------- segmentation
 
-export type PerimeterSegment =
-    | { kind: 'line'; from: number; to: number; fit: WallLineFit; lengthMm: number }
-    | { kind: 'arc'; from: number; to: number; fit: CircleFit | null; points: number };
-
-export interface PerimeterCorner {
-    /** Perimeter point indices of the arc between two lines. */
-    from: number;
-    to: number;
-    radiusTipCentreMm: number | null;
-    radiusPhysicalMm: number | null;
-    center: Xy | null;
-    maxResidualMm: number | null;
-    /** Interior angle between the two straight walls the arc joins (degrees). */
-    interiorAngleDeg: number | null;
-}
-
-function residualFrom(fit: WallLineFit, q: Xy): number {
-    return (q.x - fit.point.x) * fit.normal.x + (q.y - fit.point.y) * fit.normal.y;
-}
-
-/** Grow a straight run from `i`: each candidate is judged against the line fitted WITHOUT it, then the line is refitted. */
-function growLineFrom(points: Xy[], i: number, tolMm: number): { to: number; fit: WallLineFit | null } {
-    const accepted = [i];
-    let fit: WallLineFit | null = null;
-    let j = i + 1;
-    while (j < points.length) {
-        if (accepted.length >= 2 && fit && Math.abs(residualFrom(fit, points[j])) > tolMm + 1e-9) {
-            break;
-        }
-        const trial = fitWallLine([...accepted, j].map((k) => points[k]), { x: 0, y: 0 });
-        if (accepted.length >= 2 && (!trial || trial.maxAbsMm > tolMm + 1e-9)) {
-            break;
-        }
-        accepted.push(j);
-        fit = trial;
-        j += 1;
-    }
-    return { to: accepted[accepted.length - 1], fit };
-}
-
-function chordLength(points: Xy[], from: number, to: number): number {
-    return Math.hypot(points[to].x - points[from].x, points[to].y - points[from].y);
-}
-
-function cornersOf(segments: PerimeterSegment[], tipRadiusMm: number | null): PerimeterCorner[] {
-    const corners: PerimeterCorner[] = [];
-    for (let s = 0; s < segments.length; s++) {
-        const seg = segments[s];
-        if (seg.kind !== 'arc') {
-            continue;
-        }
-        const before = s > 0 && segments[s - 1].kind === 'line' ? segments[s - 1] : null;
-        const after = s + 1 < segments.length && segments[s + 1].kind === 'line' ? segments[s + 1] : null;
-        let interior: number | null = null;
-        if (before && after && before.kind === 'line' && after.kind === 'line') {
-            const dot = Math.max(-1, Math.min(1, -(before.fit.normal.x * after.fit.normal.x + before.fit.normal.y * after.fit.normal.y)));
-            interior = r3((Math.acos(dot) * 180) / Math.PI);
-        }
-        corners.push({
-            from: seg.from,
-            to: seg.to,
-            radiusTipCentreMm: seg.fit ? seg.fit.radius : null,
-            radiusPhysicalMm: seg.fit && tipRadiusMm !== null ? r3(seg.fit.radius + tipRadiusMm) : null,
-            center: seg.fit ? seg.fit.center : null,
-            maxResidualMm: seg.fit ? seg.fit.maxResidual : null,
-            interiorAngleDeg: interior,
-        });
-    }
-    return corners;
-}
-
-/**
- * Split an ordered perimeter into straight walls and the curves between
- * them. A wall is a run of >= minLinePoints contacts, at least
- * minLineLengthMm long (an arc sampled every fraction of a millimetre is
- * locally straight, so a short run is part of the curve around it), whose
- * residuals from the running line stay under tolMm - each candidate judged
- * against the line WITHOUT it. Each wall is then extended over the
- * neighbouring points the greedy split left behind, as far as they stay on
- * its line. Everything between two walls is a curve, fitted with a circle,
- * including the tangent point at each end. Corners are the curves between
- * two walls, with the interior angle of those walls. Pure.
- */
-export function segmentPerimeter(
-    points: Xy[],
-    tolMm: number,
-    minLinePoints: number = 4,
-    tipRadiusMm: number | null = null,
-    minLineLengthMm: number = 4
-): {
-    segments: PerimeterSegment[];
-    corners: PerimeterCorner[];
-} {
-    const n = points.length;
-    const lines: { from: number; to: number; fit: WallLineFit }[] = [];
-    let i = 0;
-    while (i < n) {
-        const grown = growLineFrom(points, i, tolMm);
-        if (grown.fit && grown.to - i + 1 >= minLinePoints && chordLength(points, i, grown.to) >= minLineLengthMm - 1e-9) {
-            lines.push({ from: i, to: grown.to, fit: grown.fit });
-            i = grown.to + 1;
-        } else {
-            i += 1;
-        }
-    }
-    for (let k = 0; k < lines.length; k++) {
-        const line = lines[k];
-        const prevTo = k > 0 ? lines[k - 1].to : -1;
-        const nextFrom = k + 1 < lines.length ? lines[k + 1].from : n;
-        while (line.from - 1 > prevTo && Math.abs(residualFrom(line.fit, points[line.from - 1])) <= tolMm + 1e-9) {
-            line.from -= 1;
-        }
-        while (line.to + 1 < nextFrom && Math.abs(residualFrom(line.fit, points[line.to + 1])) <= tolMm + 1e-9) {
-            line.to += 1;
-        }
-        const refit = fitWallLine(points.slice(line.from, line.to + 1), { x: 0, y: 0 });
-        if (refit) {
-            line.fit = refit;
-        }
-    }
-    const segments: PerimeterSegment[] = [];
-    const pushCurve = (from: number, to: number) => {
-        const a = Math.max(0, from);
-        const b = Math.min(n - 1, to);
-        if (b < a) {
-            return;
-        }
-        const pts = points.slice(a, b + 1);
-        segments.push({ kind: 'arc', from: a, to: b, fit: pts.length >= 3 ? fitCircle(pts) : null, points: pts.length });
-    };
-    let cursor = 0;
-    for (const line of lines) {
-        if (line.from > cursor) {
-            pushCurve(cursor - 1, line.from);
-        }
-        segments.push({ kind: 'line', from: line.from, to: line.to, fit: line.fit, lengthMm: r3(chordLength(points, line.from, line.to)) });
-        cursor = line.to + 1;
-    }
-    if (cursor < n) {
-        pushCurve(cursor - 1, n - 1);
-    }
-    return { segments, corners: cornersOf(segments, tipRadiusMm) };
-}
+// What the result reports from the points (normals from local geometry,
+// merged walls, corner fits off both walls, irregular lobes, lengths) lives
+// in perimeterAnalysis.ts (#183); re-exported here for the existing callers.
+export { segmentPerimeter } from './perimeterAnalysis';
+export type { CornerShape, PerimeterCorner, PerimeterPiece, PerimeterSegment, SegmentOptions } from './perimeterAnalysis';
 
 // ---------------------------------------------------------------- estimate
 

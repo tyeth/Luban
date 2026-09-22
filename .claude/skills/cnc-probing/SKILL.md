@@ -217,7 +217,9 @@ the wall on `wall_side` (default right = counter-clockwise inside), steps `fine_
 it and bumps 0.1 toward it until contact — each contact is a perimeter point; after EVERY contact
 the tip retreats along the inward normal one fine step at a time until the probe reads RELEASED, then
 one more (the release-verified standoff — T8 on 2026-09-22 parked one step off the contact, 0.05 mm
-inside a wavy wooden wall, and the next advance rubbed). A blocked step retreats exactly that step; if
+inside a wavy wooden wall, and the next advance rubbed); a retreat step short of the last point known
+free waits at most ~0.5 s for the release, only the step past it waits the full timeout (and aborts if
+still triggered). A blocked step retreats exactly that step; if
 the probe releases there it is a corner (turn `turn_step_deg` away from the wall), if not it is a RUB
 (the wall came to the tip: the standoff is repaired and the crawl goes on). A wall that falls away
 turns the heading toward it; runs proven straight go at `coarse_step_mm` (1) with the heading aligned
@@ -227,7 +229,14 @@ skipped as a rub, not reported as a stuck probe. The first wall is found with th
 march; fine steps belong to the crawl. Time (measured T8): a crawl cycle is 0.9 s — 9 s/mm at 0.1 mm,
 0.93 s/mm at 1 mm — so a 330 mm pocket is ~50 min at 0.1 everywhere and ~6 min with coarse straights;
 the confirm page states the figure. Result: ordered `perimeter` (tip-centre + `surface` one tip radius
-into the material, normal, step kind incl. `rub`, confirmed), `segments`, `corners`, `closed`,
+into the material along `normal` — the normal of the LOCAL wall, a line through the neighbouring
+contacts, not the crawl heading, which lagged 30-90 deg after corners), step kind incl. `rub`,
+confirmed), `segments` (straight walls with collinear runs MERGED — T8's 4-wall pocket had come out as
+11 — each with its tip-centre `fit` and wall `surface` line; curves with `shape`), `corners` (circle
+fitted ONLY to the points off BOTH adjacent walls, with `residualsMm`, `fitIndices`, `onWallPoints`;
+`shape` `arc` / `sharp` / `irregular` — an irregular lobe has NO radius: read its `polyline`, its
+line / arc `pieces` and `singleArc`, the misfit one circle would have had), `lengths` (`tipCentreMm`,
+`surfaceMm` — the one to compare with CAD — and the `surfaceFromTurnMm` cross-check), `closed`,
 `ending` (incl. `aborted`), `counts` (rubs, releaseSteps, confirmsSkipped), `standoffMm`, `timing`,
 `endState` (parked, or HELD with the exact recovery). On ANY abort `result.trace` carries the partial
 perimeter, the measured first wall and the counts — never an empty result. A long crawl overflows the

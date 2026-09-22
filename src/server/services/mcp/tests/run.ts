@@ -27,6 +27,7 @@ import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as machineTravelTests } from './machineTravel.test';
 import { tests as marchCoreTests } from './marchCore.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
+import { tests as perimeterAnalysisTests } from './perimeterAnalysis.test';
 import { tests as perimeterTraceTests } from './perimeterTrace.test';
 import { tests as probeFeedHealthTests } from './probeFeedHealth.test';
 import { tests as procedureLimitsTests } from './procedureLimits.test';
@@ -72,6 +73,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['inspectionReport', inspectionReportTests],
     ['wallFollow', wallFollowTests],
     ['cornerFit', cornerFitTests],
+    ['perimeterAnalysis', perimeterAnalysisTests],
     ['perimeterTrace', perimeterTraceTests],
 ];
 

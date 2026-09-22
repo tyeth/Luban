@@ -1127,9 +1127,12 @@ ${describeProbeCornerPlanAsGcode(plan)}`;
             + 'wall), or a keep-out. Lift-and-retest CONFIRM cycles run only where they buy accuracy (confirm_at, default '
             + '["first","turns","unexpected"]: the first wall, after a major direction change, an unexpected contact after a straight '
             + 'run; add "every" with accuracy_every_mm for accuracy points) - a routine bump is one sensed contact. Result: perimeter '
-            + '(ordered tip-centre points with surface = + tip radius into the material, normal, step kind, confirmed flag), segments '
-            + '(lines / arcs with residuals), corners (radius tip-centre + physical, centre, interior angle), closed, lengthMm, counts, '
-            + 'timing. The confirm page states the step count and time estimate (~0.3 s per sensor-checked step on GPIO). Also '
+            + '(ordered tip-centre points; normal = the LOCAL wall normal from a line through the neighbouring contacts, surface = + tip '
+            + 'radius along it; step kind, confirmed flag), segments (straight walls with collinear runs merged, each with its tip-centre '
+            + 'fit and wall surface line; curves with a shape), corners (circle fitted only to the points off BOTH adjacent walls: '
+            + 'radius tip-centre + physical, centre, per-point residuals, interior angle; shape arc / sharp / irregular - an IRREGULAR '
+            + 'lobe reports no radius but a polyline, line / arc pieces and the one-circle misfit), lengths (tipCentreMm and surfaceMm, '
+            + 'the one to compare with CAD), closed, counts, timing. The confirm page states the step count and time estimate (~0.3 s per sensor-checked step on GPIO). Also '
             + 'probe_program op kind "trace". The same crawl with the normal flipped traces a boss / the outer stock outline (not yet exposed).',
         inputSchema: {
             type: 'object',
