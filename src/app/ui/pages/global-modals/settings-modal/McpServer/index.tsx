@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import api from '../../../../../api';
 import i18n from '../../../../../lib/i18n';
 import UniApi from '../../../../../lib/uni-api';
+import { McpHealthPanel } from '../../../../components/McpHealth';
 import SvgIcon from '../../../../components/SvgIcon';
 import styles from '../form.styl';
 
@@ -80,6 +81,17 @@ interface McpStatus {
         allowLanSource: 'env' | 'config' | 'default';
     };
     lanUrls: string[];
+    jobsUrl?: string;
+    https?: {
+        certFile: string;
+        keyFile: string;
+        envOverrides: string[];
+        running: boolean;
+        port: number | null;
+        error: string | null;
+        jobsUrl: string | null;
+        lanUrls: string[];
+    };
     transport: McpTransportSettings;
     sensors: McpSensorSettings;
     mqtt: McpMqttSettings;
@@ -144,6 +156,8 @@ const McpServer: React.FC = () => {
     const [enabled, setEnabled] = useState(false);
     const [port, setPort] = useState('');
     const [allowLan, setAllowLan] = useState(false);
+    const [httpsCert, setHttpsCert] = useState('');
+    const [httpsKey, setHttpsKey] = useState('');
     const [toolSetterEnabled, setToolSetterEnabled] = useState(true);
     const [probeEnabled, setProbeEnabled] = useState(true);
     const [transport, setTransport] = useState('');
@@ -172,6 +186,8 @@ const McpServer: React.FC = () => {
                 setEnabled(body.settings.enabled);
                 setPort(String(body.settings.port));
                 setAllowLan(!!body.settings.allowLan);
+                setHttpsCert(body.https?.certFile || '');
+                setHttpsKey(body.https?.keyFile || '');
                 if (body.sensors) {
                     setToolSetterEnabled(body.sensors.toolSetter !== false);
                     setProbeEnabled(body.sensors.probe !== false);
@@ -218,6 +234,10 @@ const McpServer: React.FC = () => {
             enabled,
             port: value,
             allowLan,
+            https: {
+                ...(status?.https?.envOverrides.includes('certFile') ? {} : { certFile: httpsCert }),
+                ...(status?.https?.envOverrides.includes('keyFile') ? {} : { keyFile: httpsKey }),
+            },
             sensors: { toolSetter: toolSetterEnabled, probe: probeEnabled },
             transport,
             mqtt: mqttUpdate,
@@ -249,7 +269,7 @@ const McpServer: React.FC = () => {
     let statusLine = i18n._('key-App/Settings/McpServer-Status unknown');
     if (status) {
         statusLine = status.running
-            ? `${i18n._('key-App/Settings/McpServer-Running this session at')} http://127.0.0.1:${status.port}/mcp (${status.toolCount} tools)`
+            ? `${i18n._('key-App/Settings/McpServer-Running this session at')} ${status.port ? `http://127.0.0.1:${status.port}/mcp` : `https://127.0.0.1:${status.https?.port}/mcp`} (${status.toolCount} tools)`
             : i18n._('key-App/Settings/McpServer-Not running this session');
         if (status.settings.source === 'env') {
             statusLine += ` — ${i18n._('key-App/Settings/McpServer-Overridden by LUBAN_MCP_PORT')}`;
@@ -288,6 +308,7 @@ const McpServer: React.FC = () => {
 
     return (
         <div className={styles['form-container']}>
+            <McpHealthPanel />
             <div className="border-bottom-normal padding-bottom-4">
                 <SvgIcon
                     name="TitleSetting"
@@ -333,6 +354,43 @@ const McpServer: React.FC = () => {
                         )}
                     </div>
                 )}
+            </div>
+
+            <div className="border-bottom-normal padding-bottom-4 margin-top-16">
+                <span>HTTPS and browser notifications</span>
+            </div>
+            <div className="margin-top-8">
+                <p>
+                    HTTPS listens on the MCP port + 1 (default 40890), alongside HTTP.
+                    Set both mkcert PEM file paths on the server, save, then restart Luban.
+                </p>
+                <label htmlFor="mcp-https-cert" className="sm-flex align-center margin-top-8">
+                    <span style={LABEL_STYLE}>Certificate file</span>
+                    <Input
+                        id="mcp-https-cert"
+                        value={httpsCert}
+                        onChange={(e) => setHttpsCert(e.target.value)}
+                        disabled={!enabled || status?.https?.envOverrides.includes('certFile')}
+                        placeholder="/path/to/mcp-cert.pem"
+                    />
+                </label>
+                <label htmlFor="mcp-https-key" className="sm-flex align-center margin-top-8">
+                    <span style={LABEL_STYLE}>Private key file</span>
+                    <Input
+                        id="mcp-https-key"
+                        value={httpsKey}
+                        onChange={(e) => setHttpsKey(e.target.value)}
+                        disabled={!enabled || status?.https?.envOverrides.includes('keyFile')}
+                        placeholder="/path/to/mcp-key.pem"
+                    />
+                </label>
+                <p className={styles['port-tips']}>Trust the mkcert CA on each browser/phone and include the server’s LAN IP in the certificate. Clear both paths to turn HTTPS off after restart. Environment overrides: LUBAN_MCP_HTTPS_CERT / LUBAN_MCP_HTTPS_KEY.</p>
+                <div>{status?.https?.running ? `HTTPS running on port ${status.https.port}` : 'HTTPS is not running this session.'}</div>
+                {status?.https?.error && <div style={{ color: '#FF4D4F' }}>{status.https.error}</div>}
+                {status?.running && status.jobsUrl && (
+                    <p><a href={status.jobsUrl} target="_blank" rel="noopener noreferrer">Open job dashboard</a></p>
+                )}
+                {status?.https?.lanUrls.map((url) => <div key={url}>{url}</div>)}
             </div>
 
             <div className="border-bottom-normal padding-bottom-4 margin-top-16">

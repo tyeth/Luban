@@ -6,6 +6,7 @@ import path from 'path';
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { JobDashboardFeed, summarizeDashboardJob } from './jobDashboardState';
 import { JobEnding, McpJobKind, McpJobState, TERMINAL_JOB_STATES } from './jobEnding';
 import { GcodeValidationReport } from './validator';
 
@@ -149,6 +150,8 @@ function range(r: { min: number; max: number } | null): string {
 }
 
 export class JobManager {
+    public readonly dashboardFeed = new JobDashboardFeed();
+
     private activeJob: McpJob | null = null;
 
     private jobs = new Map<string, McpJob>();
@@ -201,6 +204,7 @@ export class JobManager {
 
     /** Record something that happened to a job (state change, phase, gcode, progress). */
     public appendEvent(job: McpJob, phase: string, detail: { [key: string]: unknown } = {}): void {
+        this.dashboardFeed.record(job, phase);
         const seq = job.eventSeq;
         job.eventSeq += 1;
         job.events.push({ at: Date.now(), seq, phase, ...detail });
@@ -323,12 +327,16 @@ export class JobManager {
         };
     }
 
+    public dashboardJobs() {
+        return [...this.jobs.values()].sort((a, b) => b.createdAt - a.createdAt).map(summarizeDashboardJob);
+    }
+
     private prune(): void {
         if (this.jobs.size <= JOB_RETENTION_LIMIT) {
             return;
         }
         const oldest = [...this.jobs.values()]
-            .filter((job) => job.state !== 'started' && job.state !== 'starting')
+            .filter((job) => this.isTerminal(job))
             .sort((a, b) => a.createdAt - b.createdAt);
         for (const job of oldest.slice(0, this.jobs.size - JOB_RETENTION_LIMIT)) {
             this.jobs.delete(job.id);
@@ -382,6 +390,10 @@ export class JobManager {
             return;
         }
         if (req.method === 'POST' && action === 'reject') {
+            if (job.state !== 'awaiting_confirmation') {
+                this.page(res, 409, `<p>Job is ${escapeHtml(job.state)}; nothing to reject.</p>`);
+                return;
+            }
             job.state = 'rejected';
             job.confirmToken = null;
             job.endedAt = Date.now();
@@ -478,9 +490,10 @@ export class JobManager {
         }
 
         return `
-            <h2>Confirm ${{ direct: 'DIRECT move', procedure: 'SERVER-DRIVEN procedure', file: 'G-code job' }[job.kind]}: ${escapeHtml(job.name)}</h2>
-            <p>Submitted by an agent over MCP. Review before approving - approval mints a
-               one-time code the agent needs to start it.</p>
+            <h2>${job.state === 'awaiting_confirmation' ? 'Confirm' : 'Review'} ${{ direct: 'DIRECT move', procedure: 'SERVER-DRIVEN procedure', file: 'G-code job' }[job.kind]}: ${escapeHtml(job.name)}</h2>
+            ${job.state === 'awaiting_confirmation'
+        ? '<p>Submitted by an agent over MCP. Review before approving - approval mints a one-time code the agent needs to start it.</p>'
+        : `<p>Job status: <strong>${escapeHtml(job.state)}</strong>.</p>`}
             ${directBanner}
             <table border="1" cellpadding="6" style="border-collapse:collapse">
                 <tr><td>Head</td><td>${escapeHtml(job.headType)}</td></tr>
@@ -497,20 +510,22 @@ export class JobManager {
             </table>
             <h3>Warnings</h3>
             ${warnings}
+            ${job.state === 'awaiting_confirmation' ? `
             <form method="post" action="/confirm/${job.id}/approve" style="display:inline">
                 <button type="submit" style="font-size:1.2em;padding:8px 24px">Approve</button>
             </form>
             <form method="post" action="/confirm/${job.id}/reject" style="display:inline;margin-left:16px">
                 <button type="submit" style="font-size:1.2em;padding:8px 24px">Reject</button>
             </form>
+            ` : `<p>Job status: <strong>${escapeHtml(job.state)}</strong>. ${escapeHtml(job.ending?.reason || job.error || '')}</p>`}
             <h3>${job.kind === 'procedure' ? 'Simulated plan - every move the runner will command' : 'G-code'}${lines.length > 80 ? ' (first and last 40 lines)' : ''}</h3>
             <pre style="background:#f6f6f6;padding:12px;overflow:auto;max-height:400px">${escapeHtml(preview)}</pre>`;
     }
 
     private page(res: http.ServerResponse, status: number, body: string): void {
-        const html = `<!doctype html><html><head><meta charset="utf-8"><title>Luban MCP job confirmation</title></head>
-            <body style="font-family:sans-serif;max-width:720px;margin:40px auto">${body}</body></html>`;
-        res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
+        const html = `<!doctype html><html><head><meta charset="utf-8"><title>Luban MCP job confirmation</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="font-family:sans-serif;max-width:720px;margin:24px auto;padding:12px"><nav><a href="/jobs">Jobs</a> &middot; <a href="/camera">Camera</a></nav>${body}</body></html>`;
+        res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(html);
     }
 }

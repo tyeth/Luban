@@ -1,12 +1,15 @@
-import http from 'http';
+import type http from 'http';
 
 import pkg from '../../../package.json';
+import { deriveMcpHealth, McpHealthInput } from '../../../shared/lib/mcpHealth';
 import logger from '../../lib/logger';
 import config from '../configstore';
 import { cameraStreamService } from './cameraStream';
 import { diagnosticsSnapshot, startDiagnostics } from './diagnostics';
 import { McpServer, isTrustedAddress, isTrustedOrigin, localSubnets } from './McpServer';
+import { McpListeners, resolveHttpsFiles } from './mcpListeners';
 import { OAuthShim } from './oauth';
+import { handleJobDashboardRequest } from './jobDashboard';
 import { jobManager } from './jobs';
 import { probeFeedService, resolveActiveProbeConfig } from './probeFeed';
 import { ToolRegistry } from './registry';
@@ -14,7 +17,7 @@ import { registerCalibrationTools } from './tools/calibration';
 import { registerCameraTools } from './tools/camera';
 import { registerCameraModelTools } from './tools/cameraModel';
 import { registerCamTools } from './tools/cam';
-import { registerGcodeTools } from './tools/gcode';
+import { registerGcodeTools, stopGcodeJob } from './tools/gcode';
 import { registerLandmarkTools } from './tools/landmarks';
 import { registerMachineTools } from './tools/machine';
 import { registerProbeTools } from './tools/probe';
@@ -38,8 +41,9 @@ const ENABLED_CONFIG_KEY = 'mcpEnabled';
 const ALLOW_LAN_CONFIG_KEY = 'mcpAllowLan';
 const DEFAULT_PORT = 40889;
 
-let httpServer: http.Server | null = null;
-let runningPort: number | null = null;
+const listeners = new McpListeners((message) => log.info(message), (message) => log.error(message));
+let runningSettings: McpSettings | null = null;
+let startupError: string | null = null;
 let registeredToolCount = 0;
 let broadcaster: McpBroadcaster | null = null;
 
@@ -125,18 +129,42 @@ function orderedLanSubnets(): { address: string; netmask: string }[] {
 }
 
 /** Where a browser should open confirm pages: a LAN address when LAN mode is on, else loopback. */
-function publicBaseUrl(port: number, allowLan: boolean): string {
+function publicBaseUrl(port: number, allowLan: boolean, scheme = 'http'): string {
     if (allowLan) {
         const subnet = orderedLanSubnets()[0];
         if (subnet) {
-            return `http://${subnet.address}:${port}`;
+            return `${scheme}://${subnet.address}:${port}`;
         }
     }
-    return `http://127.0.0.1:${port}`;
+    return `${scheme}://127.0.0.1:${port}`;
 }
 
-function lanUrls(port: number): string[] {
-    return orderedLanSubnets().map((subnet) => `http://${subnet.address}:${port}/mcp`);
+function lanUrls(port: number, scheme = 'http'): string[] {
+    return orderedLanSubnets().map((subnet) => `${scheme}://${subnet.address}:${port}/mcp`);
+}
+
+/** Served by Luban's authenticated main API even when both MCP listeners are down. */
+export function getMcpHealth() {
+    const enabled = resolveSettings().enabled;
+    const snapshot: McpHealthInput = {
+        enabled,
+        running: listeners.httpPort !== null || listeners.httpsPort !== null,
+        starting: listeners.started && !listeners.httpPort && !listeners.httpsPort && !listeners.httpError && !listeners.httpsError,
+        startupError,
+        httpError: listeners.httpError,
+        httpsError: listeners.httpsError,
+        certificateValidTo: listeners.certificateValidTo,
+        probeTransportSelected: !!String(process.env.LUBAN_MCP_PROBE_TRANSPORT || config.get('mcpProbeTransport') || '').trim(),
+    };
+    if (enabled) {
+        try {
+            snapshot.probe = probeFeedService.status() as McpHealthInput['probe'];
+            snapshot.camera = cameraStreamService.status();
+        } catch (err) {
+            snapshot.diagnosticError = (err as Error).message;
+        }
+    }
+    return deriveMcpHealth(snapshot);
 }
 
 /**
@@ -145,14 +173,33 @@ function lanUrls(port: number): string[] {
  */
 export function getMcpStatus() {
     const settings = resolveSettings();
+    const live = runningSettings || settings;
+    const httpsSettings = resolveHttpsFiles(process.env, (key) => config.get(key));
+    const httpsBase = listeners.httpsPort ? publicBaseUrl(listeners.httpsPort, live.allowLan, 'https') : null;
     return {
-        running: !!httpServer,
-        port: runningPort,
+        running: listeners.httpPort !== null || listeners.httpsPort !== null,
+        port: listeners.httpPort,
+        httpError: listeners.httpError,
+        startupError,
+        health: getMcpHealth(),
+        https: {
+            ...httpsSettings,
+            configured: !!(httpsSettings.certFile || httpsSettings.keyFile),
+            configuredPort: settings.port < 65535 ? settings.port + 1 : null,
+            running: listeners.httpsPort !== null,
+            port: listeners.httpsPort,
+            error: listeners.httpsError,
+            certificateValidTo: listeners.certificateValidTo,
+            jobsUrl: httpsBase ? `${httpsBase}/jobs` : null,
+            mcpUrl: httpsBase ? `${httpsBase}/mcp` : null,
+            lanUrls: listeners.httpsPort && live.allowLan ? lanUrls(listeners.httpsPort, 'https') : [],
+        },
         toolCount: registeredToolCount,
+        jobsUrl: `${httpsBase || publicBaseUrl(live.port, live.allowLan)}/jobs`,
         settings,
         // LAN URLs an agent on the same subnet can use (only meaningful when
         // allowLan is on AND the server is running with it).
-        lanUrls: settings.allowLan ? lanUrls(settings.port) : [],
+        lanUrls: listeners.httpPort && live.allowLan ? lanUrls(listeners.httpPort) : [],
         // Sensor feed snapshot for the Workspace connection pills; live
         // updates arrive over mcp:activity (tool 'probe_feed').
         probeFeed: probeFeedService.status(),
@@ -163,7 +210,7 @@ export function getMcpStatus() {
         // cameraStream.ts. URLs follow the LAN setting like confirm pages.
         cameraStream: {
             ...cameraStreamService.status(),
-            ...(httpServer ? {} : {
+            ...(listeners.started ? {} : {
                 pageUrl: `${publicBaseUrl(settings.port, settings.allowLan)}/camera`,
                 streamUrl: `${publicBaseUrl(settings.port, settings.allowLan)}/camera/stream.mjpeg`,
                 snapshotUrl: `${publicBaseUrl(settings.port, settings.allowLan)}/camera/snapshot.jpg`,
@@ -176,8 +223,8 @@ export interface McpBroadcaster {
     broadcast: (eventName: string, options?: object) => void;
 }
 
-export function startMcpService(socketServer?: McpBroadcaster): void {
-    if (httpServer) {
+function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
+    if (listeners.started) {
         return;
     }
 
@@ -186,11 +233,12 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         return;
     }
     const port = settings.port;
+    runningSettings = settings;
 
     const registry = new ToolRegistry();
     registerStatusTools(registry);
     registerMachineTools(registry);
-    const baseUrl = () => publicBaseUrl(port, settings.allowLan);
+    const baseUrl = () => publicBaseUrl(listeners.httpsPort || port, settings.allowLan, listeners.httpsPort ? 'https' : 'http');
     registerGcodeTools(registry, baseUrl);
     registerCameraTools(registry);
     registerCameraModelTools(registry);
@@ -223,7 +271,7 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         identifyClient: (req) => oauth.identifyClient(req),
     });
 
-    httpServer = http.createServer((req, res) => {
+    const handleRequest: http.RequestListener = (req, res) => {
         // Same trust boundary for every route: local processes only (plus, in
         // LAN mode, hosts on this machine's own subnets), and no browser
         // contexts other than localhost / the app's own scheme (or, in LAN
@@ -236,6 +284,10 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         }
 
         const url = new URL(req.url, 'http://localhost');
+        if (url.pathname === '/' || url.pathname === '/jobs' || url.pathname.startsWith('/jobs/')) {
+            handleJobDashboardRequest(req, res, url, jobManager, async (id) => stopGcodeJob({ job_id: id, wait_ms: 0 }, 'operator'));
+            return;
+        }
         if (url.pathname.startsWith('/confirm')) {
             // Human job-confirmation pages (jobs.ts)
             jobManager.handleConfirmRequest(req, res, url.pathname);
@@ -251,20 +303,8 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         }
 
         mcpServer.handleRequest(req, res);
-    });
-    httpServer.on('error', (err) => {
-        log.error(`MCP server error: ${err.message}`);
-        httpServer = null;
-        runningPort = null;
-    });
-    const bindHost = settings.allowLan ? '0.0.0.0' : '127.0.0.1';
-    httpServer.listen(port, bindHost, () => {
-        runningPort = port;
-        const reach = settings.allowLan
-            ? ` and on the local subnets: ${lanUrls(port).join(', ') || '(no LAN interface found)'}`
-            : ' (loopback only)';
-        log.info(`MCP server listening at http://127.0.0.1:${port}/mcp${reach}`);
-    });
+    };
+    listeners.start({ port, allowLan: settings.allowLan, ...resolveHttpsFiles(process.env, (key) => config.get(key)) }, handleRequest);
     startDiagnostics();
 
     // Arm the external probe feed (and its overtravel tripwire) without any
@@ -277,11 +317,22 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     }
 }
 
+export function startMcpService(socketServer?: McpBroadcaster): void {
+    if (listeners.started) { return; }
+    startupError = null;
+    try {
+        startConfiguredMcpService(socketServer);
+    } catch (err) {
+        startupError = (err as Error).message || String(err);
+        listeners.stop();
+        log.error(`MCP startup failed: ${startupError}`);
+        // Keep Luban and its main API available to report the failure.
+    }
+}
+
 export function stopMcpService(): void {
     cameraStreamService.shutdown();
-    if (httpServer) {
-        httpServer.close();
-        httpServer = null;
-        runningPort = null;
-    }
+    listeners.stop();
+    runningSettings = null;
+    startupError = null;
 }

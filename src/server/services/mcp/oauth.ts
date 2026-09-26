@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import http from 'http';
+import type { TLSSocket } from 'tls';
 
 import logger from '../../lib/logger';
 
@@ -177,11 +178,12 @@ export class OAuthShim {
      * is only ever echoed back to the client that sent it.
      */
     private issuer(req: http.IncomingMessage): string {
+        const scheme = (req.socket as TLSSocket).encrypted ? 'https' : 'http';
         const host = req.headers.host;
         if (typeof host === 'string' && /^[A-Za-z0-9.\-[\]:]{1,253}$/.test(host)) {
-            return `http://${host}`;
+            return `${scheme}://${host}`;
         }
-        return `http://127.0.0.1:${this.port}`;
+        return `${scheme}://127.0.0.1:${req.socket.localPort || this.port}`;
     }
 
     private protectedResourceMetadata(req: http.IncomingMessage, res: http.ServerResponse): void {

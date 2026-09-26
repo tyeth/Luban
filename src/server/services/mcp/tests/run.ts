@@ -21,11 +21,14 @@ import { tests as directMovePlanTests } from './directMovePlan.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as frameRecoveryTests } from './frameRecovery.test';
 import { tests as inspectionReportTests } from './inspectionReport.test';
+import { tests as jobDashboardTests } from './jobDashboard.test';
 import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as machineTravelTests } from './machineTravel.test';
 import { tests as marchCoreTests } from './marchCore.test';
+import { tests as mcpHealthTests } from './mcpHealth.test';
+import { tests as mcpListenersTests } from './mcpListeners.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as perimeterAnalysisTests } from './perimeterAnalysis.test';
 import { tests as perimeterTraceTests } from './perimeterTrace.test';
@@ -65,8 +68,11 @@ const suites: Array<[string, TestCase[]]> = [
     ['traversePlan', traversePlanTests],
     ['directMovePlan', directMovePlanTests],
     ['jobEnding', jobEndingTests],
+    ['jobDashboard', jobDashboardTests],
     ['landmarkClearance', landmarkClearanceTests],
     ['mjpegFanout', mjpegFanoutTests],
+    ['mcpListeners', mcpListenersTests],
+    ['mcpHealth', mcpHealthTests],
     ['marchCore', marchCoreTests],
     ['camLinks', camLinksTests],
     ['wallClearance', wallClearanceTests],

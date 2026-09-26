@@ -288,6 +288,77 @@ function describeSuggestion(suggestion: { gcode: string; changes: string[] } | n
     return `\n\nRe-submit this instead (${suggestion.changes.join('; ')}):\n${suggestion.gcode}`;
 }
 
+/** Shared operator/MCP stop path; actor is server-supplied, never an MCP argument. */
+export async function stopGcodeJob(args: { job_id?: string; wait_ms?: number }, actor: 'agent' | 'operator' = 'agent'): Promise<object> {
+    const job = jobManager.get(String(args.job_id || ''));
+    if (!job) {
+        throw new McpToolError('Unknown job_id.');
+    }
+    const plan = planJobStop(job.kind, job.state);
+    if (plan.action === 'already-ended') {
+        return { ok: true, stopped: true, stopping: false, withdrawn: false, note: plan.note, job: jobManager.describe(job) };
+    }
+    if (plan.action === 'withdraw') {
+        // Never handed to the machine: withdraw it here so the operator's
+        // confirm link cannot start it later. Before this only procedures
+        // were withdrawn and a staged file/direct job stayed approvable.
+        job.state = 'stopped';
+        job.endedAt = Date.now();
+        job.ending = { kind: 'withdrawn', reason: `withdrawn by the ${actor} before it started`, at: job.endedAt };
+        job.confirmToken = null;
+        jobManager.appendEvent(job, 'stopped', { note: `withdrawn by the ${actor} before it started` });
+        if (jobManager.getActive() === job) {
+            jobManager.setActive(null);
+        }
+        return { ok: true, stopped: true, stopping: false, withdrawn: true, note: plan.note, job: jobManager.describe(job) };
+    }
+    if (plan.action === 'request-procedure-stop') {
+        const request = requestProcedureStop(`stop_gcode_job by the ${actor}`);
+        jobManager.appendEvent(job, 'stop-requested', { note: `stop requested by the ${actor}; the runner stops at the next step boundary and raises` });
+        const waitMs = Math.min(Math.max(args.wait_ms === undefined ? STOP_WAIT_DEFAULT_MS : Number(args.wait_ms) || 0, 0), MAX_WAIT_MS);
+        const deadline = Date.now() + waitMs;
+        while (!TERMINAL_JOB_STATES.includes(job.state) && Date.now() < deadline) {
+            await sleep(250);
+        }
+        const stopped = TERMINAL_JOB_STATES.includes(job.state);
+        return {
+            ok: true,
+            stopped,
+            stopping: !stopped,
+            withdrawn: false,
+            requestedAt: request.requestedAt,
+            note: stopped
+                ? `Procedure ${job.state} (${job.ending ? job.ending.kind : 'ending unknown'}${job.ending && job.ending.measured !== undefined ? `, ${job.ending.measured} measured` : ''}); `
+                    + `completed measurements are in result (${job.error || 'no error'}).`
+                : `Stop requested ${Date.now() - request.requestedAt} ms ago; the runner is finishing its current step and raising. Long-poll get_gcode_job_status.`,
+            job: jobManager.describe(job),
+        };
+    }
+    const channel = getJobChannel();
+    if (typeof channel.stopGcodeJob !== 'function') {
+        throw new McpToolError('The connected channel does not support stopping jobs.');
+    }
+    const stopped = await channel.stopGcodeJob();
+    if (stopped.ok) {
+        job.state = 'stopped';
+        job.endedAt = Date.now();
+        job.ending = { kind: actor === 'operator' ? 'stopped-by-operator' : 'machine-stopped', reason: `firmware stop sent by the ${actor}${stopped.text ? `: ${stopped.text}` : ''}`, at: job.endedAt };
+        jobManager.appendEvent(job, 'stopped', { note: `stop sent by the ${actor}${stopped.text ? `: ${stopped.text}` : ''}` });
+        if (jobManager.getActive() === job) {
+            jobManager.setActive(null);
+        }
+    }
+    return {
+        ok: stopped.ok,
+        stopped: stopped.ok,
+        stopping: false,
+        withdrawn: false,
+        text: stopped.text || null,
+        note: plan.note,
+        job: jobManager.describe(job),
+    };
+}
+
 export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
         name: 'validate_gcode',
@@ -1118,73 +1189,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             additionalProperties: false,
         },
         handler: async (args: { job_id?: string; wait_ms?: number }) => {
-            const job = jobManager.get(String(args.job_id || ''));
-            if (!job) {
-                throw new McpToolError('Unknown job_id.');
-            }
-            const plan = planJobStop(job.kind, job.state);
-            if (plan.action === 'already-ended') {
-                return { ok: true, stopped: true, stopping: false, withdrawn: false, note: plan.note, job: jobManager.describe(job) };
-            }
-            if (plan.action === 'withdraw') {
-                // Never handed to the machine: withdraw it here so the operator's
-                // confirm link cannot start it later. Before this only procedures
-                // were withdrawn and a staged file/direct job stayed approvable.
-                job.state = 'stopped';
-                job.endedAt = Date.now();
-                job.ending = { kind: 'withdrawn', reason: 'withdrawn by the agent before it started', at: job.endedAt };
-                job.confirmToken = null;
-                jobManager.appendEvent(job, 'stopped', { note: 'withdrawn by the agent before it started' });
-                if (jobManager.getActive() === job) {
-                    jobManager.setActive(null);
-                }
-                return { ok: true, stopped: true, stopping: false, withdrawn: true, note: plan.note, job: jobManager.describe(job) };
-            }
-            if (plan.action === 'request-procedure-stop') {
-                const request = requestProcedureStop('stop_gcode_job by the agent');
-                jobManager.appendEvent(job, 'stop-requested', { note: 'stop requested by the agent; the runner stops at the next step boundary and raises' });
-                const waitMs = Math.min(Math.max(Number(args.wait_ms) || STOP_WAIT_DEFAULT_MS, 0), MAX_WAIT_MS);
-                const deadline = Date.now() + waitMs;
-                while (!TERMINAL_JOB_STATES.includes(job.state) && Date.now() < deadline) {
-                    await sleep(250);
-                }
-                const stopped = TERMINAL_JOB_STATES.includes(job.state);
-                return {
-                    ok: true,
-                    stopped,
-                    stopping: !stopped,
-                    withdrawn: false,
-                    requestedAt: request.requestedAt,
-                    note: stopped
-                        ? `Procedure ${job.state} (${job.ending ? job.ending.kind : 'ending unknown'}${job.ending && job.ending.measured !== undefined ? `, ${job.ending.measured} measured` : ''}); `
-                            + `completed measurements are in result (${job.error || 'no error'}).`
-                        : `Stop requested ${Date.now() - request.requestedAt} ms ago; the runner is finishing its current step and raising. Long-poll get_gcode_job_status.`,
-                    job: jobManager.describe(job),
-                };
-            }
-            const channel = getJobChannel();
-            if (typeof channel.stopGcodeJob !== 'function') {
-                throw new McpToolError('The connected channel does not support stopping jobs.');
-            }
-            const stopped = await channel.stopGcodeJob();
-            if (stopped.ok) {
-                job.state = 'stopped';
-                job.endedAt = Date.now();
-                job.ending = { kind: 'machine-stopped', reason: `firmware stop sent by the agent${stopped.text ? `: ${stopped.text}` : ''}`, at: job.endedAt };
-                jobManager.appendEvent(job, 'stopped', { note: `stop sent by the agent${stopped.text ? `: ${stopped.text}` : ''}` });
-                if (jobManager.getActive() === job) {
-                    jobManager.setActive(null);
-                }
-            }
-            return {
-                ok: stopped.ok,
-                stopped: stopped.ok,
-                stopping: false,
-                withdrawn: false,
-                text: stopped.text || null,
-                note: plan.note,
-                job: jobManager.describe(job),
-            };
+            return stopGcodeJob(args);
         },
     });
 }

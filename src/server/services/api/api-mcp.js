@@ -1,5 +1,5 @@
 import config from '../configstore';
-import { getMcpStatus } from '../mcp';
+import { getMcpHealth, getMcpStatus } from '../mcp';
 import { MAX_MAX_CLIENTS, MAX_STREAM_FPS, MIN_STREAM_FPS, STREAM_ENABLED_KEY, STREAM_FPS_KEY, STREAM_MAX_CLIENTS_KEY, cameraStreamService } from '../mcp/cameraStream';
 import { MAX_RECENT_LIMIT, MIN_RECENT_LIMIT, diagnosticsRecentLimit } from '../mcp/diagnostics';
 import { DEFAULT_BLINKA_ENV, resolveGpioFeedConfig } from '../mcp/gpioFeed';
@@ -165,6 +165,10 @@ function settingsPayload() {
     };
 }
 
+export const getHealth = (req, res) => {
+    res.send(getMcpHealth());
+};
+
 export const getStatus = (req, res) => {
     res.send(settingsPayload());
 };
@@ -200,6 +204,14 @@ export const clearAlarm = (req, res) => {
 export const updateSettings = (req, res) => {
     const { enabled, port, allowLan, sensors, mqtt, gpio, transport, buffers, approvalHandoff: handoff, cameraStream } = req.body || {};
 
+    const tls = (req.body || {}).https;
+    if (tls !== undefined) {
+        if (!tls || typeof tls !== 'object' || Array.isArray(tls)
+            || ['certFile', 'keyFile'].some((field) => tls[field] !== undefined && typeof tls[field] !== 'string')) {
+            res.status(ERR_BAD_REQUEST).send({ msg: 'https.certFile and https.keyFile must be file path strings.' });
+            return;
+        }
+    }
     if (port !== undefined) {
         const value = Number(port);
         if (!Number.isInteger(value) || value < 1 || value > 65535) {
@@ -207,6 +219,14 @@ export const updateSettings = (req, res) => {
             return;
         }
         config.set('mcpPort', value);
+    }
+    if (tls) {
+        for (const [field, key] of [['certFile', 'mcpHttpsCert'], ['keyFile', 'mcpHttpsKey']]) {
+            if (tls[field] !== undefined) {
+                const value = tls[field].trim();
+                if (value) { config.set(key, value); } else { config.unset(key); }
+            }
+        }
     }
     if (enabled !== undefined) {
         config.set('mcpEnabled', !!enabled);

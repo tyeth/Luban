@@ -90,6 +90,7 @@ img{max-width:100%;height:auto;display:block;background:#000;border:1px solid #3
 #status{font-size:13px;color:#aaa;margin:8px 0;font-family:monospace;white-space:pre-wrap}
 a{color:#7ab}
 </style></head><body>
+<nav style="margin-bottom:12px"><a href="/jobs">Jobs</a></nav>
 <img id="stream" src="${escapeHtml(urls.stream)}" alt="camera stream">
 <div id="status">connecting...</div>
 <div><a href="${escapeHtml(urls.snapshot)}" target="_blank">snapshot.jpg</a> &middot;
@@ -290,7 +291,8 @@ class CameraStreamService implements LiveFrameSource {
             return;
         }
         if (pathname === '/camera' || pathname === '/camera/') {
-            const body = pageHtml(this.urls(), this.settings().fps);
+            // Relative paths preserve the browser's HTTP/HTTPS origin, including the port.
+            const body = pageHtml({ page: '/camera', stream: '/camera/stream.mjpeg', snapshot: '/camera/snapshot.jpg' }, this.settings().fps);
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
             res.end(req.method === 'HEAD' ? undefined : body);
             return;
