@@ -13,6 +13,8 @@ The software is inspired by [cncjs](https://github.com/cncjs/cncjs) by cheton.
 
 > ⚠️ **This fork adds an experimental MCP server that lets AI agents drive the machine** — see [src/server/services/mcp/README.md](src/server/services/mcp/README.md). **Health & safety:** do not use the MCP server unless you accept the risk of software-commanded motion; never leave your CNC machine unattended or approach it while it is running; always wear appropriate PPE (eye and hearing protection, no loose clothing or jewellery).
 
+MCP setup: run `python3 src/server/services/mcp/setup.py --help` from the Luban checkout; see the [setup helper instructions](src/server/services/mcp/README.md#setup-helper).
+
 We use [LunarSlicer](https://github.com/Snapmaker/LunarSlicer) for 3D slicing.
 
 ![Software Screenshot](https://user-images.githubusercontent.com/3749551/219274513-0f0d1e56-2e0a-4c9b-ad8b-7b5801a00cde.jpg)

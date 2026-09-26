@@ -72,6 +72,69 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
   ffmpeg input wired up. `mcpCameraUrl` (HTTP snapshot, e.g. Android IP Webcam) remains
   platform-independent and takes precedence everywhere.
 
+## Setup helper
+
+The MCP server is part of Luban, not a separate app. `setup.py` lives beside this README
+and edits Luban's existing configstore. It needs Python 3.8+ and only the standard library;
+no `npm install` is needed to run the helper. Use `python3` on Linux/macOS or `py -3` on
+Windows. Examples below run from the **Luban repository root**; from any other directory,
+pass the absolute path to `src/server/services/mcp/setup.py`. It resolves its requirements
+relative to itself, not your current working directory.
+
+Close Luban before applying setup. Preview the basic local HTTP setup, then apply it:
+
+```sh
+python3 src/server/services/mcp/setup.py
+python3 src/server/services/mcp/setup.py --apply
+```
+
+For phone/LAN HTTPS access, first [install mkcert](https://github.com/FiloSottile/mkcert#installation)
+and put it on PATH (Linux browser trust also needs `libnss3-tools`). Replace the example IP
+with the **Luban computer's LAN IPv4 address**:
+
+```sh
+python3 src/server/services/mcp/setup.py --https --lan-ip 192.168.1.153 --install-ca
+python3 src/server/services/mcp/setup.py --https --lan-ip 192.168.1.153 --install-ca --apply
+```
+
+`--install-ca` explicitly runs `mkcert -install`, which changes this computer's CA trust
+and may request elevation. Without it the helper generates certificates without installing
+trust. The helper does not install mkcert or OS packages itself. Transfer and trust only
+`rootCA.pem` on each phone/PC using the [HTTPS instructions below](#https-with-mkcert-http-port--1),
+then open `https://192.168.1.153:40890/jobs` and opt into notifications for that tab session.
+
+For the optional GPIO/Blinka probe transport, add `--blinka` to either setup command or run:
+
+```sh
+python3 src/server/services/mcp/setup.py --blinka --apply
+```
+
+This creates a venv with the Python running the helper, installs this subfolder's
+`requirements.txt`, and saves its interpreter path. Python must support `venv`/pip
+(on Debian/Ubuntu install the matching `python3-venv` package if needed). Choose the GPIO
+transport, sensor pins and inversion in Luban's MCP Settings afterwards. USB drivers,
+Linux device permissions and wiring remain hardware-specific; the helper never opens sensors.
+
+The helper enables MCP, preserves unrelated settings, keeps an existing HTTP port or defaults
+to 40889, and preserves LAN access unless `--lan-ip` or `--local-only` is supplied. `--https`
+adds HTTPS on port + 1; it requires `--lan-ip` when LAN access is enabled. Repeating
+`--lan-ip` includes multiple interfaces. `--port`, `--config` and `--data-dir` override the
+port, configstore location and generated-file directory; `--help` lists all options.
+Existing TLS settings are preserved unless `--https` is requested. Each HTTPS/Blinka setup
+creates fresh files, so renewal or a failed dependency installation leaves previous assets
+intact. Unused old directories may be removed after confirming the new configuration works.
+
+Before replacing a configstore the helper saves a private `.backup-*` copy beside it,
+refuses invalid JSON, and aborts if the file changes during setup. Generated files live
+outside the checkout by default: `~/.local/share/luban/mcp` on Linux,
+`~/Library/Application Support/Luban/mcp` on macOS, or `%LOCALAPPDATA%\Luban\mcp` on Windows.
+Environment overrides still take precedence. Start Luban normally after setup and check
+**Settings → MCP Server** for health and dashboard links. The helper does not install Luban,
+start/restart services, connect to a machine, or deploy to another computer.
+
+Helper regression tests (temporary directories and mocked external installers):
+`python3 -B -m unittest discover -s src/server/services/mcp/tests -p 'test_setup.py'`.
+
 ## Health alerts inside Luban
 
 When MCP is enabled, Luban's app shell checks `GET /api/mcp/health` every five seconds
@@ -122,7 +185,7 @@ One-time setup, on the computer that will run Luban (schedule its restart when n
 
 1. Install [mkcert using its official instructions](https://github.com/FiloSottile/mkcert#installation).
    On Linux, install `libnss3-tools` for browser trust support. Run `mkcert -install` to create
-   and trust the local CA on that computer. Luban itself never runs mkcert or changes trust stores.
+   and trust the local CA on that computer. The Luban app never runs mkcert or changes trust stores; the setup helper only installs trust with `--install-ca --apply`.
 2. Generate the server certificate for localhost **and the actual LAN IPv4 address** you will
    open from the phone. Example for Linux/macOS; replace `192.168.1.153` with the server's IP:
 
