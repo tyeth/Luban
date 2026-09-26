@@ -291,7 +291,8 @@ class CameraStreamService implements LiveFrameSource {
             return;
         }
         if (pathname === '/camera' || pathname === '/camera/') {
-            const body = pageHtml(this.urls(), this.settings().fps);
+            // Relative paths preserve the browser's HTTP/HTTPS origin, including the port.
+            const body = pageHtml({ page: '/camera', stream: '/camera/stream.mjpeg', snapshot: '/camera/snapshot.jpg' }, this.settings().fps);
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
             res.end(req.method === 'HEAD' ? undefined : body);
             return;

@@ -27,6 +27,7 @@ import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
 import { tests as machineTravelTests } from './machineTravel.test';
 import { tests as marchCoreTests } from './marchCore.test';
+import { tests as mcpListenersTests } from './mcpListeners.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as perimeterAnalysisTests } from './perimeterAnalysis.test';
 import { tests as perimeterTraceTests } from './perimeterTrace.test';
@@ -69,6 +70,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['jobDashboard', jobDashboardTests],
     ['landmarkClearance', landmarkClearanceTests],
     ['mjpegFanout', mjpegFanoutTests],
+    ['mcpListeners', mcpListenersTests],
     ['marchCore', marchCoreTests],
     ['camLinks', camLinksTests],
     ['wallClearance', wallClearanceTests],
