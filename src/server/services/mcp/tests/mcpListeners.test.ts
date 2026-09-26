@@ -42,11 +42,12 @@ function loadModule(file: string, dependencies: Record<string, unknown>) {
     return exports;
 }
 
-function fixture(readError = false, tlsError = false) {
+function fixture(readError = false, tlsError = false, validTo = '2099-01-01', validFrom = '2020-01-01') {
     const servers: FakeServer[] = [];
     const errors: string[] = [];
     const files: string[] = [];
     const { McpListeners: Listeners } = loadModule('mcpListeners.ts', {
+        crypto: { X509Certificate: class { public validFrom = validFrom; public validTo = validTo; } },
         fs: { readFileSync: (file: string) => { files.push(file); if (readError) { throw new Error('ENOENT'); } return file; } },
         http: { createServer: (handler: http.RequestListener) => { const server = new FakeServer(handler); servers.push(server); return server; } },
         https: { createServer: (options: object, handler: http.RequestListener) => {
@@ -99,6 +100,8 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             { setup: fixture(), settings: { ...settings, port: 65535 } },
             { setup: fixture(true), settings },
             { setup: fixture(false, true), settings },
+            { setup: fixture(false, false, '2001-01-01'), settings },
+            { setup: fixture(false, false, '2099-01-01', '2098-01-01'), settings },
         ]) {
             test.setup.listeners.start(test.settings, handler);
             test.setup.servers[0].ready();
@@ -129,11 +132,13 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.strictEqual(listeners.httpsError, null);
         servers[2].emit('error', new Error('HTTP busy'));
         assert.strictEqual(listeners.httpPort, null);
+        assert.strictEqual(listeners.httpError, 'HTTP busy');
         assert.strictEqual(listeners.httpsPort, 40890);
         // A late callback from the previous generation cannot corrupt the new listener.
         servers[0].ready();
         servers[1].emit('error', new Error('old listener'));
         assert.strictEqual(listeners.httpPort, null);
+        assert.strictEqual(listeners.httpError, 'HTTP busy');
         assert.strictEqual(listeners.httpsPort, 40890);
         listeners.stop();
     }],

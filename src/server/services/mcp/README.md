@@ -72,6 +72,42 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
   ffmpeg input wired up. `mcpCameraUrl` (HTTP snapshot, e.g. Android IP Webcam) remains
   platform-independent and takes precedence everywhere.
 
+## Health alerts inside Luban
+
+When MCP is enabled, Luban's app shell checks `GET /api/mcp/health` every five seconds
+(after each completed request). This endpoint uses Luban's authenticated main API, so a
+failed MCP HTTP/HTTPS listener does not prevent the operator from seeing the problem.
+The initial snapshot reports failures that happened before the UI opened, including
+synchronous MCP startup exceptions; these exceptions are contained so Luban can continue
+starting and display the error.
+
+A persistent, dismissible in-app toast identifies each active problem and offers **Open
+MCP Settings**. The **MCP service health** panel in Settings remains available after a toast
+is dismissed. Alerts cover:
+
+- MCP startup exceptions, an enabled service that is not running, and HTTP bind errors.
+- HTTPS certificate/key loading and bind errors; expired or not-yet-valid certificates are
+  refused at startup, and a loaded certificate expiring during a session is also reported.
+- Configured probe feeds that disconnect or fail to reconnect (including Blinka interpreter,
+  USB bridge and MQTT errors), and incomplete explicitly selected/bound sensor configurations.
+- Latched sensor alarms and errors from an enabled camera stream.
+
+Issue IDs stay stable across retries, so a disconnected probe bridge does not produce a new
+toast every five seconds. Existing visible toasts update if the diagnosis changes; dismissed
+ones stay dismissed until that incident clears. On recovery the fault toast closes and a
+brief resolution message appears. A later recurrence can notify again. Normal initial
+connection, wholly unused optional probe feeds, and deliberately disabled sensors are quiet;
+turning MCP off suppresses health alerts without claiming a recovery. These alerts do not
+request OS notification permission and are separate from `/jobs` browser-session preferences.
+
+Checks have network timeouts, never overlap within a monitor, and stop when the component
+unmounts. After two consecutive status failures, a client that last saw MCP enabled reports
+that health is unavailable and preserves the last known problems as potentially stale. No
+status-failure alert appears before the client has established that MCP is enabled.
+Monitoring only reads status; it does not reconnect sensors, restart Luban, clear alarms,
+or issue machine commands. Client-specific CA trust/hostname failures cannot be inferred
+from the server's TLS listener status; follow the browser certificate setup below.
+
 ## HTTPS with mkcert (HTTP port + 1)
 
 The MCP service can listen on both **HTTP 40889** and **HTTPS 40890** (or your configured

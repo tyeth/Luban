@@ -1,6 +1,7 @@
 import type http from 'http';
 
 import pkg from '../../../package.json';
+import { deriveMcpHealth, McpHealthInput } from '../../../shared/lib/mcpHealth';
 import logger from '../../lib/logger';
 import config from '../configstore';
 import { cameraStreamService } from './cameraStream';
@@ -42,6 +43,7 @@ const DEFAULT_PORT = 40889;
 
 const listeners = new McpListeners((message) => log.info(message), (message) => log.error(message));
 let runningSettings: McpSettings | null = null;
+let startupError: string | null = null;
 let registeredToolCount = 0;
 let broadcaster: McpBroadcaster | null = null;
 
@@ -141,6 +143,30 @@ function lanUrls(port: number, scheme = 'http'): string[] {
     return orderedLanSubnets().map((subnet) => `${scheme}://${subnet.address}:${port}/mcp`);
 }
 
+/** Served by Luban's authenticated main API even when both MCP listeners are down. */
+export function getMcpHealth() {
+    const enabled = resolveSettings().enabled;
+    const snapshot: McpHealthInput = {
+        enabled,
+        running: listeners.httpPort !== null || listeners.httpsPort !== null,
+        starting: listeners.started && !listeners.httpPort && !listeners.httpsPort && !listeners.httpError && !listeners.httpsError,
+        startupError,
+        httpError: listeners.httpError,
+        httpsError: listeners.httpsError,
+        certificateValidTo: listeners.certificateValidTo,
+        probeTransportSelected: !!String(process.env.LUBAN_MCP_PROBE_TRANSPORT || config.get('mcpProbeTransport') || '').trim(),
+    };
+    if (enabled) {
+        try {
+            snapshot.probe = probeFeedService.status() as McpHealthInput['probe'];
+            snapshot.camera = cameraStreamService.status();
+        } catch (err) {
+            snapshot.diagnosticError = (err as Error).message;
+        }
+    }
+    return deriveMcpHealth(snapshot);
+}
+
 /**
  * Status of the MCP service for this run. Settings changes apply at the
  * next start; `running`/`port` describe what is actually live now.
@@ -153,6 +179,9 @@ export function getMcpStatus() {
     return {
         running: listeners.httpPort !== null || listeners.httpsPort !== null,
         port: listeners.httpPort,
+        httpError: listeners.httpError,
+        startupError,
+        health: getMcpHealth(),
         https: {
             ...httpsSettings,
             configured: !!(httpsSettings.certFile || httpsSettings.keyFile),
@@ -160,6 +189,7 @@ export function getMcpStatus() {
             running: listeners.httpsPort !== null,
             port: listeners.httpsPort,
             error: listeners.httpsError,
+            certificateValidTo: listeners.certificateValidTo,
             jobsUrl: httpsBase ? `${httpsBase}/jobs` : null,
             mcpUrl: httpsBase ? `${httpsBase}/mcp` : null,
             lanUrls: listeners.httpsPort && live.allowLan ? lanUrls(listeners.httpsPort, 'https') : [],
@@ -193,7 +223,7 @@ export interface McpBroadcaster {
     broadcast: (eventName: string, options?: object) => void;
 }
 
-export function startMcpService(socketServer?: McpBroadcaster): void {
+function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
     if (listeners.started) {
         return;
     }
@@ -287,8 +317,22 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
     }
 }
 
+export function startMcpService(socketServer?: McpBroadcaster): void {
+    if (listeners.started) { return; }
+    startupError = null;
+    try {
+        startConfiguredMcpService(socketServer);
+    } catch (err) {
+        startupError = (err as Error).message || String(err);
+        listeners.stop();
+        log.error(`MCP startup failed: ${startupError}`);
+        // Keep Luban and its main API available to report the failure.
+    }
+}
+
 export function stopMcpService(): void {
     cameraStreamService.shutdown();
     listeners.stop();
     runningSettings = null;
+    startupError = null;
 }

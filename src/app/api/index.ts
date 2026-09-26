@@ -131,6 +131,7 @@ const unsetState = defaultAPIFactory(({ key }) => request.delete('/api/state').q
 // MCP server
 //
 const getMcpStatus = defaultAPIFactory(() => request.get('/api/mcp'));
+const getMcpHealth = defaultAPIFactory(() => request.get('/api/mcp/health').timeout({ response: 5000, deadline: 8000 }));
 const setMcpSettings = defaultAPIFactory((options) => request.post('/api/mcp').send(options));
 const clearMcpAlarm = defaultAPIFactory((options) => request.post('/api/mcp/clear-alarm').send(options || {}));
 
@@ -363,6 +364,7 @@ export default {
     // MCP server
     getMcpStatus,
     setMcpSettings,
+    getMcpHealth,
     clearMcpAlarm,
 
     // G-code

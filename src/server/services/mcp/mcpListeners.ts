@@ -1,3 +1,4 @@
+import { X509Certificate } from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import https from 'https';
@@ -37,6 +38,10 @@ export class McpListeners {
 
     public httpsError: string | null = null;
 
+    public httpError: string | null = null;
+
+    public certificateValidTo: number | null = null;
+
     private info: (message: string) => void;
 
     private error: (message: string) => void;
@@ -62,12 +67,15 @@ export class McpListeners {
             return;
         }
         this.httpsError = null;
+        this.httpError = null;
+        this.certificateValidTo = null;
         const host = settings.allowLan ? '0.0.0.0' : '127.0.0.1';
         const server = http.createServer(handler);
         this.httpServer = server;
         this.track(server);
         server.on('error', (err: Error) => {
             if (this.httpServer !== server) { return; }
+            this.httpError = err.message;
             this.error(`MCP HTTP listener: ${err.message}`);
             server.close();
             this.httpServer = null;
@@ -88,8 +96,14 @@ export class McpListeners {
             if (settings.port >= 65535) {
                 throw new Error('HTTPS uses MCP port + 1; set the HTTP port to 65534 or lower.');
             }
+            const cert = fs.readFileSync(settings.certFile);
+            const parsed = new X509Certificate(cert);
+            this.certificateValidTo = Date.parse(parsed.validTo);
+            if (Date.parse(parsed.validFrom) > Date.now() || this.certificateValidTo <= Date.now()) {
+                throw new Error('The HTTPS certificate is expired or not yet valid. Regenerate it with mkcert and check the system clock.');
+            }
             const secure = https.createServer({
-                cert: fs.readFileSync(settings.certFile),
+                cert,
                 key: fs.readFileSync(settings.keyFile),
                 minVersion: 'TLSv1.2',
             }, handler);
@@ -122,6 +136,8 @@ export class McpListeners {
         this.httpPort = null;
         this.httpsPort = null;
         this.httpsError = null;
+        this.httpError = null;
+        this.certificateValidTo = null;
         // Node 16's server.close() does not close keep-alive/stream sockets.
         for (const socket of this.sockets) { socket.destroy(); }
         this.sockets.clear();

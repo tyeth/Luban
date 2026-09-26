@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import api from '../../../../../api';
 import i18n from '../../../../../lib/i18n';
 import UniApi from '../../../../../lib/uni-api';
+import { McpHealthPanel } from '../../../../components/McpHealth';
 import SvgIcon from '../../../../components/SvgIcon';
 import styles from '../form.styl';
 
@@ -307,6 +308,7 @@ const McpServer: React.FC = () => {
 
     return (
         <div className={styles['form-container']}>
+            <McpHealthPanel />
             <div className="border-bottom-normal padding-bottom-4">
                 <SvgIcon
                     name="TitleSetting"

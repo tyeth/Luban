@@ -1,5 +1,5 @@
 import config from '../configstore';
-import { getMcpStatus } from '../mcp';
+import { getMcpHealth, getMcpStatus } from '../mcp';
 import { MAX_MAX_CLIENTS, MAX_STREAM_FPS, MIN_STREAM_FPS, STREAM_ENABLED_KEY, STREAM_FPS_KEY, STREAM_MAX_CLIENTS_KEY, cameraStreamService } from '../mcp/cameraStream';
 import { MAX_RECENT_LIMIT, MIN_RECENT_LIMIT, diagnosticsRecentLimit } from '../mcp/diagnostics';
 import { DEFAULT_BLINKA_ENV, resolveGpioFeedConfig } from '../mcp/gpioFeed';
@@ -164,6 +164,10 @@ function settingsPayload() {
         approval: approvalSettings(),
     };
 }
+
+export const getHealth = (req, res) => {
+    res.send(getMcpHealth());
+};
 
 export const getStatus = (req, res) => {
     res.send(settingsPayload());
