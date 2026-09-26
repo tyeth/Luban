@@ -24,6 +24,7 @@ import { registerProbeTools } from './tools/probe';
 import { registerProbingTools } from './tools/probing';
 import { registerStatusTools } from './tools/status';
 import { registerToolSetterTools } from './tools/toolsetter';
+import { registerThreadMillingTools } from './tools/threadMilling';
 
 const log = logger('service:mcp');
 
@@ -240,6 +241,7 @@ function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
     registerMachineTools(registry);
     const baseUrl = () => publicBaseUrl(listeners.httpsPort || port, settings.allowLan, listeners.httpsPort ? 'https' : 'http');
     registerGcodeTools(registry, baseUrl);
+    registerThreadMillingTools(registry);
     registerCameraTools(registry);
     registerCameraModelTools(registry);
     registerCalibrationTools(registry);

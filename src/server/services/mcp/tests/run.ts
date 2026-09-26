@@ -41,6 +41,7 @@ import { tests as surveyMosaicTests } from './surveyMosaic.test';
 import { tests as surveyPlanTests } from './surveyPlan.test';
 import { tests as toolProtrusionTests } from './toolProtrusion.test';
 import { tests as traversePlanTests } from './traversePlan.test';
+import { tests as threadMillingTests } from './threadMilling.test';
 import { tests as validatorTests } from './validator.test';
 import { tests as wallClearanceTests } from './wallClearance.test';
 import { tests as wallFollowTests } from './wallFollow.test';
@@ -49,6 +50,7 @@ type TestCase = [string, () => void | Promise<void>];
 
 const suites: Array<[string, TestCase[]]> = [
     ['validator', validatorTests],
+    ['threadMilling', threadMillingTests],
     ['machinePosition', machinePositionTests],
     ['machineTravel', machineTravelTests],
     ['envelopeChecks', envelopeChecksTests],

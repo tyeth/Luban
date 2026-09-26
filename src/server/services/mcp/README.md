@@ -1417,3 +1417,11 @@ toolhead camera. Everything a fresh install needs:
 - **#60 install size**: bundle/asar the main process, squeeze the remaining server externals.
 - **`sensor_delay_ms` defaults are MQTT-sized** (200–300 ms); on the GPIO transport they can
   drop to ~50 ms — per call for now, a transport-aware default later.
+
+## Thread-milling import
+
+`convert_thread_milling_gcode` converts Fanuc-style thread-milling exports to
+reviewable Snapmaker G0/G1 programs offline. See [thread-milling support](docs/thread-milling.md)
+for firmware findings, generator option coverage, required declarations, spindle
+modes, examples and limitations. Running a converted file uses the existing job
+approval flow.

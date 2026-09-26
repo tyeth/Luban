@@ -159,6 +159,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     let minZWithSpindleOn: number | null = null;
     let setsWorkOrigin = false;
     const warnings: string[] = [];
+    const fanucCodes = new Set<string>();
 
     // Frame tracking. On this controller `G53` on its own line selects the
     // machine workspace and stays selected until a G54..G59 reselects a work
@@ -201,6 +202,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         }
 
         for (const code of codes) {
+            if (['G41', 'G42', 'G43', 'M6', 'M30'].includes(code)) fanucCodes.add(code);
             if (code === 'G90') {
                 relativeMode = false;
                 distanceModeSet = true;
@@ -281,6 +283,11 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         workspaceSelects: [...workspaceSelects].sort(),
         inlineG53Lines,
     };
+
+    if (fanucCodes.size) {
+        warnings.push(`Fanuc-style commands (${[...fanucCodes].join(', ')}) do not have their machining-centre semantics on Snapmaker. `
+            + 'For thread-milling generator output, use convert_thread_milling_gcode and review its explicit conversions before staging.');
+    }
 
     if (usesRelativeMotion) {
         warnings.push('Contains G91 relative motion; extents exclude relative segments and are unreliable.');
