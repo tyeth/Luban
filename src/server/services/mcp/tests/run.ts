@@ -21,6 +21,7 @@ import { tests as directMovePlanTests } from './directMovePlan.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as frameRecoveryTests } from './frameRecovery.test';
 import { tests as inspectionReportTests } from './inspectionReport.test';
+import { tests as jobDashboardTests } from './jobDashboard.test';
 import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
@@ -65,6 +66,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['traversePlan', traversePlanTests],
     ['directMovePlan', directMovePlanTests],
     ['jobEnding', jobEndingTests],
+    ['jobDashboard', jobDashboardTests],
     ['landmarkClearance', landmarkClearanceTests],
     ['mjpegFanout', mjpegFanoutTests],
     ['marchCore', marchCoreTests],

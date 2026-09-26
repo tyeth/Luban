@@ -7,6 +7,7 @@ import { cameraStreamService } from './cameraStream';
 import { diagnosticsSnapshot, startDiagnostics } from './diagnostics';
 import { McpServer, isTrustedAddress, isTrustedOrigin, localSubnets } from './McpServer';
 import { OAuthShim } from './oauth';
+import { handleJobDashboardRequest } from './jobDashboard';
 import { jobManager } from './jobs';
 import { probeFeedService, resolveActiveProbeConfig } from './probeFeed';
 import { ToolRegistry } from './registry';
@@ -14,7 +15,7 @@ import { registerCalibrationTools } from './tools/calibration';
 import { registerCameraTools } from './tools/camera';
 import { registerCameraModelTools } from './tools/cameraModel';
 import { registerCamTools } from './tools/cam';
-import { registerGcodeTools } from './tools/gcode';
+import { registerGcodeTools, stopGcodeJob } from './tools/gcode';
 import { registerLandmarkTools } from './tools/landmarks';
 import { registerMachineTools } from './tools/machine';
 import { registerProbeTools } from './tools/probe';
@@ -149,6 +150,7 @@ export function getMcpStatus() {
         running: !!httpServer,
         port: runningPort,
         toolCount: registeredToolCount,
+        jobsUrl: `${publicBaseUrl(settings.port, settings.allowLan)}/jobs`,
         settings,
         // LAN URLs an agent on the same subnet can use (only meaningful when
         // allowLan is on AND the server is running with it).
@@ -236,6 +238,10 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
         }
 
         const url = new URL(req.url, 'http://localhost');
+        if (url.pathname === '/' || url.pathname === '/jobs' || url.pathname.startsWith('/jobs/')) {
+            handleJobDashboardRequest(req, res, url, jobManager, async (id) => stopGcodeJob({ job_id: id, wait_ms: 0 }, 'operator'));
+            return;
+        }
         if (url.pathname.startsWith('/confirm')) {
             // Human job-confirmation pages (jobs.ts)
             jobManager.handleConfirmRequest(req, res, url.pathname);

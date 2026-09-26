@@ -90,6 +90,7 @@ img{max-width:100%;height:auto;display:block;background:#000;border:1px solid #3
 #status{font-size:13px;color:#aaa;margin:8px 0;font-family:monospace;white-space:pre-wrap}
 a{color:#7ab}
 </style></head><body>
+<nav style="margin-bottom:12px"><a href="/jobs">Jobs</a></nav>
 <img id="stream" src="${escapeHtml(urls.stream)}" alt="camera stream">
 <div id="status">connecting...</div>
 <div><a href="${escapeHtml(urls.snapshot)}" target="_blank">snapshot.jpg</a> &middot;

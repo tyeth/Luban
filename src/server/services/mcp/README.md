@@ -71,6 +71,56 @@ A project-scope `.mcp.json` at the repo root points Claude Code sessions at
   ffmpeg input wired up. `mcpCameraUrl` (HTTP snapshot, e.g. Android IP Webcam) remains
   platform-independent and takes precedence everywhere.
 
+## Browser job dashboard
+
+Open `/jobs` (or `/`) on the MCP port, for example `http://127.0.0.1:40889/jobs`.
+With LAN access enabled, use the same server's LAN address from a phone or PC.
+The dashboard follows the existing address/Origin gate; it does not enable LAN access.
+`getMcpStatus().jobsUrl` exposes the link, and camera and confirmation pages link back to Jobs.
+
+- Running jobs, ready-for-approval jobs, approved jobs waiting to run, and recent history
+  are separate lists. History includes rejected, completed, failed, stopped/cancelled,
+  and dismissed/withdrawn jobs, with ending reasons and expandable results/latest 100 events.
+- Review links open the existing confirmation page in another tab; approval behavior is unchanged.
+  Stale confirmation pages cannot approve or reject a job after it leaves the pending state.
+- **Stop job** targets the currently active job ID and reuses the MCP stop implementation,
+  with operator attribution. Procedures request a stop at the next step boundary and follow
+  their existing guarded retreat; file/direct jobs use firmware stop. **Dismiss job** withdraws
+  a pending/approved job and invalidates its approval, without sending a machine stop.
+  A stale action returns 409, and failures remain visible.
+- Lists poll every two seconds, flag disconnection/stale data and retry. These are in-memory
+  records, cleared on server restart. Retention normally caps the total at 50, pruning only
+  terminal jobs so pending/approved/running records survive. A separate 300-event lifecycle
+  feed preserves quick start/finish transitions between polls and reports retention gaps.
+
+**Notifications are opt-in per tab session**, independent of every job and other clients.
+Page toasts work on plain LAN HTTP. System notifications request browser permission only on
+an explicit click, use a service worker, and need a browser-trusted HTTPS origin (localhost
+is also allowed). Browser permission may persist; the on/off preference uses `sessionStorage`,
+never configstore, localStorage or a server subscription. It survives reload in that tab;
+a new session starts off, even if permission was previously granted. Initial history is not
+announced, and notification delivery deduplicates by lifecycle cursor. Short disconnects
+catch up; restarting the server resets the cursor without replaying history.
+
+Keep the page open and connected. Mobile OS/tab suspension can delay delivery; there is no
+background Web Push service or delivery guarantee when the browser sleeps/closes. iPhone/iPad
+system notifications require a supported HTTPS Home Screen web app; `/jobs/manifest.webmanifest`
+provides standalone installation metadata. Native system notification delivery still depends
+on browser/OS support. The page explains unavailable/denied permissions and offers page toasts.
+See [MDN Notifications API](https://developer.mozilla.org/en-US/docs/Web/API/Notifications_API)
+and [WebKit iOS Web Push requirements](https://webkit.org/blog/13878/web-push-for-web-apps-on-ios-and-ipados/).
+
+No TLS listener or reverse proxy is configured by this feature. HTTPS hosting must retain the
+existing MCP trust boundary (numeric LAN/loopback Origin checks); this is not an internet-facing
+service. Reliable locked-phone notifications would be a separate Web Push feature, with
+explicit subscription/session expiry semantics.
+
+HTTP routes: `GET /jobs/status.json?since=<cursor>&instance=<instance>` (small list + notices),
+`GET /jobs/<id>.json` (details), `POST /jobs/<id>/stop`, `POST /jobs/<id>/dismiss`.
+Actions require `X-Luban-Job-Action: 1`, use no CORS, reject cross-site fetches, and are checked
+against current state before invoking the shared stop path. The list excludes confirmation
+tokens, file paths, runners and large result payloads. Assets are served without external dependencies.
+
 ## Live camera stream (2026-09-16)
 
 The MCP http server also serves the camera to a **browser**, so the operator can watch the
