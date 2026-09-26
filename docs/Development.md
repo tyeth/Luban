@@ -38,6 +38,42 @@ Or you can follow the instructions below to set up the development environment f
 > npm run build && npm run build:win-x64 (for Windows)
 ```
 
+### Build release assets with GitHub Actions
+
+Publish a release or prerelease whose tag includes the current
+[release workflow](../.github/workflows/build-on-create-release.yml). **Build Release
+Assets** runs on `release.published`, including prereleases published from a draft.
+It builds the tagged source and attaches Windows x64 `.exe`, macOS x64/arm64
+`.dmg` and `.zip`, and Linux x64 `.deb`, `.rpm`, and `.tar.gz` packages to that
+release. Generated update metadata and blockmaps are included when present. The
+release keeps its prerelease status, title, and notes. Package filenames and the
+app version come from the tagged source's package version, not the release tag.
+
+No personal access token is required for the public submodules or GitHub asset
+uploads: checkout uses `SACP_TOKEN` when configured and otherwise `github.token`;
+uploads use the workflow's `GITHUB_TOKEN` with `contents: write`. Node 22 and the
+platform dependency setup match the normal build workflow. Shared packaging
+scripts handle missing Apple credentials: empty certificate secrets are unset,
+macOS apps are ad-hoc signed, and notarization is skipped without Apple account
+credentials. Such macOS packages still need the user's first-launch Gatekeeper
+approval. OSS uploads remain restricted to `Snapmaker/Luban`.
+
+To recover an existing release, select **Actions → Build Release Assets → Run
+workflow**, choose a branch containing the updated workflow, enter its existing
+published `release_tag`, and select `windows`, `macos`, `linux`, or `all`. The
+workflow definition must also be present on the repository's default branch for
+manual dispatch to be available. The build checks out the release tag, not the
+selected workflow branch; older tags also retain their older packaging scripts.
+Draft or nonexistent releases are rejected. Retries replace assets with matching
+names; runs for the same tag are serialized. The `release-windows`,
+`release-macos`, and `release-linux` Actions artifacts retain the packages even if
+uploading them to the release fails.
+
+Re-running an old failed run uses its old workflow revision. Use manual dispatch
+to apply these workflow fixes to an existing tag, or publish a new release tagged
+after the workflow change was merged. Neither this workflow nor a normal CI
+build installs the application on a machine.
+
 ### Additional Notes
 
 - For developers in China, you can use taobao mirror to install npm packages.
