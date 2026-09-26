@@ -1,9 +1,10 @@
 /* eslint-disable camelcase */
 import { McpToolError, ToolRegistry } from '../registry';
-import { convertThreadMillingGcode } from '../threadMilling';
+import { convertThreadMillingGcode, THREAD_MILLING_CONTROLLERS, ThreadMillingController } from '../threadMilling';
 
 interface ConvertArgs {
     gcode: string;
+    source_controller?: ThreadMillingController;
     tool_center_path: boolean;
     tool_length_applied: boolean;
     spindle_mode: 'power_percent' | 'cnc_200w_rpm';
@@ -14,7 +15,7 @@ interface ConvertArgs {
 export function registerThreadMillingTools(registry: ToolRegistry): void {
     registry.register({
         name: 'convert_thread_milling_gcode',
-        description: 'Offline conversion of Fanuc-style thread-milling G-code to explicit Snapmaker G0/G1 moves. '
+        description: 'Offline conversion of Machining Doctor thread-milling G-code to explicit Snapmaker G0/G1 moves. '
             + 'Supports G2/G3 helices, full circles, G90/G91, metric/inch input, repeated turns and passes. '
             + 'Requires a zero-compensation tool-centre path and work Z already referenced to the fitted tool tip. '
             + 'Select power_percent for the standard CNC head, or cnc_200w_rpm to retain RPM for the 200 W head. '
@@ -23,7 +24,8 @@ export function registerThreadMillingTools(registry: ToolRegistry): void {
         inputSchema: {
             type: 'object',
             properties: {
-                gcode: { type: 'string', description: 'Complete Fanuc-style generator output, including M30/M2.' },
+                gcode: { type: 'string', description: 'Complete generator output, including M30/M2.' },
+                source_controller: { type: 'string', enum: THREAD_MILLING_CONTROLLERS, description: 'Generator controller selection. Default fanuc. Explicit selection is required for Okuma, Mazak and Siemens setup syntax.' },
                 tool_center_path: { type: 'boolean', const: true, description: 'Explicit declaration: tool-centre path with zero D compensation. D1 is a register number.' },
                 tool_length_applied: { type: 'boolean', const: true, description: 'Explicit declaration: fitted tool tip is already accounted for in work Z. G43/H is removed, its motion retained.' },
                 spindle_mode: { type: 'string', enum: ['power_percent', 'cnc_200w_rpm'] },
@@ -37,6 +39,7 @@ export function registerThreadMillingTools(registry: ToolRegistry): void {
             const args = input as ConvertArgs;
             try {
                 return convertThreadMillingGcode(args.gcode, {
+                    sourceController: args.source_controller,
                     toolCenterPath: args.tool_center_path,
                     toolLengthApplied: args.tool_length_applied,
                     spindleMode: args.spindle_mode,

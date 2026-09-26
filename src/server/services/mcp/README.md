@@ -1420,7 +1420,7 @@ toolhead camera. Everything a fresh install needs:
 
 ## Thread-milling import
 
-`convert_thread_milling_gcode` converts Fanuc-style thread-milling exports to
+`convert_thread_milling_gcode` converts Machining Doctor thread-milling exports (eight controller variants) to
 reviewable Snapmaker G0/G1 programs offline. See [thread-milling support](docs/thread-milling.md)
 for firmware findings, generator option coverage, required declarations, spindle
 modes, examples and limitations. Running a converted file uses the existing job

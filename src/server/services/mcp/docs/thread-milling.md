@@ -1,6 +1,6 @@
 # Thread-milling program import
 
-`convert_thread_milling_gcode` converts Fanuc-style thread-milling output to an
+`convert_thread_milling_gcode` converts Machining Doctor thread-milling output to an
 explicit absolute G0/G1 program for Snapmaker. It runs offline: no connection,
 origin modification, staging or motion. The source file is not modified.
 
@@ -16,12 +16,22 @@ it to zero. The final rapid returns to the source's work Z20.
 ```json
 {
   "gcode": "<complete generator output>",
+  "source_controller": "fanuc",
   "tool_center_path": true,
   "tool_length_applied": true,
   "spindle_mode": "cnc_200w_rpm",
   "chord_tolerance_mm": 0.002
 }
 ```
+
+`source_controller` accepts `fanuc` (default), `okuma`, `mazak`, `haas`,
+`siemens_c`, `siemens_d`, `mitsubishi` and `mori_seiki`. These are the generator's
+observed export variants, not general emulators of each controller. Okuma maps
+only its standalone G15 H1 workspace selection to the target G54 origin and
+removes G56/H length lookup under the tool-tip declaration. Mazak's initial T0
+preselection is removed; Siemens H on G0 is removed while retaining the move.
+All these transformations are reported, and a mismatched source-controller
+selection refuses unfamiliar setup syntax.
 
 For the standard CNC head, choose `spindle_mode: "power_percent"` and supply
 `spindle_power_percent` (integer 1–100). This deliberately replaces source RPM;
@@ -55,8 +65,8 @@ preserves them rather than generating new cutting parameters.
 
 | Generator choice | Import behavior / verification |
 | --- | --- |
-| Internal / external | Preserve source centre, approach, cutting radius and retract; both covered by synthetic tests. |
-| RH / LH, climb / conventional | Preserve G2/G3 direction and signed Z travel; all eight combinations tested. |
+| Internal / external | Preserve source centre, approach, cutting radius and retract; both covered by live and synthetic tests. |
+| RH / LH, climb / conventional | Preserve G2/G3 direction and signed Z travel; all eight combinations tested using live and synthetic outputs. |
 | Single tooth | Preserve repeated continuous helical turns. |
 | Multi tooth, longer than thread | Preserve one full turn. |
 | Multi tooth, shorter than thread | Preserve repeated approach/turn/retract and axial repositioning; exact supplied fixture plus synthetic tests. |
@@ -69,19 +79,38 @@ preserves them rather than generating new cutting parameters.
 | Nonzero controller compensation | Not implemented; known nonzero generator headers rejected even with a zero-compensation declaration. Regenerate a tool-centre path. |
 | Coolant | M7/M8/M9 removed and reported; coolant is not controlled by the emitted file. |
 | Tool change and length register | One initial M6 Tn removed; tool must already be fitted. Mid-program tool changes rejected. G43/H handled as above. |
-| Controller selection | Fanuc-style numeric G-code subset. Unsupported dialects/commands return line-numbered errors. |
+| Controller selection | All eight live dropdown variants captured and tested; explicit dialect selection handles the differing setup blocks. |
 
-The live interactive form returned a Cloudflare HTTP 403 verification challenge in both HTTP retrieval and headless Playwright. The table is
-coverage of the public documentation and the supplied Fanuc export, not a claim
-that every live controller dropdown or export dialect has been exercised. The
-24-case option matrix is synthetic and clearly labelled in tests. Additional
-controller-specific exports are needed before claiming those dialects.
+The page HTML and public calculation entry point were obtained through a visible
+Playwright session after HTTP/headless requests encountered Cloudflare. The form
+calls a server-side generator; its backend implementation is not public page code.
+Live fixtures cover all eight controller selections, the 24 machining combinations
+with two radial passes, and ten further cases: precision 1–5, one/ten flutes, five
+radial passes, nonzero XYZ datum and independent input/output units. They supplement
+the synthetic matrix and geometry invariants rather than replacing them.
+
+Additional form choices are accounted for as follows:
+
+| Form control | Behavior |
+| --- | --- |
+| Unified UNC/UNF/UNEF or metric; standard or special size | Source dimensions and pitch carry the choice. The importer does not implement a separate thread lookup or infer a nominal diameter. |
+| Input units vs program units | Only G20/G21 in the exported program determines scaling; captured mixed-unit cases verify this. |
+| Precision 1–5 | All five captured outputs tested. Preserve rounded coordinates; refuse inconsistent arcs and suggest increasing precision. No promise of thread accuracy from coarse input. |
+| Solid/indexable, material, cutting speed, feed per tooth, approach factor, maximum RPM | These produce source S/F values. Preserve feeds and apply the explicit spindle policy; no duplicated material database or feed recommendation. |
+| Flutes 1–10; radial passes 1–5 and individual depth percentages | One/three/ten flutes and one/two/five passes exercised. Preserve the resulting speeds, feeds and radial paths. |
+| Program/tool/D/H numbers | Program metadata removed, one pre-fitted tool required, D/H declarations enforced; nondefault identifiers tested. |
+| XYZ datum, axial/radial safety distance and rapid feed | Preserve source coordinates, sequence and feed; nonzero datum and changed clearances tested. No invented clearance. |
+| Centre/peripheral toggle | In the inspected page, the toggle did not enter the server request or change the D=0 export. Do not assume it applies compensation; nonzero compensation remains unsupported. |
+
+The live dropdown duplicates the Siemens C-Type label; its `sd` value produces a
+D-Type program. Mori Seiki's output has a blank controller-name comment. Fixtures
+record these observations; `source_controller` avoids guessing from the comment.
 
 Unsupported input includes non-XY planes, G93/G95 feed modes, R-format arcs,
 absolute arc centres, macros/subroutines, canned cycles, rotary axes, workspace
 changes and origin writes. They fail explicitly rather than being discarded.
 Unit-system changes after feed or motion are refused.
-Only G54, explicitly declared units/distance mode/G17/G94, incremental I/J and
+Only G54 (or the mapped Okuma G15 H1), explicitly declared units/distance mode/G17/G94, incremental I/J and
 one pre-fitted tool are accepted. M2/M30 must terminate the program.
 
 ## Firmware evidence
@@ -111,7 +140,7 @@ installed firmware version.
 Every emitted command occupies its own block. Arcs become G1 segments with a
 0.002 mm default chord tolerance, at most 10 degrees and approximately 0.25 mm per
 segment. Source endpoint radius mismatch up to the smaller of 0.002 mm or 1% of radius is separately reported
-and linearly blended to retain exact endpoints; larger mismatch is refused.
+and linearly blended to retain exact endpoints; larger mismatch is refused with a precision diagnostic.
 Output coordinates use six decimal places. Segmentation tolerance describes
 geometry, not machine accuracy. Input is capped at 2 MB and output at 200000 moves.
 
@@ -119,6 +148,6 @@ geometry, not machine accuracy. Input is capped at 2 MB and output at 200000 mov
 
 The MCP suite includes the supplied export, full-circle winding/radius/pitch and
 chord checks, partial helices, inch conversion, modal/compact blocks, feed/RPM
-handling, the 24-case machining option matrix, parser refusal cases, and an offline
+handling, the 24-case machining option matrix, parser refusal cases, live controller/option fixtures, and an offline
 MCP registration test. No cutting run or machine acceptance test is performed by
 these tests.

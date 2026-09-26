@@ -1,7 +1,7 @@
 import assert from 'assert';
 import fs from 'fs';
 import path from 'path';
-import { convertThreadMillingGcode, ThreadMillingOptions } from '../threadMilling';
+import { convertThreadMillingGcode, THREAD_MILLING_CONTROLLERS, ThreadMillingOptions } from '../threadMilling';
 import { McpToolError, ToolRegistry } from '../registry';
 import { registerThreadMillingTools } from '../tools/threadMilling';
 import { validateGcode } from '../validator';
@@ -82,6 +82,11 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         near(pts[pts.length - 1].z, -125.73);
         assert.deepEqual(result.validation.feedRates, { min: 2540, max: 2540 });
         assert.ok(result.gcode.includes('M3 S12000'));
+    }],
+    ['rapid-block feed words survive conversion and remain modal for cutting', () => {
+        const result = convert(simple('G3 I-1 J0').replace('G0 X1 Y0 Z-5\nF100', 'G0 X1 Y0 Z-5 F123'));
+        assert.ok(result.gcode.includes('G0 X1 Y0 Z-5 F123'));
+        assert.deepEqual(result.validation.feedRates, { min: 123, max: 123 });
     }],
     ['partial absolute arc keeps quarter-turn sweep and helical endpoint', () => {
         const result = convert(simple('G3 X0 Y1 Z-4.8 I-1 J0'));
@@ -167,4 +172,48 @@ for (const internal of [true, false]) {
             }
         }
     }
+}
+
+for (const controller of THREAD_MILLING_CONTROLLERS) {
+    tests.push([`live ${controller} export preserves the same six arcs and four full turns`, () => {
+        const source = fs.readFileSync(path.join(__dirname, 'fixtures/thread-milling-controllers', `${controller}.nc`), 'utf8');
+        const result = convert(source, { sourceController: controller });
+        const reference = convert(fs.readFileSync(path.join(__dirname, 'fixtures/thread-milling-controllers/fanuc.nc'), 'utf8'));
+        assert.equal(result.arcCount, 6);
+        assert.equal(result.fullCircleCount, 4);
+        assert.deepEqual(points(result.gcode), points(reference.gcode));
+        assert.deepEqual(result.validation, reference.validation);
+        if (['okuma', 'mazak', 'siemens_c', 'siemens_d'].includes(controller)) {
+            assert.throws(() => convert(source), /Line \d+:/);
+        }
+    }]);
+}
+
+tests.push(['controller handling is explicit and refuses unrecognised workspace/preselection variants', () => {
+    const okuma = fs.readFileSync(path.join(__dirname, 'fixtures/thread-milling-controllers/okuma.nc'), 'utf8');
+    assert.throws(() => convert(okuma.replace('G15 H1', 'G15 H2'), { sourceController: 'okuma' }), /G15 H1/);
+    assert.throws(() => convert(sample, { sourceController: 'okuma' }), /Fanuc offset codes/);
+    const mazak = fs.readFileSync(path.join(__dirname, 'fixtures/thread-milling-controllers/mazak.nc'), 'utf8');
+    assert.throws(() => convert(mazak.replace('T1 T0', 'T1 T2'), { sourceController: 'mazak' }), /Duplicate T/);
+}]);
+
+interface LiveOptionCase {
+    name: string;
+    gcode: string[];
+    expectedArcs: number;
+    expectedFullCircles: number;
+    expectedMinZ: number;
+    expectedFinalZ: number;
+}
+const liveOptions: LiveOptionCase[] = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/thread-milling-live-options.json'), 'utf8'));
+for (const fixture of liveOptions) {
+    tests.push([`live generator options: ${fixture.name}`, () => {
+        const result = convert(fixture.gcode.join('\n'), { spindleMode: 'power_percent', spindlePowerPercent: 80 });
+        assert.equal(result.arcCount, fixture.expectedArcs);
+        assert.equal(result.fullCircleCount, fixture.expectedFullCircles);
+        assert.equal(result.validation.usesRelativeMotion, false);
+        near((result.validation.extents.z as { min: number }).min, fixture.expectedMinZ);
+        near(points(result.gcode).slice(-1)[0].z, fixture.expectedFinalZ);
+        assert.ok(result.gcode.includes('M3 P80'));
+    }]);
 }

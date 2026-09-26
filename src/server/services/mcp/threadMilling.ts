@@ -1,11 +1,15 @@
 /**
- * Offline import of the Machining Doctor Fanuc thread-milling subset.
+ * Offline import of the observed Machining Doctor thread-milling controller variants.
  * No machine state, transport or origin writes. Emit explicit absolute G0/G1
  * blocks so preview and validation see the same polygon the controller runs.
  */
 import { GcodeValidationReport, validateGcode } from './validator';
 
+export const THREAD_MILLING_CONTROLLERS = ['fanuc', 'okuma', 'mazak', 'haas', 'siemens_c', 'siemens_d', 'mitsubishi', 'mori_seiki'] as const;
+export type ThreadMillingController = typeof THREAD_MILLING_CONTROLLERS[number];
+
 export interface ThreadMillingOptions {
+    sourceController?: ThreadMillingController;
     /** Caller has verified that D compensation is zero; D1 is a register, not 1 mm. */
     toolCenterPath: boolean;
     /** Work Z is already referenced to the fitted tool tip; do not apply H again. */
@@ -82,6 +86,8 @@ export function convertThreadMillingGcode(source: string, options: ThreadMilling
     if (options.toolLengthApplied !== true) {
         throw new Error('Confirm tool_length_applied: true only when work Z already references the fitted tool tip.');
     }
+    const controller = options.sourceController === undefined ? 'fanuc' : options.sourceController;
+    if (!THREAD_MILLING_CONTROLLERS.includes(controller)) throw new Error('Unsupported source_controller.');
     const power = options.spindlePowerPercent;
     if (!['power_percent', 'cnc_200w_rpm'].includes(options.spindleMode)) throw new Error('Choose spindle_mode: power_percent or cnc_200w_rpm.');
     if (options.spindleMode === 'cnc_200w_rpm' && power !== undefined) throw new Error('Do not supply power in RPM mode.');
@@ -93,7 +99,7 @@ export function convertThreadMillingGcode(source: string, options: ThreadMilling
         throw new Error('chord_tolerance_mm must be between 0.00001 and 0.01 mm.');
     }
     const output = [
-        '; Thread-milling import: review before staging',
+        `; Thread-milling import from ${controller}: review before staging`,
         '; Tool-centre path, zero D compensation; work Z already references the fitted tool tip',
         `; Spindle mode: ${options.spindleMode}; source feeds preserved in mm/min`,
         'G21', 'G90', 'G54',
@@ -130,12 +136,27 @@ export function convertThreadMillingGcode(source: string, options: ThreadMilling
             fail(line, 'Accumulated position is out of range.');
         }
         const axes = AXES.filter((axis) => point[axis] !== undefined).map((axis) => `${axis}${number(point[axis] as number)}`);
-        output.push(`G${mode} ${axes.join(' ')}${mode === 1 ? ` F${number(feed as number)}` : ''}`);
+        output.push(`G${mode} ${axes.join(' ')}${feed !== undefined ? ` F${number(feed)}` : ''}`);
     };
 
     source.split(/\r?\n/).forEach((text, index) => {
         const line = index + 1;
-        const tokens = wordsOnLine(text, line);
+        const programHeader = text.trim().toUpperCase();
+        if ((controller === 'okuma' && /^%O[0-9]+\.MIN%$/.test(programHeader))
+            || (controller === 'siemens_c' && /^%MPF\s+[0-9]+$/.test(programHeader))) {
+            if (moved || ended) fail(line, 'Program header after motion or program end.');
+            changes.add('Removed controller-specific program wrapper.');
+            return;
+        }
+        let tokens = wordsOnLine(text, line);
+        // The live Mazak export preselects T0 after the actual initial tool.
+        // This is not a second fitted tool; only accept the exact observed idiom.
+        const toolWords = tokens.filter(([letter]) => letter === 'T');
+        if (controller === 'mazak' && !moved && toolChanges === 0 && toolWords.length === 2
+            && toolWords[0][1] > 0 && toolWords[1][1] === 0 && tokens.some(([letter, value]) => letter === 'M' && value === 6)) {
+            tokens = tokens.filter(([letter, value]) => letter !== 'T' || value !== 0);
+            changes.add('Removed Mazak initial T0 preselection; the first T tool must already be fitted.');
+        }
         if (!tokens.length) return;
         if (ended) fail(line, 'Executable words after program end.');
         const g: number[] = [];
@@ -156,6 +177,24 @@ export function convertThreadMillingGcode(source: string, options: ThreadMilling
             changes.add('Removed program delimiters, block numbers and program number.');
             return;
         }
+        if (controller === 'okuma') {
+            if (g.includes(43) || g.includes(54)) fail(line, 'Use the generator Okuma G15 H1 / G56 Hn setup, not Fanuc offset codes.');
+            if (g.includes(15)) {
+                if (g.length !== 1 || m.length || words.H !== 1 || Object.keys(words).some((key) => !['H', 'N'].includes(key))) {
+                    fail(line, 'Only a standalone Okuma G15 H1 workspace selection is supported.');
+                }
+                g[0] = 54;
+                delete words.H;
+                changes.add('Mapped Okuma G15 H1 to the declared target G54 work origin.');
+            }
+            if (g.includes(56)) {
+                g[g.indexOf(56)] = 43;
+                changes.add('Removed Okuma G56/H tool-length lookup under the tool-tip work-origin declaration.');
+            }
+        }
+        const siemensLength = ['siemens_c', 'siemens_d'].includes(controller) && g.includes(0)
+            && words.H !== undefined && AXES.some((axis) => words[axis] !== undefined);
+        if (siemensLength) changes.add('Removed Siemens H lookup on G0; retained its motion under the tool-tip work-origin declaration.');
         const groups = [[0, 1, 2, 3], [90, 91], [40, 41, 42], [20, 21]];
         groups.forEach((group) => {
             if (g.filter((code) => group.includes(code)).length > 1) fail(line, 'Conflicting modal codes.');
@@ -182,7 +221,7 @@ export function convertThreadMillingGcode(source: string, options: ThreadMilling
         if (g.includes(43) && (words.H === undefined || !AXES.some((axis) => words[axis] !== undefined))) {
             fail(line, 'G43 requires an H register and a modal motion target.');
         }
-        if (words.H !== undefined && (!g.includes(43) || !Number.isInteger(words.H) || words.H < 0)) fail(line, 'Invalid H register.');
+        if (words.H !== undefined && ((!g.includes(43) && !siemensLength) || !Number.isInteger(words.H) || words.H < 0)) fail(line, 'Invalid H register.');
         if (words.F !== undefined) {
             if (words.F <= 0) fail(line, 'Feed must be positive.');
             if (unitScale === null) fail(line, 'Declare G20/G21 before the feed.');
@@ -265,7 +304,7 @@ export function convertThreadMillingGcode(source: string, options: ThreadMilling
             // Generator coordinates are rounded to 0.001 mm. Do not repair an
             // inconsistent radius by silently drawing a different circle.
             if (endRadius === 0 || Math.abs(endRadius - radius) > Math.min(0.002, radius * 0.01)) {
-                fail(line, 'Arc endpoint radius differs from its start by more than 0.002 mm or 1 percent.');
+                fail(line, 'Arc endpoint radius differs from its start by more than 0.002 mm or 1 percent; increase generator precision.');
             }
             const full = Math.hypot(tx - x, ty - y) < 1e-9;
             const startAngle = Math.atan2(y - cy, x - cx);
