@@ -24,6 +24,13 @@ concurrency:
     cancel-in-progress: true
 
 jobs:
+    # Lint, type checks and tests run beside the builds, not before them:
+    # the packages still build when a check fails.
+    checks:
+        name: Checks
+        uses: ./.github/workflows/checks.yml
+        secrets: inherit
+
     build-windows:
         name: Build Windows Packages
         if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'windows' || inputs.platforms == 'all'
