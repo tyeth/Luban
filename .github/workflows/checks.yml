@@ -84,6 +84,28 @@ jobs:
             # records them and this fails when a file gains or loses any.
             -   run: npm run typecheck:app
 
+    typecheck-mcp:
+        name: Type check (MCP, strict)
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v4
+                with:
+                    ref: ${{ inputs.ref }}
+                    token: ${{ secrets.SACP_TOKEN || github.token }}
+                    submodules: 'true'
+
+            -   uses: actions/setup-node@v7
+                with:
+                    node-version: 22
+                    cache: npm
+
+            -   run: npm install --ignore-scripts
+
+            # The MCP code's own strict tsconfig. It also compiles the legacy
+            # server modules the MCP imports; only errors in
+            # src/server/services/mcp/ count, and there must be none.
+            -   run: npm run typecheck:mcp
+
     test:
         name: Tests
         runs-on: ubuntu-latest

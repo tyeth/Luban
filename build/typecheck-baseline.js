@@ -9,17 +9,26 @@
  * message, so unrelated edits that move or reword an existing error do not
  * trip the check.
  *
+ * --only <path prefix> counts just the errors in files under that prefix. The
+ * MCP code's strict tsconfig pulls in the legacy server modules it imports,
+ * whose strict-mode errors are not the MCP's to fix; with an empty baseline
+ * the MCP files themselves must stay clean.
+ *
  * Usage:
- *   node build/typecheck-baseline.js <tsconfig> <baseline.json>           check
- *   node build/typecheck-baseline.js <tsconfig> <baseline.json> --update  rewrite the baseline
+ *   node build/typecheck-baseline.js <tsconfig> <baseline.json> [--only <prefix>]           check
+ *   node build/typecheck-baseline.js <tsconfig> <baseline.json> [--only <prefix>] --update  rewrite the baseline
  */
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const [tsconfig, baselineFile, flag] = process.argv.slice(2);
-if (!tsconfig || !baselineFile) {
-    console.error('usage: node build/typecheck-baseline.js <tsconfig> <baseline.json> [--update]');
+const argv = process.argv.slice(2);
+const update = argv.includes('--update');
+const onlyAt = argv.indexOf('--only');
+const only = onlyAt >= 0 ? argv[onlyAt + 1] : null;
+const [tsconfig, baselineFile] = argv.filter((arg, i) => !arg.startsWith('--') && (onlyAt < 0 || i !== onlyAt + 1));
+if (!tsconfig || !baselineFile || (onlyAt >= 0 && !only)) {
+    console.error('usage: node build/typecheck-baseline.js <tsconfig> <baseline.json> [--only <prefix>] [--update]');
     process.exit(2);
 }
 
@@ -36,18 +45,23 @@ function currentErrors() {
     }
     const counts = {};
     let total = 0;
+    let reported = 0;
     for (const line of result.stdout.split(/\r?\n/)) {
         const match = ERROR_LINE.exec(line);
         if (!match) {
             continue;
         }
+        reported++;
         const file = match[1].split(path.sep).join('/');
+        if (only && !file.startsWith(only)) {
+            continue;
+        }
         const code = match[2];
         counts[file] = counts[file] || {};
         counts[file][code] = (counts[file][code] || 0) + 1;
         total++;
     }
-    if (total === 0 && result.status !== 0) {
+    if (reported === 0 && result.status !== 0) {
         // tsc failed without reporting type errors (bad config, crash).
         process.stdout.write(result.stdout);
         process.stderr.write(result.stderr);
@@ -68,9 +82,11 @@ function sorted(counts) {
 }
 
 const { counts, total } = currentErrors();
+const onlyArgs = only ? ` --only ${only}` : '';
 
-if (flag === '--update') {
-    fs.writeFileSync(baselineFile, `${JSON.stringify({ tsconfig, total, errors: sorted(counts) }, null, 2)}\n`);
+if (update) {
+    const written = only ? { tsconfig, only, total, errors: sorted(counts) } : { tsconfig, total, errors: sorted(counts) };
+    fs.writeFileSync(baselineFile, `${JSON.stringify(written, null, 2)}\n`);
     console.log(`Baseline written: ${total} errors in ${Object.keys(counts).length} files -> ${baselineFile}`);
     process.exit(0);
 }
@@ -90,7 +106,7 @@ for (const file of new Set([...Object.keys(baseline), ...Object.keys(counts)])) 
     }
 }
 
-console.log(`${tsconfig}: ${total} errors (baseline ${baselineFile}).`);
+console.log(`${tsconfig}: ${total} errors${only ? ` under ${only}` : ''} (baseline ${baselineFile}).`);
 if (added.length) {
     console.error(`\nNew type errors (fix them; the baseline only shrinks):\n  ${added.sort().join('\n  ')}`);
     console.error(`\nRun \`npx tsc --noEmit -p ${tsconfig}\` and look at the files above.`);
@@ -98,6 +114,6 @@ if (added.length) {
 if (removed.length) {
     const log = added.length ? console.error : console.log;
     log(`\nErrors fixed since the baseline:\n  ${removed.sort().join('\n  ')}`);
-    log(`\nLower the baseline: node build/typecheck-baseline.js ${tsconfig} ${baselineFile} --update`);
+    log(`\nLower the baseline: node build/typecheck-baseline.js ${tsconfig} ${baselineFile}${onlyArgs} --update`);
 }
 process.exit(added.length || removed.length ? 1 : 0);

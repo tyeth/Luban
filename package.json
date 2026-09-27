@@ -65,9 +65,10 @@
     "build:main": "cross-env NODE_ENV=production babel \"./src/*.js\" --config-file ./babel.config.js -d ./output/",
     "build:app": "webpack --config webpack.config.app.production.js",
     "test:workspace-jog": "node test/workspaceJog.js",
-    "typecheck": "npm run typecheck:server && npm run typecheck:app",
+    "typecheck": "npm run typecheck:server && npm run typecheck:app && npm run typecheck:mcp",
     "typecheck:server": "tsc --noEmit -p tsconfig-server.json",
-    "typecheck:app": "node build/typecheck-baseline.js tsconfig.json build/tsc-baseline/app.json"
+    "typecheck:app": "node build/typecheck-baseline.js tsconfig.json build/tsc-baseline/app.json",
+    "typecheck:mcp": "node build/typecheck-baseline.js src/server/services/mcp/tests/tsconfig.json build/tsc-baseline/mcp.json --only src/server/services/mcp/"
   },
   "keywords": [
     "Snapmaker",
