@@ -24,15 +24,15 @@ function job(id = 'abcdef', state: McpJob['state'] = 'awaiting_confirmation'): M
         confirmToken: 'secret',
         filePath: '/secret/job.nc',
         runner: async () => ({}),
-    } as McpJob;
+    } as unknown as McpJob;
 }
 
 async function request(manager: object, route: string, method = 'GET', headers = {}, stop: (id: string) => Promise<object> = async () => ({ ok: true })) {
-    return new Promise<{ status: number; body: string; headers: object }>((resolve) => {
+    return new Promise<{ status: number; body: string; headers: Record<string, string> }>((resolve) => {
         let status: number;
-        let responseHeaders: object;
+        let responseHeaders: Record<string, string>;
         const res = {
-            writeHead(code: number, values: object) { status = code; responseHeaders = values; },
+            writeHead(code: number, values: Record<string, string>) { status = code; responseHeaders = values; },
             end(body: string) { resolve({ status, body, headers: responseHeaders }); },
         } as http.ServerResponse;
         handleJobDashboardRequest({ method, headers } as http.IncomingMessage, res, new URL(route, 'http://localhost'), manager as JobManager, stop);
@@ -164,7 +164,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
     ['workspace changes invalidate prior approvals even after reapproval, but permit freshly staged jobs', () => {
         const { JobManager: Manager } = managerFixture();
         const manager: JobManager = new Manager();
-        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as McpJob['validation'];
+        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as unknown as McpJob['validation'];
         const old = manager.submit('', 'old', 'cnc', validation);
         old.state = 'approved'; old.confirmToken = 'human-token'; old.approvedAt = Date.now();
         const change = manager.submit('', 'workspace', 'cnc', validation, 'procedure');
@@ -259,7 +259,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
     ['shared stop path attributes operator stops, withdraws staged jobs, and requests procedure stops without waiting', async () => {
         const { JobManager: Manager } = managerFixture();
         const manager: JobManager = new Manager();
-        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as McpJob['validation'];
+        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as unknown as McpJob['validation'];
         let firmwareStops = 0;
         let reason = '';
         const dependencies: Record<string, unknown> = {};
@@ -336,7 +336,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
     ['retention protects every pending job and stale reject cannot change a running or ended job', () => {
         const { JobManager: Manager } = managerFixture();
         const manager: JobManager = new Manager();
-        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as McpJob['validation'];
+        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as unknown as McpJob['validation'];
         const first = manager.submit('', 'first', 'cnc', validation);
         for (let i = 0; i < 55; i++) { manager.submit('', `job-${i}`, 'cnc', validation); }
         assert(manager.get(first.id));

@@ -66,7 +66,7 @@ function simulate(inside: (p: Xy) => boolean): Sim {
             return null;
         }
         for (let k = 0; k < 20; k++) {
-            const mid = (lo + hi) / 2;
+            const mid: number = (lo + hi) / 2;
             if (inside({ x: from.x + unit.x * mid, y: from.y + unit.y * mid })) {
                 lo = mid;
             } else {

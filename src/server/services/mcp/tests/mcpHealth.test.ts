@@ -105,7 +105,9 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         let sequence = 0;
         const calls: string[] = [];
         const visible = new Set<string>();
-        let content: React.ReactElement;
+        // Assigned inside callbacks (here and act() below) that
+        // control-flow analysis does not follow.
+        let content!: React.ReactElement;
         const toast = Object.assign((element: React.ReactElement, options: { toastId: string }) => {
             content = element; calls.push('add'); visible.add(options.toastId);
         }, {
@@ -124,7 +126,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             setTimeout: (fn: () => Promise<void>) => { sequence++; timers.set(sequence, fn); return sequence; },
             clearTimeout: (id: number) => timers.delete(id),
         });
-        let root: renderer.ReactTestRenderer;
+        let root!: renderer.ReactTestRenderer;
         await act(async () => { root = renderer.create(React.createElement(module.McpHealthNotifications)); });
         const tick = async () => {
             const [id, fn] = [...timers.entries()][0]; timers.delete(id);
