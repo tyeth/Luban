@@ -555,6 +555,11 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 throw new McpToolError(`Machine is ${status || 'in an unknown state'}, not idle.`);
             }
 
+            const active = jobManager.getActive();
+            if (active?.state === 'started') {
+                throw new McpToolError('Another job or step is still active; wait for it to finish before starting this job.');
+            }
+
             // Consumed from here on, success or not - a failed start needs a
             // fresh human approval, not a retry loop.
             const verdict = jobManager.consumeToken(job, token);

@@ -219,13 +219,19 @@ export type { SteppedBlock, SteppedTraverseResult } from './marchCore';
 
 /** The real machine behind the pure traverse / descent cores (marchCore.ts). */
 function machineIo(sensorDelayMs: number = GPIO_SENSOR_DELAY_MS.default): SteppedIo & DescentIo {
+    let contactsBeforeMove = probeFeedService.contactCount('probe');
+    const move = async (tool: string, words: { x?: number; y?: number; z?: number }, feed: number) => {
+        contactsBeforeMove = probeFeedService.contactCount('probe');
+        await moveMachineSettled(tool, words, feed);
+    };
     return {
-        move: async (tool, words, feed) => moveMachineSettled(tool, words, feed),
-        moveZ: async (tool, z, feed) => moveMachineSettled(tool, { z }, feed),
+        move,
+        moveZ: async (tool, z, feed) => move(tool, { z }, feed),
         descendFast: async (tool, fromZ, toZ) => {
             await descendInSegments(tool, fromZ, toZ, 'probe', sensorDelayMs);
         },
-        sense: async (t0, delayMs) => (await senseAfter('probe', t0, delayMs)).contact,
+        sense: async (t0, delayMs) => (await senseAfter('probe', t0, delayMs)).contact
+            || probeFeedService.contactCount('probe') > contactsBeforeMove,
         senseRelease: async (t0, timeoutMs) => (await senseReleaseAfter('probe', t0, timeoutMs)).contact,
         setExpectedContact: () => probeFeedService.setExpectedContact(['probe']),
         clearExpectedContact: () => probeFeedService.clearExpectedContact(),
@@ -250,6 +256,8 @@ export interface SteppedTraverseParams {
     onContact?: 'retry' | 'block';
     /** Never retreat behind the traverse start (a reverse-vector retreat). */
     capRetreatAtStart?: boolean;
+    extraBackoffMm?: number;
+    backtrackMm?: number;
     sensorDelayMs: number;
     /** Give up after this many lifts on one traverse (default 60). */
     maxLifts?: number;
@@ -284,17 +292,27 @@ export async function steppedTraverseZ(
     from: { x: number; y: number },
     to: { x: number; y: number },
     z: number,
-    params: { liftMm: number; maxZ: number; sensorDelayMs: number; onMax?: 'plain-move' | 'block' },
+    params: { liftMm: number; maxZ: number; sensorDelayMs: number; onMax?: 'plain-move' | 'block'; extraBackoffMm?: number; backtrackMm?: number },
     announce: Announce
-): Promise<{ z: number; position: Xyz; lifts: SteppedTraverseResult['lifts']; steps: number; toppedOut: boolean; blocked: SteppedBlock | null }> {
+): Promise<{ z: number; position: Xyz; lifts: SteppedTraverseResult['lifts']; steps: number; toppedOut: boolean; blocked: SteppedBlock | null; clearTailMm?: number }> {
     const result = await steppedTraverse(tag, name, { x: from.x, y: from.y, z }, { x: to.x, y: to.y, z }, {
         retreatUnit: { x: 0, y: 0, z: 1 },
         liftMm: params.liftMm,
         maxLiftTotalMm: Math.max(0, r3(params.maxZ - z)),
         onMax: params.onMax || 'plain-move',
+        extraBackoffMm: params.extraBackoffMm,
+        backtrackMm: params.backtrackMm,
         sensorDelayMs: params.sensorDelayMs,
     }, announce);
-    return { z: result.position.z, position: result.position, lifts: result.lifts, steps: result.steps, toppedOut: result.toppedOut, blocked: result.blocked };
+    return {
+        z: result.position.z,
+        position: result.position,
+        lifts: result.lifts,
+        steps: result.steps,
+        toppedOut: result.toppedOut,
+        blocked: result.blocked,
+        clearTailMm: result.clearTailMm,
+    };
 }
 
 /**

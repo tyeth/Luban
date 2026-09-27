@@ -283,7 +283,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             + 'difference between the last two tool setter measurements (new - previous; overridable '
             + 'via explicit old/new trigger Zs), so work Z keeps meaning the same physical plane with '
             + 'the new tool. Stages a single G92 for operator confirmation - nothing moves; the work '
-            + 'coordinate frame shifts. This is the ONE sanctioned work-origin write: it does what the '
+            + 'coordinate frame shifts. This is the sanctioned tool-length transfer: it does what the '
             + 'touchscreen manual tool-change wizard does after its two operator confirmations. The two '
             + 'stored measurements must be an ordered old/new pair taken since the machine last '
             + '(re)connected (work origins die on a reboot) unless old/new trigger Zs are passed '
@@ -354,7 +354,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 '; frame: WORK - this G92 rewrites the work origin Z of the selected workspace; the toolhead does NOT move',
                 `; toolhead stays at machine Z ${position.machine.z}; current work Z reads ${position.work.z}; after this G92 it reads ${newWorkZ}`,
                 `; work-origin Z offset ${position.originOffset.z} -> ${offsetAfter}; work Z0 = machine Z ${(-position.originOffset.z).toFixed(3)} -> ${(-offsetAfter).toFixed(3)}`,
-                '; the ONE sanctioned work-origin write: what the touchscreen tool-change wizard does after its two confirmations',
+                '; the sanctioned tool-length transfer: what the touchscreen tool-change wizard does after its two confirmations',
                 `G92 Z${newWorkZ.toFixed(3)}`,
             ].join('\n');
             const validation = validateStagedEnvelope(gcode, 'apply_tool_length_offset');

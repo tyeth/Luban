@@ -6,6 +6,7 @@ import path from 'path';
 
 import DataStorage from '../../../DataStorage';
 import { captureFrame } from '../camera';
+import { probeCaptureSchema, surfaceCaptureSchema } from '../probeCapture';
 import { jobEventLimit, jobManager } from '../jobs';
 import { describeProbeCirclePlanAsGcode, planProbeCircle, runProbeCircleProcedure } from '../probeCircle';
 import { describeProbePlanAsGcode, planProbePoint, runProbePointProcedure } from '../probeTool';
@@ -189,7 +190,11 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
             + 'concrete numbers; the runner re-verifies the machine matches the simulation before '
             + 'every march. Contact is expected ONLY during marches - a touch during any hop, raise '
             + 'or descent latches the CRASH alarm. Every number must be measured or operator-stated. '
-            + 'Ends raised at the traverse height. Results keyed by march name, machine coords only.',
+            + 'Optional capture on a probe step photographs the final contact before retracting. '
+            + 'EVERY probe, including a continuing miss, returns to its own start and then raises before the next step. '
+            + 'For related local stations prefer surface_path/grid, wall_follow, trace, corner or stock_outline when their '
+            + 'geometry fits; one approval does not make this sequence a continuous low path. '
+            + 'Results keyed by march name, machine coords only.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -206,6 +211,7 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
                             y: { type: 'number', description: 'hop: target machine Y.' },
                             z: { type: 'number', description: 'descend: absolute machine Z.' },
                             name: { type: 'string', description: 'probe: unique result key.' },
+                            capture: probeCaptureSchema,
                             dx: { type: 'number', description: 'probe: direction X component.' },
                             dy: { type: 'number', description: 'probe: direction Y component.' },
                             dz: { type: 'number', description: 'probe: direction Z component (<= 0).' },
@@ -350,12 +356,13 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
     // is repeated in both tool descriptions on purpose: the MCP client caches
     // schemas, and the operator-authorised law-2 exception must be visible
     // wherever the tool is read.
-    const SURFACE_ENVELOPE_TEXT = 'ENVELOPE (operator-authorised 2026-09-05, the ONLY exception to motion law 2 - '
-        + 'valid only inside this procedure, only between consecutive stations): after each station the probe '
-        + 'retracts to LAST CONTACT + z_safe_delta_mm (default 20, HARD CAP 20) and hops horizontally AT THAT '
-        + 'HEIGHT to the next station, which must be within max_hop_mm (default 60, HARD CAP 60) - a wider '
-        + 'spacing/pitch is REFUSED at staging, never split silently. Hops run in <= 10 mm sensor-checked segments '
-        + 'expecting NO contact: a touch during a hop is a collision and latches the CRASH alarm. Each -Z march '
+    const SURFACE_ENVELOPE_TEXT = 'SURFACE ENVELOPE (operator-authorised 2026-09-05; valid only inside this '
+        + 'procedure between consecutive stations; other probing procedures have their own bounded links): '
+        + 'guarded mode retracts to LAST CONTACT + z_safe_delta_mm (default 20, HARD CAP 20) and hops in <= 10 mm '
+        + 'sensor-checked segments expecting NO contact; a touch latches CRASH. Stepped mode uses LAST CONTACT + '
+        + 'hop_lift_mm (default 2) and touch-probing links with backoff/lift recovery; contact during a lift holds. '
+        + 'Both modes require the next station within max_hop_mm (default 60, HARD CAP 60) - wider spacing/pitch '
+        + 'is REFUSED at staging, never split silently. Each -Z march '
         + 'searches from the hop height down to max(last contact - max_drop_mm (default 40, cap 80), '
         + 'floor_z_machine (default start_z_machine - max_drop_mm)); reaching the floor without contact records '
         + 'the station as no_contact and continues with the reference height unchanged (the first station finding '
@@ -364,6 +371,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
         + 'toolhead machine Z with the tip just above the surface, never a guess). Ends raised at the traverse '
         + 'height. All numbers MACHINE coordinates; Z values are toolhead Z at contact (surface = Z - probe length).';
     const surfaceCommonProperties = {
+        capture: surfaceCaptureSchema,
         start_z_machine: {
             type: 'number',
             description: 'REQUIRED. Toolhead machine Z where the first -Z march starts (probe tip just above the '
@@ -376,7 +384,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
         },
         z_safe_delta_mm: {
             type: 'number',
-            description: 'Retract above the last contact for the hop to the next station. Default 20, HARD CAP 20 '
+            description: 'Guarded mode: retract above the last contact for the next hop. Stepped mode uses hop_lift_mm instead. Default 20, HARD CAP 20 '
                 + '(operator law), min 3. Above the cap = refused.',
         },
         max_hop_mm: {
@@ -416,7 +424,8 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
             enum: ['guarded', 'stepped'],
             description: 'Travel between stations: "guarded" (default) hops at last contact + z_safe_delta_mm expecting no contact '
                 + '(a contact aborts); "stepped" travels at last contact + hop_lift_mm as a touch-probing traverse (1 mm steps, '
-                + 'probe expected) that backs off, lifts hop_lift_mm and continues on contact - the height follows the surface '
+                + 'probe expected) that backs off with up to one ball radius of extra clearance on a verified incoming path, '
+                + 'then lifts in sensor-checked 0.5 mm segments. Contact during a lift holds the program. The height follows the surface '
                 + 'in steps, gentle over a slope or one lift at the wall of a hole, instead of a fixed clearance.',
         },
         hop_lift_mm: { type: 'number', description: 'stepped hop_mode: lift per contact and travel height above the last contact, default 2 (0.5-10).' },
@@ -1225,11 +1234,14 @@ ${describeProbeTracePlanAsGcode(plan)}`;
         description: 'Stage a COMPOSITE probing program for ONE human approval: an ordered list of operations - '
             + 'rotate_b (turn the rotary axis to an absolute B, toolhead at/above the traverse height), '
             + 'surface_path, surface_grid, sequence, stock_outline, wall_follow, corner and trace (the same arguments as the standalone tools), '
+            + 'sequence probe steps and surface scans can request capture before retraction (see their capture schema). '
             + 'capture (one camera frame, stamped with position and B, saved on the job record - view it afterwards with '
             + 'get_frame; give it x/y and it first hops there at the traverse height like a sequence hop, else no motion) '
             + 'and home (machine home, LAST op only; '
             + 'it also homes B) - run by one '
-            + 'runner that hands the machine from op to op, each ending raised at the traverse height. Numbers an op '
+            + 'runner that hands the machine from op to op. Each successful probing op ends raised at the traverse height; '
+            + 'references and groups do not retain a low pose between ops. Keep related stations in one suitable surface, '
+            + 'wall_follow, trace, corner or stock_outline op to use its local links; sequence raises after every probe. Numbers an op '
             + 'cannot know at staging are REFERENCES to earlier results: {"from": "<opId>.<path>", "plus"?, "minus"?, '
             + '"between": [low, high]} - e.g. expected_z_machine: {"from": "c90.top.z", "between": [195, 240]} where c90 '
             + 'is a sequence op with a probe named "top" (.x/.y/.z read contactMachine), or start_z_machine: {"from": '
@@ -1243,7 +1255,7 @@ ${describeProbeTracePlanAsGcode(plan)}`;
             + 'The bounds are REQUIRED (law 3): the confirm '
             + 'page shows them with a preview at the mid-point and the runner refuses the op (stopping the program '
             + 'raised, keeping earlier results) if the value resolves outside them. A failed op stops the program '
-            + 'unless on_fail: "skip". Result: per-op status and the standalone tool\'s result object (stations, fits, '
+            + 'unless on_fail: "skip"; a held probe contact always stops the program. Result: per-op status and the standalone tool\'s result object (stations, fits, '
             + 'timing), plus the B schedule. Use it to string the four faces, sides and end of a rotary stock into one '
             + 'approved operation instead of 18 approvals - or "capture at (x, y), rotate_b 180, capture, home" to look '
             + 'at both sides of a rotary part under one click.',

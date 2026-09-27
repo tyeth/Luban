@@ -62,13 +62,29 @@ better frames.
 - The repeatable *board-viewing* camera pose is the pre-home park (machine X0 Y0), not
   machine home — at home the work area is out of frame entirely.
 
-## The camera is session state — start here, every session
+## Live inspection during a program
+
+`list_cameras` returns `stream_url` (`/camera`, operator viewer), `mjpeg_url` (raw video) and
+`snapshot_url` (current still). The viewer can stay open while probing; MCP captures share its
+source rather than opening a competing camera process. `/camera/status.json` reports freshness.
+`capture_frame` is read-only and needs no calibration or move for qualitative inspection. Check
+the selected camera before interpreting a view. A live image is not synchronized evidence of a
+particular contact, nor proof of clearance. Use the `capture` option on a sequence probe step or
+selected surface-scan stations for a saved frame **before retraction**; see
+[probe-spot captures](../cnc-probing/SKILL.md#live-viewing-and-photographs-at-probe-spots).
+
+Start with the available view and task: calibration is necessary for metric positioning, not for
+simply observing the cut, checking probe placement or identifying a feature. Reuse a verified
+model and applicable position-stamped views within the same unchanged setup; avoid repeating a
+full setter search just to take an inspection photograph.
+
+## The camera is session state — verify before metric use
 
 **The camera is not a rig constant.** It can sit differently after every power cycle, be
 knocked, be re-aimed, or be a different camera entirely. Nothing you remember about where it
 points survives that, and no number in this file is one.
 
-So the first camera call of any session is **`verify_camera_model`**: position the toolhead
+**Before metric pixel-to-machine calculations or model-based positioning, use `verify_camera_model`**: position the toolhead
 over a target whose machine coordinates are known (the tool setter is the obvious one), capture,
 say where it appears in the frame, and read the residual. It passes, or it does not:
 

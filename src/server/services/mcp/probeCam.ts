@@ -40,6 +40,7 @@ import {
     steppedTraverseZ,
 } from './march';
 import { probeFeedService } from './probeFeed';
+import { probeAbortHeld } from './programAbort';
 import { ParsedProbeGcode, ProbeGcodeError, parseProbingGcode } from './probeGcode';
 import { DESCENT_GUARD_MM } from './probeSequence';
 import {
@@ -907,7 +908,9 @@ export async function runProbeCamProcedure(plan: ProbeCamPlan, jobId: string | n
         return result;
     } catch (err) {
         const isTrip = !!probeFeedService.getTrip();
-        if (!isTrip) {
+        if (probeAbortHeld((err as { partial?: object }).partial)) {
+            announce('abort-held', 'contact during lift - holding even if the sensor subsequently releases');
+        } else if (!isTrip) {
             try {
                 // Law 8: straight up to the traverse height. Held only while the
                 // probe still reads contact (lifting would drag the tip).

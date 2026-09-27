@@ -32,8 +32,9 @@ shifted exactly, without ever re-touching the stock.
   `set_tool_setter_config` — on this machine the park is Z at the homing
   height, X at the far end, Y free).
 - Every motion step below stages a job the OPERATOR approves on a confirm page.
-  Call `start_gcode_job` with `wait_for_approval_ms` (e.g. 110000) right after
-  staging: their click starts it with nothing to copy (`approved: false` on
+  Call `start_gcode_job` with `wait_for_approval_ms` (e.g. 110000) after
+  delivering the confirm URL and ending the staging turn: their click starts it
+  with nothing to copy (`approved: false` on
   timeout means call again). If hand-off is disabled in their settings, the
   one-time code they give you goes in as `confirm_token`.
 
@@ -65,7 +66,27 @@ If the new tool reads already-triggered before the second run (a longer tool
 pressed into the setter by the wizard), the run refuses to start - the
 operator raises it slightly from the touchscreen first.
 
+## Complete the datum work before removing the probe
+
+When this swap follows setup probing, first establish and independently check the milling WCS
+using [accessible work references](../cnc-motion-rules/references/work-datums.md). Record its
+XYZ/orientation, B context and model registration while the probe is still available. A machine
+ready to measure tool lengths is not necessarily ready to cut: swapping cannot repair missing
+X/Y registration, make an inaccessible origin probeable, or validate the approach to work zero.
+One established WCS may serve all indexed cuts in the same mounting; the tool-length transfer
+preserves it and does not require new XYZ zeros or datum probes for each B angle. After a
+rotation or tool swap, re-evaluate any planned origin return: valid offsets do not prove that
+the previous route clears the rotated stock or the new cutter/holder. Retain the reference
+and choose a different verified entry if zero is obstructed.
+
 ## The sequence (flow A)
+
+First establish that the work Z reference belongs to the outgoing tool, either
+from its original touch-off or a verified chain of earlier tool-length transfers.
+`originOffset` does not record tool identity. If that history is unknown or broken,
+measuring an arbitrary old/new pair cannot repair it: the operator must re-establish
+the reference before cutting. For thread milling, this is the precondition behind
+`tool_length_applied: true`; see [cnc-thread-milling](../cnc-thread-milling/SKILL.md).
 
 1. **Measure the old tool** — `run_tool_setter` with the operator-stated
    `bit_length_mm` — the tool's PROTRUSION from the collet in mm (a length, never its
@@ -74,6 +95,13 @@ operator raises it slightly from the touchscreen first.
    this session, and the operator confirms nothing has moved. A completed run leaves the
    head at the traverse height (machine Z328 — `result.finalZ`), never at its start height,
    so the park move that follows needs no separate Z raise.
+   If the outgoing tool is the touch probe, include `accept_probe_contact: true`.
+   Never calculate `old_trigger_z` as setter surface + stored probe effective length;
+   that is not a measurement from this connection and cannot satisfy the reuse rule.
+   Stored probe calibration for interpreting surface measurements and a live tool-setter
+   pair for transferring work Z are different evidence. Probe trigger pretravel and
+   setter contact can also differ; do not invent a correction if the reference method
+   is uncertain — resolve how Z0 was established with the operator.
 2. **Park** — `goto_tool_change_position`. One approval, two
    `start_gcode_job` calls: Z rises to the park height first, then X/Y.
 3. **The operator swaps the tool by hand.** Wait for their word; never infer
@@ -84,7 +112,7 @@ operator raises it slightly from the touchscreen first.
    `start_gcode_job {job_id, wait_for_approval_ms: 110000}` (defaults to those
    two measurements). It stages a single `G92` — nothing moves; the work frame
    shifts by `new − old`. A longer tool makes the current work Z read LOWER.
-   This is the ONE sanctioned work-origin write (`cnc-motion-rules` §4): it mirrors what
+   This is the sanctioned tool-length transfer (`cnc-motion-rules` §4): it mirrors what
    the touchscreen wizard does after its two operator confirmations. Never `G92` by hand.
 6. **Verify** — `get_position`: `originOffset.z` must have changed by the
    delta, and the operator should sanity-check the displayed work Z against

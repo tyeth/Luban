@@ -23,6 +23,7 @@ import {
     fitOutline,
 } from './outlineFit';
 import { probeFeedService } from './probeFeed';
+import { probeAbortHeld } from './programAbort';
 import { DESCENT_GUARD_MM } from './probeSequence';
 import {
     COARSE_FEED,
@@ -596,7 +597,9 @@ export async function runProbeOutlineProcedure(plan: ProbeOutlinePlan): Promise<
         return result;
     } catch (err) {
         const isTrip = !!probeFeedService.getTrip();
-        if (!isTrip) {
+        if (probeAbortHeld((err as { partial?: object }).partial)) {
+            announce('abort-held', 'contact during lift - holding even if the sensor subsequently releases');
+        } else if (!isTrip) {
             try {
                 await abortRaiseToTop(tag, (phase, z, note) => announce(phase, z === null ? note : `Z${z} - ${note}`), { holdIfTriggered: 'probe' });
             } catch (retreatErr) {

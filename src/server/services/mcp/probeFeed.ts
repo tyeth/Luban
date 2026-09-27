@@ -493,6 +493,8 @@ export class ProbeFeedService {
 
     private readings = new Map<ProbeChannel, ProbeReading>();
 
+    private contactCounts = new Map<ProbeChannel, number>();
+
     private trip: SafetyTrip | null = null;
 
     // Crash guard (added after the 2026-09-01 probe crash): while any
@@ -550,6 +552,11 @@ export class ProbeFeedService {
 
     public isConnected(): boolean {
         return !!(this.transport && this.transport.isConnected());
+    }
+
+    /** Monotonic trigger count: detects even a touch-and-release during a move. */
+    public contactCount(channel: ProbeChannel): number {
+        return this.contactCounts.get(channel) || 0;
     }
 
     public getReading(channel: ProbeChannel): ProbeReading | null {
@@ -785,6 +792,9 @@ export class ProbeFeedService {
             source: cfg.channels[channel] || channel,
         };
         this.readings.set(channel, reading);
+        if (reading.triggered) {
+            this.contactCounts.set(channel, this.contactCount(channel) + 1);
+        }
         // Transport -> server latency when the transport stamped the reading
         // (GPIO monitor wall clock); part of the sensor-timing evidence.
         const pipeMs = meta && meta.sentAt ? Math.max(0, reading.receivedAt - meta.sentAt) : undefined;

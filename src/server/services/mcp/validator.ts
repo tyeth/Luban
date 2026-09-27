@@ -16,7 +16,7 @@
 export type JobFrame = 'machine' | 'work';
 
 export interface FrameDeclaration {
-    /** Frame in force at the first motion line: G53 -> machine, G54..G59 -> work, none -> null. */
+    /** Frame in force at the first motion line: G53 -> machine, G54..G59.3 -> work, none -> null. */
     declared: JobFrame | null;
     /** Where the declaration came from: a code in the file, the submit argument, or nothing. */
     source: 'gcode' | 'argument' | null;
@@ -26,7 +26,7 @@ export interface FrameDeclaration {
     firstMotionLine: number | null;
     /** Motion occurred under BOTH frames (a trailing G54 with no motion after it is not mixed). */
     mixed: boolean;
-    /** Distinct workspace-select codes seen (G54..G59). */
+    /** Distinct workspace-select codes seen (G54..G59.3). */
     workspaceSelects: string[];
     /** Lines carrying G53 together with a motion word - this controller does not honour inline G53. */
     inlineG53Lines: number[];
@@ -71,7 +71,7 @@ export interface GcodeValidationReport {
     motionAxes: { xy: number; z: number; both: number };
     fourAxis: boolean; // any B-axis word
     minZWithSpindleOn: number | null;
-    /** G92 rewrites the work origin; the only sanctioned path is apply_tool_length_offset. */
+    /** G92 rewrites the work origin; use the human-gated workspace or tool-length tool. */
     setsWorkOrigin: boolean;
     frame: FrameDeclaration;
     /**
@@ -87,7 +87,7 @@ export interface GcodeValidationReport {
 }
 
 const MOTION_RE = /^G0*[0123](?:\.\d+)?$/;
-const WORKSPACE_RE = /^G5[4-9]$/;
+const WORKSPACE_RE = /^G(?:5[4-9]|59\.[123])$/;
 
 interface ParsedLine {
     /** Every G/M code on the line, in order (a line may carry G53 G0 ...). */
@@ -159,9 +159,10 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     let minZWithSpindleOn: number | null = null;
     let setsWorkOrigin = false;
     const warnings: string[] = [];
+    const fanucCodes = new Set<string>();
 
     // Frame tracking. On this controller `G53` on its own line selects the
-    // machine workspace and stays selected until a G54..G59 reselects a work
+    // machine workspace and stays selected until a G54..G59.3 reselects a work
     // workspace (every MCP emitter and Luban's own Home button rely on that:
     // `G53; G28; G54`). An inline `G53 G0 ...` is NOT honoured by the firmware -
     // the move runs in the selected workspace - so it never counts as a
@@ -201,6 +202,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         }
 
         for (const code of codes) {
+            if (['G41', 'G42', 'G43', 'M6', 'M30'].includes(code)) fanucCodes.add(code);
             if (code === 'G90') {
                 relativeMode = false;
                 distanceModeSet = true;
@@ -282,6 +284,11 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         inlineG53Lines,
     };
 
+    if (fanucCodes.size) {
+        warnings.push(`Fanuc-style commands (${[...fanucCodes].join(', ')}) do not have their machining-centre semantics on Snapmaker. `
+            + 'For thread-milling generator output, use convert_thread_milling_gcode and review its explicit conversions before staging.');
+    }
+
     if (usesRelativeMotion) {
         warnings.push('Contains G91 relative motion; extents exclude relative segments and are unreliable.');
     }
@@ -309,8 +316,8 @@ export function validateGcode(gcode: string): GcodeValidationReport {
     }
     if (setsWorkOrigin) {
         warnings.push('Contains G92: this REWRITES the work origin for every job that follows. The only '
-            + 'sanctioned work-origin write is apply_tool_length_offset (it mirrors the touchscreen '
-            + 'tool-change wizard). Remove it unless the operator asked for exactly this.');
+            + 'sanctioned MCP origin writes use set_workspace_origin (measured XYZ) or apply_tool_length_offset '
+            + '(measured tool change), each human-gated. Remove raw origin writes unless the operator asked for exactly this.');
     }
     if (inlineG53Lines.length) {
         warnings.push(`Inline G53 with a move on line(s) ${inlineG53Lines.join(', ')}: this controller does NOT `
@@ -318,7 +325,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
             + 'Put G53 on its own line before the moves (and G54 after) instead.');
     }
     if (frame.mixed) {
-        warnings.push('Motion occurs under BOTH frames (G53 machine and G54..G59 work). Extents mix the two; '
+        warnings.push('Motion occurs under BOTH frames (G53 machine and G54..G59.3 work). Extents mix the two; '
             + 'review every Z with its frame.');
     }
     if (usesHoming) {
@@ -534,6 +541,18 @@ export function resolveJobFrame(input: GcodeValidationReport, ctx: FrameResoluti
     // machine workspace, and that is exactly what happened on 2026-09-19.
     if (report.frame.endsInFrame === 'machine') {
         return { report, refusal: FRAME_REFUSAL_NO_RESTORE };
+    }
+
+    // A heartbeat supplies an offset, not its workspace identity or a table of offsets.
+    // Never apply that one offset to named/multiple workspaces or a changing origin.
+    if (report.frame.mixed || report.setsWorkOrigin
+        || (report.frame.declared === 'work' && report.frame.workspaceSelects.length > 0)) {
+        report.machineZExtents = null;
+        report.originOffsetZAtStaging = null;
+        report.warnings.push('Machine Z extents are UNRESOLVED: this file selects a named workspace, mixes frames, or rewrites an origin. '
+            + 'The live heartbeat does not identify every named workspace offset. Verify each required workspace and review each section against its own offset; '
+            + 'one current offset cannot validate the whole file. Prefer one WCS; additional workspaces are supported for existing jobs that require them.');
+        return { report, refusal: null };
     }
 
     const zMax = ctx.machineZMax;

@@ -32,6 +32,7 @@ import { tests as mcpListenersTests } from './mcpListeners.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as perimeterAnalysisTests } from './perimeterAnalysis.test';
 import { tests as perimeterTraceTests } from './perimeterTrace.test';
+import { tests as probeInspectionTests } from './probeInspection.test';
 import { tests as probeFeedHealthTests } from './probeFeedHealth.test';
 import { tests as procedureLimitsTests } from './procedureLimits.test';
 import { tests as programEnvelopeTests } from './programEnvelope.test';
@@ -41,6 +42,8 @@ import { tests as surveyMosaicTests } from './surveyMosaic.test';
 import { tests as surveyPlanTests } from './surveyPlan.test';
 import { tests as toolProtrusionTests } from './toolProtrusion.test';
 import { tests as traversePlanTests } from './traversePlan.test';
+import { tests as threadMillingTests } from './threadMilling.test';
+import { tests as workspaceTests } from './workspace.test';
 import { tests as validatorTests } from './validator.test';
 import { tests as wallClearanceTests } from './wallClearance.test';
 import { tests as wallFollowTests } from './wallFollow.test';
@@ -49,6 +52,8 @@ type TestCase = [string, () => void | Promise<void>];
 
 const suites: Array<[string, TestCase[]]> = [
     ['validator', validatorTests],
+    ['workspace', workspaceTests],
+    ['threadMilling', threadMillingTests],
     ['machinePosition', machinePositionTests],
     ['machineTravel', machineTravelTests],
     ['envelopeChecks', envelopeChecksTests],
@@ -58,6 +63,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['bootstrapPlan', bootstrapPlanTests],
     ['frameRecovery', frameRecoveryTests],
     ['probeFeedHealth', probeFeedHealthTests],
+    ['probeInspection', probeInspectionTests],
     ['procedureLimits', procedureLimitsTests],
     ['programOps', programOpsTests],
     ['programEnvelope', programEnvelopeTests],

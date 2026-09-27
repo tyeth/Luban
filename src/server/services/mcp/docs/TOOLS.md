@@ -1,7 +1,8 @@
-# Luban MCP tool surface (54 tools)
+# Luban MCP tool surface
 
-Terse per-tool reference. Machines: A350 = CNC, F350 = printer. Motion tools stage a job and
-need one operator click on the confirm page; nothing moves on an agent's word alone. Results
+Terse per-tool reference. Machines: A350 = CNC, F350 = printer. Staged motion needs
+one operator click on the confirm page; direct-call exceptions are governed by
+`cnc-motion-rules`. Results
 quote coordinates with their frame (machine vs work). Call `get_stored_state` first in a fresh
 session.
 
@@ -9,7 +10,7 @@ session.
 
 - `get_stored_state` — everything known in one call: calibrations, landmarks, tool region, limits, camera (incl. `camera.stream.stream_url`, the operator's live view), connection, probe feed. Start here.
 - `get_connection_status` — is Luban connected to a machine, over what channel.
-- `get_machine_profile` — kinematics, work envelope, toolhead module offsets.
+- `get_machine_profile` — kinematics, work envelope, toolhead module offsets and `connectedHead` (`headType`, `toolHead`, possibly null). `toolHeads` lists compatible heads, not the currently fitted one; generic `headType: "cnc"` alone cannot choose thread-milling spindle mode.
 - `get_position` — the machine POSITION OF RECORD: judged machine coordinates with `reliability` (verified | heartbeat | cached-offset | awaiting-resync | stale), the frame it rests on and `reasons`, plus the raw work report and originOffset. Motion refuses unless verified/heartbeat/cached-offset; never derive machine = work − offset yourself.
 - `query_firmware_position` — raw `M114`; use when `get_position` looks suspect.
 - `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures; `machinePosition` counts rejected heartbeats by reason (out-of-bounds, frame-flip, no-offset-yet), resyncs and disconnects.
@@ -17,16 +18,20 @@ session.
 
 ## G-code jobs
 
-- `validate_gcode` — static inspection: extents, spindle state, distance-mode hazards, and the FRAME the job declares (G53 own-line = machine, G54..G59 = work; inline `G53 G0` flagged - the firmware ignores it; G92 flagged). Free, run before submitting.
-- `submit_gcode_job {gcode, name, frame?: "machine"|"work", head_type?}` — stage a file job (the gcode TEXT, not a path); returns the confirm-page URL — deliver it to the operator as the last line of your message, alone. REFUSED unless the job declares its frame: `G53` on its own line before the first move (machine), or `G54..G59` in the file / `frame: "work"` for a Luban/slicer export (work; the file is never modified). `frame: "machine"` without a literal G53 is refused. The confirm page shows Frame and machine-resolved Z extents.
-- `start_gcode_job {job_id, wait_for_approval_ms?, wait_ms?, confirm_token?}` — call right after staging with `wait_for_approval_ms` (e.g. 110000): the operator's click on the confirm page starts the job; `approved: false, timed_out: true` means call again, never restage. Procedures return the result if it lands within `wait_ms` (default 25 s), else `running` — long-poll `get_gcode_job_status`.
+- `convert_thread_milling_gcode {gcode, source_controller?, tool_center_path: true, tool_length_applied: true, spindle_mode, spindle_power_percent?, chord_tolerance_mm?}` — OFFLINE import of internal/external Machining Doctor exports to explicit absolute Snapmaker G0/G1. Requires zero cutter compensation and work Z already referenced to the fitted cutter. Choose `power_percent` with integer percentage 1–100 for the standard head, or `cnc_200w_rpm` to retain 8000–18000 source RPM on the 200 W head. Never auto-selects the head or rescales feeds. Returns `gcode`, `changes`, `warnings`, `sourceSpindleRpm`, arc/full-circle/segment counts and `validation`; no connection, staging, origin write or motion. Review, then submit the converted text with `head_type: "cnc"`, `frame: "work"`. See [thread-milling guide](thread-milling.md) and [agent skill](../../../../../.claude/skills/cnc-thread-milling/SKILL.md).
+
+- `validate_gcode` — static inspection: extents, spindle state, distance-mode hazards, and the FRAME the job declares (G53 own-line = machine, G54..G59.3 = work; inline `G53 G0` flagged - the firmware ignores it; G92 flagged). Free, run before submitting.
+- `submit_gcode_job {gcode, name, frame?: "machine"|"work", head_type?}` — stage a file job (the gcode TEXT, not a path); returns the confirm-page URL — deliver it to the operator as the last line of your message, alone. REFUSED unless the job declares its frame: `G53` on its own line before the first move (machine), or `G54..G59.3` in the file / `frame: "work"` for a Luban/slicer export (work; the file is never modified). `frame: "machine"` without a literal G53 is refused. The confirm page shows Frame and machine-resolved Z extents when resolvable. Named workspace selectors, mixed frames and origin writes leave machine extents unresolved: one live offset cannot establish every section; review each required workspace separately.
+- `start_gcode_job {job_id, wait_for_approval_ms?, wait_ms?, confirm_token?}` — after delivering the confirm URL and ending the staging turn, call with `wait_for_approval_ms` (e.g. 110000): the operator's click on the confirm page starts the job; `approved: false, timed_out: true` means call again, never restage. Procedures return the result if it lands within `wait_ms` (default 25 s), else `running` — long-poll `get_gcode_job_status`.
 - `get_gcode_job_status {job_id, wait_ms?, since_event?}` — event log plus stored result and `ending` (why it ended: completed | stopped-by-agent | stopped-by-operator | withdrawn | rejected-by-operator | crash-alarm | overtravel-alarm | unexpected-contact | controller-rejected | timeout | operation-failure | machine-stopped | completion-unverified, with reason and measured count); a stopped or failed procedure keeps every completed station under `result`. Long-poll with `wait_ms` / `since_event` instead of spinning.
 - `stop_gcode_job` — procedures stop cooperatively at the next step and raise; file jobs get a firmware stop. Partial result kept.
 
-## Direct motion (each is one approved job)
+## Transport and direct motion
 
 - `home` — machine home (`G53;G28;G54`; also homes B). Default first step after (re)connecting; raises Z first and clears the NOT-HOMED state. It is not a remedy for a `get_position` reliability of `awaiting-resync` or `stale` — a rejected or aged beat is a reporting fault, not a position fault, and motion is refused until the record recovers on its own (next coherent beat, ~2 s).
-- `goto_work_origin` — STAGE a move to work X0 Y0 (confirm page shows the destination in MACHINE coordinates; refused while the origin offset is untrusted). Distinct from `home`, which runs on the call.
+- `set_workspace_origin {workspace, origin_machine: {x,y,z}, datum_reference, reason}` — HUMAN-GATED replacement of all XYZ in an explicit G54–G59.3 workspace. Origin is measured machine coordinates, with Z as TOOLHEAD Z for the fitted tool. No motion or need to visit zero. Checks unchanged staging state, requires firmware selection acknowledgement and two fresh readbacks; no B/E write or automatic rollback. Leaves the named workspace active and invalidates earlier staged jobs. See [workspaces](workspaces.md).
+- `select_workspace {workspace, reason}` — HUMAN-GATED selection/readback of an existing G54–G59.3 workspace without rewriting its origin. Prefer one WCS; additional workspaces only when necessary, particularly for existing G-code jobs. Standard MCP procedures may reselect G54, so verify/reselect before submitting the file.
+- `goto_work_origin` — STAGE XY to work X0 Y0 at the current toolhead Z; no automatic raise, Z0 descent, datum setting or physical registration check. The confirm page shows the MACHINE destination; untrusted offsets, insufficient transport height, travel and mapped landmark conflicts are refused. Check the actual route and fitted tool/holder against fixtures. After B rotation, a retained WCS can remain valid while access to zero is obstructed; use another verified entry without re-zeroing. Distinct from `home`, which runs on the call.
 - `move_z {z | z_targets[], coordinate_system: "machine"|"work", feed_rate?, reason}` — single Z target or a batch; one approval covers the list, one `start_gcode_job` per step. Only on the operator's explicit request.
 - `traverse_xy {x?, y? | targets: [{x?, y?}], coordinate_system?: "machine" (default) | "work", feed_rate?, reason}` — law-2 TRANSPORT: an absolute XY target or an ordered `targets` series at the height the head is already at (>= the motion floor), one approval, one `start_gcode_job` per leg, like `move_z`. Refused unless the head is already at/above `mcpMotionFloorZ` (default 320; no override); every leg checked against landmarks and the travel; Z never written; default frame machine (`G53` per step). Use this, never a hand-written file job, to move the head.
 - `move_and_capture` — one guarded XY move followed by a position-stamped frame; the unit of visual alignment. Z-gated first: the head is raised to the safe traverse height before any XY, and the call is refused when Z cannot be established.
@@ -54,7 +59,7 @@ session.
 It can sit differently after every power cycle, be knocked, be re-aimed, or be a different camera. Nothing converts a pixel into a machine coordinate, or a machine coordinate into a pose, until a model is solved AND verified on this connection. Plain captures never need one.
 
 - `get_camera_model {history?}` — the model, its state (verified | unverified | superseded), why it is not usable, and which tool fixes it. Read-only.
-- `verify_camera_model {target, pixel_u, pixel_v, tolerance_px?}` — predict where a target of known machine coordinates should appear at the CURRENT toolhead position, compare with where it does, record the residual in px and mm. **The first camera call of any session.** Beyond tolerance the model stays unverified and says the camera has probably moved. No motion - position with `traverse_xy` first.
+- `verify_camera_model {target, pixel_u, pixel_v, tolerance_px?}` — predict where a target of known machine coordinates should appear at the CURRENT toolhead position, compare with where it does, record the residual in px and mm. **Before metric camera use; plain observation needs no calibration.** Beyond tolerance the model stays unverified and says the camera has probably moved. No motion - position with `traverse_xy` first.
 - `camera_bootstrap {stage, reason, ...}` — solve the geometry FROM NOTHING, two staged procedures, one approval each. `stage: "search"`: a grid at the park height bracketing the tool setter, whose machine XY is known exactly - which frames contain it gives the camera offset INCLUDING ITS SIGN with no prior assumption, and it is the only step meaningful without a calibration. `stage: "poses"`: the poses that implies, each sweeping Z from the park height to the motion floor with XY stationary. A pose the TOOLHEAD cannot reach is dropped with a reason, never quietly adjusted.
 - `set_camera_model {offset, rotation, intrinsics, valid_band_z, central_region, residuals, ...}` — store a solve from `scripts/camera_bootstrap.py`. Always stored UNVERIFIED; the previous model is kept superseded, never overwritten.
 - `plan_view_pose {target, toolhead_z?}` — where must the TOOLHEAD go to see this machine point? Returns the pose, the standoff and the field of view, from the model. Use it instead of computing a pose; never carry one between sessions.
@@ -82,29 +87,43 @@ It can sit differently after every power cycle, be knocked, be re-aimed, or be a
 
 - `probe_point` — one axis from the current position. The atom.
 - `probe_vector` — probe along any downward or lateral unit vector.
-- `probe_sequence` — enumerated hop / descend / probe circuit with law-2 hops at safe traverse height; keep-out boxes honoured at plan time.
-- `probe_circle` — N radial marches plus least-squares circle fit, outside a boss or inside a hole. Reports rms and residuals.
-- `probe_surface_path` — N minus-Z stations along a line: per-station contact, best-fit slope, flatness.
-- `probe_surface_grid` — serpentine minus-Z grid: Z matrix, best-fit plane and residuals, ASCII height map. Both scans hop at last contact plus `z_safe_delta_mm`.
-- `probe_stock_outline` — from an estimate of a block, find its top, true outline and centre in one approved procedure.
-- `probe_program` — composite program: an ordered list of operations, derived references, jig geometry, keep-out and groups under one approval. The new-stock survey lives here. Op kinds: `rotate_b`, `surface_path`, `surface_grid`, `sequence`, `stock_outline`, `capture {x?, y?}` (a position- and B-stamped frame saved on the job record; with x/y it first hops there at the traverse height, travel- and obstacle-checked like a sequence hop, else no motion) and `home` (machine home, last op only, homes B too) — so "capture at (x, y), rotate_b 180, capture, home" is one click.
+- `probe_sequence` — enumerated hop / descend / probe circuit. Every probe returns to its own start and raises, including continuing misses; keep-out boxes honoured at plan time. Use a continuous procedure below for related local stations.
+- `probe_circle` — N radial marches plus least-squares circle fit. Inside a hole, returns to the staged interior origin between radials; outside a boss, repositions at full height. Reports rms and residuals.
+- `probe_surface_path` — N minus-Z stations along a line: per-station contact, best-fit slope, flatness. Optional `capture: {stations: [1, 4], settle_ms?, label?}` saves stationary photos at selected contacts before retraction (also `probe_surface_grid`).
+- `probe_surface_grid` — serpentine minus-Z grid: Z matrix, best-fit plane and residuals, ASCII height map. Both scans link locally: guarded at last contact plus `z_safe_delta_mm`, stepped at last contact plus `hop_lift_mm` with contact recovery.
+- `probe_stock_outline` — from a block estimate, find its top, outline and centre. Links top samples and same-side samples locally; raises when changing sides.
+- `probe_wall_follow` — repeated vertical-wall contacts with standoff and stepped links away from the face on a bump; no full-height return between stations.
+- `probe_corner` — internal corner between fitted walls: bisector find then radial probes from the measured centre, returning there between contacts.
+- `probe_trace_perimeter` — bounded internal-pocket crawl with release-verified standoff, coarse steps on proven straights and selective confirmations; external tracing is not exposed.
+- `probe_program` — composite program: an ordered list of operations, derived references, jig geometry, keep-out and groups under one approval. The new-stock survey lives here. Each completed probing op ends raised; references/groups do not fuse local motion between ops. Op kinds: `rotate_b`, `surface_path`, `surface_grid`, `sequence`, `stock_outline`, `wall_follow`, `corner`, `trace`, `capture {x?, y?}` (a position- and B-stamped frame saved on the job record; with x/y it first hops there at the traverse height, travel- and obstacle-checked like a sequence hop, else no motion) and `home` (machine home, last op only, homes B too) — so "capture at (x, y), rotate_b 180, capture, home" is one click.
 - `set_probe_geometry` — jig and tool constants a rotary `probe_program` can reference as the `axis` namespace. Measured or operator-stated, with a reason.
 
 ## CAM probing programs
 
 - FreeCAD side: `docs/post/freecad_probe_emitter.py` writes a `run_probing_gcode` program with `(PROBE ...)` nominals, normals and tolerances read straight off the selected faces (the Path Probe operation carries none of that, so it is bypassed, along with the post processor). `frame="machine"` + a measured `App.Placement` for a re-clamped part.
 
-- `run_probing_gcode` — stage a CAM-generated probing program (Fusion 360, FreeCAD, any Grbl/Marlin post, or hand-written). `G38` cycles are translated into staged probes, never sent raw. Returns an inspection report.
+- `run_probing_gcode` — stage a CAM-generated probing program (Fusion 360, FreeCAD, any Grbl/Marlin post, or hand-written). `G38` cycles are translated into staged probes, never sent raw. Default `link_mode: raise` repositions at full height; `stepped`/`wall` provide local links with blocked-station handling. Every G38.2/G38.3 cycle still returns to its own start. Returns an inspection report.
 - `get_inspection_report` — re-render a finished or aborted probing run's report in another format, such as Fusion's.
+
+For tool selection, timing and the limits of local continuation, see [inspection planning](probe-inspection.md#efficient-inspection-planning).
 
 ## Standing rules the tools assume
 
-- The endmill is always in the spindle; never plan as if the collet is empty.
-- Any XY move over 1 mm is planned at the safe traverse height - machine Z328 (home). Landmarks are honoured literally: a hop at 328 clears them on its own merits, a lower hop is checked like any low segment.
+- A tool or probe is always in the spindle; establish which is fitted and never plan as if the collet is empty.
+- XY transport over 1 mm is planned at or above the motion floor, machine Z320 by default; park/procedure traverse height is machine Z328. Read the stored limits and canonical motion rules. Landmarks are honoured literally: a hop at 328 clears them on its own merits, a lower hop is checked like any low segment.
 - No Z motion without a direct request. "Home" always means machine home.
 - Approval covers one bounded series of moves and never carries forward. A staged procedure or program is ONE approval for every move inside its envelope — the efficient lawful form.
-- Every motion tool stages a job: call `start_gcode_job` with `wait_for_approval_ms` after staging; the operator's click starts it. Hand the confirm URL over as the last line of the message, alone.
+- For staged motion, deliver the confirm URL as the last line and end the turn before waiting with `start_gcode_job`. `home` and `move_and_capture` are direct-call exceptions governed by `cnc-motion-rules`; never infer permission from this tool index.
 - Agents plan, stage, record and quote in MACHINE coordinates. Every staged job declares its frame or is refused; `G90`/`G91` is distance mode, not a frame; never a bare frameless `Z`.
-- The work origin is the operator's (touchscreen, Luban, tool-change wizard). Read it fresh from `get_position`; never assume it; never write it except through `apply_tool_length_offset`.
+- The work origin is the operator's (touchscreen, Luban, tool-change wizard). Read it fresh from `get_position`; never assume it; write measured XYZ only through human-gated `set_workspace_origin`, or transfer measured tool length through `apply_tool_length_offset`. Prefer one WCS; multiple workspaces are frowned upon but supported if an existing G-code job requires them.
 - `get_position.machine` is the judged position of record with a `reliability`; a reading more than 50 mm outside the travel is a bug, never a position, and is ignored until the next coherent beat. Do not derive a machine position from one heartbeat by hand.
 - Canonical agent guidance: `.claude/skills/cnc-motion-rules/SKILL.md`.
+
+### Probe-spot photographs and shoulder recovery
+
+Sequence probe steps accept `capture: {settle_ms?, label?}`; surface scans select 1-based
+`capture.stations`. Frames are saved beside measurement results before retraction. Continuous
+viewing remains available at `list_cameras.stream.stream_url`; it does not synchronize a photo
+to a contact. Stepped surface links use bounded ball-radius backoff along verified incoming
+paths and sensor-check their rises. Nested probe holds stop the whole program, including
+`on_fail: skip`. See [probe inspection](probe-inspection.md) for schemas, limits and recovery details.

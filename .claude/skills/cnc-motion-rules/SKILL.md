@@ -1,6 +1,6 @@
 ---
 name: cnc-motion-rules
-description: "The standing motion and coordinate rules for the Snapmaker A350 CNC driven through the Luban MCP tools, plus the canonical tool calls. Load this FIRST, before planning, staging, describing or reasoning about ANY machine motion or position: moves, jogs, traverses, homing, Z changes, probing, tool changes, running or staging an existing gcode/CAM/Luban program, clearance heights, work origins, machine coordinates, G53/G54/G90/G91, the heartbeat position or its reliability. It is also the answer to 'get_position says something odd'. The other CNC skills (cnc-probing, cnc-visual-alignment, tool-change) assume these rules and point here; for a plain transit or a plain 'run this file' this is the only skill you need."
+description: "The standing motion and coordinate rules for the Snapmaker A350 CNC driven through the Luban MCP tools, plus the canonical tool calls. Load this FIRST, before planning, staging, describing or reasoning about ANY machine motion or position: moves, jogs, traverses, homing, Z changes, probing, tool changes, running or staging an existing gcode/CAM/Luban program, clearance heights, work origins, machine coordinates, G53/G54/G90/G91, the heartbeat position or its reliability. It is also the answer to 'get_position says something odd'. The other CNC skills (cnc-probing, cnc-visual-alignment, tool-change) assume these rules and point here; for a plain transit or a Snapmaker-ready file this is the only skill you need; thread-milling controller exports also need cnc-thread-milling."
 ---
 
 # CNC motion rules (operator law — the canonical copy)
@@ -25,9 +25,9 @@ item, quoting the tool result — not an essay):
    and the MCP resolves it (§2). Never convert a file's coordinates by hand. No bare `Z`.
 3. **Height.** Any XY move over 1 mm runs at or above the MOTION FLOOR — machine **Z320**
    (`mcpMotionFloorZ`; a head reading 319.96 is at it). That is not the same number as the PARK
-   height, machine Z328 = home, which is where procedures hop between stations, retreat to on an
-   abort, and end. If the head is below the floor, the retreat is its own `move_z` step and needs
-   its own word from the operator: ask "may I raise Z first?" — a transit request is not
+   height, machine Z328 = home, used for ordinary procedure transfers and successful finishes.
+   Local measurement links use the specific envelopes in §4; aborts follow law 8. For ordinary
+   transport below the floor, the retreat is its own `move_z` step and needs its own word from the operator: ask "may I raise Z first?" — a transit request is not
    authority to move Z.
 4. **Obstacles.** The same `get_stored_state` call: does the path — the whole SEGMENT from
    where the toolhead is to where it is going, not the destination point — cross a landmark box
@@ -84,9 +84,9 @@ item, quoting the tool result — not an essay):
    operator's explicit words, never for planning.
 
    **The floor is not the park height.** `mcpSafeTraverseZ` (machine Z328 = home) is where
-   procedures hop between stations, retreat to on an abort, and finish; that is unchanged, and
-   `planRaiseToTop` still targets it. The floor could only drop below it once clearances stopped
-   carrying tool length (law 4): a hop at the floor is checked against every stored landmark
+   ordinary procedure transfers and successful finishes occur; local measurement links use §4.
+   `planRaiseToTop` still targets it, subject to the held-contact rule in law 8. The floor could
+   only drop below it once clearances stopped carrying tool length (law 4): a hop at the floor is checked against every stored landmark
    exactly like any low segment, and there is still **no exemption for being high**. What it
    costs is 8 mm less blind protection for anything on the bed with no landmark — which is why
    an unmapped object taller than the floor minus the tool is the operator's problem to state,
@@ -153,7 +153,8 @@ item, quoting the tool result — not an essay):
    down.** This is what the server does on every procedure abort (`abortRaiseToTop`): no motion
    if the overtravel trip is closing the connection; HOLD if the probe still reads contact (the
    operator frees it); nothing sent if the head is already at the top; otherwise one Z-only
-   move to `mcpSafeTraverseZ`. It is also what YOU do when recovering by hand: after any abort,
+   move to `mcpSafeTraverseZ`. A nested runner's `abort-held` remains a HOLD for the whole program,
+   including `on_fail: skip`; the outer runner must not raise over that decision. It is also what YOU do when recovering by hand: after any abort,
    refusal or doubt, the first motion is `move_z` to the traverse height, then re-prove position
    (`get_position`), then plan again. Never "return to where the procedure started" — before
    the travel, the start height is BELOW the head (appendix A, 2026-09-16). A COMPLETED
@@ -164,7 +165,7 @@ item, quoting the tool result — not an essay):
 ## 2. Coordinate doctrine
 
 **Two frames exist on the controller.** `G53` selects the MACHINE frame (home = X−19 Y342
-Z328); `G54`–`G59` select numbered WORK workspaces whose origin the operator sets. The
+Z328); `G54`–`G59.3` select numbered WORK workspaces whose origin the operator sets. The
 heartbeat reports the *currently selected* workspace. `G90`/`G91` is **distance mode**, not a
 frame: a bare `G90 / G0 Z0` runs in whatever workspace is selected. It is undeclared, and
 undeclared is refused.
@@ -178,7 +179,9 @@ Landmarks, tool-setter config, probe results and the geometry store are all mach
   hand the bytes through **unchanged**. You never add `G53` or `G54` to a file you did not
   write; you never convert its Z by hand. The MCP resolves the extents through the live origin
   and the confirm page shows `Frame: WORK (declared by argument)` plus the **machine-resolved Z
-  extents** — read both to the operator. `frame: "work"` resolves against the offset on the
+  extents** when resolvable — read both to the operator. Files selecting named workspaces,
+  mixing frames or rewriting an origin have unresolved machine extents; review each section
+  using its verified workspace, never apply one live offset to the whole file. `frame: "work"` resolves against the offset on the
   heartbeat, i.e. the workspace currently selected on the controller.
 - **Machine-frame job.** `G53` must appear literally on its own line before the first move
   (the controller needs it; `frame: "machine"` without it is refused). The tools emit `G90` /
@@ -187,10 +190,28 @@ Landmarks, tool-setter config, probe results and the geometry store are all mach
 - Warned, not refused: `G92`, relative moves, Z outside 0…328 in either frame, a work-frame
   absolute `Z0`, inline `G53 G0 …` (the firmware ignores a one-shot G53).
 
-**The work origin belongs to the operator, Luban and the firmware — not to you.** It persists
-across homing, **dies on a machine reboot**, and moves when the operator re-zeros or changes
-tools. Read it fresh from `get_position.originOffset`; never assume it; the ONE sanctioned write
-is `apply_tool_length_offset` (§4).
+**The work origin belongs to the operator, Luban and the firmware.** Read it fresh from
+`get_position.originOffset`; reverify after reconnect/reboot, re-zeroing or tool changes rather
+than assuming persistence. Origin writes use the human-gated `set_workspace_origin` for measured
+XYZ registration, or `apply_tool_length_offset` for a measured tool-length transfer (§4).
+Never inject raw G92/G10 to bypass them. Prefer one established WCS: multiple workspaces are
+frowned upon, but supported when necessary to use an existing G-code job. B indexing alone
+is not a reason to introduce another workspace.
+
+**Choose the milling datum before completing CAM or removing the probe.** Prefer stable,
+accessible references that can establish and recheck XYZ and orientation in the mounted setup.
+A CAD origin or coherent live offset alone is not a verified datum. Read
+[work-datum selection and verification](references/work-datums.md) when choosing a WCS,
+registering a model or preparing the probe-to-cutter handoff. Confirm the origin's measurement
+method, surviving references, tool/B context and complete return/approach paths. Derived centres
+are valid only with measured registration and a repeatable check. Prefer one verified WCS
+across indexed B operations in the same mounting; changing angle does not require re-zeroing or
+re-probing the datum. CAM must account for the measured rotary axis and B orientation in that
+common frame. After rotation, the previous zero or its approach may be obstructed: retain the
+WCS as a reference, but do not return there without checking access in the new orientation.
+Use a separate verified entry point when access is blocked or unverified. `goto_work_origin`
+is XY at the current Z, not an automatic raise or a move to work Z0; datum choice never
+replaces clearance.
 
 **Gantry top is machine Z328.** Work Z0 is wherever the operator put it — on this rig it has
 been the stock top and it has been Z328.
@@ -253,12 +274,13 @@ start position — expect it, do not act on it.
 
 ## 4. Sanctioned exceptions (and their exact limits)
 
-- **Surface-scan hop envelope** (`probe_surface_path` / `probe_surface_grid` only, between
-  consecutive stations): retract to **LAST CONTACT + `z_safe_delta_mm`** (cap 20, min 3) and hop
-  at most `max_hop_mm` (cap 60). Lowering either is always allowed; raising is refused. `hop_mode`
-  `guarded` (default) hops at travel feed in ≤ 10 mm sensor-checked segments and treats contact
-  as a COLLISION; `stepped` is a touch-probing traverse that lifts on contact. Choose by the
-  height change between consecutive stations, not by the surface's name: spacing × steepest
+- **Surface-scan hop envelope** (`probe_surface_path` / `probe_surface_grid`, between
+  consecutive stations): `guarded` retracts to **LAST CONTACT + `z_safe_delta_mm`** (cap 20,
+  min 3) and hops in ≤ 10 mm sensor-checked segments; contact is a COLLISION. `stepped` uses
+  **LAST CONTACT + `hop_lift_mm`** (default 2, 0.5–10 mm), then touch-probing links that back
+  off and lift on contact, subject to release and lift-contact checks. Either mode limits
+  station spacing to `max_hop_mm` (cap 60); these bounds cannot be exceeded by inference.
+  Choose by the height change between consecutive stations, not by the surface's name: spacing × steepest
   credible slope ≪ `z_safe_delta_mm` → `guarded`; a station may sit more than `z_safe_delta_mm`
   above or below its neighbour (steps, pockets, edges, unknown stock) → `stepped`.
 - **Stepped links in `run_probing_gcode`** (`link_mode` `"stepped"` / `"wall"`, between
@@ -270,7 +292,29 @@ start position — expect it, do not act on it.
   `blocked` station, not a crash: the head lifts straight back up the column it came down. A
   `blocked` station is a normal report outcome; `top_z_machine` (measured, never a guess) caps
   the +Z lifts at the top; an abort still obeys law 8.
-- **`apply_tool_length_offset`** — the one sanctioned work-origin write: a single `G92` shifting
+- **Other bounded probing procedures** have their own local links: `probe_wall_follow`
+  steps along at a standoff and backs away from the face on a bump; `probe_stock_outline`
+  links top samples and same-side samples locally but raises when changing sides;
+  `probe_trace_perimeter` crawls an internal pocket with release-verified standoff and
+  bounded travel; `probe_corner` returns along measured paths to its centre between radial
+  contacts; inside `probe_circle` returns to its staged interior origin between radials
+  (outside circles use full-height repositioning). Use each procedure's entry conditions,
+  limits and recovery policy; none grants an arbitrary low XY move. See `cnc-probing`'s
+  [planning reference](../cnc-probing/references/planning.md).
+- **Composition boundary:** `probe_sequence` returns to each probe's start and raises after
+  every probe, including continuing misses. `probe_program` references and groups share
+  measurements/approval, not a low position between ops: each successful probing op ends
+  raised. Prefer related stations within a suitable continuous op. Ordinary calls split into
+  ≤1 mm increments are not a substitute for a sanctioned probing envelope.
+- **`set_workspace_origin`** — stage an explicit G54–G59.3 XYZ origin from measured machine
+  coordinates, with datum/tool/B evidence and a reason. Human approval is required; no axis
+  moves and there is no need to visit work zero. Z is the machine **toolhead** Z at which the
+  fitted tool has work Z0, not physical surface Z. See [work datums](references/work-datums.md).
+  `select_workspace` similarly gates selection of an existing offset without rewriting it.
+  Both leave that workspace active, verify controller acknowledgement/readback and invalidate
+  other staged jobs. Restage them afterwards. Existing motion/probing tools commonly restore
+  G54, so verify/reselect the intended workspace before an existing file job.
+- **`apply_tool_length_offset`** — the sanctioned tool-change origin adjustment: a single `G92` shifting
   work Z by (new − old) trigger height, what the touchscreen wizard does after its two operator
   confirmations. Requires a reliable position and a measurement pair from this connection.
 - **`operator_confirmed_clearance`** — on `move_and_capture` only: skips the homed-first guard
@@ -287,9 +331,11 @@ start position — expect it, do not act on it.
   dies on a reboot, so "work zero" can be anywhere on the bed — read the operator the machine
   numbers), and it is refused while the origin offset is not the heartbeat's own or the position
   is not trusted (§3). Never called "home".
-- **Motion floor** = `mcpMotionFloorZ` = machine Z320: the lowest Z any XY move may happen at.
+- **Motion floor** = `mcpMotionFloorZ` = machine Z320: the floor for ordinary XY transport
+  over 1 mm; bounded in-procedure links use §4.
 - **Park height** (a.k.a. traverse height) = `mcpSafeTraverseZ` = machine Z328: where procedures
-  hop, retreat on abort, and end. `get_stored_state.limits` reports both.
+  perform ordinary transfers and finish; local links use §4 and aborts use law 8.
+  `get_stored_state.limits` reports both.
 - **Toolhead Z** = the Z the heartbeat reports for the head; **physical / surface height** =
   toolhead Z at contact minus the probe (or tool) length.
 - **`bit_length_mm`** (tool setter) = the fitted tool's PROTRUSION from the collet in mm — a
@@ -305,6 +351,13 @@ only. Never hand-seed tool-setter measurement history. Historical position notes
 session are never live position: home first.
 
 ## 7. Running a program someone else generated (Luban, Fusion, hand-written)
+
+**Thread-milling exports need preparation.** Load
+[`cnc-thread-milling`](../cnc-thread-milling/SKILL.md) for internal or external
+threads. Its offline `convert_thread_milling_gcode` flow translates supported
+Machining Doctor output into a separate Snapmaker program. Never submit the raw
+controller export. Review the result, then use the sequence below on the returned
+text unchanged. Ordinary Luban exports still pass through unchanged.
 
 This is what the machine is for, and it is one approval:
 
@@ -346,6 +399,12 @@ start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
 home {}
 // Z, one operator-confirmed step per target
 move_z {"z": 328, "coordinate_system": "machine", "reason": "..."}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+// Offline thread-milling conversion: only after verifying the declarations and actual head.
+// This RPM example requires the 200 W head; standard-head percentage arguments are in cnc-thread-milling.
+convert_thread_milling_gcode {"gcode": "<complete generator export>", "source_controller": "fanuc", "tool_center_path": true, "tool_length_applied": true, "spindle_mode": "cnc_200w_rpm"}
+// Review changes, warnings and validation BEFORE staging; conversion alone grants no motion authority.
+submit_gcode_job {"gcode": "<reviewed converted text>", "name": "thread.nc", "head_type": "cnc", "frame": "work"}
 start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
 // A Luban export (the file text, unchanged)
 submit_gcode_job {"gcode": "<file text>", "name": "pocket.nc", "frame": "work"}
@@ -398,9 +457,12 @@ Reference grammar: `{"from": "<opId>.<probeName>.<x|y|z>" | "<opId>.summary.<fie
 "axis.<x|z_contact|z_physical|tip_radius|probe_length>", "plus"?: n|path, "minus"?: n|path,
 "between": [lo, hi]}`; two-operand forms `{"mid": [a, b]}`, `{"diff": [a, b], "scale"?}`,
 `{"min"|"max": [...]}`. `between` is mandatory (law 3). A reference to a probe that missed
-refuses its op at run time — give the finding march enough `max_travel_mm`. A blind −Z march
-costs about `max_travel / coarse_step` sensor windows (~1 mm/step, ~0.3 s each): ask for an
-approximate height and shorten it — a long limit costs time, not safety.
+refuses its op at run time — give the finding march enough `max_travel_mm`. A blind −Z find
+advances in sensor-checked physical segments until contact or its limit.
+Use actual job timings, including controller and confirmation costs, rather than assuming a
+fixed time per logical step. A generous maximum does not add travel after an earlier contact.
+Approximate heights help locate a region; they do not authorise a blind descent. Reuse valid
+measured approach evidence only for the applicable column, tool, setup and B orientation.
 
 ## Appendix A — why these laws exist
 

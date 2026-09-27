@@ -484,13 +484,16 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    than a single height). Any XY move over 1 mm happens at or above `mcpMotionFloorZ`
    (default **320**, with the heartbeat's 0.05 mm float noise tolerated, so 319.95 up) — no
    local hops above a measured feature, no other "measured safe" heights. Retreat, traverse,
-   descend — in that order. Sub-gantry XY is only fine positioning <= 1 mm (touch nudges,
-   probe march steps). Enforced: direct XY below the floor refused without
+   descend — in that order. Sub-gantry XY is limited to fine positioning <= 1 mm and the
+   selected probing procedure’s bounded local links (see
+   [inspection planning](docs/probe-inspection.md#efficient-inspection-planning)).
+   Enforced: direct XY below the floor refused without
    `operator_confirmed_clearance`, which is for emergencies on the operator's explicit
    words, not a planning device.
 
    The floor is NOT the park height. `mcpSafeTraverseZ` (328 = home Z) is where procedures
-   hop between stations, retreat to on an abort, and end; that is unchanged. The floor could
+   perform ordinary transfers and finish. Local links use the selected probing procedure's
+   envelope; held-contact aborts must not force a raise. The floor could
    only drop below it once clearances stopped carrying tool length (law 4), because a hop at
    the floor is checked against every stored landmark exactly like any low segment — there
    is still no exemption for being high. What the floor costs is 8 mm less blind protection
@@ -547,18 +550,21 @@ it with no decision point, when the operator had authorised "step 1" only. Laws:
    `result.finalZ` reports where it was actually left. `stay_at_trigger` (touchscreen swap
    wizard) is the one exception: no retreat at all, the tip is held in contact.
 
-### Surface scans — the one bounded exception to law 2 (operator-authorised 2026-09-05)
+### Surface scans — bounded local links (operator-authorised 2026-09-05)
 
 `probe_surface_path` and `probe_surface_grid` measure a TOP surface with many −Z marches
 in one approved circuit. The operator's words: *"with the grid we need the point to point
 variation to not risk the probe toolhead so no more than 20mm z safe delta from the top
 (within a horizontal change of 60mm)"*. Hence, **inside these two procedures only, between
-consecutive stations only**, the probe retracts to `last contact + z_safe_delta_mm` and hops
-horizontally at that height instead of at the gantry. Nothing else inherits this. Bounds
-(`surfaceScan.ts`, refused at staging — never clamped or split silently):
+consecutive stations only**, guarded mode retracts to `last contact + z_safe_delta_mm` and
+hops horizontally there. Stepped mode uses `last contact + hop_lift_mm` with contact-aware
+backoff/lift recovery. Other continuous probing tools have their own bounded links; none of
+these envelopes transfers to arbitrary motion. See
+[inspection planning](docs/probe-inspection.md#efficient-inspection-planning).
+Bounds (`surfaceScan.ts`, refused at staging — never clamped or split silently):
 
 - `z_safe_delta_mm` default 20, **hard cap 20** (min 3) — the hop height above the last real
-  contact (`resolveEnvelope`).
+  contact in guarded mode (`resolveEnvelope`); stepped mode uses `hop_lift_mm` (default 2).
 - `max_hop_mm` default 60, **hard cap 60** — every consecutive station pair must be within
   it (`assertHopsWithin`); a spacing/pitch that violates it is refused naming the pair.
 - `max_drop_mm` default 40, cap 80 — a station's march may search at most this far below the
@@ -569,12 +575,12 @@ horizontally at that height instead of at the gantry. Nothing else inherits this
   reference to base the envelope on).
 - `start_z_machine` is REQUIRED — measured or operator-stated, never guessed. The approach to
   station 1 is a full law-2 move: raise to the traverse height, hop, guarded 1 mm descent
-  (`probe_sequence` pattern; contact = CRASH). Completion and abort both raise to the
-  traverse height.
-- Runtime (`probeSurface.ts`): hops go through `moveMachineSettled` with
-  `clearExpectedContact()` in ≤ 10 mm sensor-checked segments, so a probe touch during a hop
-  latches CRASH (law 5); only marches run with `setExpectedContact(['probe'])`. The staged
-  position and every march start are re-checked (one re-read after ~1.2 s).
+  (`probe_sequence` pattern; contact = CRASH). Successful completion raises to the traverse
+  height; abort recovery preserves a held-contact decision.
+- Runtime (`probeSurface.ts`): guarded hops run with `clearExpectedContact()` in ≤ 10 mm
+  sensor-checked segments; a touch latches CRASH. Stepped links expect probe contact and use
+  `steppedTraverseZ`, with release-checked backoff and sensor-checked lifts; lift contact holds
+  before further XY movement. The staged position and every march start are re-checked.
 
 **Descents are segmented (operator law, 2026-09-05).** A single long `G1` toward the work
 cannot be stopped once sent — a collision would be driven to the end of the move. Every
@@ -651,8 +657,12 @@ d7ac9247838e aborted because only start − max_drop was honoured).
 
 **`probe_program` — one approval for a whole survey (2026-09-06).** An ordered list of
 operations, staged once and approved on ONE confirm page that enumerates every op's envelope
-and the B rotation schedule, run by one runner that hands the machine from op to op (each ends
-raised at the traverse height): `rotate_b` (absolute B on the direct path, refused unless the
+and the B rotation schedule. Each successful probing op ends raised at the traverse height;
+references and grouping pass results and share approval, not a retained low pose between ops.
+Keep related stations in one suitable continuous op. In particular, `sequence` returns to each
+probe's start and raises after every probe, including a continuing miss. Supported operations
+are listed in [TOOLS.md](docs/TOOLS.md). Original survey examples use: `rotate_b` (absolute B
+on the direct path, refused unless the
 toolhead is at/above the safe traverse height, verified by the M114 in the same batch or the
 heartbeat's `b`), `surface_path`, `surface_grid` and `sequence` with their standalone
 arguments. Numbers an op cannot know at staging are **references** to earlier results —
@@ -1417,3 +1427,21 @@ toolhead camera. Everything a fresh install needs:
 - **#60 install size**: bundle/asar the main process, squeeze the remaining server externals.
 - **`sensor_delay_ms` defaults are MQTT-sized** (200–300 ms); on the GPIO transport they can
   drop to ~50 ms — per call for now, a transport-aware default later.
+
+## Thread-milling import
+
+`convert_thread_milling_gcode` converts Machining Doctor thread-milling exports (eight controller variants) to
+reviewable Snapmaker G0/G1 programs offline. See [thread-milling support](docs/thread-milling.md)
+for firmware findings, generator option coverage, required declarations, spindle
+modes, examples and limitations. The dedicated
+[`cnc-thread-milling` skill](../../../../.claude/skills/cnc-thread-milling/SKILL.md)
+covers cutter geometry, internal bore/external boss review, multiple features and
+tool changes under `cnc-motion-rules`. Running a converted file uses the existing
+job approval flow. See the [baseline evaluation review](docs/thread-milling-evaluation.md)
+for the documentation gaps addressed and the next-evaluation constraints.
+
+### Probe inspection and camera evidence
+
+[Probe inspection](docs/probe-inspection.md) documents contact-synchronized photos in sequence
+and surface operations, the continuous camera endpoints, bounded ball-radius shoulder backoff,
+and propagation of held probe aborts through composite programs.

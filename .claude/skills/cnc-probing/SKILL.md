@@ -1,6 +1,6 @@
 ---
 name: cnc-probing
-description: "Measure work with the spindle touch probe via the Luban MCP tools — probe_point, probe_vector, probe_sequence, probe_circle, probe_surface_path/grid flatness scans, probe_stock_outline, probe_program (many ops, one approval), run_tool_setter with accept_probe_contact — under the motion laws of the cnc-motion-rules skill (load that first). Use whenever the user wants to probe stock, find surfaces/edges or an unknown height, check flatness or map a surface, locate a crown or a block, or calibrate the touch probe. CAM probing programs (run_probing_gcode) live in references/cam-probing.md."
+description: "Plan and run touch-probe measurements through Luban MCP: top profiles, flatness, walls, pockets, edges, holes, stock outlines and probe calibration. Choose bounded local continuation and measurement density to answer the machining question. Load cnc-motion-rules first; CAM probing programs use references/cam-probing.md."
 ---
 
 # CNC probing: the touch probe
@@ -14,23 +14,51 @@ description: "Measure work with the spindle touch probe via the Luban MCP tools 
 
 | Item | Value | Note |
 |---|---|---|
-| Traverse height | machine Z328 | every hop; every procedure ends here |
+| Park / procedure traverse height | machine Z328 | ordinary transport and successful procedure completion; local links use the procedure’s own envelope |
 | Probe effective length | `geometry.probe.effectiveLength` | never a remembered figure; measure if unset |
 | Tool setter | surface machine Z100.5; trigger 175.5 with the 75 mm reference | `run_tool_setter` |
 | Rotary axis | `geometry.rotary` (axisX ≈ 170, axisZ physical ≈ 112) | B-dependent stock heights |
 | Chuck jaws | reach ~Y269 | a `keep_out` volume for programs |
 | Tailstock | inside the `rotary-axis` box, Y < ~110; height UNMEASURED | measure it (see below), then `set_landmark` |
 
-## The fastest lawful shape for almost every request
+## Choose measurements that answer the machining question
 
-**Find the top, then scan it — one `probe_program`, one approval** (the JSON is in
-`cnc-motion-rules` §8). The first op is a `sequence`: `hop` to the station at the traverse
-height, then a `probe` with `dz: -1` and a generous `max_travel_mm` (up to 150; the floor must
-keep the tip off the bed and above the axis if a cylinder is expected). The second op references
-`<id>.<probe>.z` for `start_z_machine` (plus 2–3 mm) and `expected_z_machine`. Separate
-`probe_point` → `probe_surface_path` approvals cost the operator a round-trip and buy nothing.
+Start with the deliverable: which boundaries, depths, remaining material and fixture clearances
+must be known to propose the cut? Include the
+[work datum and its recheck](../cnc-motion-rules/references/work-datums.md): identify accessible
+references for XYZ/orientation, verify probe-body access and measure them before the probe is
+removed. A top profile alone does not register the milling WCS. Reuse completed measurements
+only while the tool, workholding, B orientation and datum remain applicable. A width measured away from the cut is a reference,
+not the cut's verified contour. Preserve partial results and refine the gaps instead of rerunning
+whole scans. Produce a reviewable geometry/cut proposal as those constraints become known.
 
-Which second op:
+**Known surface:** use the valid measured contact to set a guarded `start_z_machine` a little
+above it and `expected_z_machine` at the contact. Do not repeat a long fine search from machine
+toolhead Z328 simply because another op or turn began. First confirm that the evidence applies
+to this approach column and unchanged setup; a different B angle needs its own evidence.
+
+**Unknown surface:** find then scan in one `probe_program` (JSON in `cnc-motion-rules` §8).
+Use a `sequence` sensor-gated −Z march from the proven safe height, then reference its contact
+for the scan's start and expected Z. A guessed height or CAD nominal cannot replace this find.
+
+For channel boundaries, state the required edge tolerance, sample coarsely to bracket transitions,
+then refine only unresolved intervals and stop once the cut-planning question is answered. Dense
+uniform sampling of a known flat bank adds time without resolving the unknown edge. Budget actual sensor-checked moves, confirm passes, captures
+and rotations; a nominal coarse step can still contain several controller transactions.
+
+**Choose the movement pattern before batching calls.** For adjacent measurements of the same
+feature, use the appropriate continuous procedure below. `sequence` returns to each march's
+start and raises after **every probe**, including a continuing miss. `probe_program` shares
+approval and measured references, but each completed probing op still finishes raised; it does
+not fuse their paths. Keep related stations inside one suitable op. Unknown fixtures and changes
+of face or B can justify full clearance. Small XY increments alone do not prove a route clear.
+
+For the complete capability/retreat comparison and timing decisions, read
+[planning and local continuation](references/planning.md) when arranging multiple probes or
+reviewing a slow inspection. For imported or hand-written probing programs and mixed station
+links, also read [CAM probing](references/cam-probing.md).
+
+Which measuring op:
 
 | The operator wants… | Op | Notes |
 |---|---|---|
@@ -42,12 +70,13 @@ Which second op:
 | the RADIUS of an internal corner between two fitted walls | `corner` | bisector march, then radial marches from the fitted centre; needs `radius_max_mm` |
 | the whole perimeter of a pocket of UNKNOWN shape | `trace` (`probe_trace_perimeter`) | 0.1 mm crawl from a point inside; needs `bounds` + `max_perimeter_mm` |
 | a VERTICAL post/boss/hole diameter and centre | `probe_circle` | vertical-axis features only — a cylinder lying along Y is a `surface_path` across it |
-| edges of stock of estimated size | `sequence` side marches | start outside the largest size; long travel is cheap |
+| edges of stock of estimated size | `sequence` side marches | start outside the bounded stock; shorten air travel using applicable measured edges |
 
 **Unknown Z, no stored axis, no operator number** (the common "scan that thing" case): the only
 lawful route is the sensor-gated −Z march from the traverse height inside the program above.
-It costs about `max_travel / coarse_step` sensor windows (~0.3 s each): ask for an approximate
-height in your one question batch and shorten it — a long limit costs time, not safety.
+Keep the travel bounded by probe-body reach and the approved search floor. Account for physical
+segments and controller latency, not just `max_travel / coarse_step`. An approximate height helps
+identify the region but does not authorise a blind descent into unknown space.
 
 **Measuring inside an unmeasured region** (the tailstock): a `keep_out` bans SCAN geometry from
 entering a volume; it does not ban deliberately measuring the thing. The sanctioned first
@@ -70,6 +99,29 @@ the Workspace → Connection pills (Probe / Tool Setter / Setter Overtravel) mus
 `unavailable: true` = the USB bridge is unplugged (tell the operator); "disabled (Settings → MCP
 Server)" = the operator switched that sensor off — ask, never bypass.
 
+## Live viewing and photographs at probe spots
+
+Use `list_cameras` → `stream_url` for the continuously available `/camera` viewer; it shares the
+capture source with MCP snapshots and can remain open during a program. `mjpeg_url` is the raw
+stream and `snapshot_url` a current still; `/camera/status.json` reports stream state/freshness.
+An asynchronous `capture_frame` can catch the head after it has retracted. For a specific probe
+spot, request the photograph in the staged program itself:
+
+- On a `sequence` **probe step**, add `"capture": {"label": "rim contact", "settle_ms": 500}`.
+- On a `surface_path` or `surface_grid` op, add
+  `"capture": {"stations": [1, 4, 7], "label": "channel transitions", "settle_ms": 500}`.
+  Station indices are 1-based, at most 60 selected frames. Select indices after planning the scan.
+
+The runner captures without motion after the final confirm contact, before retracting; a
+continuing no-contact station is photographed at its search limit. The result's `capture` contains
+the persistent file, frame ID, actual machine pose/B, timestamp and camera identity, or an explicit
+camera failure. Read `get_frame {file}` for durable evidence (the frame-ID cache holds only 12).
+The actual final-pass pose can differ from the reported median contact. A camera failure is
+recorded and normal retraction continues; a stop or safety alarm still stops the procedure.
+These options apply to sequence and surface scans, including inside `probe_program`; a standalone
+program `capture` after a scan still sees its raised finish position. Do not recreate a low pose
+with an extra move just for a picture. If the live schema lacks `capture`, the server needs updating.
+
 ## Surface flatness and height maps
 
 Both procedures measure a TOP surface with many −Z marches under ONE approval; every number is
@@ -90,12 +142,13 @@ never a rough estimate when a march can measure it. `expected_z_machine` gives s
 slow zone. The runner reaches station 1 law-2 style (raise, hop at 328, segmented guarded
 descent), then works the envelope.
 
-**Envelope (operator law, 2026-09-05)** — the one exception to law 2, between consecutive
-stations only. Lowering a value is always allowed; raising past a cap is refused.
+**Surface envelope (operator law, 2026-09-05)** — applies between consecutive stations in
+these scans. Other continuous procedures have their own bounded links; this envelope does not
+transfer to ordinary motion or arbitrary operations. Keep parameters within their stated bounds.
 
 | Parameter | Default | Cap | Meaning |
 |---|---|---|---|
-| `z_safe_delta_mm` | 20 (conservative; use 5 on a surface known to vary < 5 mm between stations) | 20, min 3 | retract above the LAST CONTACT for the hop |
+| `z_safe_delta_mm` | 20 (conservative; use 5 on a surface known to vary < 5 mm between stations) | 20, min 3 | guarded-mode lift above LAST CONTACT; stepped uses `hop_lift_mm` |
 | `max_hop_mm` | 60 | 60 | largest station-to-station distance; check `span / (stations − 1) ≤ 60` before staging |
 | `max_drop_mm` | 40 | 80 | how far below the previous contact a station may search; also bounded by `floor_z_machine` |
 | `hop_mode` | `guarded` | — | see `cnc-motion-rules` §4: spacing × slope ≪ delta → guarded; steps/pockets/unknown → `stepped` (+ `hop_lift_mm`, default 2) |
@@ -103,8 +156,9 @@ stations only. Lowering a value is always allowed; raising past a cap is refused
 
 Contact during a `guarded` hop is a collision already in progress (detected at the end of a ≤ 10
 mm segment); a `no_contact` station records and the scan continues; the first station finding
-nothing aborts. Completion and abort both raise to 328. `stop_gcode_job` stops at the next step
-boundary and keeps every completed station under `result` with `ending` saying why.
+nothing aborts. Successful completion raises to 328; abort recovery follows the motion rules,
+including held contact. `stop_gcode_job` stops at the next step boundary and keeps every
+completed station under `result` with `ending` saying why.
 
 **Event budget — compute it the moment you know the station count.** The job keeps
 `mcpJobEventLimit` events (default 2000, `get_mcp_diagnostics → buffers`); beyond it the log
@@ -120,11 +174,19 @@ midpoint of the two flank stations at each Z level, or of matching plateaus) —
 preserves the crown's X and offsets only the height by the tip radius, so crown-X answers survive
 an unknown tip radius while height answers do not. Quote ± the station pitch / 2 at least.
 For "is it flat", report the plane residual peak-to-valley and the tilt, every Z as toolhead Z
-with physical = Z − probe length, and the B angle.
+with physical = Z − probe length, and the B angle. For fixture separation, calculate the signed
+coordinate difference and absolute distance from the actual cut before saying closer/farther.
+A tip-centre transition at one X/B is not a material identification or a full cutter/holder clearance;
+state the measured bracket, tip convention and unmeasured extent.
 
-**Speed.** Read `result.timing` (or `get_job_timing`). The coarse walk down from the hop height
-dominates; on stock known to vary < 5 mm use `z_safe_delta_mm: 5`, `confirm_passes: 2`,
-`sensor_delay_ms: 30–50` on GPIO. Never raise the coarse feed yourself.
+**Speed.** Read `result.timing` (or `get_job_timing`) before choosing a remedy: initial search,
+repeated full approaches, local links, fine approaches and confirmations have different costs.
+`execMs` includes motion and controller/transport overhead; `senseMs` is inside `idleMs`, so do
+not add overlapping totals. Use `runMs` for runtime and keep approval/chat gaps separate.
+Reduce redundant stations first; keep the confirmations needed by the measurement tolerance.
+For guarded scans on a surface known to vary less than 5 mm between stations, `z_safe_delta_mm: 5`
+can shorten local approaches. Stepped scans instead use `hop_lift_mm` for their local lift.
+Use the transport-appropriate sensor window above; never raise the coarse feed yourself.
 
 ## Whole-stock programs (`probe_program`)
 
@@ -141,22 +203,34 @@ is how a program places the camera; without `x/y` it is NO motion), `home {}` (m
 only; it also homes B — the page says so), and `group {for_b: [0, 90, 180, 270], ops}` which
 runs its inner ops once per angle (`${b}` in strings; a `capture` may sit inside, a `home` may
 not). A `capture` first waits for two idle heartbeats at the expected B (a frame is never taken
-mid-move). Every probing op ends raised at 328; a program that ends with `home` ends AT HOME.
+mid-move). Every successfully completed probing op ends at machine toolhead Z328; a program that ends with `home` ends AT HOME.
 **Look at both sides of a rotary part under one click**: `capture {x, y}` → `rotate_b 180` →
 `capture` → `home`. References (grammar in
 `cnc-motion-rules` §8) may sit in any numeric argument; bounds are mandatory (law 3); order ops
 so every reference points backwards; `on_fail: "skip"` lets a non-critical op fail without
-ending the program (a requested stop always ends it). Staging REFUSES a program whose event
+ending the program (a requested stop or held probe contact always ends it; skip cannot override a hold). Staging REFUSES a program whose event
 estimate exceeds the limit and tells you the number to ask for.
 
 `sequence` steps: `{"kind": "hop", "x", "y"}` (at the hop height), `{"kind": "descend", "z"}`
 (guarded segments then 1 mm sensor-checked steps), `{"kind": "probe", "name", "dx"|"dy"|"dz",
-"max_travel_mm", "on_miss"?}`. Results read as `<opId>.<name>.x|y|z` (contactMachine).
+"max_travel_mm", "on_miss"?, "capture": {"settle_ms"?, "label"?}?}`. After each probe the head
+returns to that probe's start, then raises to park before the next step. Results read as
+`<opId>.<name>.x|y|z` (contactMachine); references pass measurement values, not a retained low pose.
 
 Geometry is NEVER a prerequisite: a program that references only its own earlier ops needs
 nothing stored. Only `axis.*` references need the rotary axis and probe length — measure and
 store them yourself (`set_probe_geometry`) or write the program without them. Rotary stock is
-B-dependent (square stock ~12 mm higher at B90); every result carries its B.
+B-dependent (square stock ~12 mm higher at B90); every result carries its B. This changes the
+surface coordinates, not the validity of an established common WCS. Keep one verified work
+frame for indexed cuts when the mounting and rotary registration remain valid; probe only
+missing geometry or checks, rather than re-zeroing or repeating datum probes at every angle.
+Prefer one established WCS; multiple workspaces are frowned upon but supported when needed
+by an existing G-code job. After measured registration, `set_workspace_origin` can stage a
+human-approved XYZ assignment from the current stationary pose; no trip to zero is needed.
+Read the motion-rules work-datum reference for toolhead-Z semantics and verification.
+A retained WCS does not authorise returning to its zero after rotation: stock/fixtures can now
+obstruct that location or the old route. Keep it as the reference and use a separately verified
+entry point unless the complete return route is clear in the new orientation.
 
 - **Derive, don't guess**: `{"mid": ["s0.west.x", "s0.east.x"]}` is the stock centre;
   `{"diff": ["s0.east.x", "s0.west.x"], "scale": 0.5, "plus": "axis.z_contact"}` the B90 face
@@ -250,7 +324,12 @@ whole program — and compare `derived` with the operator's calipers.
 `run_tool_setter` with `accept_probe_contact: true` and a conservative `bit_length_mm`
 (`bit_length_mm` is the fitted tool's PROTRUSION in mm — a length, never a diameter; declare
 LOW). Setter surface = machine Z100.5, so effective length = measured trigger Z − 100.5; store
-it with `set_probe_geometry`. **Any probed surface height = contact toolhead Z − probe length.**
+it with `set_probe_geometry`. This derives effective length FROM a measured trigger
+and the verified setter reference; the historical 100.5 example is not a fresh
+reading. Never reverse the formula to fabricate `old_trigger_z` for a tool change.
+That requires the same-connection measurement pair (or the documented same-tool,
+same-session reuse) in [tool-change](../tool-change/SKILL.md).
+**Any probed surface height = contact toolhead Z − probe length.**
 The run ends with the head raised straight up to the traverse height (machine Z328, reported as
 `result.finalZ`), never at its start height — the next hop starts from there.
 
@@ -268,3 +347,20 @@ verify with `query_firmware_position` before re-staging.
 (≤ 1 mm or one sensor window), raises to 328, and ends the job `stopped` with everything measured
 so far in `result` and `ending.kind: stopped-by-agent`. It is not an emergency stop — the crash
 guard and the machine's own stop are.
+
+## Steep shoulders and aborted scans
+
+In stepped surface scans, the runner backs along the incoming path before rising. It can add
+up to one **stored probe-ball radius** (half `probe_tip_diameter`, not half the exposed stylus
+length), in 0.25 mm steps, only within the already verified straight corridor at the same height.
+A change in direction/height discards that extra clearance evidence. Lifts are checked in 0.5 mm
+segments, including brief touch-and-release events; a contact during a lift holds the procedure
+before another sideways move. There is no arbitrary sideways escape or repeated rise against a
+triggered probe. Missing ball geometry disables the additional margin.
+
+Read `ending`, the saved partial stations and recovery phases. `abort-held` means held, even if
+the feed later releases; the outer program must preserve that decision and must not claim it
+raised. Never equate an error message's nominal step with the actual travelled distance. Re-plan
+from the verified final state, using independent approaches if the surface cannot be followed.
+Long-poll `get_gcode_job_status` with the previous response's `next_event_index` as `since_event`;
+do not use a fabricated large cursor or repeatedly fetch the whole event history.

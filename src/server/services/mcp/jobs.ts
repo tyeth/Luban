@@ -135,6 +135,8 @@ export interface McpJob {
     // Procedure jobs: the server-side runner start_gcode_job invokes after
     // the operator's token is consumed. Never serialised or described.
     runner?: () => Promise<object>;
+    /** Workspace state against which this job was staged; old approvals cannot survive a change. */
+    workspaceRevision?: number;
 }
 
 function escapeHtml(text: string): string {
@@ -158,6 +160,8 @@ export class JobManager {
 
     private jobsDir: string | null = null;
 
+    private workspaceRevision = 0;
+
     private ensureJobsDir(): string {
         if (!this.jobsDir) {
             this.jobsDir = path.join(DataStorage.tmpDir, 'mcp-jobs');
@@ -180,6 +184,7 @@ export class JobManager {
             filePath,
             createdAt: Date.now(),
             validation,
+            workspaceRevision: this.workspaceRevision,
             state: 'awaiting_confirmation',
             confirmToken: null,
             approvedAt: null,
@@ -270,10 +275,22 @@ export class JobManager {
         return this.jobs.get(id) || null;
     }
 
-    /**
-     * Verify a human-supplied confirm token for a job. Single-use, expiring.
-     */
+    /** Invalidate reviews made against the old (or intermediate) workspace state. */
+    public invalidateWorkspaceApprovals(changingJob: McpJob): void {
+        this.workspaceRevision += 1;
+        changingJob.workspaceRevision = this.workspaceRevision;
+        for (const job of this.jobs.values()) {
+            if (job !== changingJob && !this.isTerminal(job)) {
+                this.appendEvent(job, 'workspace_approval_stale', { note: 'Workspace state changed; restage this job against the verified offsets before approval.' });
+            }
+        }
+    }
+
+    /** Verify a human-supplied confirm token for a job. Single-use, expiring. */
     public consumeToken(job: McpJob, token: string): { ok: boolean; reason?: string } {
+        if ((job.workspaceRevision || 0) !== this.workspaceRevision) {
+            return { ok: false, reason: 'Workspace state changed since this job was staged; restage it against the verified offsets for a new approval.' };
+        }
         // A batch direct job mid-series reads 'started' with steps remaining
         // and its token re-armed; the operator's one approval covers the
         // exact list, so the same code keeps working (bug found live

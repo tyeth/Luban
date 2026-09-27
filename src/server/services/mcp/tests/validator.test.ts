@@ -36,14 +36,15 @@ export const tests: Array<[string, () => void]> = [
         assert.deepEqual(r.report.machineZExtents, { min: 300, max: 300 });
     }],
 
-    ['G54 before the first move declares WORK and resolves Z through the offset', () => {
+    ['G54 declares WORK but an anonymous current offset cannot prove its machine extents', () => {
         const r = resolveJobFrame(validateGcode('G90\nG54\nG0 Z10\nG1 Z-2\n'), ctx({ originOffsetZ: -200 }));
         assert.equal(r.refusal, null);
         assert.equal(r.report.frame.declared, 'work');
         assert.equal(r.report.frame.source, 'gcode');
         assert.deepEqual(r.report.frame.workspaceSelects, ['G54']);
-        assert.deepEqual(r.report.machineZExtents, { min: 198, max: 210 });
-        assert.equal(r.report.originOffsetZAtStaging, -200);
+        assert.equal(r.report.machineZExtents, null);
+        assert.equal(r.report.originOffsetZAtStaging, null);
+        assert(r.report.warnings.some((w) => w.includes('UNRESOLVED')));
     }],
 
     ['a Luban export (no workspace select) is accepted with frame:"work" and left byte-identical', () => {
@@ -115,7 +116,7 @@ export const tests: Array<[string, () => void]> = [
     }],
 
     ['a work-frame job with an unreliable offset gets unresolved machine extents and a warning', () => {
-        const r = resolveJobFrame(validateGcode('G90\nG54\nG1 Z10\n'), ctx({ offsetReliable: false }));
+        const r = resolveJobFrame(validateGcode('G90\nG1 Z10\n'), ctx({ frameArgument: 'work', offsetReliable: false }));
         assert.equal(r.refusal, null);
         assert.equal(r.report.machineZExtents, null);
         assert.ok(r.report.warnings.some((w) => w.includes('not reliable right now')));
