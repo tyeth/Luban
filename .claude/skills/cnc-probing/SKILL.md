@@ -224,6 +224,10 @@ B-dependent (square stock ~12 mm higher at B90); every result carries its B. Thi
 surface coordinates, not the validity of an established common WCS. Keep one verified work
 frame for indexed cuts when the mounting and rotary registration remain valid; probe only
 missing geometry or checks, rather than re-zeroing or repeating datum probes at every angle.
+Prefer one established WCS; multiple workspaces are frowned upon but supported when needed
+by an existing G-code job. After measured registration, `set_workspace_origin` can stage a
+human-approved XYZ assignment from the current stationary pose; no trip to zero is needed.
+Read the motion-rules work-datum reference for toolhead-Z semantics and verification.
 A retained WCS does not authorise returning to its zero after rotation: stock/fixtures can now
 obstruct that location or the old route. Keep it as the reference and use a separately verified
 entry point unless the complete return route is clear in the new orientation.

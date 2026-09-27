@@ -6,6 +6,8 @@ import ts from 'typescript';
 import type http from 'http';
 import type { JobManager, McpJob } from '../jobs';
 import * as jobEnding from '../jobEnding';
+import * as workspace from '../workspace';
+import { validateGcode } from '../validator';
 import { handleJobDashboardRequest } from '../jobDashboard';
 import { JobDashboardFeed, summarizeDashboardJob } from '../jobDashboardState';
 import { dashboardHtml, notificationWorker } from '../jobDashboardPage';
@@ -76,6 +78,110 @@ function managerFixture() {
 }
 
 export const tests: Array<[string, () => void | Promise<void>]> = [
+    ['registered workspace tool stages inertly and the real start gate refuses absent approval', async () => {
+        const { JobManager: Manager } = managerFixture();
+        const manager: JobManager = new Manager();
+        let commands = 0;
+        let sequence = 0;
+        let resetAt = 1;
+        let runnerCalls = 0;
+        const channel = { uploadGcodeFile: () => undefined, startGcodeJob: () => undefined };
+        const state = { timestamp: Date.now(), status: 'idle', headPower: 0 };
+        const connection = { getCurrentChannel: () => channel, getLatestMachineState: () => state };
+        const position = {
+            machine: { x: 230, y: 245, z: 328 },
+            work: { x: 60, y: 110, z: 120 },
+            originOffset: { x: -170, y: -135, z: -208 },
+            originOffsetSource: 'heartbeat',
+            reliability: 'heartbeat',
+            frame: 'work-frame',
+            warnings: [],
+            machineStatus: 'idle',
+            isHomed: true,
+            b: 0,
+            isFourAxis: true,
+            reportedAt: state.timestamp,
+            reportAgeMs: 0,
+        };
+        const handlers: Record<string, any> = {}; // eslint-disable-line @typescript-eslint/no-explicit-any
+        const registry = { register: (tool: { name: string }) => { handlers[tool.name] = tool; } };
+        const dependencies = {
+            '../../machine/ConnectionManager': { connectionManager: connection },
+            '../jobs': { jobManager: manager },
+            '../positionOfRecord': { currentGcodeSequence: () => sequence },
+            '../probeFeed': { probeFeedService: { assertNoOvertravel: () => undefined } },
+            '../probing': { assertMachineReadyForProcedure: () => undefined, checkProcedureStop: () => undefined, getDirectChannel: () => channel },
+            '../registry': { McpToolError: Error },
+            '../workspace': workspace,
+            './camera': { sendGcodeVisible: async () => { commands++; return { result: 0 }; } },
+            './machine': { getPositionSnapshot: () => position, machinePositionDiagnostics: () => ({ resetAt }) },
+            './staging': { validateStagedEnvelope: validateGcode },
+        };
+        isolatedModule('tools/workspace.ts', dependencies).registerWorkspaceTools(registry, () => 'http://localhost');
+        const staged = await handlers.set_workspace_origin.handler({
+            workspace: 'G59.3', origin_machine: { x: 230, y: 245, z: 231.3 }, datum_reference: 'Measured datum; probe; B0', reason: 'Existing job',
+        });
+        assert.strictEqual(commands, 0);
+        assert(staged.confirm_url.endsWith(staged.job.id));
+        const stagedJob = manager.get(staged.job.id);
+        assert(stagedJob);
+        assert.strictEqual(stagedJob.state, 'awaiting_confirmation');
+        assert.strictEqual(stagedJob.kind, 'procedure');
+        assert.strictEqual((manager.describe(stagedJob) as { confirmToken?: string }).confirmToken, undefined);
+        const runner = stagedJob.runner;
+        assert(runner);
+        stagedJob.runner = async () => { runnerCalls++; return {}; };
+        const startDeps: Record<string, unknown> = {};
+        const source = fs.readFileSync(path.join(__dirname, '../tools/gcode.ts'), 'utf8');
+        for (const match of source.matchAll(/from '([^']+)'/g)) startDeps[match[1]] = {};
+        Object.assign(startDeps, {
+            '../../../lib/logger': () => ({}),
+            '../../machine/ConnectionManager': { connectionManager: connection },
+            '../jobs': { jobManager: manager, TERMINAL_JOB_STATES: jobEnding.TERMINAL_JOB_STATES },
+            '../registry': { McpToolError: Error },
+            '../probeFeed': { probeFeedService: { assertNoOvertravel: () => undefined } },
+            './machine': { assertFreshHeartbeat: () => undefined },
+        });
+        isolatedModule('tools/gcode.ts', startDeps).registerGcodeTools(registry, () => 'http://localhost');
+        await assert.rejects(async () => handlers.start_gcode_job.handler({ job_id: stagedJob.id, confirm_token: 'invented' }), /not approved/);
+        assert.strictEqual(runnerCalls, 0);
+        assert.strictEqual(commands, 0);
+        sequence++;
+        await assert.rejects(runner, /after staging/);
+        sequence--;
+        resetAt++;
+        await assert.rejects(runner, /connection changed/);
+        assert.strictEqual(commands, 0);
+        // An idle controller between procedure commands is not an idle server runner.
+        stagedJob.state = 'approved'; stagedJob.confirmToken = 'human'; stagedJob.approvedAt = Date.now();
+        const active = manager.submit('', 'active procedure', 'cnc', validateGcode(''), 'procedure');
+        active.state = 'started'; manager.setActive(active);
+        await assert.rejects(async () => handlers.start_gcode_job.handler({ job_id: stagedJob.id, confirm_token: 'human' }), /still active/);
+        assert.strictEqual(stagedJob.tokenUsed, false);
+        assert.strictEqual(runnerCalls, 0);
+    }],
+
+    ['workspace changes invalidate prior approvals even after reapproval, but permit freshly staged jobs', () => {
+        const { JobManager: Manager } = managerFixture();
+        const manager: JobManager = new Manager();
+        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as McpJob['validation'];
+        const old = manager.submit('', 'old', 'cnc', validation);
+        old.state = 'approved'; old.confirmToken = 'human-token'; old.approvedAt = Date.now();
+        const change = manager.submit('', 'workspace', 'cnc', validation, 'procedure');
+        manager.invalidateWorkspaceApprovals(change);
+        assert.strictEqual(manager.consumeToken(old, 'human-token').ok, false);
+        assert.strictEqual(old.tokenUsed, false);
+        assert(manager.consumeToken(old, 'human-token').reason?.includes('restage'));
+        const intermediate = manager.submit('', 'during update', 'cnc', validation);
+        intermediate.state = 'approved'; intermediate.confirmToken = 'human-token'; intermediate.approvedAt = Date.now();
+        manager.invalidateWorkspaceApprovals(change);
+        assert.strictEqual(manager.consumeToken(intermediate, 'human-token').ok, false);
+        const fresh = manager.submit('', 'new', 'cnc', validation);
+        assert.strictEqual(manager.consumeToken(fresh, 'human-token').ok, false);
+        fresh.state = 'approved'; fresh.confirmToken = 'human-token'; fresh.approvedAt = Date.now();
+        assert.strictEqual(manager.consumeToken(fresh, 'wrong-token').ok, false);
+        assert.strictEqual(manager.consumeToken(fresh, 'human-token').ok, true);
+    }],
     ['feed preserves quick lifecycle transitions, skips telemetry, and suppresses initial history', () => {
         const feed = new JobDashboardFeed();
         const initial = feed.read(null, null);

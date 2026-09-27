@@ -172,3 +172,20 @@ validation of the newly committed recovery/capture changes.
 Validation is offline: simulated-machine traversal regressions, real runner tests with mocked
 machine/camera IO, camera failure/freshness tests and held-abort tests. These changes do not
 restart the running machine service or qualify the current fixture for milling.
+
+
+### Latest datum handoff and workspace tooling
+
+The subsequent inspection turn measured a B0 rim at toolhead Z201.3 and edge contacts at
+X203.1/Y253.4 (job `4a426e131af8`). It proposed an air-side reference at machine
+X230/Y245/toolhead Z231.3, moved there in jobs `65a87b00d77f` and `0857228250d7`, then waited
+for the operator to set XYZ manually. The mapping readback was not evidence that this origin
+had been set. B0 approach evidence also does not certify access after B rotation.
+
+`set_workspace_origin` closes that tooling gap: a measured origin can be assigned from a
+stationary verified pose with one explicit human approval and checked readback. Travelling to
+the zero point merely to press Set Origin is unnecessary. `select_workspace` supports an
+existing job's required offsets without rewriting them. Prefer one common WCS; multiple
+workspaces are discouraged and supported only when needed, especially for existing G-code.
+See [workspace tools and verification limits](workspaces.md). These changes remain offline;
+the inspection machine and its installed skills are not changed by this PR.

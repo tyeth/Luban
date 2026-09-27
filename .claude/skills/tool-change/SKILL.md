@@ -112,7 +112,7 @@ the reference before cutting. For thread milling, this is the precondition behin
    `start_gcode_job {job_id, wait_for_approval_ms: 110000}` (defaults to those
    two measurements). It stages a single `G92` — nothing moves; the work frame
    shifts by `new − old`. A longer tool makes the current work Z read LOWER.
-   This is the ONE sanctioned work-origin write (`cnc-motion-rules` §4): it mirrors what
+   This is the sanctioned tool-length transfer (`cnc-motion-rules` §4): it mirrors what
    the touchscreen wizard does after its two operator confirmations. Never `G92` by hand.
 6. **Verify** — `get_position`: `originOffset.z` must have changed by the
    delta, and the operator should sanity-check the displayed work Z against

@@ -24,6 +24,7 @@ import { registerProbeTools } from './tools/probe';
 import { registerProbingTools } from './tools/probing';
 import { registerStatusTools } from './tools/status';
 import { registerToolSetterTools } from './tools/toolsetter';
+import { registerWorkspaceTools } from './tools/workspace';
 import { registerThreadMillingTools } from './tools/threadMilling';
 
 const log = logger('service:mcp');
@@ -248,6 +249,7 @@ function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
     registerLandmarkTools(registry);
     registerProbeTools(registry);
     registerToolSetterTools(registry, baseUrl);
+    registerWorkspaceTools(registry, baseUrl);
     registerProbingTools(registry, baseUrl);
     registerCamTools(registry, baseUrl);
     registeredToolCount = registry.list().length;

@@ -56,9 +56,10 @@ than adopting the snapshot to make the model match. Reading, homing, `restore_wo
 
 Acquire missing datum evidence with bounded machine-frame probing under the existing motion
 rules, not with motion dependent on the unverified work frame. Setting/re-zeroing the work
-origin uses the operator's supported touchscreen/Luban workflow; the only sanctioned MCP
-origin adjustment remains `apply_tool_length_offset`. Do not inject G92/G10 or choose another
-workspace to hide a registration mismatch. Re-read the selected live frame after setting it
+origin can use the human-gated `set_workspace_origin` workflow below or the operator's
+supported touchscreen/Luban workflow. `apply_tool_length_offset` transfers an established
+Z reference across tools. Do not inject G92/G10 or choose another workspace to hide a
+registration mismatch. Re-read the selected live frame after setting it
 and check an accessible reference with a predicted coordinate/tolerance, not merely the
 zero display. Keep that check separate from the measurements used to construct the datum.
 
@@ -100,9 +101,10 @@ No return to zero is needed to execute correctly registered toolpaths, and no re
 needed merely because zero is no longer reachable. A prior B0 route or safe arrival height
 is not clearance evidence at B90.
 
-Separate work offsets are an option when the actual setup/post requires them, such as a
-re-clamping or an explicitly planned independent setup. They are not a prerequisite for
-multi-angle machining. Distinguish a loss of datum registration from a changed surface height
+**Multiple workspaces are frowned upon. Prefer one established WCS.** Firmware G54 through
+G59.3 are supported when necessary to utilise an existing G-code job with those workspaces;
+verify each required offset and its measured registration before using the job. Do not add
+workspaces simply for each B angle or to conceal a registration error. Distinguish a loss of datum registration from a changed surface height
 or clearance after indexing.
 
 ## Work zero is not a clearance move
@@ -125,3 +127,50 @@ A setup is ready for cutting only when datum measurement and recheck, model/work
 registration, fitted-tool Z transfer, indexed orientations and complete approach/cut/exit
 clearances are established for the exact program. Otherwise identify the specific missing
 measurement or setup action; an attractive review model or numeric offset is not readiness.
+
+
+## Set a measured origin without travelling to zero
+
+Call `set_workspace_origin` with an explicit `workspace` (normally G54), all XYZ in
+`origin_machine`, `datum_reference` identifying measured evidence/tool/B context, and `reason`.
+The requested origin is the machine-coordinate position at which work XYZ should read zero;
+**Z is toolhead Z for the fitted tool**, not the physical surface height. A measured offset or
+virtual centre can be assigned while the head remains at a verified parked position. Do not
+spend an approval or a descent merely to position at the proposed zero before setting it.
+
+Example values are illustrative, not authorisation for this setup:
+
+```json
+{
+  "workspace": "G54",
+  "origin_machine": {"x": 230, "y": 245, "z": 231.3},
+  "datum_reference": "Measured rim/edge job IDs; calibrated probe fitted; B0 registration; independent witness check",
+  "reason": "Establish the common measured datum for indexed cuts"
+}
+```
+
+Deliver the confirm URL immediately. The operator reviews replacement of **all XYZ** in the
+named workspace; `start_gcode_job` requires their approval. Staging sends no controller
+commands. Execution checks that position, B, current offset, connection and command sequence
+still match the staged setup. It selects the named workspace, requires firmware acknowledgement,
+reads its old offset, writes once and verifies two fresh agreeing offset/position reports.
+No B/E origin is written, and no other workspace's stored origin is changed.
+
+Use `select_workspace {workspace, reason}` when an existing job needs an already established
+workspace; selection is human-gated and verified without rewriting the origin. These tools
+leave the requested workspace active. Standard MCP probing/transport and `restore_work_frame`
+can reselect G54: recheck/reselect before the file job. The thread-milling converter and CAM
+probing importer retain their own workspace restrictions; general firmware support does not
+broaden those importers.
+
+A workspace change makes earlier staged jobs stale, including previously approved jobs.
+Complete and verify the setup, then restage the cutting job against it. If acknowledgement or
+readback fails, report the result as **unverified**; the controller may already have changed.
+There is no automatic retry, rollback or recovery motion. Inspect the frame/offset before
+continuing. Successful readback verifies the coordinate assignment, not physical datum
+accuracy or access: retain the independent reference check and full path review above.
+
+A file naming workspaces cannot have all machine extents established from one anonymous live
+offset. The validator marks those extents unresolved, including a single explicit G54;
+review each required workspace/section separately. Preserve an existing file's workspace
+selectors instead of silently rewriting them to make the validation display look resolved.

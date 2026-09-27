@@ -15,7 +15,7 @@
         "Uses convert_thread_milling_gcode with real argument names: gcode, source_controller fanuc (or default), tool_center_path true, tool_length_applied true, spindle_mode",
         "Chooses spindle_mode from the actual head (reads get_machine_profile/get_stored_state or asks) rather than assuming; notes S17991 is only kept in cnc_200w_rpm mode (8000-18000) and that power_percent does NOT rescale feeds",
         "Only declares tool_length_applied true once work Z has been referenced with the thread mill itself fitted (tool change flow / tool setter + apply_tool_length_offset, or the operator setting Z with this cutter)",
-        "Treats the work origin (X0 Y0 at the hole centre, Z0 at the stock top) as the operator's, never writing it except via apply_tool_length_offset; asks how/whether the hole centre is set",
+        "Treats the work origin (X0 Y0 at the hole centre, Z0 at the stock top) as the operator's, establishing measured XYZ only via human-gated set_workspace_origin and transferring tool length via apply_tool_length_offset; asks how/whether the hole centre is set",
         "Notes that the program's first move (G00 X0 Y0 before G43 Z20) runs at whatever Z the head is at, so the head must be at or above the motion floor / park height before the job starts",
         "Submits with submit_gcode_job using frame 'work' and head_type 'cnc', after reviewing changes/warnings/validation (or validate_gcode)",
         "Staging turn ends with the confirm URL as the last line; start_gcode_job with wait_for_approval_ms comes after, in the background",

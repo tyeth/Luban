@@ -88,6 +88,10 @@ verify the reference history. Measure an outgoing probe with
 probe length plus a remembered setter height. Use
 [cnc-probing](../cnc-probing/SKILL.md) for requested missing measurements.
 
+Prefer one established WCS across rotary angles. Multiple workspaces are frowned upon but
+supported when necessary for an existing G-code job; this does not expand the converter's
+input restrictions. Use the human-gated workspace tools for measured registration/selection,
+then restage the job after verification. Setting an origin requires no travel to zero.
 The converter emits G54. Verify that the live work origin being reviewed is the
 intended G54 origin; do not stage against an unrelated selected workspace or
 manually translate work coordinates into machine coordinates. The initial machine

@@ -165,7 +165,7 @@ item, quoting the tool result — not an essay):
 ## 2. Coordinate doctrine
 
 **Two frames exist on the controller.** `G53` selects the MACHINE frame (home = X−19 Y342
-Z328); `G54`–`G59` select numbered WORK workspaces whose origin the operator sets. The
+Z328); `G54`–`G59.3` select numbered WORK workspaces whose origin the operator sets. The
 heartbeat reports the *currently selected* workspace. `G90`/`G91` is **distance mode**, not a
 frame: a bare `G90 / G0 Z0` runs in whatever workspace is selected. It is undeclared, and
 undeclared is refused.
@@ -179,7 +179,9 @@ Landmarks, tool-setter config, probe results and the geometry store are all mach
   hand the bytes through **unchanged**. You never add `G53` or `G54` to a file you did not
   write; you never convert its Z by hand. The MCP resolves the extents through the live origin
   and the confirm page shows `Frame: WORK (declared by argument)` plus the **machine-resolved Z
-  extents** — read both to the operator. `frame: "work"` resolves against the offset on the
+  extents** when resolvable — read both to the operator. Files selecting named workspaces,
+  mixing frames or rewriting an origin have unresolved machine extents; review each section
+  using its verified workspace, never apply one live offset to the whole file. `frame: "work"` resolves against the offset on the
   heartbeat, i.e. the workspace currently selected on the controller.
 - **Machine-frame job.** `G53` must appear literally on its own line before the first move
   (the controller needs it; `frame: "machine"` without it is refused). The tools emit `G90` /
@@ -188,10 +190,13 @@ Landmarks, tool-setter config, probe results and the geometry store are all mach
 - Warned, not refused: `G92`, relative moves, Z outside 0…328 in either frame, a work-frame
   absolute `Z0`, inline `G53 G0 …` (the firmware ignores a one-shot G53).
 
-**The work origin belongs to the operator, Luban and the firmware — not to you.** It persists
-across homing, **dies on a machine reboot**, and moves when the operator re-zeros or changes
-tools. Read it fresh from `get_position.originOffset`; never assume it; the ONE sanctioned write
-is `apply_tool_length_offset` (§4).
+**The work origin belongs to the operator, Luban and the firmware.** Read it fresh from
+`get_position.originOffset`; reverify after reconnect/reboot, re-zeroing or tool changes rather
+than assuming persistence. Origin writes use the human-gated `set_workspace_origin` for measured
+XYZ registration, or `apply_tool_length_offset` for a measured tool-length transfer (§4).
+Never inject raw G92/G10 to bypass them. Prefer one established WCS: multiple workspaces are
+frowned upon, but supported when necessary to use an existing G-code job. B indexing alone
+is not a reason to introduce another workspace.
 
 **Choose the milling datum before completing CAM or removing the probe.** Prefer stable,
 accessible references that can establish and recheck XYZ and orientation in the mounted setup.
@@ -301,7 +306,15 @@ start position — expect it, do not act on it.
   measurements/approval, not a low position between ops: each successful probing op ends
   raised. Prefer related stations within a suitable continuous op. Ordinary calls split into
   ≤1 mm increments are not a substitute for a sanctioned probing envelope.
-- **`apply_tool_length_offset`** — the one sanctioned work-origin write: a single `G92` shifting
+- **`set_workspace_origin`** — stage an explicit G54–G59.3 XYZ origin from measured machine
+  coordinates, with datum/tool/B evidence and a reason. Human approval is required; no axis
+  moves and there is no need to visit work zero. Z is the machine **toolhead** Z at which the
+  fitted tool has work Z0, not physical surface Z. See [work datums](references/work-datums.md).
+  `select_workspace` similarly gates selection of an existing offset without rewriting it.
+  Both leave that workspace active, verify controller acknowledgement/readback and invalidate
+  other staged jobs. Restage them afterwards. Existing motion/probing tools commonly restore
+  G54, so verify/reselect the intended workspace before an existing file job.
+- **`apply_tool_length_offset`** — the sanctioned tool-change origin adjustment: a single `G92` shifting
   work Z by (new − old) trigger height, what the touchscreen wizard does after its two operator
   confirmations. Requires a reliable position and a measurement pair from this connection.
 - **`operator_confirmed_clearance`** — on `move_and_capture` only: skips the homed-first guard
