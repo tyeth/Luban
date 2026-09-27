@@ -60,6 +60,7 @@ interface McpCameraStreamStatus {
     enabled: boolean;
     source: 'env' | 'config' | 'default';
     fps: number;
+    storedFps: number | null;
     maxClients: number;
     pageUrl: string | null;
     streamUrl: string | null;
