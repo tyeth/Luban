@@ -7,6 +7,9 @@ import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import { steppedTraverseZ } from './march';
 import { probeFeedService } from './probeFeed';
+import { probeAbortHeld } from './programAbort';
+import { ProbeCapturePlan, planProbeCapture } from './probeCapture';
+import { captureProbeSpot } from './probeCaptureRuntime';
 import { DESCENT_GUARD_MM } from './probeSequence';
 import {
     COARSE_FEED,
@@ -108,6 +111,7 @@ export interface ProbeSurfacePlan {
     kind: SurfaceScanKind;
     tool: 'probe_surface_path' | 'probe_surface_grid';
     stations: SurfaceStation[];
+    capture: ProbeCapturePlan | null;
     /** Operator-stated toolhead machine Z at which the FIRST march starts (tip just above the surface). */
     startZMachine: number;
     /** Deepest toolhead Z any march may ever command (default start_z - max_drop). */
@@ -147,6 +151,8 @@ export interface ProbeSurfacePlan {
      */
     hopMode: 'guarded' | 'stepped';
     hopLiftMm: number;
+    /** Staged ball-radius limit for extra retreat along verified incoming paths. */
+    hopBackoffMm: number;
     path?: {
         start: { x: number; y: number };
         end: { x: number; y: number };
@@ -164,6 +170,7 @@ export interface ProbeSurfacePlan {
 }
 
 interface CommonArgs {
+    capture?: unknown;
     start_z_machine?: unknown;
     floor_z_machine?: unknown;
     z_safe_delta_mm?: unknown;
@@ -316,6 +323,7 @@ function finishPlan(
         kind,
         tool: kind === 'path' ? 'probe_surface_path' : 'probe_surface_grid',
         stations,
+        capture: planProbeCapture(args.capture, stations.length),
         startZMachine: Number(startZ.toFixed(3)),
         absoluteFloorZ: Number(floorZ.toFixed(3)),
         zSafeDeltaMm: env.zSafeDeltaMm,
@@ -335,6 +343,7 @@ function finishPlan(
         profile,
         hopMode,
         hopLiftMm,
+        hopBackoffMm: Math.max(0, Math.min(MAX_TIP_RADIUS_MM, (probeGeometry()?.tipDiameter || 0) / 2)),
     };
 }
 
@@ -420,8 +429,9 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
         `;   Worst press into the probe: ${plan.fineStepMm} mm where the surface lies in the zone; one coarse step (${plan.coarseStepMm} mm)`,
         `;   where it is higher; station 1 without expected_z_machine uses ${coarseStepFor(plan, plan.expectedZMachine !== null)} mm coarse steps (cap 1).`,
         ...(plan.hopMode === 'stepped' ? [
+            `; HOP MODE stepped: extra backoff up to ${plan.hopBackoffMm} mm (one stored ball radius), only along verified same-height incoming path; lifts are sensor-checked every 0.5 mm.`,
             `; HOP MODE stepped: between stations the probe travels at last contact + ${plan.hopLiftMm} mm as a TOUCH-PROBING traverse (1 mm steps, F300,`,
-            `;   probe expected): a contact backs off 1 mm, lifts ${plan.hopLiftMm} mm and continues - the height follows the surface in steps (never above Z${plan.hopZ}).`,
+            `;   probe expected): a contact backs off the actual link step (up to 1 mm), lifts ${plan.hopLiftMm} mm and continues - the height follows the surface in steps (never above Z${plan.hopZ}).`,
         ] : []),
         ...(plan.profile ? [
             `; EXPECTED PROFILE: cylinder along machine Y, axis X${plan.profile.centerX}, tip-on-axis Z${plan.profile.centerZContact}, radius ${plan.profile.radius}`
@@ -493,7 +503,10 @@ export function describeProbeSurfacePlanAsGcode(plan: ProbeSurfacePlan): string 
         lines.push(`G1 Z${plan.absoluteFloorZ.toFixed(3)} F${COARSE_FEED}; deepest allowed at this station (absolute floor) - no contact by here = no_contact`);
         lines.push(`; ...on contact: release, fine, confirm; retract to contact + ${plan.zSafeDeltaMm} mm`);
     }
-    lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; finish at the safe traverse height (also on any abort)`);
+    lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; finish at the safe traverse height (on abort: raise only if recovery is not held and sensors permit)`);
+    if (plan.capture) {
+        lines.push(`; CAMERA: stationary at stations ${plan.capture.stations?.join(', ')}, after final contact (or no-contact floor), BEFORE retract; settle ${plan.capture.settleMs} ms. Camera failures are recorded; motion then retreats normally.`);
+    }
     lines.push('G54;');
     return lines.join('\n');
 }
@@ -517,6 +530,7 @@ export interface SurfaceStationResult {
     approach?: 'slow-zone' | 'coarse-contact';
     /** Upper bound on how far the probe was pressed past contact by the step that found it. */
     worstPressMm?: number;
+    capture?: object;
 }
 
 /**
@@ -797,6 +811,7 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
         announce('descend', `Z${plan.startZMachine} (guarded final ${DESCENT_GUARD_MM} mm)`);
 
         let currentZ = plan.startZMachine;
+        let incoming: { ux: number; uy: number; z: number; length: number } | null = null;
         for (const station of plan.stations) {
             stationIndex = station.index;
             const isFirst = station.index === 1;
@@ -807,10 +822,23 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                 const previous = plan.stations[station.index - 2];
                 probeFeedService.clearExpectedContact();
                 if (plan.hopMode === 'stepped') {
+                    const dx = station.x - previous.x;
+                    const dy = station.y - previous.y;
+                    const length = Math.hypot(dx, dy);
+                    const ux = length ? dx / length : 0;
+                    const uy = length ? dy / length : 0;
+                    const backtrackMm = incoming && Math.abs(incoming.z - currentZ) < 1e-6
+                        && Math.abs(incoming.ux - ux) < 1e-6 && Math.abs(incoming.uy - uy) < 1e-6
+                        ? Math.min(incoming.length, plan.hopBackoffMm) : 0;
                     const traverse = await steppedTraverseZ(plan.tool, station.label, previous, station, currentZ, {
-                        liftMm: plan.hopLiftMm, maxZ: plan.hopZ, sensorDelayMs: plan.sensorDelayMs,
+                        liftMm: plan.hopLiftMm,
+                        maxZ: plan.hopZ,
+                        sensorDelayMs: plan.sensorDelayMs,
+                        extraBackoffMm: plan.hopBackoffMm,
+                        backtrackMm,
                     }, announce);
                     currentZ = traverse.z;
+                    incoming = { ux, uy, z: currentZ, length: traverse.clearTailMm || 0 };
                     announce(`hop-${station.label}`, `${station.hopFromPreviousMm} mm to (${station.x}, ${station.y}), stepped traverse: `
                         + `${traverse.lifts.length} lift(s), arrived at Z${currentZ}`);
                 } else {
@@ -906,6 +934,11 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                     + `${outcome.approach}, press <= ${outcome.worstPressMm} mm`);
             }
 
+            if (plan.capture?.stations?.includes(station.index)) {
+                results[results.length - 1].capture = await captureProbeSpot(plan.capture, plan.tool, station.label);
+                announce(`capture-${station.label}`, JSON.stringify(results[results.length - 1].capture));
+            }
+
             // Retract to the hop height (contact still expected while leaving
             // the surface), prove the probe released, then hand over to the
             // crash guard for the hop.
@@ -916,6 +949,9 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                 throw new ProcedureAbort(`Station "${station.label}": probe still triggered after retracting to Z${retractTo} - stuck probe or feed fault.`);
             }
             probeFeedService.clearExpectedContact();
+            if (incoming && Math.abs(incoming.z - retractTo) > 1e-6) {
+                incoming = null;
+            }
             currentZ = retractTo;
         }
 
@@ -923,7 +959,9 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
         announce('scan-complete', `${results.filter((r) => r.status === 'contact').length}/${results.length} contacts, raised to Z${plan.hopZ}`);
     } catch (err) {
         const isTrip = !!probeFeedService.getTrip();
-        if (!isTrip) {
+        if (probeAbortHeld((err as { partial?: object }).partial)) {
+            announce('abort-held', 'contact during lift - holding even if the sensor subsequently releases');
+        } else if (!isTrip) {
             try {
                 await abortRaiseToTop(plan.tool, (phase, z, note) => announce(phase, z === null ? note : `Z${z} - ${note}`), { holdIfTriggered: 'probe' });
             } catch (retreatErr) {

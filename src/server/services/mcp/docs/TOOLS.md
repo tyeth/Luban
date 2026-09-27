@@ -57,7 +57,7 @@ session.
 It can sit differently after every power cycle, be knocked, be re-aimed, or be a different camera. Nothing converts a pixel into a machine coordinate, or a machine coordinate into a pose, until a model is solved AND verified on this connection. Plain captures never need one.
 
 - `get_camera_model {history?}` — the model, its state (verified | unverified | superseded), why it is not usable, and which tool fixes it. Read-only.
-- `verify_camera_model {target, pixel_u, pixel_v, tolerance_px?}` — predict where a target of known machine coordinates should appear at the CURRENT toolhead position, compare with where it does, record the residual in px and mm. **The first camera call of any session.** Beyond tolerance the model stays unverified and says the camera has probably moved. No motion - position with `traverse_xy` first.
+- `verify_camera_model {target, pixel_u, pixel_v, tolerance_px?}` — predict where a target of known machine coordinates should appear at the CURRENT toolhead position, compare with where it does, record the residual in px and mm. **Before metric camera use; plain observation needs no calibration.** Beyond tolerance the model stays unverified and says the camera has probably moved. No motion - position with `traverse_xy` first.
 - `camera_bootstrap {stage, reason, ...}` — solve the geometry FROM NOTHING, two staged procedures, one approval each. `stage: "search"`: a grid at the park height bracketing the tool setter, whose machine XY is known exactly - which frames contain it gives the camera offset INCLUDING ITS SIGN with no prior assumption, and it is the only step meaningful without a calibration. `stage: "poses"`: the poses that implies, each sweeping Z from the park height to the motion floor with XY stationary. A pose the TOOLHEAD cannot reach is dropped with a reason, never quietly adjusted.
 - `set_camera_model {offset, rotation, intrinsics, valid_band_z, central_region, residuals, ...}` — store a solve from `scripts/camera_bootstrap.py`. Always stored UNVERIFIED; the previous model is kept superseded, never overwritten.
 - `plan_view_pose {target, toolhead_z?}` — where must the TOOLHEAD go to see this machine point? Returns the pose, the standoff and the field of view, from the model. Use it instead of computing a pose; never carry one between sessions.
@@ -87,7 +87,7 @@ It can sit differently after every power cycle, be knocked, be re-aimed, or be a
 - `probe_vector` — probe along any downward or lateral unit vector.
 - `probe_sequence` — enumerated hop / descend / probe circuit with law-2 hops at safe traverse height; keep-out boxes honoured at plan time.
 - `probe_circle` — N radial marches plus least-squares circle fit, outside a boss or inside a hole. Reports rms and residuals.
-- `probe_surface_path` — N minus-Z stations along a line: per-station contact, best-fit slope, flatness.
+- `probe_surface_path` — N minus-Z stations along a line: per-station contact, best-fit slope, flatness. Optional `capture: {stations: [1, 4], settle_ms?, label?}` saves stationary photos at selected contacts before retraction (also `probe_surface_grid`).
 - `probe_surface_grid` — serpentine minus-Z grid: Z matrix, best-fit plane and residuals, ASCII height map. Both scans hop at last contact plus `z_safe_delta_mm`.
 - `probe_stock_outline` — from an estimate of a block, find its top, true outline and centre in one approved procedure.
 - `probe_program` — composite program: an ordered list of operations, derived references, jig geometry, keep-out and groups under one approval. The new-stock survey lives here. Op kinds: `rotate_b`, `surface_path`, `surface_grid`, `sequence`, `stock_outline`, `capture {x?, y?}` (a position- and B-stamped frame saved on the job record; with x/y it first hops there at the traverse height, travel- and obstacle-checked like a sequence hop, else no motion) and `home` (machine home, last op only, homes B too) — so "capture at (x, y), rotate_b 180, capture, home" is one click.
@@ -111,3 +111,12 @@ It can sit differently after every power cycle, be knocked, be re-aimed, or be a
 - The work origin is the operator's (touchscreen, Luban, tool-change wizard). Read it fresh from `get_position`; never assume it; never write it except through `apply_tool_length_offset`.
 - `get_position.machine` is the judged position of record with a `reliability`; a reading more than 50 mm outside the travel is a bug, never a position, and is ignored until the next coherent beat. Do not derive a machine position from one heartbeat by hand.
 - Canonical agent guidance: `.claude/skills/cnc-motion-rules/SKILL.md`.
+
+### Probe-spot photographs and shoulder recovery
+
+Sequence probe steps accept `capture: {settle_ms?, label?}`; surface scans select 1-based
+`capture.stations`. Frames are saved beside measurement results before retraction. Continuous
+viewing remains available at `list_cameras.stream.stream_url`; it does not synchronize a photo
+to a contact. Stepped surface links use bounded ball-radius backoff along verified incoming
+paths and sensor-check their rises. Nested probe holds stop the whole program, including
+`on_fail: skip`. See [probe inspection](probe-inspection.md) for schemas, limits and recovery details.

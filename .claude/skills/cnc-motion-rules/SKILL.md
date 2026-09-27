@@ -153,7 +153,8 @@ item, quoting the tool result — not an essay):
    down.** This is what the server does on every procedure abort (`abortRaiseToTop`): no motion
    if the overtravel trip is closing the connection; HOLD if the probe still reads contact (the
    operator frees it); nothing sent if the head is already at the top; otherwise one Z-only
-   move to `mcpSafeTraverseZ`. It is also what YOU do when recovering by hand: after any abort,
+   move to `mcpSafeTraverseZ`. A nested runner's `abort-held` remains a HOLD for the whole program,
+   including `on_fail: skip`; the outer runner must not raise over that decision. It is also what YOU do when recovering by hand: after any abort,
    refusal or doubt, the first motion is `move_z` to the traverse height, then re-prove position
    (`get_position`), then plan again. Never "return to where the procedure started" — before
    the travel, the start height is BELOW the head (appendix A, 2026-09-16). A COMPLETED

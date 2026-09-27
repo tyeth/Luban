@@ -1429,3 +1429,9 @@ covers cutter geometry, internal bore/external boss review, multiple features an
 tool changes under `cnc-motion-rules`. Running a converted file uses the existing
 job approval flow. See the [baseline evaluation review](docs/thread-milling-evaluation.md)
 for the documentation gaps addressed and the next-evaluation constraints.
+
+### Probe inspection and camera evidence
+
+[Probe inspection](docs/probe-inspection.md) documents contact-synchronized photos in sequence
+and surface operations, the continuous camera endpoints, bounded ball-radius shoulder backoff,
+and propagation of held probe aborts through composite programs.

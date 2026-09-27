@@ -105,7 +105,7 @@ export const tests: Array<[string, () => Promise<void> | void]> = [
         assert.ok(along(result.position) >= -1e-6, 'never behind the traverse start');
         // The link is 1.72 mm long: step 1 clear, the step to the end touches; hop-back to s = 1, then
         // the 2 mm retreat is capped to the 1 mm of proven path behind that point - back at the start.
-        assert.equal(result.blocked!.retreatMm, STEPPED_HOP_STEP_MM + 1);
+        assert.equal(result.blocked!.retreatMm, Number(len.toFixed(3)));
         assert.deepEqual(result.position, from);
         assert.equal(fake.expected[fake.expected.length - 1], false, 'expected contact cleared on return');
     }],
@@ -252,3 +252,60 @@ export const tests: Array<[string, () => Promise<void> | void]> = [
         assert.equal(fake.moves.length, 0);
     }],
 ];
+
+const topParams = {
+    retreatUnit: { x: 0, y: 0, z: 1 },
+    liftMm: 2,
+    maxLiftTotalMm: 20,
+    onMax: 'plain-move' as const,
+    sensorDelayMs: 50,
+    releaseTimeoutMs: 100,
+    travelFeed: 600,
+};
+tests.push(
+    ['0.5 mm shoulder link adds at most one ball radius along its verified incoming corridor before rising', async () => {
+        const from = { x: 0, y: 259, z: 194.2 };
+        const fake = fakeMachine(from, (p) => p.y >= 259.5 && p.z < 200);
+        const result = await steppedTraverseCore(fake.io, 'scan', 's20', from, { ...from, y: 259.5 }, {
+            ...topParams, extraBackoffMm: 1.25, backtrackMm: 1.25,
+        }, silent);
+        assert.equal(result.blocked, null);
+        const extra = fake.moves.filter((m) => m.tag.includes('hop-back-extra'));
+        assert.ok(extra.length);
+        assert.equal(Math.min(...extra.map((m) => m.words.y!)), 257.75);
+        assert.ok(fake.moves.filter((m) => m.tag.includes('hop-lift')).every((m) => m.words.y! < 259.5));
+        assert.ok(result.position.z >= 200);
+    }],
+    ['extra backoff releases a ball that remains triggered at the ordinary backoff', async () => {
+        const from = { x: 0, y: 259, z: 194.2 };
+        let latched = false;
+        const fake = fakeMachine(from, (p) => {
+            if (p.y >= 259.5 && p.z < 196) { latched = true; }
+            if (p.y <= 258.5 || p.z >= 196) { latched = false; }
+            return latched;
+        });
+        const result = await steppedTraverseCore(fake.io, 'scan', 's20', from, { ...from, y: 259.5 }, {
+            ...topParams, extraBackoffMm: 1.25, backtrackMm: 0.5,
+        }, silent);
+        assert.equal(result.blocked, null);
+        assert.equal(Math.min(...fake.moves.map((m) => m.words.y ?? 259)), 258.5, 'never leaves verified corridor');
+    }],
+    ['catch during rise aborts before another XY step even if the contact subsequently releases', async () => {
+        const from = { x: 0, y: 0, z: 10 };
+        const fake = fakeMachine(from, (p) => p.x >= 0.5 && p.z < 14 || p.z >= 10.5);
+        await assert.rejects(async () => steppedTraverseCore(fake.io, 'scan', 's2', from, { ...from, x: 0.5 }, topParams, silent), /contact during lift/);
+        assert.ok(fake.moves[fake.moves.length - 1].tag.includes('hop-lift'));
+        assert.equal(fake.position.x, 0);
+        assert.equal(fake.position.z, 10.5);
+    }],
+    ['fractional backoff reports its actual distance and never backs beyond an unverified start', async () => {
+        let touched = false;
+        const from = { x: 0, y: 0, z: 10 };
+        const fake = fakeMachine(from, (p) => { touched = touched || p.x >= 0.5; return touched; });
+        await assert.rejects(async () => steppedTraverseCore(fake.io, 'scan', 's2', from, { ...from, x: 0.5 }, {
+            ...topParams, extraBackoffMm: 1.25,
+        }, silent), /backing off 0.5 mm/);
+        assert.equal(Math.min(...fake.moves.map((m) => m.words.x ?? 0)), 0);
+        assert.ok(!fake.moves.some((m) => m.tag.includes('hop-lift')));
+    }],
+);

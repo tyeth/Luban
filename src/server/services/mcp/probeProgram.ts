@@ -53,6 +53,7 @@ import {
     ROTATE_FEED,
     TRAVEL_FEED,
     assertMachineReadyForProcedure,
+    abortRaiseToTop,
     knownMachinePosition,
     moveMachineSettled,
     procedureStopRequested,
@@ -75,6 +76,7 @@ import {
 } from './programRefs';
 import { B_AXIS_DEG, MAX_SWEPT_RADIUS_MM, within } from './procedureLimits';
 import { captureFrame } from './camera';
+import { finishProgramAbort, probeAbortHeld } from './programAbort';
 import { describeCaptureOp, describeHomeOp, describeRotateOp } from './programEnvelope';
 import { programFramePath } from './programFrames';
 import {
@@ -188,7 +190,8 @@ function eventBudgetFor(sub: SubPlan | { kind: 'rotate_b' }): number {
         return 20;
     }
     if (sub.kind === 'sequence') {
-        return 20 + sub.plan.steps.length * 20 + sub.plan.steps.filter((st) => st.kind === 'probe').length * 60;
+        return 20 + sub.plan.steps.length * 20 + sub.plan.steps.filter((st) => st.kind === 'probe').length * 60
+            + sub.plan.steps.filter((st) => st.kind === 'probe' && st.capture).length * CAPTURE_EVENT_BUDGET;
     }
     if (sub.kind === 'stock_outline') {
         return 60 + sub.plan.topPoints.length * 80 + sub.plan.sidePoints.length * 90;
@@ -205,7 +208,7 @@ function eventBudgetFor(sub: SubPlan | { kind: 'rotate_b' }): number {
         // Every crawl step is a send: the worst-case step count of the estimate plus the confirm cycles.
         return 100 + sub.plan.estimate.worstCycles * 3 + sub.plan.estimate.confirmCycles * 60;
     }
-    return 40 + sub.plan.stations.length * 120;
+    return 40 + sub.plan.stations.length * 120 + (sub.plan.capture?.stations?.length || 0) * CAPTURE_EVENT_BUDGET;
 }
 const ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
 
@@ -669,21 +672,14 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
             // A requested stop (stop_gcode_job) ends the PROGRAM, whatever the
             // op's on_fail says.
             const stop = procedureStopRequested();
-            if (trip || stop || op.on_fail === 'stop' || op.kind === 'rotate_b' || op.kind === 'home') {
+            const held = probeAbortHeld(partial) || probeFeedService.getReading('probe')?.triggered === true;
+            if (trip || stop || held || op.on_fail === 'stop' || op.kind === 'rotate_b' || op.kind === 'home') {
                 stoppedAt = op.id;
-                // Every sub-runner raises to the traverse height on its own
-                // abort; make sure of it here for the program as a whole
-                // (unless an alarm is latched - then nothing moves).
-                if (!trip) {
-                    try {
-                        const known = knownMachinePosition();
-                        if (known.position.z !== null && known.position.z < plan.hopZ - RECHECK_TOLERANCE_MM) {
-                            await moveMachineSettled('probe_program:abort-raise', { z: plan.hopZ }, TRAVEL_FEED);
-                        }
-                    } catch (raiseErr) {
-                        announce('abort-raise-failed', (raiseErr as Error).message);
-                    }
-                }
+                const tail = await finishProgramAbort(held, !!trip, async () => abortRaiseToTop(
+                    'probe_program',
+                    (phase, z, note) => announce(phase, z === null ? note : `Z${z} - ${note}`),
+                    { holdIfTriggered: 'probe' }
+                ));
                 for (const later of plan.ops.slice(index + 1)) {
                     report.push({
                         id: later.id,
@@ -697,7 +693,6 @@ export async function runProbeProgramProcedure(plan: ProbeProgramPlan): Promise<
                     });
                 }
                 const completed = report.filter((r) => r.status === 'completed').length;
-                const tail = trip ? 'A safety alarm is latched - the operator must clear it.' : 'Machine raised to the traverse height.';
                 const Ctor = stop || isProcedureStopped(err) ? ProcedureStopped : ProcedureAbort;
                 throw new Ctor(`Program "${plan.name}" stopped at op "${op.id}" (${index + 1}/${plan.ops.length}): ${message} `
                     + `${completed} earlier op(s) completed; their results are on the job record under result.ops. ${tail}`,

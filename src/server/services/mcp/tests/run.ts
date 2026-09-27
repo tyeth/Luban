@@ -32,6 +32,7 @@ import { tests as mcpListenersTests } from './mcpListeners.test';
 import { tests as mjpegFanoutTests } from './mjpegFanout.test';
 import { tests as perimeterAnalysisTests } from './perimeterAnalysis.test';
 import { tests as perimeterTraceTests } from './perimeterTrace.test';
+import { tests as probeInspectionTests } from './probeInspection.test';
 import { tests as probeFeedHealthTests } from './probeFeedHealth.test';
 import { tests as procedureLimitsTests } from './procedureLimits.test';
 import { tests as programEnvelopeTests } from './programEnvelope.test';
@@ -60,6 +61,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['bootstrapPlan', bootstrapPlanTests],
     ['frameRecovery', frameRecoveryTests],
     ['probeFeedHealth', probeFeedHealthTests],
+    ['probeInspection', probeInspectionTests],
     ['procedureLimits', procedureLimitsTests],
     ['programOps', programOpsTests],
     ['programEnvelope', programEnvelopeTests],

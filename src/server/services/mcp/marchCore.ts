@@ -60,6 +60,10 @@ export interface SteppedTraverseParams {
      * reverse travel vector, and only the path from `from` is proven clear).
      */
     capRetreatAtStart?: boolean;
+    /** Extra top-link backoff, bounded by the staged probe-ball radius. */
+    extraBackoffMm?: number;
+    /** Proven collinear incoming corridor at this SAME Z, behind from. */
+    backtrackMm?: number;
     sensorDelayMs: number;
     releaseTimeoutMs: number;
     /** Give up after this many lifts on one traverse (default 60). */
@@ -87,6 +91,8 @@ export interface SteppedTraverseResult {
     lifts: { x: number; y: number; z: number; liftMm: number }[];
     steps: number;
     toppedOut: boolean;
+    /** Verified straight trailing corridor at the arrival height. */
+    clearTailMm?: number;
     /** Set when the traverse did NOT reach `to`: the contact that stopped it. */
     blocked: SteppedBlock | null;
 }
@@ -138,6 +144,11 @@ export async function steppedTraverseCore(
     };
     const maxLifts = params.maxLifts ?? 60;
     let liftingStopped = false;
+    const top = ru.x === 0 && ru.y === 0 && ru.z === 1 && Math.abs(u.z) < 1e-9;
+    const extraBackoff = top ? Math.floor(Math.max(0, params.extraBackoffMm || 0) * 1000) / 1000 : 0;
+    // A lift invalidates the old plane's clearance history. Never back into
+    // unvisited space at the new height, even if its XY projection is familiar.
+    let planeStart = top ? -Math.floor(Math.max(0, params.backtrackMm || 0) * 1000) / 1000 : 0;
     io.setExpectedContact();
     try {
         let s = 0;
@@ -154,13 +165,29 @@ export async function steppedTraverseCore(
             }
             // The surface is closer here: back off one step along the path
             // (the one direction proven clear), wait for the release.
-            const back = at(s);
+            const standardBackS = s;
+            let back = at(s);
             const t1 = io.now();
             await io.move(`${tag}:hop-back:${name}`, words(back), STEPPED_HOP_FEED);
-            const stillTriggered = await io.senseRelease(t1, params.releaseTimeoutMs);
+            let stillTriggered = await io.senseRelease(t1, params.releaseTimeoutMs);
+            // Make room for the ball before rising beside a steep shoulder.
+            // Only retrace a verified path, in <=0.25 mm increments, up to
+            // one ball radius beyond the ordinary backoff. No guessed side step.
+            const backLimit = r3(Math.max(planeStart, s - extraBackoff));
+            while (s - backLimit > 1e-9) {
+                s = r3(Math.max(backLimit, s - 0.25));
+                back = at(s);
+                const tb = io.now();
+                await io.move(`${tag}:hop-back-extra:${name}`, words(back), STEPPED_HOP_FEED);
+                stillTriggered = await io.senseRelease(tb, params.releaseTimeoutMs);
+            }
+            const backedMm = r3(next - s);
+            if (standardBackS - s > 1e-9) {
+                announce(`hop-back-extra-${name}`, `${r3(standardBackS - s)} mm additional retreat along the verified path (ball-radius cap ${extraBackoff} mm)`);
+            }
             if (stillTriggered) {
-                throw new ProcedureAbort(`Stepped traverse "${name}": probe still triggered after backing off ${STEPPED_HOP_STEP_MM} mm `
-                    + `at (${back.x}, ${back.y}, ${back.z}).`);
+                throw new ProcedureAbort(`Stepped traverse "${name}": probe still triggered after backing off ${backedMm} mm `
+                    + `at (${back.x}, ${back.y}, ${back.z}); verified retreat exhausted - holding.`);
             }
             const blockedHere = (retreatMm: number): SteppedTraverseResult => ({
                 position: at(s),
@@ -179,7 +206,7 @@ export async function steppedTraverseCore(
             if (liftingStopped) {
                 if (params.onMax === 'block') {
                     announce(`hop-blocked-${name}`, `contact at (${p.x}, ${p.y}, ${p.z}) with the retreat at its cap ${params.maxLiftTotalMm} mm - destination BLOCKED`);
-                    return blockedHere(STEPPED_HOP_STEP_MM);
+                    return blockedHere(backedMm);
                 }
                 throw new ProcedureAbort(`Stepped traverse "${name}": contact at (${p.x}, ${p.y}, ${p.z}) with the retreat already at its cap `
                     + `${params.maxLiftTotalMm} mm - something stands where the approved plan has empty space.`);
@@ -201,25 +228,40 @@ export async function steppedTraverseCore(
                 }
                 if (params.onMax === 'block') {
                     announce(`hop-blocked-${name}`, `contact at (${p.x}, ${p.y}, ${p.z}) with no retreat left (cap ${params.maxLiftTotalMm} mm) - destination BLOCKED`);
-                    return blockedHere(STEPPED_HOP_STEP_MM);
+                    return blockedHere(backedMm);
                 }
                 throw new ProcedureAbort(`Stepped traverse "${name}": contact at (${p.x}, ${p.y}, ${p.z}) with no retreat left (cap ${params.maxLiftTotalMm} mm).`);
             }
-            liftTotal = r3(liftTotal + lift);
-            lifts.push({ x: p.x, y: p.y, z: p.z, liftMm: r3(lift) });
-            const lifted = at(s);
+            const liftBefore = liftTotal;
+            const liftTarget = r3(liftTotal + lift);
             announce(`hop-lift-${name}`, `surface closer at (${p.x}, ${p.y}, ${p.z}): retreat ${r3(lift)} mm along `
-                + `(${r3(ru.x)}, ${r3(ru.y)}, ${r3(ru.z)}) (total ${liftTotal})`);
-            await io.move(`${tag}:hop-lift:${name}`, words(lifted), params.travelFeed);
+                + `(${r3(ru.x)}, ${r3(ru.y)}, ${r3(ru.z)}) (total ${liftTarget})`);
+            if (top) {
+                // A rise can catch the side of the ball. Sense each segment,
+                // including transient contact, BEFORE issuing any next XY step.
+                while (liftTarget - liftTotal > 1e-9) {
+                    liftTotal = r3(Math.min(liftTarget, liftTotal + 0.5));
+                    const tl = io.now();
+                    await io.move(`${tag}:hop-lift:${name}`, words(at(s)), STEPPED_HOP_FEED);
+                    if (await io.sense(tl, params.sensorDelayMs)) {
+                        throw new ProcedureAbort(`Stepped traverse "${name}": contact during lift at (${at(s).x}, ${at(s).y}, ${at(s).z}) - holding before further travel.`, { holdPosition: true });
+                    }
+                }
+                planeStart = s;
+            } else {
+                liftTotal = liftTarget;
+                await io.move(`${tag}:hop-lift:${name}`, words(at(s)), params.travelFeed);
+            }
+            lifts.push({ x: p.x, y: p.y, z: p.z, liftMm: r3(liftTotal - liftBefore) });
             if (onContact === 'block') {
                 // A wall: the retreat along the path is the whole answer; the
                 // destination is blocked and the caller carries on from here.
-                announce(`hop-blocked-${name}`, `wall at (${p.x}, ${p.y}, ${p.z}) - retreated ${r3(STEPPED_HOP_STEP_MM + lift)} mm along the path; destination BLOCKED`);
-                return blockedHere(STEPPED_HOP_STEP_MM + lift);
+                announce(`hop-blocked-${name}`, `wall at (${p.x}, ${p.y}, ${p.z}) - retreated ${r3(backedMm + lift)} mm along the path; destination BLOCKED`);
+                return blockedHere(backedMm + lift);
             }
             if (liftTotal >= params.maxLiftTotalMm - 1e-9) {
                 if (params.onMax === 'plain-move') {
-                    // At the traverse height nothing can be in the way (law 2).
+                    // The caller has checked the full staged path against obstacles.
                     io.clearExpectedContact();
                     await io.move(`${tag}:hop-top:${name}`, words(at(length)), params.travelFeed);
                     return { position: at(length), liftTotalMm: liftTotal, lifts, steps, toppedOut: true, blocked: null };
@@ -227,7 +269,7 @@ export async function steppedTraverseCore(
                 liftingStopped = true;
             }
         }
-        return { position: at(length), liftTotalMm: liftTotal, lifts, steps, toppedOut: liftingStopped, blocked: null };
+        return { position: at(length), liftTotalMm: liftTotal, lifts, steps, toppedOut: liftingStopped, blocked: null, clearTailMm: r3(length - planeStart) };
     } finally {
         io.clearExpectedContact();
     }

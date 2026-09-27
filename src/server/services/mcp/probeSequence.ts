@@ -6,6 +6,8 @@ import { mcpBroadcast } from './index';
 import { clearanceOptions } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import { probeFeedService } from './probeFeed';
+import { ProbeCapturePlan, planProbeCapture } from './probeCapture';
+import { captureProbeSpot } from './probeCaptureRuntime';
 import {
     COARSE_FEED,
     FINE_FEED,
@@ -78,6 +80,7 @@ interface SequenceStepProbe {
      * a measurement ("nothing within N mm"), not a fault.
      */
     onMiss: 'continue' | 'abort';
+    capture: ProbeCapturePlan | null;
 }
 type SequenceStep = SequenceStepHop | SequenceStepDescend | SequenceStepProbe;
 
@@ -126,6 +129,9 @@ export function planProbeSequence(args: {
     (args.steps as { [key: string]: unknown }[]).forEach((raw, index) => {
         const kind = String(raw.kind || '');
         const at = `steps[${index}]`;
+        if (raw.capture !== undefined && kind !== 'probe') {
+            throw new McpToolError(`${at}: capture is available only on a probe step, before its retreat.`);
+        }
         if (kind === 'hop') {
             const hx = Number(raw.x);
             const hy = Number(raw.y);
@@ -195,6 +201,7 @@ export function planProbeSequence(args: {
                 maxTravelMm: travel,
                 start: { ...virtual },
                 onMiss: onMissRaw,
+                capture: planProbeCapture(raw.capture),
             });
             names.add(name);
             probeCount += 1;
@@ -301,6 +308,9 @@ export function describeProbeSequencePlanAsGcode(plan: ProbeSequencePlan): strin
             lines.push(`; ...on contact: retreat/release, ${plan.fineStepMm} mm fine approach, `
                 + `${plan.confirmPasses} confirm cycle(s) (lift ${plan.backoffMm} mm); at the limit without contact: `
                 + `${step.onMiss === 'abort' ? 'ABORTS the sequence' : 'records no_contact, retreats and CONTINUES with the next step (on_miss: continue)'}`);
+            if (step.capture) {
+                lines.push(`; CAMERA: stationary at final confirmed contact BEFORE retract, settle ${step.capture.settleMs} ms; save frame with result. A continuing miss captures at its search limit.`);
+            }
             lines.push(`G1 X${step.start.x.toFixed(3)} Y${step.start.y.toFixed(3)} Z${step.start.z.toFixed(3)} `
                 + `F${TRAVEL_FEED}; retreat to the march start (an ABORT raises straight up to the traverse height instead)`);
             lines.push(`G1 Z${plan.hopZ.toFixed(3)} F${TRAVEL_FEED}; raise to traverse height`);
@@ -341,6 +351,7 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
         /** no_contact: where the march ended (its approved limit), machine coords. */
         limitMachine?: { x: number; y: number; z: number };
         maxTravelMm?: number;
+        capture?: object;
     }[] = [];
 
     let stepIndex = 0;
@@ -430,6 +441,10 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                         maxTravelMm: step.maxTravelMm,
                     });
                     announce(`no-contact-${step.name}`, `nothing within ${step.maxTravelMm} mm (limit at ${limit.x}, ${limit.y}, ${limit.z}); continuing`);
+                    if (step.capture) {
+                        results[results.length - 1].capture = await captureProbeSpot(step.capture, 'probe_sequence', step.name);
+                        announce(`capture-${step.name}`, JSON.stringify(results[results.length - 1].capture));
+                    }
                     await moveMachineSettled(`seq:retreat:${step.name}`, {
                         x: step.start.x, y: step.start.y, z: step.start.z,
                     }, TRAVEL_FEED);
@@ -507,6 +522,10 @@ export async function runProbeSequenceProcedure(plan: ProbeSequencePlan): Promis
                 });
                 announce(`measured-${step.name}`, `(${contact.x}, ${contact.y}, ${contact.z}) spread ${spreadMm}`);
 
+                if (step.capture) {
+                    results[results.length - 1].capture = await captureProbeSpot(step.capture, 'probe_sequence', step.name);
+                    announce(`capture-${step.name}`, JSON.stringify(results[results.length - 1].capture));
+                }
                 // Retreat to the march start, then raise (still expected-contact
                 // until physically clear of the surface).
                 await moveMachineSettled(`seq:retreat:${step.name}`, {
