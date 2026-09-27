@@ -1,8 +1,15 @@
 # CAM probing programs: `run_probing_gcode`
 
-Read this only when the operator hands you a probing program from Fusion 360, FreeCAD, a Grbl
-sender macro or a hand-written file. Everything else about probing is in `SKILL.md`; the motion
-laws are in `cnc-motion-rules`.
+Read this when handling an imported or hand-written probing program, or assessing whether
+planned mixed-direction stations fit the existing CAM link modes. Prefer the native surface,
+wall, trace or outline procedure when it directly fits the measurement. The motion laws are
+in `cnc-motion-rules`; this runner does not bypass entry-clearance or approval requirements.
+
+`stepped` / `wall` already support local continuation between planned stations. Each G38.2 /
+G38.3 cycle nevertheless retreats to its own start after contact or a continuing miss; it does
+not retain the measured endpoint or dynamically branch on it. The program raises at completion,
+and rotary indexing requires full clearance. Read the live schema and hardware-validation
+status before choosing this route.
 
 Pass the program text as `gcode` with a `reason`; it is **translated, never sent raw** (the
 Snapmaker controller compiles G38 in but on the 3DP probe input, so a raw G38 never touches the
@@ -25,8 +32,8 @@ CNC probe):
   station blocked instead of climbing out of the pocket, and a raise-mode descent contact AT the
   top (within one guarded 1 mm step) is a blocked station rather than a collision. `blocked`
   stations appear in the report with `blockedBy`, link contacts under `linkContacts` (and as extra
-  CSV rows), `summary.blocked` counts them. An ABORT still raises straight to the traverse height
-  (law 8), holding only while the probe reads contact;
+  CSV rows), `summary.blocked` counts them. An abort follows law 8; a nested held-contact decision remains held even if the sensor
+  later releases;
 - a bare `G0 B<angle>` line is a 3+2 station (raise, then the verified rotation); `B` with XYZ,
   incremental `B` and `A`/`C` are refused;
 - feeds in the file are ignored; `M3`/`M4` (a spinning tool during a probe is a crash), `M0`/`M1`,

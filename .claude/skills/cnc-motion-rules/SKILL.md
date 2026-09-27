@@ -25,9 +25,9 @@ item, quoting the tool result — not an essay):
    and the MCP resolves it (§2). Never convert a file's coordinates by hand. No bare `Z`.
 3. **Height.** Any XY move over 1 mm runs at or above the MOTION FLOOR — machine **Z320**
    (`mcpMotionFloorZ`; a head reading 319.96 is at it). That is not the same number as the PARK
-   height, machine Z328 = home, which is where procedures hop between stations, retreat to on an
-   abort, and end. If the head is below the floor, the retreat is its own `move_z` step and needs
-   its own word from the operator: ask "may I raise Z first?" — a transit request is not
+   height, machine Z328 = home, used for ordinary procedure transfers and successful finishes.
+   Local measurement links use the specific envelopes in §4; aborts follow law 8. For ordinary
+   transport below the floor, the retreat is its own `move_z` step and needs its own word from the operator: ask "may I raise Z first?" — a transit request is not
    authority to move Z.
 4. **Obstacles.** The same `get_stored_state` call: does the path — the whole SEGMENT from
    where the toolhead is to where it is going, not the destination point — cross a landmark box
@@ -84,9 +84,9 @@ item, quoting the tool result — not an essay):
    operator's explicit words, never for planning.
 
    **The floor is not the park height.** `mcpSafeTraverseZ` (machine Z328 = home) is where
-   procedures hop between stations, retreat to on an abort, and finish; that is unchanged, and
-   `planRaiseToTop` still targets it. The floor could only drop below it once clearances stopped
-   carrying tool length (law 4): a hop at the floor is checked against every stored landmark
+   ordinary procedure transfers and successful finishes occur; local measurement links use §4.
+   `planRaiseToTop` still targets it, subject to the held-contact rule in law 8. The floor could
+   only drop below it once clearances stopped carrying tool length (law 4): a hop at the floor is checked against every stored landmark
    exactly like any low segment, and there is still **no exemption for being high**. What it
    costs is 8 mm less blind protection for anything on the bed with no landmark — which is why
    an unmapped object taller than the floor minus the tool is the operator's problem to state,
@@ -254,12 +254,13 @@ start position — expect it, do not act on it.
 
 ## 4. Sanctioned exceptions (and their exact limits)
 
-- **Surface-scan hop envelope** (`probe_surface_path` / `probe_surface_grid` only, between
-  consecutive stations): retract to **LAST CONTACT + `z_safe_delta_mm`** (cap 20, min 3) and hop
-  at most `max_hop_mm` (cap 60). Lowering either is always allowed; raising is refused. `hop_mode`
-  `guarded` (default) hops at travel feed in ≤ 10 mm sensor-checked segments and treats contact
-  as a COLLISION; `stepped` is a touch-probing traverse that lifts on contact. Choose by the
-  height change between consecutive stations, not by the surface's name: spacing × steepest
+- **Surface-scan hop envelope** (`probe_surface_path` / `probe_surface_grid`, between
+  consecutive stations): `guarded` retracts to **LAST CONTACT + `z_safe_delta_mm`** (cap 20,
+  min 3) and hops in ≤ 10 mm sensor-checked segments; contact is a COLLISION. `stepped` uses
+  **LAST CONTACT + `hop_lift_mm`** (default 2, 0.5–10 mm), then touch-probing links that back
+  off and lift on contact, subject to release and lift-contact checks. Either mode limits
+  station spacing to `max_hop_mm` (cap 60); these bounds cannot be exceeded by inference.
+  Choose by the height change between consecutive stations, not by the surface's name: spacing × steepest
   credible slope ≪ `z_safe_delta_mm` → `guarded`; a station may sit more than `z_safe_delta_mm`
   above or below its neighbour (steps, pockets, edges, unknown stock) → `stepped`.
 - **Stepped links in `run_probing_gcode`** (`link_mode` `"stepped"` / `"wall"`, between
@@ -271,6 +272,20 @@ start position — expect it, do not act on it.
   `blocked` station, not a crash: the head lifts straight back up the column it came down. A
   `blocked` station is a normal report outcome; `top_z_machine` (measured, never a guess) caps
   the +Z lifts at the top; an abort still obeys law 8.
+- **Other bounded probing procedures** have their own local links: `probe_wall_follow`
+  steps along at a standoff and backs away from the face on a bump; `probe_stock_outline`
+  links top samples and same-side samples locally but raises when changing sides;
+  `probe_trace_perimeter` crawls an internal pocket with release-verified standoff and
+  bounded travel; `probe_corner` returns along measured paths to its centre between radial
+  contacts; inside `probe_circle` returns to its staged interior origin between radials
+  (outside circles use full-height repositioning). Use each procedure's entry conditions,
+  limits and recovery policy; none grants an arbitrary low XY move. See `cnc-probing`'s
+  [planning reference](../cnc-probing/references/planning.md).
+- **Composition boundary:** `probe_sequence` returns to each probe's start and raises after
+  every probe, including continuing misses. `probe_program` references and groups share
+  measurements/approval, not a low position between ops: each successful probing op ends
+  raised. Prefer related stations within a suitable continuous op. Ordinary calls split into
+  ≤1 mm increments are not a substitute for a sanctioned probing envelope.
 - **`apply_tool_length_offset`** — the one sanctioned work-origin write: a single `G92` shifting
   work Z by (new − old) trigger height, what the touchscreen wizard does after its two operator
   confirmations. Requires a reliable position and a measurement pair from this connection.
@@ -288,9 +303,11 @@ start position — expect it, do not act on it.
   dies on a reboot, so "work zero" can be anywhere on the bed — read the operator the machine
   numbers), and it is refused while the origin offset is not the heartbeat's own or the position
   is not trusted (§3). Never called "home".
-- **Motion floor** = `mcpMotionFloorZ` = machine Z320: the lowest Z any XY move may happen at.
+- **Motion floor** = `mcpMotionFloorZ` = machine Z320: the floor for ordinary XY transport
+  over 1 mm; bounded in-procedure links use §4.
 - **Park height** (a.k.a. traverse height) = `mcpSafeTraverseZ` = machine Z328: where procedures
-  hop, retreat on abort, and end. `get_stored_state.limits` reports both.
+  perform ordinary transfers and finish; local links use §4 and aborts use law 8.
+  `get_stored_state.limits` reports both.
 - **Toolhead Z** = the Z the heartbeat reports for the head; **physical / surface height** =
   toolhead Z at contact minus the probe (or tool) length.
 - **`bit_length_mm`** (tool setter) = the fitted tool's PROTRUSION from the collet in mm — a
@@ -412,9 +429,12 @@ Reference grammar: `{"from": "<opId>.<probeName>.<x|y|z>" | "<opId>.summary.<fie
 "axis.<x|z_contact|z_physical|tip_radius|probe_length>", "plus"?: n|path, "minus"?: n|path,
 "between": [lo, hi]}`; two-operand forms `{"mid": [a, b]}`, `{"diff": [a, b], "scale"?}`,
 `{"min"|"max": [...]}`. `between` is mandatory (law 3). A reference to a probe that missed
-refuses its op at run time — give the finding march enough `max_travel_mm`. A blind −Z march
-costs about `max_travel / coarse_step` sensor windows (~1 mm/step, ~0.3 s each): ask for an
-approximate height and shorten it — a long limit costs time, not safety.
+refuses its op at run time — give the finding march enough `max_travel_mm`. A blind −Z find
+advances in sensor-checked physical segments until contact or its limit.
+Use actual job timings, including controller and confirmation costs, rather than assuming a
+fixed time per logical step. A generous maximum does not add travel after an earlier contact.
+Approximate heights help locate a region; they do not authorise a blind descent. Reuse valid
+measured approach evidence only for the applicable column, tool, setup and B orientation.
 
 ## Appendix A — why these laws exist
 

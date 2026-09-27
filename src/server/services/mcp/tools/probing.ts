@@ -191,7 +191,10 @@ ${describeProbeVectorPlanAsGcode(plan)}`;
             + 'every march. Contact is expected ONLY during marches - a touch during any hop, raise '
             + 'or descent latches the CRASH alarm. Every number must be measured or operator-stated. '
             + 'Optional capture on a probe step photographs the final contact before retracting. '
-            + 'Ends raised at the traverse height. Results keyed by march name, machine coords only.',
+            + 'EVERY probe, including a continuing miss, returns to its own start and then raises before the next step. '
+            + 'For related local stations prefer surface_path/grid, wall_follow, trace, corner or stock_outline when their '
+            + 'geometry fits; one approval does not make this sequence a continuous low path. '
+            + 'Results keyed by march name, machine coords only.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -353,12 +356,13 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
     // is repeated in both tool descriptions on purpose: the MCP client caches
     // schemas, and the operator-authorised law-2 exception must be visible
     // wherever the tool is read.
-    const SURFACE_ENVELOPE_TEXT = 'ENVELOPE (operator-authorised 2026-09-05, the ONLY exception to motion law 2 - '
-        + 'valid only inside this procedure, only between consecutive stations): after each station the probe '
-        + 'retracts to LAST CONTACT + z_safe_delta_mm (default 20, HARD CAP 20) and hops horizontally AT THAT '
-        + 'HEIGHT to the next station, which must be within max_hop_mm (default 60, HARD CAP 60) - a wider '
-        + 'spacing/pitch is REFUSED at staging, never split silently. Hops run in <= 10 mm sensor-checked segments '
-        + 'expecting NO contact: a touch during a hop is a collision and latches the CRASH alarm. Each -Z march '
+    const SURFACE_ENVELOPE_TEXT = 'SURFACE ENVELOPE (operator-authorised 2026-09-05; valid only inside this '
+        + 'procedure between consecutive stations; other probing procedures have their own bounded links): '
+        + 'guarded mode retracts to LAST CONTACT + z_safe_delta_mm (default 20, HARD CAP 20) and hops in <= 10 mm '
+        + 'sensor-checked segments expecting NO contact; a touch latches CRASH. Stepped mode uses LAST CONTACT + '
+        + 'hop_lift_mm (default 2) and touch-probing links with backoff/lift recovery; contact during a lift holds. '
+        + 'Both modes require the next station within max_hop_mm (default 60, HARD CAP 60) - wider spacing/pitch '
+        + 'is REFUSED at staging, never split silently. Each -Z march '
         + 'searches from the hop height down to max(last contact - max_drop_mm (default 40, cap 80), '
         + 'floor_z_machine (default start_z_machine - max_drop_mm)); reaching the floor without contact records '
         + 'the station as no_contact and continues with the reference height unchanged (the first station finding '
@@ -380,7 +384,7 @@ ${describeProbeCirclePlanAsGcode(plan)}`;
         },
         z_safe_delta_mm: {
             type: 'number',
-            description: 'Retract above the last contact for the hop to the next station. Default 20, HARD CAP 20 '
+            description: 'Guarded mode: retract above the last contact for the next hop. Stepped mode uses hop_lift_mm instead. Default 20, HARD CAP 20 '
                 + '(operator law), min 3. Above the cap = refused.',
         },
         max_hop_mm: {
@@ -1235,7 +1239,9 @@ ${describeProbeTracePlanAsGcode(plan)}`;
             + 'get_frame; give it x/y and it first hops there at the traverse height like a sequence hop, else no motion) '
             + 'and home (machine home, LAST op only; '
             + 'it also homes B) - run by one '
-            + 'runner that hands the machine from op to op, each ending raised at the traverse height. Numbers an op '
+            + 'runner that hands the machine from op to op. Each successful probing op ends raised at the traverse height; '
+            + 'references and groups do not retain a low pose between ops. Keep related stations in one suitable surface, '
+            + 'wall_follow, trace, corner or stock_outline op to use its local links; sequence raises after every probe. Numbers an op '
             + 'cannot know at staging are REFERENCES to earlier results: {"from": "<opId>.<path>", "plus"?, "minus"?, '
             + '"between": [low, high]} - e.g. expected_z_machine: {"from": "c90.top.z", "between": [195, 240]} where c90 '
             + 'is a sequence op with a probe named "top" (.x/.y/.z read contactMachine), or start_z_machine: {"from": '

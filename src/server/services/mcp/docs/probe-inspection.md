@@ -86,6 +86,62 @@ from the park height. Find unknown surfaces with a sensor-gated march. Bracket t
 coarsely and refine them to the required tolerance; avoid dense resampling of known flat banks.
 Use the previous job response's `next_event_index` for long-polling `since_event`.
 
+### Existing local continuation and composition limits
+
+Local continuation is already implemented across the toolset. The agent-facing
+[planning reference](../../../../../.claude/skills/cnc-probing/references/planning.md)
+compares all measurement families and their return boundaries. Implementation anchors:
+
+- `probeSurface.ts`: guarded or stepped local links between top stations.
+- `probeWallFollow.ts`: contact-relative standoff, stepped link, then the next side march.
+- `probeOutline.ts`: local top links and same-side standoff links; full reposition on a side change.
+- `probeTracePerimeter.ts` / `perimeterTrace.ts`: internal-perimeter crawl with verified release,
+  coarse straight runs and selective confirmations.
+- `probeCorner.ts`: radial marches from the measured centre; `probeCircle.ts`: internal radials
+  from the staged interior origin. External circles still reposition at full height.
+- `probeCam.ts` / `camLinks.ts`: `stepped` and `wall` links, with blocked-station outcomes.
+  G38.2/G38.3 returns to the cycle start even on a continuing miss; the default link mode is `raise`.
+- `march.ts`: `marchToContact` returns a contact or miss and leaves retreat policy to its caller.
+  It is an internal primitive, not an independently callable MCP tool.
+
+`probe_sequence` deliberately returns to the march start and raises after every probe.
+`probe_program` resolves bounded references and batches approval, but successful probing ops
+still finish raised. These are specific composition boundaries, not evidence that guarded
+continuation is missing. Before proposing new motion machinery, determine whether an existing
+continuous procedure fits the geometry and entry conditions. Do not use an internal-pocket
+routine for an unbounded external fixture, or bypass a refused route with many tiny moves.
+
+### Timing and the 2026-09-27 inspection follow-up
+
+The seven probing jobs following `7685888d887d` took approximately **21m 31s** of execution,
+excluding approvals and conversation gaps. Their timing records support two different findings:
+
+- Repeated approaches to the same columns (X205/Y263 and X210/Y263) accounted for about
+  **2m 25s** of return/re-descent work. The sequence runner enforces those returns. This is
+  observed transport cost, not a demonstrated saving: an alternative must preserve the
+  unknown-jaw checks, valid entry geometry and conditional choices after contacts/misses.
+- `cc6e2592ccd6` took **5m 51s** for 17 top stations from machine Y278 to Y270 at X195/B0.
+  It already used 16 local 0.5 mm links and 2 mm local retracts. Thirteen contacts lay around
+  toolhead Z214.2–214.3; fine/confirm approaches dominated, not repeated returns to Z328.
+  Bracket the transition coarsely and refine to the required tolerance instead of sampling
+  the whole plateau densely. Trace's selective confirmations already solve a related
+  problem for internal perimeters; they are not currently a top-scan option.
+
+Read `runMs`, `byKind` and station timings. `execMs` includes motion and controller/transport
+overhead; `senseMs` is part of `idleMs`, which can include time before the run. Do not double
+count them or assume coarse descent always dominates. Retain the confirmation quality and
+sensor window required for the measurement and transport. Full clearance for unknown jaws,
+changed faces/B orientations or unsafe local links can be justified.
+
+For conclusions, compare coordinates explicitly: a boundary at Y270.5–271 is farther from a
+cut near Y256 than a historical Y269 estimate (14.5–15 mm versus 13 mm along Y). This is a
+coordinate comparison, not verified machining clearance. A top transition at one X/B remains
+a probe-reference measurement; material identity, ball geometry, unmeasured fixture extent
+and cutter/holder dimensions must be resolved before using it as a milling limit.
+
+The follow-up observed the existing running service and installed skills; it was not hardware
+validation of the newly committed recovery/capture changes.
+
 Validation is offline: simulated-machine traversal regressions, real runner tests with mocked
 machine/camera IO, camera failure/freshness tests and held-abort tests. These changes do not
 restart the running machine service or qualify the current fixture for milling.

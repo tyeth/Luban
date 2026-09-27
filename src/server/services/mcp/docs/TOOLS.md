@@ -85,20 +85,25 @@ It can sit differently after every power cycle, be knocked, be re-aimed, or be a
 
 - `probe_point` — one axis from the current position. The atom.
 - `probe_vector` — probe along any downward or lateral unit vector.
-- `probe_sequence` — enumerated hop / descend / probe circuit with law-2 hops at safe traverse height; keep-out boxes honoured at plan time.
-- `probe_circle` — N radial marches plus least-squares circle fit, outside a boss or inside a hole. Reports rms and residuals.
+- `probe_sequence` — enumerated hop / descend / probe circuit. Every probe returns to its own start and raises, including continuing misses; keep-out boxes honoured at plan time. Use a continuous procedure below for related local stations.
+- `probe_circle` — N radial marches plus least-squares circle fit. Inside a hole, returns to the staged interior origin between radials; outside a boss, repositions at full height. Reports rms and residuals.
 - `probe_surface_path` — N minus-Z stations along a line: per-station contact, best-fit slope, flatness. Optional `capture: {stations: [1, 4], settle_ms?, label?}` saves stationary photos at selected contacts before retraction (also `probe_surface_grid`).
-- `probe_surface_grid` — serpentine minus-Z grid: Z matrix, best-fit plane and residuals, ASCII height map. Both scans hop at last contact plus `z_safe_delta_mm`.
-- `probe_stock_outline` — from an estimate of a block, find its top, true outline and centre in one approved procedure.
-- `probe_program` — composite program: an ordered list of operations, derived references, jig geometry, keep-out and groups under one approval. The new-stock survey lives here. Op kinds: `rotate_b`, `surface_path`, `surface_grid`, `sequence`, `stock_outline`, `capture {x?, y?}` (a position- and B-stamped frame saved on the job record; with x/y it first hops there at the traverse height, travel- and obstacle-checked like a sequence hop, else no motion) and `home` (machine home, last op only, homes B too) — so "capture at (x, y), rotate_b 180, capture, home" is one click.
+- `probe_surface_grid` — serpentine minus-Z grid: Z matrix, best-fit plane and residuals, ASCII height map. Both scans link locally: guarded at last contact plus `z_safe_delta_mm`, stepped at last contact plus `hop_lift_mm` with contact recovery.
+- `probe_stock_outline` — from a block estimate, find its top, outline and centre. Links top samples and same-side samples locally; raises when changing sides.
+- `probe_wall_follow` — repeated vertical-wall contacts with standoff and stepped links away from the face on a bump; no full-height return between stations.
+- `probe_corner` — internal corner between fitted walls: bisector find then radial probes from the measured centre, returning there between contacts.
+- `probe_trace_perimeter` — bounded internal-pocket crawl with release-verified standoff, coarse steps on proven straights and selective confirmations; external tracing is not exposed.
+- `probe_program` — composite program: an ordered list of operations, derived references, jig geometry, keep-out and groups under one approval. The new-stock survey lives here. Each completed probing op ends raised; references/groups do not fuse local motion between ops. Op kinds: `rotate_b`, `surface_path`, `surface_grid`, `sequence`, `stock_outline`, `wall_follow`, `corner`, `trace`, `capture {x?, y?}` (a position- and B-stamped frame saved on the job record; with x/y it first hops there at the traverse height, travel- and obstacle-checked like a sequence hop, else no motion) and `home` (machine home, last op only, homes B too) — so "capture at (x, y), rotate_b 180, capture, home" is one click.
 - `set_probe_geometry` — jig and tool constants a rotary `probe_program` can reference as the `axis` namespace. Measured or operator-stated, with a reason.
 
 ## CAM probing programs
 
 - FreeCAD side: `docs/post/freecad_probe_emitter.py` writes a `run_probing_gcode` program with `(PROBE ...)` nominals, normals and tolerances read straight off the selected faces (the Path Probe operation carries none of that, so it is bypassed, along with the post processor). `frame="machine"` + a measured `App.Placement` for a re-clamped part.
 
-- `run_probing_gcode` — stage a CAM-generated probing program (Fusion 360, FreeCAD, any Grbl/Marlin post, or hand-written). `G38` cycles are translated into staged probes, never sent raw. Returns an inspection report.
+- `run_probing_gcode` — stage a CAM-generated probing program (Fusion 360, FreeCAD, any Grbl/Marlin post, or hand-written). `G38` cycles are translated into staged probes, never sent raw. Default `link_mode: raise` repositions at full height; `stepped`/`wall` provide local links with blocked-station handling. Every G38.2/G38.3 cycle still returns to its own start. Returns an inspection report.
 - `get_inspection_report` — re-render a finished or aborted probing run's report in another format, such as Fusion's.
+
+For tool selection, timing and the limits of local continuation, see [inspection planning](probe-inspection.md#efficient-inspection-planning).
 
 ## Standing rules the tools assume
 
