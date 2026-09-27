@@ -1,6 +1,6 @@
 ---
 name: cnc-motion-rules
-description: "The standing motion and coordinate rules for the Snapmaker A350 CNC driven through the Luban MCP tools, plus the canonical tool calls. Load this FIRST, before planning, staging, describing or reasoning about ANY machine motion or position: moves, jogs, traverses, homing, Z changes, probing, tool changes, running or staging an existing gcode/CAM/Luban program, clearance heights, work origins, machine coordinates, G53/G54/G90/G91, the heartbeat position or its reliability. It is also the answer to 'get_position says something odd'. The other CNC skills (cnc-probing, cnc-visual-alignment, tool-change) assume these rules and point here; for a plain transit or a plain 'run this file' this is the only skill you need."
+description: "The standing motion and coordinate rules for the Snapmaker A350 CNC driven through the Luban MCP tools, plus the canonical tool calls. Load this FIRST, before planning, staging, describing or reasoning about ANY machine motion or position: moves, jogs, traverses, homing, Z changes, probing, tool changes, running or staging an existing gcode/CAM/Luban program, clearance heights, work origins, machine coordinates, G53/G54/G90/G91, the heartbeat position or its reliability. It is also the answer to 'get_position says something odd'. The other CNC skills (cnc-probing, cnc-visual-alignment, tool-change) assume these rules and point here; for a plain transit or a Snapmaker-ready file this is the only skill you need; thread-milling controller exports also need cnc-thread-milling."
 ---
 
 # CNC motion rules (operator law — the canonical copy)
@@ -306,6 +306,13 @@ session are never live position: home first.
 
 ## 7. Running a program someone else generated (Luban, Fusion, hand-written)
 
+**Thread-milling exports need preparation.** Load
+[`cnc-thread-milling`](../cnc-thread-milling/SKILL.md) for internal or external
+threads. Its offline `convert_thread_milling_gcode` flow translates supported
+Machining Doctor output into a separate Snapmaker program. Never submit the raw
+controller export. Review the result, then use the sequence below on the returned
+text unchanged. Ordinary Luban exports still pass through unchanged.
+
 This is what the machine is for, and it is one approval:
 
 1. Preflight, asked as ONE batch only where the prompt leaves it open: same tool as when the
@@ -346,6 +353,12 @@ start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
 home {}
 // Z, one operator-confirmed step per target
 move_z {"z": 328, "coordinate_system": "machine", "reason": "..."}
+start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
+// Offline thread-milling conversion: only after verifying the declarations and actual head.
+// This RPM example requires the 200 W head; standard-head percentage arguments are in cnc-thread-milling.
+convert_thread_milling_gcode {"gcode": "<complete generator export>", "source_controller": "fanuc", "tool_center_path": true, "tool_length_applied": true, "spindle_mode": "cnc_200w_rpm"}
+// Review changes, warnings and validation BEFORE staging; conversion alone grants no motion authority.
+submit_gcode_job {"gcode": "<reviewed converted text>", "name": "thread.nc", "head_type": "cnc", "frame": "work"}
 start_gcode_job {"job_id": "<id>", "wait_for_approval_ms": 110000}
 // A Luban export (the file text, unchanged)
 submit_gcode_job {"gcode": "<file text>", "name": "pocket.nc", "frame": "work"}

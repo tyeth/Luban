@@ -1423,5 +1423,9 @@ toolhead camera. Everything a fresh install needs:
 `convert_thread_milling_gcode` converts Machining Doctor thread-milling exports (eight controller variants) to
 reviewable Snapmaker G0/G1 programs offline. See [thread-milling support](docs/thread-milling.md)
 for firmware findings, generator option coverage, required declarations, spindle
-modes, examples and limitations. Running a converted file uses the existing job
-approval flow.
+modes, examples and limitations. The dedicated
+[`cnc-thread-milling` skill](../../../../.claude/skills/cnc-thread-milling/SKILL.md)
+covers cutter geometry, internal bore/external boss review, multiple features and
+tool changes under `cnc-motion-rules`. Running a converted file uses the existing
+job approval flow. See the [baseline evaluation review](docs/thread-milling-evaluation.md)
+for the documentation gaps addressed and the next-evaluation constraints.

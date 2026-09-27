@@ -1,7 +1,8 @@
-# Luban MCP tool surface (54 tools)
+# Luban MCP tool surface
 
-Terse per-tool reference. Machines: A350 = CNC, F350 = printer. Motion tools stage a job and
-need one operator click on the confirm page; nothing moves on an agent's word alone. Results
+Terse per-tool reference. Machines: A350 = CNC, F350 = printer. Staged motion needs
+one operator click on the confirm page; direct-call exceptions are governed by
+`cnc-motion-rules`. Results
 quote coordinates with their frame (machine vs work). Call `get_stored_state` first in a fresh
 session.
 
@@ -9,7 +10,7 @@ session.
 
 - `get_stored_state` — everything known in one call: calibrations, landmarks, tool region, limits, camera (incl. `camera.stream.stream_url`, the operator's live view), connection, probe feed. Start here.
 - `get_connection_status` — is Luban connected to a machine, over what channel.
-- `get_machine_profile` — kinematics, work envelope, toolhead module offsets.
+- `get_machine_profile` — kinematics, work envelope, toolhead module offsets and `connectedHead` (`headType`, `toolHead`, possibly null). `toolHeads` lists compatible heads, not the currently fitted one; generic `headType: "cnc"` alone cannot choose thread-milling spindle mode.
 - `get_position` — the machine POSITION OF RECORD: judged machine coordinates with `reliability` (verified | heartbeat | cached-offset | awaiting-resync | stale), the frame it rests on and `reasons`, plus the raw work report and originOffset. Motion refuses unless verified/heartbeat/cached-offset; never derive machine = work − offset yourself.
 - `query_firmware_position` — raw `M114`; use when `get_position` looks suspect.
 - `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures; `machinePosition` counts rejected heartbeats by reason (out-of-bounds, frame-flip, no-offset-yet), resyncs and disconnects.
@@ -17,13 +18,15 @@ session.
 
 ## G-code jobs
 
+- `convert_thread_milling_gcode {gcode, source_controller?, tool_center_path: true, tool_length_applied: true, spindle_mode, spindle_power_percent?, chord_tolerance_mm?}` — OFFLINE import of internal/external Machining Doctor exports to explicit absolute Snapmaker G0/G1. Requires zero cutter compensation and work Z already referenced to the fitted cutter. Choose `power_percent` with integer percentage 1–100 for the standard head, or `cnc_200w_rpm` to retain 8000–18000 source RPM on the 200 W head. Never auto-selects the head or rescales feeds. Returns `gcode`, `changes`, `warnings`, `sourceSpindleRpm`, arc/full-circle/segment counts and `validation`; no connection, staging, origin write or motion. Review, then submit the converted text with `head_type: "cnc"`, `frame: "work"`. See [thread-milling guide](thread-milling.md) and [agent skill](../../../../../.claude/skills/cnc-thread-milling/SKILL.md).
+
 - `validate_gcode` — static inspection: extents, spindle state, distance-mode hazards, and the FRAME the job declares (G53 own-line = machine, G54..G59 = work; inline `G53 G0` flagged - the firmware ignores it; G92 flagged). Free, run before submitting.
 - `submit_gcode_job {gcode, name, frame?: "machine"|"work", head_type?}` — stage a file job (the gcode TEXT, not a path); returns the confirm-page URL — deliver it to the operator as the last line of your message, alone. REFUSED unless the job declares its frame: `G53` on its own line before the first move (machine), or `G54..G59` in the file / `frame: "work"` for a Luban/slicer export (work; the file is never modified). `frame: "machine"` without a literal G53 is refused. The confirm page shows Frame and machine-resolved Z extents.
-- `start_gcode_job {job_id, wait_for_approval_ms?, wait_ms?, confirm_token?}` — call right after staging with `wait_for_approval_ms` (e.g. 110000): the operator's click on the confirm page starts the job; `approved: false, timed_out: true` means call again, never restage. Procedures return the result if it lands within `wait_ms` (default 25 s), else `running` — long-poll `get_gcode_job_status`.
+- `start_gcode_job {job_id, wait_for_approval_ms?, wait_ms?, confirm_token?}` — after delivering the confirm URL and ending the staging turn, call with `wait_for_approval_ms` (e.g. 110000): the operator's click on the confirm page starts the job; `approved: false, timed_out: true` means call again, never restage. Procedures return the result if it lands within `wait_ms` (default 25 s), else `running` — long-poll `get_gcode_job_status`.
 - `get_gcode_job_status {job_id, wait_ms?, since_event?}` — event log plus stored result and `ending` (why it ended: completed | stopped-by-agent | stopped-by-operator | withdrawn | rejected-by-operator | crash-alarm | overtravel-alarm | unexpected-contact | controller-rejected | timeout | operation-failure | machine-stopped | completion-unverified, with reason and measured count); a stopped or failed procedure keeps every completed station under `result`. Long-poll with `wait_ms` / `since_event` instead of spinning.
 - `stop_gcode_job` — procedures stop cooperatively at the next step and raise; file jobs get a firmware stop. Partial result kept.
 
-## Direct motion (each is one approved job)
+## Transport and direct motion
 
 - `home` — machine home (`G53;G28;G54`; also homes B). Default first step after (re)connecting; raises Z first and clears the NOT-HOMED state. It is not a remedy for a `get_position` reliability of `awaiting-resync` or `stale` — a rejected or aged beat is a reporting fault, not a position fault, and motion is refused until the record recovers on its own (next coherent beat, ~2 s).
 - `goto_work_origin` — STAGE a move to work X0 Y0 (confirm page shows the destination in MACHINE coordinates; refused while the origin offset is untrusted). Distinct from `home`, which runs on the call.
@@ -99,11 +102,11 @@ It can sit differently after every power cycle, be knocked, be re-aimed, or be a
 
 ## Standing rules the tools assume
 
-- The endmill is always in the spindle; never plan as if the collet is empty.
-- Any XY move over 1 mm is planned at the safe traverse height - machine Z328 (home). Landmarks are honoured literally: a hop at 328 clears them on its own merits, a lower hop is checked like any low segment.
+- A tool or probe is always in the spindle; establish which is fitted and never plan as if the collet is empty.
+- XY transport over 1 mm is planned at or above the motion floor, machine Z320 by default; park/procedure traverse height is machine Z328. Read the stored limits and canonical motion rules. Landmarks are honoured literally: a hop at 328 clears them on its own merits, a lower hop is checked like any low segment.
 - No Z motion without a direct request. "Home" always means machine home.
 - Approval covers one bounded series of moves and never carries forward. A staged procedure or program is ONE approval for every move inside its envelope — the efficient lawful form.
-- Every motion tool stages a job: call `start_gcode_job` with `wait_for_approval_ms` after staging; the operator's click starts it. Hand the confirm URL over as the last line of the message, alone.
+- For staged motion, deliver the confirm URL as the last line and end the turn before waiting with `start_gcode_job`. `home` and `move_and_capture` are direct-call exceptions governed by `cnc-motion-rules`; never infer permission from this tool index.
 - Agents plan, stage, record and quote in MACHINE coordinates. Every staged job declares its frame or is refused; `G90`/`G91` is distance mode, not a frame; never a bare frameless `Z`.
 - The work origin is the operator's (touchscreen, Luban, tool-change wizard). Read it fresh from `get_position`; never assume it; never write it except through `apply_tool_length_offset`.
 - `get_position.machine` is the judged position of record with a `reliability`; a reading more than 50 mm outside the travel is a bug, never a position, and is ignored until the next coherent beat. Do not derive a machine position from one heartbeat by hand.

@@ -250,7 +250,12 @@ whole program — and compare `derived` with the operator's calipers.
 `run_tool_setter` with `accept_probe_contact: true` and a conservative `bit_length_mm`
 (`bit_length_mm` is the fitted tool's PROTRUSION in mm — a length, never a diameter; declare
 LOW). Setter surface = machine Z100.5, so effective length = measured trigger Z − 100.5; store
-it with `set_probe_geometry`. **Any probed surface height = contact toolhead Z − probe length.**
+it with `set_probe_geometry`. This derives effective length FROM a measured trigger
+and the verified setter reference; the historical 100.5 example is not a fresh
+reading. Never reverse the formula to fabricate `old_trigger_z` for a tool change.
+That requires the same-connection measurement pair (or the documented same-tool,
+same-session reuse) in [tool-change](../tool-change/SKILL.md).
+**Any probed surface height = contact toolhead Z − probe length.**
 The run ends with the head raised straight up to the traverse height (machine Z328, reported as
 `result.finalZ`), never at its start height — the next hop starts from there.
 
