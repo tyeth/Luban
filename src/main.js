@@ -530,10 +530,10 @@ const showMainWindow = async () => {
     startupMark('main: window created');
     mainWindow = window;
     // Monitor policy links, do not allow redirection
-    window.webContents.on('did-attach-webview', (e, webContent)=>  {
-        webContent.on('will-navigate', (e, url) => {
-            if (url.includes('policy')) {
-                e.preventDefault();
+    window.webContents.on('did-attach-webview', (_attachEvent, webContent) => {
+        webContent.on('will-navigate', (navigateEvent, navigateUrl) => {
+            if (navigateUrl.includes('policy')) {
+                navigateEvent.preventDefault();
             }
         });
     });
