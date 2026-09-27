@@ -335,7 +335,7 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
                     windowsHide: true,
                 });
             } catch (err) {
-                settle(new Error(`Failed to spawn "${this.cfg.python}": ${err.message}`));
+                settle(new Error(`Failed to spawn "${this.cfg.python}": ${(err as Error).message}`));
                 return;
             }
             this.child = child;

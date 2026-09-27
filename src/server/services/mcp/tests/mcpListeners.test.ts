@@ -81,7 +81,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             assert.strictEqual(servers[1].port, 40890);
             assert.strictEqual(servers[1].host, allowLan ? '0.0.0.0' : '127.0.0.1');
             assert.strictEqual(servers[0].host, servers[1].host);
-            assert.strictEqual(servers[1].options.minVersion, 'TLSv1.2');
+            assert.strictEqual(servers[1].options?.minVersion, 'TLSv1.2');
             assert.strictEqual(listeners.httpsPort, null);
             servers.forEach((server) => server.ready());
             assert.strictEqual(listeners.httpPort, 40889);

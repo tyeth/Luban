@@ -386,13 +386,13 @@ class CameraStreamService implements LiveFrameSource {
                     'X-Frame-Captured-At': String(latest.capturedAt),
                     'X-Frame-Source': 'stream',
                     'X-Frame-Stale': 'true',
-                    'X-Frame-Error': String(err.message).replace(/[\r\n]+/g, ' ').slice(0, 200),
+                    'X-Frame-Error': String((err as Error).message).replace(/[\r\n]+/g, ' ').slice(0, 200),
                 });
                 res.end(req.method === 'HEAD' ? undefined : latest.jpg);
                 return;
             }
             res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
-            res.end(`${err.message}\n`);
+            res.end(`${(err as Error).message}\n`);
         }
     }
 
@@ -486,7 +486,7 @@ class CameraStreamService implements LiveFrameSource {
             this.device = device;
             this.spawnFfmpeg(inputArgs, device);
         } catch (err) {
-            this.noteFailure(err.message);
+            this.noteFailure((err as Error).message);
         } finally {
             this.starting = false;
         }
@@ -505,7 +505,7 @@ class CameraStreamService implements LiveFrameSource {
         try {
             child = spawn(ffmpegBinary(), args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
         } catch (err) {
-            this.noteFailure(`ffmpeg spawn failed: ${err.message}`);
+            this.noteFailure(`ffmpeg spawn failed: ${(err as Error).message}`);
             return;
         }
         this.child = child;

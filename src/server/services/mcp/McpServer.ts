@@ -180,7 +180,7 @@ export class McpServer {
             return;
         }
 
-        const url = new URL(req.url, 'http://localhost');
+        const url = new URL(req.url || '/', 'http://localhost');
         if (url.pathname !== '/mcp') {
             this.respond(res, 404, { error: 'not found' });
             return;
@@ -296,7 +296,7 @@ export class McpServer {
                     return rpcError(id, JSONRPC_METHOD_NOT_FOUND, `Method not found: ${method}`);
             }
         } catch (err) {
-            log.error(`MCP ${method} failed: ${err.message}`);
+            log.error(`MCP ${method} failed: ${(err as Error).message}`);
             return rpcError(id, JSONRPC_INTERNAL_ERROR, 'Internal error');
         }
     }
@@ -345,7 +345,7 @@ export class McpServer {
         } catch (err) {
             // Tool failures are results, not protocol errors, so the model
             // calling the tool can read them.
-            const text = err instanceof McpToolError ? err.message : `Tool failed: ${err.message}`;
+            const text = err instanceof McpToolError ? err.message : `Tool failed: ${(err as Error).message}`;
             log.warn(`tool ${name} failed in ${Date.now() - startedAt}ms: ${text}`);
             this.onActivity && this.onActivity({ tool: name, ok: false, durationMs: Date.now() - startedAt, error: text });
             return rpcResult(id, {

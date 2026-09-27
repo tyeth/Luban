@@ -61,7 +61,7 @@ export const tests: Array<[string, () => void]> = [
 
     ['a substring that names both cameras is refused, not guessed', () => {
         const match = matchCameraDevice('by-id', BOTH);
-        assert.equal(match.ok, false);
+        assert.ok(!match.ok);
         assert.equal(match.entry, null);
         assert.match(match.reason, /matches 2 cameras/);
         // Both must be named, or the caller cannot make the next try right.
@@ -71,20 +71,20 @@ export const tests: Array<[string, () => void]> = [
 
     ['an index is refused: device numbering does not survive a replug', () => {
         const match = matchCameraDevice('0', BOTH);
-        assert.equal(match.ok, false);
+        assert.ok(!match.ok);
         assert.match(match.reason, /replug/);
     }],
 
     ['a camera that is not attached is refused with the ones that are', () => {
         const match = matchCameraDevice('/dev/video9', BOTH);
-        assert.equal(match.ok, false);
+        assert.ok(!match.ok);
         assert.match(match.reason, /No attached camera matches/);
         assert.match(match.reason, /C920/);
     }],
 
     ['an empty device names the attached cameras rather than defaulting', () => {
         const match = matchCameraDevice('   ', BOTH);
-        assert.equal(match.ok, false);
+        assert.ok(!match.ok);
         assert.match(match.reason, /Sonix/);
     }],
 
@@ -96,7 +96,7 @@ export const tests: Array<[string, () => void]> = [
 
     ['no cameras attached says so instead of resolving', () => {
         const match = matchCameraDevice('/dev/video0', []);
-        assert.equal(match.ok, false);
+        assert.ok(!match.ok);
         assert.match(match.reason, /none attached/);
     }],
 

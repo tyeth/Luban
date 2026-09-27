@@ -48,7 +48,7 @@ export class CameraModelStore {
         try {
             fs.writeJsonSync(this.file(), this.cache, { spaces: 2 });
         } catch (err) {
-            log.error(`Failed to persist the camera model: ${err.message}`);
+            log.error(`Failed to persist the camera model: ${(err as Error).message}`);
         }
     }
 

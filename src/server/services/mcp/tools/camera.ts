@@ -151,6 +151,9 @@ export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcod
     // Crash-guard bracket: the HTTP channel executes synchronously, so the
     // await spans the motion window - a contact-sensor trigger inside it
     // that no procedure expects is treated as a collision (probeFeed).
+    if (typeof channel.executeGcode !== 'function') {
+        throw new McpToolError('The connected channel does not support direct moves.');
+    }
     probeFeedService.motionBegin();
     noteDirectGcodeStart();
     let executed;

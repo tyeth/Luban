@@ -287,7 +287,7 @@ function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
             return;
         }
 
-        const url = new URL(req.url, 'http://localhost');
+        const url = new URL(req.url || '/', 'http://localhost');
         if (url.pathname === '/' || url.pathname === '/jobs' || url.pathname.startsWith('/jobs/')) {
             handleJobDashboardRequest(req, res, url, jobManager, async (id) => stopGcodeJob({ job_id: id, wait_ms: 0 }, 'operator'));
             return;

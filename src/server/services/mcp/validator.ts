@@ -148,7 +148,9 @@ export function validateGcode(gcode: string): GcodeValidationReport {
 
     let x: { min: number; max: number } | null = null;
     let y: { min: number; max: number } | null = null;
-    let z: { min: number; max: number } | null = null;
+    // Assigned inside lines.forEach below, which control-flow analysis does
+    // not follow; the cast keeps z from narrowing to its null initialiser.
+    let z = null as { min: number; max: number } | null;
     let b: { min: number; max: number } | null = null;
     let feed: { min: number; max: number } | null = null;
     let maxS: number | null = null;

@@ -798,7 +798,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                             frame = await captureFrame();
                         } catch (err) {
                             throw new McpToolError(`Capture failed at waypoint ${leg.index}/${waypoints.length} of the `
-                                + `Z ${level.z} pass (machine ${leg.x}, ${leg.y}): ${err.message}. Survey aborted; `
+                                + `Z ${level.z} pass (machine ${leg.x}, ${leg.y}): ${(err as Error).message}. Survey aborted; `
                                 + `${frames.length} frames saved in ${dir}.`);
                         }
                         const file = path.join(dir, `z${level.z}_wp${String(leg.index).padStart(3, '0')}_x${leg.x}_y${leg.y}.jpg`);

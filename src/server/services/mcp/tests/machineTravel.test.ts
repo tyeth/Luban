@@ -1,6 +1,7 @@
 import { strict as assert } from 'assert';
 
 import { clampBand, clampRay, describeClipping, outsideTravel, resolveTravel } from '../machineTravel';
+import type { ResolvedTravel, TravelInput } from '../machineTravel';
 
 // The A350 as it actually is: a 320 x 350 definition, a machine frame that
 // runs X -19...339, and a home position at X-19 Y342 that PROVES the low X
@@ -9,15 +10,21 @@ const A350 = { x: 320, y: 350 };
 const NOTHING_STATED = { xMin: null, xMax: null, yMin: null, yMax: null };
 const AT_HOME = { x: -19, y: 342 };
 
+function travelFor(input: TravelInput): ResolvedTravel {
+    const travel = resolveTravel(input);
+    assert.ok(travel, 'travel should resolve');
+    return travel;
+}
+
 export const tests: Array<[string, () => void]> = [
     ['with nothing stated the travel is the machine definition', () => {
-        const travel = resolveTravel({ size: A350, stated: NOTHING_STATED, observed: null });
+        const travel = travelFor({ size: A350, stated: NOTHING_STATED, observed: null });
         assert.deepEqual(travel.limits, { xMin: 0, xMax: 320, yMin: 0, yMax: 350 });
         assert.equal(travel.ends.xMin.source, 'nominal');
     }],
 
     ['a position the toolhead has occupied widens an unstated end - it is proof of reach', () => {
-        const travel = resolveTravel({ size: A350, stated: NOTHING_STATED, observed: AT_HOME });
+        const travel = travelFor({ size: A350, stated: NOTHING_STATED, observed: AT_HOME });
         assert.equal(travel.limits.xMin, -19);
         assert.equal(travel.ends.xMin.source, 'observed');
         // Y342 is INSIDE the nominal 0..350, so it changes nothing.
@@ -26,7 +33,7 @@ export const tests: Array<[string, () => void]> = [
     }],
 
     ['a stated limit beats both the definition and the observation', () => {
-        const travel = resolveTravel({
+        const travel = travelFor({
             size: A350,
             stated: { xMin: -19, xMax: 339, yMin: 0, yMax: 342 },
             observed: AT_HOME,
@@ -38,7 +45,7 @@ export const tests: Array<[string, () => void]> = [
 
     ['an observation outside a stated limit is a conflict, not a silent widening', () => {
         // Someone stated X can only reach 0, but the machine is sitting at -19.
-        const travel = resolveTravel({
+        const travel = travelFor({
             size: A350,
             stated: { xMin: 0, xMax: null, yMin: null, yMax: null },
             observed: AT_HOME,
@@ -53,7 +60,7 @@ export const tests: Array<[string, () => void]> = [
     // microns is float noise, not a machine that went somewhere it should
     // not have, and a warning that cries wolf is a warning nobody reads.
     ['the heartbeat\'s float noise is not a conflict', () => {
-        const travel = resolveTravel({
+        const travel = travelFor({
             size: A350,
             stated: { xMin: -19, xMax: 339, yMin: 0, yMax: 342 },
             observed: { x: -19.00000610351563, y: 342 },
@@ -63,7 +70,7 @@ export const tests: Array<[string, () => void]> = [
     }],
 
     ['float noise does not widen an unstated end either', () => {
-        const travel = resolveTravel({
+        const travel = travelFor({
             size: { x: 320, y: 350 },
             stated: NOTHING_STATED,
             observed: { x: -0.0000061, y: 0 },
@@ -73,7 +80,7 @@ export const tests: Array<[string, () => void]> = [
     }],
 
     ['a real excursion past a stated limit is still a conflict', () => {
-        const travel = resolveTravel({
+        const travel = travelFor({
             size: A350,
             stated: { xMin: -19, xMax: null, yMin: null, yMax: null },
             observed: { x: -24, y: 342 },
@@ -87,7 +94,7 @@ export const tests: Array<[string, () => void]> = [
     }],
 
     ['an unknown machine with every end stated is planned from those', () => {
-        const travel = resolveTravel({
+        const travel = travelFor({
             size: null,
             stated: { xMin: -19, xMax: 339, yMin: 0, yMax: 342 },
             observed: null,
@@ -146,6 +153,7 @@ export const tests: Array<[string, () => void]> = [
     ['clipping is described only when something was actually lost', () => {
         assert.equal(describeClipping('X', clampBand(79, 98, -19, 339)), null);
         const text = describeClipping('X', clampBand(79, 200, -19, 339));
+        assert.ok(text);
         assert.match(text, /102 mm below X-19/);
         assert.match(text, /not planned/);
     }],
