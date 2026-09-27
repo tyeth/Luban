@@ -32,6 +32,8 @@ export type JobEndingKind =
     | 'overtravel-alarm'
     | 'unexpected-contact'
     | 'controller-rejected'
+    /** A file job whose machine Z assumed a workspace offset that did not verify before streaming. */
+    | 'workspace-unverified'
     | 'timeout'
     | 'operation-failure'
     | 'machine-stopped'

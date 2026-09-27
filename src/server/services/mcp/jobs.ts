@@ -483,7 +483,10 @@ export class JobManager {
             frameText = 'n/a (no motion)';
         }
         let machineZ = 'UNRESOLVED - see warnings';
-        if (v.machineZExtents) {
+        if (v.machineZExtents && v.machineZResolvedFor) {
+            machineZ = `${range(v.machineZExtents)} - if ${v.machineZResolvedFor} is the active workspace; on start, ${v.machineZResolvedFor} is `
+                + `selected (no motion) and the job refuses to stream unless its offset Z is ${v.originOffsetZAtStaging}`;
+        } else if (v.machineZExtents) {
             machineZ = range(v.machineZExtents);
         } else if (v.motionLineCount === 0) {
             machineZ = '-';

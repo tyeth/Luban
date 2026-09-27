@@ -36,15 +36,51 @@ export const tests: Array<[string, () => void]> = [
         assert.deepEqual(r.report.machineZExtents, { min: 300, max: 300 });
     }],
 
-    ['G54 declares WORK but an anonymous current offset cannot prove its machine extents', () => {
-        const r = resolveJobFrame(validateGcode('G90\nG54\nG0 Z10\nG1 Z-2\n'), ctx({ originOffsetZ: -200 }));
+    ['a G54-only file resolves machine Z against the live offset and names G54 as the assumption start verifies', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG54\nG0 Z10\nG1 Z-2\n'), ctx({ originOffsetZ: -200, verifiesG54AtStart: true }));
         assert.equal(r.refusal, null);
         assert.equal(r.report.frame.declared, 'work');
         assert.equal(r.report.frame.source, 'gcode');
         assert.deepEqual(r.report.frame.workspaceSelects, ['G54']);
+        assert.deepEqual(r.report.machineZExtents, { min: 198, max: 210 });
+        assert.equal(r.report.originOffsetZAtStaging, -200);
+        assert.equal(r.report.machineZResolvedFor, 'G54');
+        assert(r.report.warnings.some((w) => w.includes('refuses to start unless G54 reports this offset')));
+        assert(!r.report.warnings.some((w) => w.includes('UNRESOLVED')));
+    }],
+
+    ['a G54-only file with an unreliable offset stays unresolved and carries no assumption', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG54\nG0 Z10\n'), ctx({ offsetReliable: false, verifiesG54AtStart: true }));
         assert.equal(r.report.machineZExtents, null);
-        assert.equal(r.report.originOffsetZAtStaging, null);
+        assert.equal(r.report.machineZResolvedFor, null);
+    }],
+
+    ['G54 selected only AFTER a move (frame from the argument) cannot be resolved by one offset', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG0 Z10\nG54\nG0 Z5\n'), ctx({ frameArgument: 'work', originOffsetZ: -200, verifiesG54AtStart: true }));
+        assert.equal(r.report.frame.source, 'argument');
+        assert.equal(r.report.machineZExtents, null);
+        assert.equal(r.report.machineZResolvedFor, null);
         assert(r.report.warnings.some((w) => w.includes('UNRESOLVED')));
+    }],
+
+    ['G54 with a G92 origin rewrite or any other workspace stays unresolved', () => {
+        for (const code of ['G90\nG54\nG92 Z0\nG0 Z10\n', 'G90\nG54\nG0 Z10\nG55\nG0 Z5\n', 'G90\nG55\nG0 Z10\n']) {
+            const r = resolveJobFrame(validateGcode(code), ctx({ originOffsetZ: -200, verifiesG54AtStart: true }));
+            assert.equal(r.report.machineZExtents, null, code);
+            assert.equal(r.report.machineZResolvedFor, null, code);
+        }
+    }],
+
+    ['a G54 envelope whose start path does not verify G54 (direct / procedure) stays unresolved', () => {
+        const r = resolveJobFrame(validateGcode('G90\nG54;\nG1 Z10 F300'), ctx({ originOffsetZ: -200 }));
+        assert.equal(r.report.machineZExtents, null);
+        assert.equal(r.report.machineZResolvedFor, null);
+        assert(r.report.warnings.some((w) => w.includes('UNRESOLVED')));
+    }],
+
+    ['a Luban export resolves without a workspace assumption: it runs in the active workspace', () => {
+        const r = resolveJobFrame(validateGcode(LUBAN_EXPORT), ctx({ frameArgument: 'work', originOffsetZ: -150 }));
+        assert.equal(r.report.machineZResolvedFor, null);
     }],
 
     ['a Luban export (no workspace select) is accepted with frame:"work" and left byte-identical', () => {

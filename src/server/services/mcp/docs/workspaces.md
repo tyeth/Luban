@@ -50,7 +50,14 @@ The validator recognises G54–G59.3 but leaves machine extents unresolved for n
 files, mixed frames and origin rewrites. It cannot honestly resolve a G55 section using an
 unidentified current offset. Verify every required workspace and review each section against
 its own offset. An unchanged file with no workspace selectors, declared `frame: "work"`, can
-still resolve against the reliable current offset. Do not strip selectors to silence warnings.
+still resolve against the reliable current offset. So can a submitted file that selects only
+G54 before its first move, such as converted thread-milling output. Its report sets
+`machineZResolvedFor: "G54"` and the confirm page states the condition. After approval,
+`start_gcode_job` selects G54 through the same no-motion runner as `select_workspace`
+(acknowledgement plus two agreeing readbacks). It refuses to upload or stream unless G54's
+offset Z matches staging within 0.05 mm (`ending.kind: "workspace-unverified"`). When the
+selection changed the offset, other staged jobs are invalidated. Server-emitted envelopes do
+not run this check and remain unresolved. Do not strip selectors to silence warnings.
 
 Firmware references:
 [workspace selection](https://github.com/Snapmaker/Snapmaker2-Controller/blob/main/Marlin/src/gcode/geometry/G53-G59.cpp)

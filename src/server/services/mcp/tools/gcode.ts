@@ -17,6 +17,7 @@ import { planTraverseXy } from '../traversePlan';
 import { JobFrame, TRANSPORT_REFUSAL, isPureTransport, resolveJobFrame, suggestGcode, validateGcode } from '../validator';
 import { GcodeChannel, sendGcodeVisible } from './camera';
 import { stagingFrameContext, validateStagedEnvelope } from './staging';
+import { verifyFileJobWorkspace } from './workspace';
 import { TRAVEL_EPSILON_MM } from '../machineTravel';
 import {
     EVENT_POLL_MS,
@@ -438,7 +439,9 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (headType === 'cnc' && isPureTransport(inspected)) {
                 throw new McpToolError(TRANSPORT_REFUSAL);
             }
-            const resolved = resolveJobFrame(inspected, stagingFrameContext(frameArgument));
+            // A file job's start selects G54 and verifies its offset first (see
+            // start_gcode_job), so a G54-only file may resolve its machine Z.
+            const resolved = resolveJobFrame(inspected, { ...stagingFrameContext(frameArgument), verifiesG54AtStart: true });
             if (resolved.refusal) {
                 throw new McpToolError(resolved.refusal + describeSuggestion(suggestGcode(args.gcode, resolved.report)));
             }
@@ -459,6 +462,8 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
         name: 'start_gcode_job',
         description: 'Start an approved job: uploads the file to the machine through the same '
             + 'prepare/start path as "Start on Luban" (door interlock applies) and starts it. '
+            + 'A file whose machine Z was resolved for G54 (validation.machineZResolvedFor) first selects G54 with no '
+            + 'motion and refuses to stream unless its offset Z matches staging (ending workspace-unverified: verify G54, restage). '
             + 'Authorisation is the operator\'s click on the confirm page. ORDER MATTERS: first deliver the staging '
             + 'result\'s confirm_url to the operator as the last line of a reply and END THE TURN (see the staging '
             + 'result\'s `handoff`); only then wait. EITHER pass the one-time code they paste (confirm_token) OR call '
@@ -743,6 +748,26 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             }
 
             job.state = 'starting';
+            if (job.validation.machineZResolvedFor) {
+                // The confirm page's machine Z assumed the live offset was this
+                // workspace's; the heartbeat cannot say so. Prove it (select,
+                // acknowledge, two agreeing readbacks, same Z) before streaming.
+                try {
+                    const verified = await verifyFileJobWorkspace(job);
+                    jobManager.appendEvent(job, 'workspace_verified', {
+                        note: `${verified.workspace} selected with no motion; offset Z ${verified.originOffset.z} matches staging`
+                            + `${verified.selectionChanged ? ' (another workspace was active before; other staged jobs were invalidated)' : ''}`,
+                    });
+                } catch (err) {
+                    job.state = 'start_failed';
+                    job.error = `Not started: ${(err as Error).message}`;
+                    job.endedAt = Date.now();
+                    job.ending = { kind: 'workspace-unverified', reason: job.error, at: job.endedAt };
+                    job.result = { workspace_check: (err as { partial?: object }).partial || null };
+                    jobManager.appendEvent(job, 'failed', { note: job.error, ending: job.ending });
+                    throw new McpToolError(job.error);
+                }
+            }
             const uploadError = await new Promise<string | null>((resolve) => {
                 channel.uploadGcodeFile(job.filePath, job.headType, `${job.name}.nc`, (msg) => {
                     resolve(msg ? String(msg) : null);
@@ -1119,7 +1144,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
         name: 'get_gcode_job_status',
         description: 'Job record with `ending` - why it ended: completed | stopped-by-agent | stopped-by-operator | '
             + 'withdrawn | rejected-by-operator | crash-alarm | overtravel-alarm | unexpected-contact | controller-rejected | '
-            + 'timeout | operation-failure | machine-stopped | completion-unverified, with the reason and how many stations/ops '
+            + 'workspace-unverified | timeout | operation-failure | machine-stopped | completion-unverified, with the reason and how many stations/ops '
             + 'were measured - its event log (state changes, runner phases, gcode traffic while active, file-job progress and '
             + 'pauses), the stored procedure result (a stopped or failed run keeps every completed station under result, with '
             + 'result.ending beside it), and live machine progress. '

@@ -83,6 +83,14 @@ export interface GcodeValidationReport {
     machineZExtents: { min: number; max: number } | null;
     /** Work-origin Z offset used to resolve machineZExtents (work-frame jobs only). */
     originOffsetZAtStaging: number | null;
+    /**
+     * The workspace whose offset machineZExtents assume, for a file that selects
+     * only G54 before its first move. The heartbeat does not name the active
+     * workspace, so start_gcode_job selects it and verifies its offset before
+     * streaming. null when the file selects no workspace (it runs in the active
+     * one, which the live offset describes) and when the extents are unresolved.
+     */
+    machineZResolvedFor: 'G54' | null;
     warnings: string[];
 }
 
@@ -355,6 +363,7 @@ export function validateGcode(gcode: string): GcodeValidationReport {
         frame,
         machineZExtents: null,
         originOffsetZAtStaging: null,
+        machineZResolvedFor: null,
         warnings,
     };
 }
@@ -480,6 +489,12 @@ export interface FrameResolutionContext {
     offsetReliable: boolean;
     /** Machine Z travel (home height), for bounds warnings; null when the machine is unknown. */
     machineZMax: number | null;
+    /**
+     * The job's start path selects G54 and verifies its offset before streaming
+     * (submit_gcode_job file jobs). Only then may a G54-only file's extents be
+     * resolved on the assumption that the live offset is G54's.
+     */
+    verifiesG54AtStart?: boolean;
 }
 
 export interface FrameResolution {
@@ -545,8 +560,15 @@ export function resolveJobFrame(input: GcodeValidationReport, ctx: FrameResoluti
 
     // A heartbeat supplies an offset, not its workspace identity or a table of offsets.
     // Never apply that one offset to named/multiple workspaces or a changing origin.
+    // One exception: a submitted file that selects only G54, before its first move
+    // (every converted thread-milling program). Its extents resolve against the live
+    // offset on the stated assumption that it is G54's, and start_gcode_job proves
+    // that by selecting G54 and comparing offsets before anything streams.
+    const selectsOnlyG54 = ctx.verifiesG54AtStart === true
+        && report.frame.declared === 'work' && report.frame.source === 'gcode'
+        && report.frame.workspaceSelects.length === 1 && report.frame.workspaceSelects[0] === 'G54';
     if (report.frame.mixed || report.setsWorkOrigin
-        || (report.frame.declared === 'work' && report.frame.workspaceSelects.length > 0)) {
+        || (report.frame.declared === 'work' && report.frame.workspaceSelects.length > 0 && !selectsOnlyG54)) {
         report.machineZExtents = null;
         report.originOffsetZAtStaging = null;
         report.warnings.push('Machine Z extents are UNRESOLVED: this file selects a named workspace, mixes frames, or rewrites an origin. '
@@ -574,6 +596,12 @@ export function resolveJobFrame(input: GcodeValidationReport, ctx: FrameResoluti
             report.machineZExtents = rawZ
                 ? { min: rawZ.min - ctx.originOffsetZ, max: rawZ.max - ctx.originOffsetZ }
                 : null;
+            if (selectsOnlyG54) {
+                report.machineZResolvedFor = 'G54';
+                report.warnings.push(`Machine Z extents assume the live work-origin offset (Z ${ctx.originOffsetZ}) is G54's: the heartbeat does not `
+                    + 'name the active workspace. Before streaming, start_gcode_job selects G54 (no motion) and refuses to start unless '
+                    + 'G54 reports this offset.');
+            }
             if (rawZ && rawZ.min <= 0 && rawZ.max >= 0) {
                 report.warnings.push('Work-frame job with an absolute Z at or crossing 0: with the current origin, work Z0 is '
                     + `machine Z ${(-ctx.originOffsetZ).toFixed(3)}. Confirm that is where you want the tool.`);

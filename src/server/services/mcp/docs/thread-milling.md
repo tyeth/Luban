@@ -109,7 +109,9 @@ machine Z against the motion floor and the entire initial segment against landma
 source work Z20 is not machine park height. Conversion invents no approach. Verify
 the intended G54 origin (the output emits G54), validate the converted text and stage
 it as a CNC work-frame job, following the link-first approval handoff. Do not assert
-machine-resolved bounds from the offline report alone.
+machine-resolved bounds from the offline report alone. The confirm page resolves
+machine Z for G54, and `start_gcode_job` verifies G54's offset before streaming
+(see [workspaces](workspaces.md#file-review)).
 
 ## Multiple features and completion
 
