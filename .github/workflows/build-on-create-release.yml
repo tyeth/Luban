@@ -55,6 +55,16 @@ jobs:
                   echo "tag=$(jq -r '.tagName' <<< "$release")" >> "$GITHUB_OUTPUT"
                   echo "prerelease=$(jq -r '.isPrerelease' <<< "$release")" >> "$GITHUB_OUTPUT"
 
+    # Lint, type checks and tests of the release tag, beside the builds (which
+    # do not wait for them); a failure is reported without blocking assets.
+    checks:
+        name: Checks
+        needs: release
+        uses: ./.github/workflows/checks.yml
+        with:
+            ref: refs/tags/${{ needs.release.outputs.tag }}
+        secrets: inherit
+
     build-windows:
         needs: release
         if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'windows' || inputs.platforms == 'all'

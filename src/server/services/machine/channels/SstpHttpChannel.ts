@@ -44,7 +44,9 @@ interface Result {
     code: number;
     msg: string;
     text?: string;
-    data?: object;
+    // Parsed JSON body; its fields depend on the endpoint.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    data?: Record<string, any>;
 }
 const _getResult = (err, res: request.Response): Result => {
     if (err) {
@@ -88,7 +90,6 @@ const _getResult = (err, res: request.Response): Result => {
     };
 };
 // let timeoutHandle = null;
-const intervalHandle = null;
 
 
 export type StateOptions = {
@@ -330,7 +331,7 @@ class SstpHttpChannel extends Channel implements
         this.heartBeatWorker = workerManager.heartBeat([{
             host: this.host,
             token: this.token
-        }], (result: object) => {
+        }], (result: { status?: string; msg?: string; res?: request.Response }) => {
             if (result.status === 'offline') {
                 log.info(`[wifi connection offline]: msg=${result.msg}`);
                 this.clearAllInterval();
@@ -374,7 +375,7 @@ class SstpHttpChannel extends Channel implements
 
                 this.socket && this.socket.emit('connection:connected', {
                     state,
-                    err: state?.err,
+                    err: data?.err,
                     type: ConnectionType.WiFi,
                 });
             } else {

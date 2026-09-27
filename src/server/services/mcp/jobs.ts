@@ -35,7 +35,8 @@ const JOB_RETENTION_LIMIT = 50;
  * the operator approves a motion ENVELOPE and the runner steps within it
  * against live sensor feedback - also on the direct path, not interlocked.
  */
-export { McpJobState, McpJobKind, TERMINAL_JOB_STATES } from './jobEnding';
+export type { McpJobState, McpJobKind } from './jobEnding';
+export { TERMINAL_JOB_STATES } from './jobEnding';
 
 export interface JobEvent {
     at: number;
