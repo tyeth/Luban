@@ -37,5 +37,8 @@ export interface ProbeTransport {
     isConnected(): boolean;
     /** Transport-specific fields merged into get_probe_feed_status. */
     describe(): object;
-    on(event: string, listener: (...args: unknown[]) => void): this;
+    on(event: 'reading', listener: (channel: ProbeChannel, value: string, meta?: ReadingMeta) => void): this;
+    on(event: 'refresh', listener: (channel: ProbeChannel, value: string) => void): this;
+    on(event: 'error', listener: (err: Error) => void): this;
+    on(event: 'close', listener: () => void): this;
 }

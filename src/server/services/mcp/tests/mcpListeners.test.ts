@@ -5,6 +5,7 @@ import path from 'path';
 import vm from 'vm';
 import ts from 'typescript';
 import type http from 'http';
+import type https from 'https';
 import { resolveHttpsFiles } from '../mcpListeners';
 import type { McpListeners } from '../mcpListeners';
 
@@ -17,7 +18,7 @@ class FakeServer extends EventEmitter {
 
     public ready: () => void = () => undefined;
 
-    public constructor(public handler: http.RequestListener, public options?: object) { super(); }
+    public constructor(public handler: http.RequestListener, public options?: https.ServerOptions) { super(); }
 
     public listen(port: number, host: string, ready: () => void): void {
         this.port = port;

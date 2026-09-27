@@ -48,7 +48,10 @@ export interface McpToolDefinition {
     // JSON Schema for the tool arguments
     inputSchema: object;
 
-    handler: (args: object) => Promise<object>;
+    // Method syntax on purpose: each tool narrows args to its own schema's
+    // shape, which a function-typed property would reject under
+    // strictFunctionTypes. Arguments are validated against inputSchema.
+    handler(args: object): Promise<object>;
 }
 
 export class ToolRegistry {
