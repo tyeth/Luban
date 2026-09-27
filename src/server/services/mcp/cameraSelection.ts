@@ -27,15 +27,20 @@ export interface CameraCandidate {
     aliases: string[];
 }
 
-export interface CameraMatch {
-    ok: boolean;
-    /** The candidate entry the query resolved to; null when it resolved to none. */
-    entry: string | null;
+export type CameraMatch = {
+    ok: true;
+    /** The candidate entry the query resolved to. */
+    entry: string;
     /** How it resolved, for a caller that wants to say so out loud. */
-    matchedOn: 'entry' | 'alias' | 'substring' | null;
+    matchedOn: 'entry' | 'alias' | 'substring';
+    reason: null;
+} | {
+    ok: false;
+    entry: null;
+    matchedOn: null;
     /** Why it did not resolve - named cameras included, so the next try can be right. */
-    reason: string | null;
-}
+    reason: string;
+};
 
 function resolved(entry: string, matchedOn: 'entry' | 'alias' | 'substring'): CameraMatch {
     return { ok: true, entry, matchedOn, reason: null };

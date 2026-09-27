@@ -100,7 +100,7 @@ export function registerWorkspaceTools(registry: ToolRegistry, getConfirmBaseUrl
                 probeFeedService.assertNoOvertravel();
                 assertMachineReadyForProcedure();
                 if (jobManager.getActive()?.state === 'started') throw new McpToolError('Another job is active; finish it before staging a workspace change.');
-                let plan;
+                let plan: ReturnType<typeof planWorkspace>;
                 try { plan = planWorkspace(args, getPositionSnapshot(), write); } catch (err) { throw new McpToolError((err as Error).message); }
                 const channel = getDirectChannel();
                 const resetAt = machinePositionDiagnostics().resetAt;

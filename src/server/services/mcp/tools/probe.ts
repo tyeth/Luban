@@ -38,7 +38,7 @@ export function registerProbeTools(registry: ToolRegistry): void {
             try {
                 await probeFeedService.connect();
             } catch (err) {
-                throw new McpToolError(`Probe feed connection failed: ${err.message}`);
+                throw new McpToolError(`Probe feed connection failed: ${(err as Error).message}`);
             }
             return probeFeedService.status();
         },

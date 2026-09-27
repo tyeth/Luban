@@ -313,13 +313,14 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
             const errorMagnitude = Math.hypot(du, dv);
             const tu = Number(args.target_pixel?.u);
             const tv = Number(args.target_pixel?.v);
-            const sameSeries = lastServoStep
-                && lastServoStep.calibrationId === entry.id
-                && Math.abs(lastServoStep.tu - tu) < 5 && Math.abs(lastServoStep.tv - tv) < 5
-                && Date.now() - lastServoStep.at < 10 * 60 * 1000;
-            if (sameSeries && errorMagnitude >= lastServoStep.magnitude * 0.95) {
+            const previousStep = lastServoStep;
+            const sameSeries = previousStep
+                && previousStep.calibrationId === entry.id
+                && Math.abs(previousStep.tu - tu) < 5 && Math.abs(previousStep.tv - tv) < 5
+                && Date.now() - previousStep.at < 10 * 60 * 1000;
+            if (sameSeries && errorMagnitude >= previousStep.magnitude * 0.95) {
                 warnings.push('Pixel error did not shrink after the previous servo step with this calibration '
-                    + `(${lastServoStep.magnitude.toFixed(1)}px -> ${errorMagnitude.toFixed(1)}px). A sign-flipped or `
+                    + `(${previousStep.magnitude.toFixed(1)}px -> ${errorMagnitude.toFixed(1)}px). A sign-flipped or `
                     + 'badly scaled matrix drives AWAY from the target: verify J.(M.e) reproduces +e before '
                     + 'iterating further.');
             }
@@ -329,16 +330,16 @@ export function registerCalibrationTools(registry: ToolRegistry): void {
             // different physical surface than the calibration (parallax read
             // ~4x wrong on hardware) or the match latched onto the wrong spot.
             if (sameSeries) {
-                const m = lastServoStep.matrix;
+                const m = previousStep.matrix;
                 const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
                 if (Math.abs(det) > 1e-9) {
                     const j = [
                         [m[1][1] / det, -m[0][1] / det],
                         [-m[1][0] / det, m[0][0] / det],
                     ];
-                    const predDu = lastServoStep.du - (j[0][0] * lastServoStep.appliedDx + j[0][1] * lastServoStep.appliedDy);
-                    const predDv = lastServoStep.dv - (j[1][0] * lastServoStep.appliedDx + j[1][1] * lastServoStep.appliedDy);
-                    const expectedChange = Math.hypot(lastServoStep.du - predDu, lastServoStep.dv - predDv);
+                    const predDu = previousStep.du - (j[0][0] * previousStep.appliedDx + j[0][1] * previousStep.appliedDy);
+                    const predDv = previousStep.dv - (j[1][0] * previousStep.appliedDx + j[1][1] * previousStep.appliedDy);
+                    const expectedChange = Math.hypot(previousStep.du - predDu, previousStep.dv - predDv);
                     const deviation = Math.hypot(du - predDu, dv - predDv);
                     if (expectedChange > 3 && deviation > Math.max(0.5 * expectedChange, 5)) {
                         warnings.push('Measured response diverges from the calibration prediction (expected error near '

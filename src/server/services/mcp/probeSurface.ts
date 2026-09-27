@@ -533,6 +533,8 @@ export interface SurfaceStationResult {
     capture?: object;
 }
 
+type MarchOutcome = { contactZ: number; passContacts: number[]; spreadMm: number; approach: 'slow-zone' | 'coarse-contact'; worstPressMm: number };
+
 /**
  * One -Z march from startZ down to floorZ at the station's XY: the exact
  * probe_vector / probe_sequence mechanics along the -Z unit vector, except
@@ -546,7 +548,7 @@ async function marchDownZ(
     floorZ: number,
     expectedContactZ: number | null,
     announce: (phase: string, note?: string) => void
-): Promise<{ contactZ: number; passContacts: number[]; spreadMm: number; approach: 'slow-zone' | 'coarse-contact'; worstPressMm: number } | null> {
+): Promise<MarchOutcome | null> {
     const travel = Number((startZ - floorZ).toFixed(3));
     const releaseTimeoutMs = releaseTimeoutFor(plan.sensorDelayMs);
     const zAt = (s: number) => Number((startZ - s).toFixed(3));
@@ -827,7 +829,7 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
                     const length = Math.hypot(dx, dy);
                     const ux = length ? dx / length : 0;
                     const uy = length ? dy / length : 0;
-                    const backtrackMm = incoming && Math.abs(incoming.z - currentZ) < 1e-6
+                    const backtrackMm: number = incoming && Math.abs(incoming.z - currentZ) < 1e-6
                         && Math.abs(incoming.ux - ux) < 1e-6 && Math.abs(incoming.uy - uy) < 1e-6
                         ? Math.min(incoming.length, plan.hopBackoffMm) : 0;
                     const traverse = await steppedTraverseZ(plan.tool, station.label, previous, station, currentZ, {
@@ -884,11 +886,11 @@ export async function runProbeSurfaceProcedure(plan: ProbeSurfacePlan): Promise<
             probeFeedService.setExpectedContact(['probe']);
             // Expected contact for the slow zone: the previous real contact,
             // or the caller's expected_z_machine for station 1.
-            let expectedContact = isFirst ? plan.expectedZMachine : reference;
+            let expectedContact: number | null = isFirst ? plan.expectedZMachine : reference;
             if (modelZ !== null) {
                 expectedContact = modelZ;
             }
-            const outcome = await marchDownZ(plan, station, marchStartZ, stationFloorZ, expectedContact, announce);
+            const outcome: MarchOutcome | null = await marchDownZ(plan, station, marchStartZ, stationFloorZ, expectedContact, announce);
             let retractTo: number;
             if (outcome === null) {
                 if (reference === null) {

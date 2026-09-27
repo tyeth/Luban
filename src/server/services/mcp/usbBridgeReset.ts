@@ -144,7 +144,7 @@ export async function resetStrandedBridges(python: string, timeoutMs: number = 1
                     }
                     resolve(result);
                 } catch (parseErr) {
-                    resolve({ ...EMPTY_RESET, error: `could not read the reset helper's output: ${parseErr.message}` });
+                    resolve({ ...EMPTY_RESET, error: `could not read the reset helper's output: ${(parseErr as Error).message}` });
                 }
             }
         );

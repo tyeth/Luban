@@ -736,10 +736,10 @@ export class ProbeFeedService {
             mcpBroadcast('mcp:activity', { tool: 'probe_feed', phase: 'connected', transport: cfg.kind });
         } catch (err) {
             this.connecting = false;
-            if (err.message !== this.lastError) {
-                log.error(`Probe feed connect failed: ${err.message}`);
+            if ((err as Error).message !== this.lastError) {
+                log.error(`Probe feed connect failed: ${(err as Error).message}`);
             }
-            this.lastError = err.message;
+            this.lastError = (err as Error).message;
             throw err;
         }
     }
@@ -856,8 +856,8 @@ export class ProbeFeedService {
                         actions.push('stop_gcode_job sent');
                         log.error(`${kind} abort: stop sent to the machine`);
                     } catch (err) {
-                        actions.push(`stop_gcode_job failed: ${err.message}`);
-                        log.error(`${kind} abort: stop failed: ${err.message}`);
+                        actions.push(`stop_gcode_job failed: ${(err as Error).message}`);
+                        log.error(`${kind} abort: stop failed: ${(err as Error).message}`);
                     }
                 }
                 if (typeof machineChannel.connectionClose === 'function') {
@@ -866,8 +866,8 @@ export class ProbeFeedService {
                         actions.push('connection force-closed');
                         log.error(`${kind} abort: machine connection force-closed`);
                     } catch (err) {
-                        actions.push(`connection close failed: ${err.message}`);
-                        log.error(`${kind} abort: close failed: ${err.message}`);
+                        actions.push(`connection close failed: ${(err as Error).message}`);
+                        log.error(`${kind} abort: close failed: ${(err as Error).message}`);
                     }
                 }
             })();

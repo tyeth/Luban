@@ -298,10 +298,11 @@ export function planProbeCam(args: CamArgs): ProbeCamPlan {
     }
     const links = classifyCamLinks(parsed.steps, linkMode);
     if (topZMachine !== null) {
+        const topZ = topZMachine;
         const lowestLink = links
             .filter((l) => l.style === 'top')
             .map((l) => { const st = parsed.steps[l.stepIndex]; return st.kind === 'move' ? Math.max(st.from.z, st.target.z) : hopZ; });
-        if (lowestLink.some((lz) => lz > topZMachine + TRAVERSE_Z_TOLERANCE_MM)) {
+        if (lowestLink.some((lz) => lz > topZ + TRAVERSE_Z_TOLERANCE_MM)) {
             warnings.push(`top_z_machine ${topZMachine}: some stepped links run ABOVE the stated top - a contact on them has no lift room and marks the station blocked at once.`);
         }
     }

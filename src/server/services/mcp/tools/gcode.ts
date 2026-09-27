@@ -55,7 +55,9 @@ interface JobChannel {
     stopGcodeJob?: () => Promise<{ ok: boolean; code?: number; text?: string }>;
 }
 
-function getJobChannel(): JobChannel {
+type FileJobChannel = JobChannel & Required<Pick<JobChannel, 'uploadGcodeFile' | 'startGcodeJob'>>;
+
+function getJobChannel(): FileJobChannel {
     const channel = connectionManager.getCurrentChannel() as unknown as JobChannel;
     if (!channel) {
         throw new McpToolError('No machine connected.');
@@ -63,7 +65,7 @@ function getJobChannel(): JobChannel {
     if (typeof channel.uploadGcodeFile !== 'function' || typeof channel.startGcodeJob !== 'function') {
         throw new McpToolError('The connected channel does not support file job submission.');
     }
-    return channel;
+    return channel as FileJobChannel;
 }
 
 interface DirectTarget {
@@ -673,9 +675,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 job.state = 'starting';
                 const issuedAt = Date.now();
                 job.startedAt = job.startedAt || issuedAt;
-                const isBatch = Array.isArray(job.steps) && job.steps.length > 0;
-                const gcodeText = isBatch
-                    ? job.steps[job.nextStep]
+                const batch = Array.isArray(job.steps) && job.steps.length > 0 ? job.steps : null;
+                const stepIndex = job.nextStep ?? 0;
+                const gcodeText = batch
+                    ? batch[stepIndex]
                     : fs.readFileSync(job.filePath, 'utf8');
                 // The staged text carries a human-facing comment header for
                 // the confirm page; the realtime execute path must get pure
@@ -688,7 +691,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                         return trimmed.length > 0 && !trimmed.startsWith(';');
                     })
                     .join('\n');
-                jobManager.appendEvent(job, 'started', { note: isBatch ? `direct step ${job.nextStep + 1}/${job.steps.length}` : 'direct move' });
+                jobManager.appendEvent(job, 'started', { note: batch ? `direct step ${stepIndex + 1}/${batch.length}` : 'direct move' });
                 jobManager.setActive(job);
                 let settle;
                 try {
@@ -716,9 +719,9 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 } finally {
                     jobManager.setActive(null);
                 }
-                if (isBatch) {
-                    job.nextStep += 1;
-                    if (job.nextStep < job.steps.length) {
+                if (batch) {
+                    job.nextStep = stepIndex + 1;
+                    if (job.nextStep < batch.length) {
                         // Same operator-approved list; keep the token usable
                         // for the remaining steps.
                         job.tokenUsed = false;
@@ -728,7 +731,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                             position: settle.position,
                             position_verified: settle.verified,
                             warning: settle.warning,
-                            remaining_steps: job.steps.length - job.nextStep,
+                            remaining_steps: batch.length - job.nextStep,
                             note: 'Step executed and settled. Call start_gcode_job again with the same '
                                 + 'job_id and code for the next approved step; positions persist.',
                         };

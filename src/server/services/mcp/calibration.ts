@@ -63,7 +63,7 @@ export class CalibrationStore {
         try {
             fs.writeJsonSync(this.file(), this.cache, { spaces: 2 });
         } catch (err) {
-            log.error(`Failed to persist camera calibration: ${err.message}`);
+            log.error(`Failed to persist camera calibration: ${(err as Error).message}`);
         }
     }
 

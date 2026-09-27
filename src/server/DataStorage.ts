@@ -70,7 +70,7 @@ const removeDir = async (dirPath: string) => {
 */
 
 class DataStorage {
-    public userDataDir = null;
+    public userDataDir: string;
     public sessionDir: string;
     public tmpDir: string;
     public configDir: string;

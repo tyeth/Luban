@@ -640,7 +640,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan): Promise<obje
         try {
             await abortRaiseToTop('toolsetter', (phase, z, note) => announce(phase, z ?? currentZ, note));
         } catch (retreatErr) {
-            log.error(`Tool setter abort retreat failed: ${retreatErr.message}`);
+            log.error(`Tool setter abort retreat failed: ${(retreatErr as Error).message}`);
         }
         if (isProcedureAbort(err)) {
             throw new McpToolError(`Tool setter run aborted: ${err.message} `
