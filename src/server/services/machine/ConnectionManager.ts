@@ -97,6 +97,53 @@ interface SetAirPurifierStrengthOptions {
 }
 
 /**
+ * Methods the concrete channels (text serial, SSTP HTTP, SACP) expose beyond
+ * the Channel base class. ConnectionManager calls them after branching on the
+ * protocol, so they are optional here rather than on Channel itself.
+ */
+type ChannelExtensionMethod =
+    | 'abortLaserMaterialThickness'
+    | 'command'
+    | 'coordinateMove'
+    | 'getActiveExtruder'
+    | 'getCalibrationPhoto'
+    | 'getCameraCalibration'
+    | 'getGcodeFile'
+    | 'getLaserMaterialThickness'
+    | 'getPhoto'
+    | 'goHome'
+    | 'laseAutoSetMaterialHeight'
+    | 'laserSetWorkHeight'
+    | 'loadFilament'
+    | 'pauseGcode'
+    | 'resumeGcode'
+    | 'setAbsoluteWorkOrigin'
+    | 'setDoorDetection'
+    | 'setEnclosureFan'
+    | 'setEnclosureLight'
+    | 'setFilterSwitch'
+    | 'setFilterWorkSpeed'
+    | 'setMatrix'
+    | 'setWorkOrigin'
+    | 'startGcode'
+    | 'stopGcode'
+    | 'switchExtruder'
+    | 'takePhoto'
+    | 'unloadFilament'
+    | 'updateActiveExtruder'
+    | 'updateBedTemperature'
+    | 'updateLaserPower'
+    | 'updateNozzleOffset'
+    | 'updateNozzleTemperature'
+    | 'updateWorkSpeed'
+    | 'updateWorkSpeedFactor'
+    | 'updateZOffset'
+    | 'uploadGcodeFile';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type ConnectedChannel = Channel & { [method in ChannelExtensionMethod]?: (...args: any[]) => any };
+
+/**
  * A singleton to manage devices connection.
  */
 class ConnectionManager {
@@ -110,7 +157,7 @@ class ConnectionManager {
     private protocol: NetworkProtocol | SerialPortProtocol = NetworkProtocol.Unknown;
 
     // channel used to communicate with machine
-    private channel: Channel = null;
+    private channel: ConnectedChannel = null;
 
     // connected machine instance to handle life cycle
     private machineInstance: MachineInstance = null;
