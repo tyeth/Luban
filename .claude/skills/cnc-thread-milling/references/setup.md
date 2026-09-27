@@ -30,7 +30,9 @@ sufficient cutting length can cut in one turn; a shorter one repeats at differen
 axial positions. Choose using confirmed reach/profile and allowable cutting load:
 single-form generally reduces simultaneous engagement at the cost of more turns;
 multi-form reduces turns but engages more forms. Do not promise a fixed force ratio
-or reuse one cutter's feeds for another.
+or reuse one cutter's feeds for another. No documented numeric threshold chooses
+between them. Do not invent one, such as a cutting-length cutoff; give the tradeoff
+and let confirmed reach, profile and load decide.
 
 ## Generator input checklist
 
@@ -87,7 +89,10 @@ having a **1.38 mm neck and three axial rows**, these are mismatches to resolve:
   follows the motion-rules authority requirements.
 
 These observations concern this file and the stated cutter, not all M2.5 tooling.
-Keep the fixture unchanged as a parser regression case.
+Keep the fixture unchanged as a parser regression case. None of its numbers (1.38,
+2.25, 2.53, S17991, its feeds, work Z−5.056) may be carried into a real generator
+entry, conversion call or approval count. They are what the diagnosis found wrong,
+not a recipe.
 
 ## Establish the work datum before generating feature coordinates
 

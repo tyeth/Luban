@@ -179,10 +179,14 @@ Landmarks, tool-setter config, probe results and the geometry store are all mach
   hand the bytes through **unchanged**. You never add `G53` or `G54` to a file you did not
   write; you never convert its Z by hand. The MCP resolves the extents through the live origin
   and the confirm page shows `Frame: WORK (declared by argument)` plus the **machine-resolved Z
-  extents** when resolvable — read both to the operator. Files selecting named workspaces,
-  mixing frames or rewriting an origin have unresolved machine extents; review each section
-  using its verified workspace, never apply one live offset to the whole file. `frame: "work"` resolves against the offset on the
-  heartbeat, i.e. the workspace currently selected on the controller.
+  extents** when resolvable — read both to the operator. A submitted file that selects only
+  `G54` before its first move (every converted thread-milling program) shows machine Z **"if G54
+  is the active workspace"**. `start_gcode_job` selects G54 (no motion) and refuses to stream
+  unless G54 reports the staging offset (`ending.kind: "workspace-unverified"`), so read the
+  condition too. Files selecting other or several workspaces, mixing frames or rewriting an
+  origin have unresolved machine extents. Review each section using its verified workspace,
+  and never apply one live offset to the whole file. `frame: "work"` resolves against the
+  offset on the heartbeat, i.e. the workspace currently selected on the controller.
 - **Machine-frame job.** `G53` must appear literally on its own line before the first move
   (the controller needs it; `frame: "machine"` without it is refused). The tools emit `G90` /
   `G53;` / moves / `G54;` — the trailing `G54;` reselects Luban's workspace.
@@ -370,7 +374,9 @@ This is what the machine is for, and it is one approval:
    of the operator, not a reason to edit the file.
 3. `submit_gcode_job {gcode, name, frame: "work"}` for a Luban/slicer export (§2); the file is
    passed through unchanged.
-4. Read the operator the confirm page's **Frame** row and **machine-resolved Z extents**.
+4. Read the operator the confirm page's **Frame** row and **machine-resolved Z extents** —
+   with any "if G54 is the active workspace" condition, or say plainly that they are
+   UNRESOLVED (named or several workspaces, mixed frames, origin rewrites, unreliable offset).
 5. Deliver the confirm URL and end the turn; then `start_gcode_job {job_id,
    wait_for_approval_ms: 110000}` in the background (or `confirm_token`); the door interlock applies to file
    jobs — the machine pauses if the door opens and resumes from the machine; the job's

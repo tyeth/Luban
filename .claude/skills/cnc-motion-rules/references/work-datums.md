@@ -171,6 +171,11 @@ continuing. Successful readback verifies the coordinate assignment, not physical
 accuracy or access: retain the independent reference check and full path review above.
 
 A file naming workspaces cannot have all machine extents established from one anonymous live
-offset. The validator marks those extents unresolved, including a single explicit G54;
-review each required workspace/section separately. Preserve an existing file's workspace
-selectors instead of silently rewriting them to make the validation display look resolved.
+offset. The validator marks those extents unresolved, with one exception. A submitted file
+that selects only G54 before its first move resolves against the live offset on the stated
+condition that it is G54's. `start_gcode_job` proves that before streaming: it selects G54
+with no motion, requires the acknowledgement and two agreeing readbacks, and refuses unless
+G54's offset Z matches staging. Server envelopes (direct moves, procedures) do not get this
+check and stay unresolved. Review each other required workspace/section separately. Preserve
+an existing file's workspace selectors instead of silently rewriting them to make the
+validation display look resolved.
