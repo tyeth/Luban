@@ -4,7 +4,7 @@ import path from 'path';
 import { convertThreadMillingGcode, THREAD_MILLING_CONTROLLERS, ThreadMillingOptions } from '../threadMilling';
 import { McpToolError, ToolRegistry } from '../registry';
 import { registerThreadMillingTools } from '../tools/threadMilling';
-import { validateGcode } from '../validator';
+import { resolveJobFrame, validateGcode } from '../validator';
 
 const sample = fs.readFileSync(path.join(__dirname, 'fixtures/thread-milling-m2_5-fanuc.nc'), 'utf8');
 const options: ThreadMillingOptions = { toolCenterPath: true, toolLengthApplied: true, spindleMode: 'cnc_200w_rpm' };
@@ -189,6 +189,14 @@ for (const controller of THREAD_MILLING_CONTROLLERS) {
     }]);
 }
 
+tests.push(['a converted program resolves machine Z on the confirm page, stating the G54 assumption start verifies', () => {
+    const converted = convert();
+    const resolved = resolveJobFrame(validateGcode(converted.gcode), { frameArgument: 'work', originOffsetZ: -200, offsetReliable: true, machineZMax: 328, verifiesG54AtStart: true });
+    assert.equal(resolved.refusal, null);
+    assert.deepEqual(resolved.report.frame.workspaceSelects, ['G54']);
+    assert.equal(resolved.report.machineZResolvedFor, 'G54');
+    assert.deepEqual(resolved.report.machineZExtents, { min: 194.944, max: 220 });
+}]);
 tests.push(['controller handling is explicit and refuses unrecognised workspace/preselection variants', () => {
     const okuma = fs.readFileSync(path.join(__dirname, 'fixtures/thread-milling-controllers/okuma.nc'), 'utf8');
     assert.throws(() => convert(okuma.replace('G15 H1', 'G15 H2'), { sourceController: 'okuma' }), /G15 H1/);

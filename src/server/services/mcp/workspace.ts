@@ -2,6 +2,7 @@
 // Pure planning and execution contract for human-gated, NO-MOTION workspace updates.
 // Firmware: Snapmaker2-Controller Marlin/src/gcode/geometry/{G53-G59,G92}.cpp.
 // G92 updates the selected workspace; no generic G10 semantics are assumed.
+import { POSITION_EPSILON_MM } from './envelopeChecks';
 import { AXES, Xyz } from './positionOfRecord';
 
 export const WORKSPACES = ['G54', 'G55', 'G56', 'G57', 'G58', 'G59', 'G59.1', 'G59.2', 'G59.3'] as const;
@@ -234,4 +235,62 @@ export async function runWorkspace(plan: WorkspacePlan, io: WorkspaceIo): Promis
         // an intermediate offset, so invalidate those as well, on success or failure.
         if (selectionAttempted) io.invalidateApprovals();
     }
+}
+
+export interface FileWorkspaceVerification {
+    workspace: Workspace;
+    verified: true;
+    /** The selection changed the offset: another workspace was active before it. */
+    selectionChanged: boolean;
+    originOffset: Xyz;
+    originOffsetZAtStaging: number;
+    motion: false;
+}
+
+/**
+ * Called by start_gcode_job, after approval and before streaming, for a file whose
+ * machine Z extents were resolved assuming `workspace` (validator machineZResolvedFor).
+ * The heartbeat names no workspace, so the staging offset is only proven to be that
+ * workspace's offset once it is selected (acknowledged, two agreeing readbacks) and
+ * its Z matches. No axis motion and no G92. A mismatch refuses the start; the named
+ * workspace then stays selected, which is what the file would have selected anyway.
+ */
+export async function verifyWorkspaceForFile(workspace: Workspace, originOffsetZAtStaging: number, io: WorkspaceIo): Promise<FileWorkspaceVerification> {
+    const before = io.snapshot();
+    let plan: WorkspacePlan;
+    try {
+        plan = planWorkspace({ workspace, reason: `verify ${workspace} before streaming a file job` }, before, false);
+    } catch (err) {
+        throw new WorkspaceUpdateError(`Cannot verify ${workspace} before streaming: ${(err as Error).message}`, {
+            workspace_requested: workspace, selection_attempted: false, verified: false, motion: false,
+        });
+    }
+    const changedFrom = (offset: Xyz) => !AXES.every((a) => Math.abs(offset[a] - before.originOffset[a]) <= POSITION_EPSILON_MM);
+    let result: { origin_offset: Xyz };
+    try {
+        // Invalidation is decided below: re-selecting the workspace that is already
+        // active changes nothing another staged job depends on.
+        result = await runWorkspace(plan, { ...io, invalidateApprovals: () => undefined }) as { origin_offset: Xyz };
+    } catch (err) {
+        const partial = (err as WorkspaceUpdateError).partial as { selection_attempted?: boolean } | undefined;
+        if (partial?.selection_attempted) io.invalidateApprovals();
+        throw err;
+    }
+    const selectionChanged = changedFrom(result.origin_offset);
+    if (selectionChanged) io.invalidateApprovals();
+    if (Math.abs(result.origin_offset.z - originOffsetZAtStaging) > POSITION_EPSILON_MM) {
+        throw new WorkspaceUpdateError(`${workspace} origin offset Z ${result.origin_offset.z} does not match the offset Z ${originOffsetZAtStaging} `
+            + `the confirm page resolved machine Z with, so its machine Z extents were not ${workspace}'s. Nothing was streamed; `
+            + `${workspace} is now selected. Verify ${workspace}'s origin and tool reference, then restage for a fresh approval.`, {
+            workspace_requested: workspace,
+            selection_attempted: true,
+            selection_acknowledged: true,
+            selection_changed: selectionChanged,
+            verified: false,
+            origin_offset: result.origin_offset,
+            origin_offset_z_at_staging: originOffsetZAtStaging,
+            motion: false,
+        });
+    }
+    return { workspace, verified: true, selectionChanged, originOffset: result.origin_offset, originOffsetZAtStaging, motion: false };
 }

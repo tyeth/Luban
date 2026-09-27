@@ -1,6 +1,6 @@
 /* eslint-disable camelcase */
 import assert from 'assert';
-import { WORKSPACES, WorkspaceIo, WorkspaceSnapshot, planWorkspace, runWorkspace } from '../workspace';
+import { WORKSPACES, WorkspaceIo, WorkspaceSnapshot, planWorkspace, runWorkspace, verifyWorkspaceForFile } from '../workspace';
 import { resolveJobFrame, validateGcode } from '../validator';
 
 function snapshot(): WorkspaceSnapshot {
@@ -123,6 +123,51 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         r.io.guard = () => { if (r.commands.length >= 2) throw new Error('operator stop'); };
         await assert.rejects(async () => runWorkspace(plan, r.io), /operator stop/);
         assert.equal(r.commands.length, 2);
+    }],
+    ['file verification re-selects the active G54 with no motion, no G92 and no invalidation', async () => {
+        const r = rig();
+        const result = await verifyWorkspaceForFile('G54', -208, r.io);
+        assert.equal(result.verified, true);
+        assert.equal(result.selectionChanged, false);
+        assert.equal(r.invalidated(), 0);
+        assert.deepEqual(r.commands, ['G21\nG53;', 'G54;\nM114']);
+        assert.equal(validateGcode(r.commands.join('\n')).motionLineCount, 0);
+    }],
+    ['file verification refuses when G55 was active and G54 has a different Z offset', async () => {
+        const r = rig();
+        r.offsets[0].z = -200;
+        r.s.originOffset = { ...r.offsets[1] };
+        for (const axis of ['x', 'y', 'z'] as const) r.s.work[axis] = Number(r.s.machine[axis]) + r.s.originOffset[axis];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await assert.rejects(async () => verifyWorkspaceForFile('G54', -208, r.io), (err: any) => {
+            assert.equal(err.partial.verified, false);
+            assert.equal(err.partial.selection_changed, true);
+            assert.equal(err.partial.motion, false);
+            return /does not match the offset Z -208/.test(err.message);
+        });
+        assert.equal(r.invalidated(), 1, 'other staged jobs were resolved against the G55 offset');
+        assert(!r.commands.some((code) => code.includes('G92')));
+    }],
+    ['file verification passes, and invalidates others, when a different active workspace shared G54 Z', async () => {
+        const r = rig();
+        r.s.originOffset = { ...r.offsets[1] };
+        for (const axis of ['x', 'y', 'z'] as const) r.s.work[axis] = Number(r.s.machine[axis]) + r.s.originOffset[axis];
+        const result = await verifyWorkspaceForFile('G54', -208, r.io);
+        assert.equal(result.selectionChanged, true);
+        assert.equal(r.invalidated(), 1);
+    }],
+    ['file verification sends nothing when the position of record is not coherent', async () => {
+        const r = rig();
+        r.s.reliability = 'awaiting-resync';
+        await assert.rejects(async () => verifyWorkspaceForFile('G54', -208, r.io), /Cannot verify G54 before streaming/);
+        assert.equal(r.commands.length, 0);
+        assert.equal(r.invalidated(), 0);
+    }],
+    ['a missing selection acknowledgement fails verification and invalidates other approvals', async () => {
+        const r = rig();
+        r.io.send = async (code) => { r.commands.push(code); return { result: 0, text: '' }; };
+        await assert.rejects(async () => verifyWorkspaceForFile('G54', -208, r.io), /did not acknowledge G54/);
+        assert.equal(r.invalidated(), 1);
     }],
     ['named or mixed workspace files never inherit a misleading single live offset', () => {
         for (const code of ['G54\nG0 Z0\nG55\nG0 Z5', 'G59.3\nG0 Z0', 'G53\nG0 Z328\nG54\nG0 Z0']) {

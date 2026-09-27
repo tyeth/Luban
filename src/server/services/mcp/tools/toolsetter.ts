@@ -218,7 +218,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
         name: 'goto_tool_change_position',
         description: 'Stage the move to the operator-set tool-change park position (machine coords '
             + 'from set_tool_setter_config: typically Z at the homing height and X at the far end; '
-            + 'Y only if configured). Two approved steps: Z up first, then X/Y. The operator then '
+            + 'Y only if configured). One approval covers two exact steps: Z up first, then X/Y, one start_gcode_job call each. The operator then '
             + 'swaps the tool BY HAND; afterwards run_tool_setter measures the new tool and '
             + 'apply_tool_length_offset shifts the work origin by the length difference.',
         inputSchema: {

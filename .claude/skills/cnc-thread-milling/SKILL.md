@@ -60,13 +60,31 @@ does not establish stock preparation, collision clearance or thread fit.
 Read [the import reference](references/import.md) for arguments, spindle modes,
 controller mapping and refusal handling before converting.
 
+The two declarations are **truth claims about the machine now, not conversion
+modes**, so the order is fixed:
+
+- (a) review the raw export's header and source against the measured cutter
+  (setup reference);
+- (b) finish any tool change or reference transfer, so the cutter that will cut is
+  fitted and work Z is referenced to it;
+- (c) convert;
+- (d) validate;
+- (e) stage.
+
+A plan that calls `convert_thread_milling_gcode` with `tool_length_applied: true`
+before its own tool-change steps is wrong even if the prose says the flag means
+"after the swap". With the probe fitted or the origin's tool history unknown, stop
+at (a).
+
 1. Preserve the complete source export separately. Verify zero cutter compensation
    and work Z referenced to the fitted tool tip before making the two required
    declarations. If setup is unfinished, retain the source and explain what is
    missing; do not assert a declaration merely to obtain a preview.
 2. Convert offline using the actual controller selection and explicit spindle
-   policy. Keep the returned `gcode`, `changes`, `warnings`, `sourceSpindleRpm`,
-   arc/full-circle/segment counts and `validation` together for review.
+   policy. **Feeds are never rescaled**: `power_percent` replaces the source RPM
+   and nothing else, so feeds generated for a different spindle speed must be
+   regenerated, not converted. Keep the returned `gcode`, `changes`, `warnings`,
+   `sourceSpindleRpm`, arc/full-circle/segment counts and `validation` together.
 3. Compare source and result: units, datum, first positioning moves, entry/exit,
    direction with signed Z travel, pitch per turn, repeated axial positions,
    every radial pass, feeds, spindle commands, deepest point and final retract.
@@ -92,9 +110,13 @@ Prefer one established WCS across rotary angles. Multiple workspaces are frowned
 supported when necessary for an existing G-code job; this does not expand the converter's
 input restrictions. Use the human-gated workspace tools for measured registration/selection,
 then restage the job after verification. Setting an origin requires no travel to zero.
-The converter emits G54. Verify that the live work origin being reviewed is the
-intended G54 origin; do not stage against an unrelated selected workspace or
-manually translate work coordinates into machine coordinates. The initial machine
+The converter emits G54. The heartbeat does not name the active workspace, so the
+confirm page resolves machine Z with the live offset **on the stated condition that
+it is G54's**. Before streaming, `start_gcode_job` selects G54 (no motion) and
+refuses to start unless G54 reports that offset. A refused start (`ending.kind:
+"workspace-unverified"`) means another workspace was active when you staged. Verify
+G54's origin and tool reference, then restage. Never strip the G54 line or manually
+translate work coordinates into machine coordinates. The initial machine
 position is unknown to offline conversion, so review the route from the actual
 position through the source's first moves. An initial XY move before the source's
 first Z move must already satisfy the motion floor and landmark checks. Source
@@ -103,8 +125,9 @@ clearance is not machine park height, and conversion adds no safe approach.
 Validate the exact converted text with `validate_gcode`, then stage that text via
 `submit_gcode_job` with `head_type: "cnc"`, `frame: "work"` and a descriptive name.
 Do not strip warnings, inject an origin change, or submit the original export.
-Read the confirm page's frame and machine-resolved Z extents to the operator and
-follow the motion-rules link-first handoff and start/status flow (§7–§8).
+Read the operator the confirm page's frame and machine Z extents, including their
+"if G54 is the active workspace" condition. Then follow the motion-rules link-first
+handoff and start/status flow (§7–§8).
 
 A stopped file job has no automatic retract and cannot resume the interrupted
 cut. Report its `ending` and establish recovery with the operator; do not restart

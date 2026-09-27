@@ -31,8 +31,8 @@ by the entire source program; spindle speed and feeds come from that program):
 ```
 
 The same call handles internal and external threads. For the standard head,
-select `power_percent` and supply the operator's chosen power. Feeds are retained
-(inch feeds converted to mm/min), never rescaled for a different spindle setting.
+select `power_percent` and supply the operator's chosen power. **Feeds are retained
+(inch feeds converted to mm/min), never rescaled for a different spindle setting.**
 An RPM refusal calls for revisiting the cutting conditions, not silently clamping
 RPM or switching to percentage mode to bypass the limit.
 
@@ -54,7 +54,9 @@ label; dropdown value `sd` produces D-Type. Mori Seiki may have a blank name com
   M7/M8/M9 coolant commands are removed and reported.
 - G2/G3 become explicit absolute G1 segments, including full helices and repeated
   turns; G20/G21 source units become mm. Output uses G21/G90/G54 and ends with
-  explicit M5/G90 instead of relying on source M2/M30 semantics.
+  explicit M5/G90 instead of relying on source M2/M30 semantics. Because the output
+  selects only G54, its confirm page shows machine Z resolved for G54, and
+  `start_gcode_job` verifies G54's offset before streaming (see the skill).
 
 The generator's centre/peripheral toggle did not change the inspected D=0 export.
 It is not evidence of applied compensation. Inspect the settings/source and the

@@ -86,7 +86,8 @@
         "Recognises the existing fitted-tool origin; does not require a needless tool change.",
         "Preserves per-boss datums and plans one job per boss, with initial-path/clearance verification and fresh position after each completion.",
         "Does not concatenate at work Z20 or claim a completed job proves thread fit.",
-        "Uses head_type cnc and frame work in the later submit shape, with URL delivery before waiting."
+        "Uses head_type cnc and frame work in the later submit shape, with URL delivery before waiting.",
+        "Reads the confirm page's machine Z extents with their 'if G54 is the active workspace' condition, and knows start_gcode_job verifies G54's offset before streaming (a mismatch ends workspace-unverified and needs a restage)."
       ]
     },
     {
@@ -98,7 +99,8 @@
         "Refuses to claim tool_center_path for nonzero compensation and asks for regeneration.",
         "Does not infer fitted head from compatible toolHeads or historical README.",
         "Does not declare tool_length_applied true for an unfitted cutter or unknown origin history.",
-        "Does not switch modes or clamp RPM to bypass a refusal; states feeds are not rescaled.",
+        "Does not switch modes or clamp RPM to bypass the S7958 refusal (below the 8000 RPM floor).",
+        "States that the converter never rescales feeds, so feeds generated for another spindle speed need regeneration.",
         "Keeps review offline and stages nothing."
       ]
     }

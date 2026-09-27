@@ -1196,7 +1196,7 @@ the traverse height — never the start height, law 9 / #91; hard floor at expec
 trigger − margin; requires the probe feed connected and the toolsetter sensor readable
 and untriggered; `store_as_reference` locks the measured Z in as the new reference;
 `stay_at_trigger` / `start_from_current` support the touchscreen swap wizard) ·
-`goto_tool_change_position` (two approved steps: Z up, then X/Y to the operator-set park) ·
+`goto_tool_change_position` (one approval for two steps: Z up, then X/Y to the operator-set park) ·
 `apply_tool_length_offset` (confirmed G92 shifting work-origin Z by the measured
 new−old tool length difference — flow A only) · **touch-probe procedures** (all staged,
 one approval per circuit, results in MACHINE coordinates): `probe_point` (one axis from the
