@@ -66,6 +66,19 @@ If the new tool reads already-triggered before the second run (a longer tool
 pressed into the setter by the wizard), the run refuses to start - the
 operator raises it slightly from the touchscreen first.
 
+## Complete the datum work before removing the probe
+
+When this swap follows setup probing, first establish and independently check the milling WCS
+using [accessible work references](../cnc-motion-rules/references/work-datums.md). Record its
+XYZ/orientation, B context and model registration while the probe is still available. A machine
+ready to measure tool lengths is not necessarily ready to cut: swapping cannot repair missing
+X/Y registration, make an inaccessible origin probeable, or validate the approach to work zero.
+One established WCS may serve all indexed cuts in the same mounting; the tool-length transfer
+preserves it and does not require new XYZ zeros or datum probes for each B angle. After a
+rotation or tool swap, re-evaluate any planned origin return: valid offsets do not prove that
+the previous route clears the rotated stock or the new cutter/holder. Retain the reference
+and choose a different verified entry if zero is obstructed.
+
 ## The sequence (flow A)
 
 First establish that the work Z reference belongs to the outgoing tool, either

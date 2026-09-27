@@ -113,6 +113,15 @@ machine-resolved bounds from the offline report alone.
 
 ## Multiple features and completion
 
+Choose and verify [accessible work references](../../../../../.claude/skills/cnc-motion-rules/references/work-datums.md)
+before removing the probe. A feature's generator coordinates must be registered to the
+measured work frame, including tool-tip Z and B orientation; a live offset alone is not
+physical datum evidence. Check approach, tool/holder clearance and repeatable datum access.
+A common verified WCS can serve multiple indexed B operations; retain it when the mounting
+and rotary registration remain valid, and use the corresponding CAM placements/post rather
+than re-zeroing at each angle. Rotation can nevertheless obstruct the old zero or approach;
+retain the WCS but use a separately verified entry instead of automatically returning to zero.
+
 Generate one program per hole or boss with its XYZ datum in the existing work frame.
 For example, with work zero at the plate corner, the feature at work (10,10) uses
 that generator XY datum. Traversing there first does not translate an absolute

@@ -193,6 +193,21 @@ across homing, **dies on a machine reboot**, and moves when the operator re-zero
 tools. Read it fresh from `get_position.originOffset`; never assume it; the ONE sanctioned write
 is `apply_tool_length_offset` (§4).
 
+**Choose the milling datum before completing CAM or removing the probe.** Prefer stable,
+accessible references that can establish and recheck XYZ and orientation in the mounted setup.
+A CAD origin or coherent live offset alone is not a verified datum. Read
+[work-datum selection and verification](references/work-datums.md) when choosing a WCS,
+registering a model or preparing the probe-to-cutter handoff. Confirm the origin's measurement
+method, surviving references, tool/B context and complete return/approach paths. Derived centres
+are valid only with measured registration and a repeatable check. Prefer one verified WCS
+across indexed B operations in the same mounting; changing angle does not require re-zeroing or
+re-probing the datum. CAM must account for the measured rotary axis and B orientation in that
+common frame. After rotation, the previous zero or its approach may be obstructed: retain the
+WCS as a reference, but do not return there without checking access in the new orientation.
+Use a separate verified entry point when access is blocked or unverified. `goto_work_origin`
+is XY at the current Z, not an automatic raise or a move to work Z0; datum choice never
+replaces clearance.
+
 **Gantry top is machine Z328.** Work Z0 is wherever the operator put it — on this rig it has
 been the stock top and it has been Z328.
 

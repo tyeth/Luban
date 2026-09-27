@@ -89,6 +89,26 @@ having a **1.38 mm neck and three axial rows**, these are mismatches to resolve:
 These observations concern this file and the stated cutter, not all M2.5 tooling.
 Keep the fixture unchanged as a parser regression case.
 
+## Establish the work datum before generating feature coordinates
+
+Apply [work-datum selection and verification](../../cnc-motion-rules/references/work-datums.md).
+Choose reachable probing references for the actual bore/boss and mounted stock, with verified
+ball/body clearance and a reference that can survive or be transferred through the cut. A hole
+centre can be derived from accessible measured features; do not insert a probe into a bore that
+cannot accommodate its ball and required travel. A nominal boss centre or CAD rotary axis is not
+a measured work origin.
+
+Record how the common work frame was established, its axis/B registration and an independent
+reference check while the probe is still fitted. Verify the approach to work XY zero and the
+feature's full entry/exit route with the actual cutter/holder. `goto_work_origin` does not raise,
+set the datum or descend to Z0. Transfer the verified tool-tip Z during the tool change; a setter
+pair cannot fix an unregistered model or missing X/Y datum. Preserve a valid existing origin
+rather than re-zeroing for each feature or indexed B angle. Multiple indexed operations can
+share one WCS when their CAM placements/post account for the measured rotary axis and B datum.
+After indexing, that zero may be obstructed even while the WCS remains valid. Do not return
+to it or reuse the old entry path automatically; verify the new route or approach the feature
+through a separate clear entry point in the same work frame.
+
 ## Multiple holes or bosses
 
 A G90 program's datum is fixed in its work frame. Moving the head to another

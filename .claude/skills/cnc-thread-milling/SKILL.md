@@ -17,7 +17,10 @@ Do not send the source controller program directly to `submit_gcode_job`.
 ## Establish the job
 
 Read [the setup reference](references/setup.md) for cutter dimensions, generator
-fields, the supplied M2.5 fixture traps and multiple-feature jobs.
+fields, the supplied M2.5 fixture traps and multiple-feature jobs. Select a
+[measurable, recheckable work datum](../cnc-motion-rules/references/work-datums.md) before CAM
+preparation and the probe-to-cutter swap. Feature centre coordinates and generator offsets must
+be registered to that verified work frame; a CAD origin or live G54 snapshot alone is insufficient.
 
 Use the supplied drawing, cutter specification and generator settings; batch only
 the missing information into one question. Keep these with the source export:

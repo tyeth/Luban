@@ -5,7 +5,7 @@ it and point back to it rather than repeating it.
 
 | Skill | Load when | Holds |
 |---|---|---|
-| [`cnc-motion-rules`](cnc-motion-rules/SKILL.md) | Before ANY motion, position or coordinate reasoning | The eight motion laws, coordinate doctrine (machine coords; the frame handshake; the work origin is the operator's), `get_position.reliability` semantics, sanctioned exceptions, vocabulary, recording rules |
+| [`cnc-motion-rules`](cnc-motion-rules/SKILL.md) | Before ANY motion, position or coordinate reasoning | The eight motion laws, coordinate doctrine (machine coords; the frame handshake; the work origin is the operator's), `get_position.reliability` semantics, sanctioned exceptions, measurable WCS selection and rechecking (`references/work-datums.md`), vocabulary, recording rules |
 | [`cnc-probing`](cnc-probing/SKILL.md) | Touch-probe measurement, surface scans, probe calibration | Measurement routing and local continuation (`references/planning.md`), contact photographs, shoulder recovery and measured timing; CAM links in `references/cam-probing.md` |
 | [`cnc-visual-alignment`](cnc-visual-alignment/SKILL.md) | Camera frames → millimetres, visual servo, landmarks in frame | Continuous live viewing, synchronized inspection frames, metric calibration and frame-reading heuristics |
 | [`tool-change`](tool-change/SKILL.md) | Swapping bits without re-touching the stock | Tool-setter flows A (MCP offset via `apply_tool_length_offset`) and B (touchscreen wizard) |

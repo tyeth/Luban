@@ -1317,7 +1317,12 @@ export function registerCameraTools(registry: ToolRegistry): void {
             + 'start. Refused while the position of record or the origin offset is not trustworthy (awaiting-resync, '
             + 'stale, cached or assumed offset, warnings), below the motion floor (law 2 - raise with move_z first), '
             + 'outside the toolhead travel, or across a landmark below its clearance. Semantically distinct from '
-            + 'home, which drives to the machine limit switches. Z is deliberately not touched. Follow with '
+            + 'home, which drives to the machine limit switches. Z is deliberately not touched: no automatic raise '
+            + 'and no descent to work Z0. This move does not establish or verify a milling datum; a coherent offset '
+            + 'does not prove physical registration. Choose measurable setup references and check the full approach '
+            + 'with the fitted tool/holder; unrecorded fixtures are not certified by this guard. After B rotation, '
+            + 'a valid retained WCS may have an obstructed zero or approach: do not automatically return there. '
+            + 'Recheck the route in the new orientation, or keep the WCS reference and use a separate verified entry. Follow with '
             + 'start_gcode_job {job_id, wait_for_approval_ms: 110000}. No frame is captured on arrival - call '
             + 'capture_frame after.',
         inputSchema: {

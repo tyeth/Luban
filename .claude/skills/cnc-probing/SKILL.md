@@ -24,8 +24,11 @@ description: "Plan and run touch-probe measurements through Luban MCP: top profi
 ## Choose measurements that answer the machining question
 
 Start with the deliverable: which boundaries, depths, remaining material and fixture clearances
-must be known to propose the cut? Reuse completed measurements only while the tool, workholding,
-B orientation and datum remain applicable. A width measured away from the cut is a reference,
+must be known to propose the cut? Include the
+[work datum and its recheck](../cnc-motion-rules/references/work-datums.md): identify accessible
+references for XYZ/orientation, verify probe-body access and measure them before the probe is
+removed. A top profile alone does not register the milling WCS. Reuse completed measurements
+only while the tool, workholding, B orientation and datum remain applicable. A width measured away from the cut is a reference,
 not the cut's verified contour. Preserve partial results and refine the gaps instead of rerunning
 whole scans. Produce a reviewable geometry/cut proposal as those constraints become known.
 
@@ -217,7 +220,13 @@ returns to that probe's start, then raises to park before the next step. Results
 Geometry is NEVER a prerequisite: a program that references only its own earlier ops needs
 nothing stored. Only `axis.*` references need the rotary axis and probe length — measure and
 store them yourself (`set_probe_geometry`) or write the program without them. Rotary stock is
-B-dependent (square stock ~12 mm higher at B90); every result carries its B.
+B-dependent (square stock ~12 mm higher at B90); every result carries its B. This changes the
+surface coordinates, not the validity of an established common WCS. Keep one verified work
+frame for indexed cuts when the mounting and rotary registration remain valid; probe only
+missing geometry or checks, rather than re-zeroing or repeating datum probes at every angle.
+A retained WCS does not authorise returning to its zero after rotation: stock/fixtures can now
+obstruct that location or the old route. Keep it as the reference and use a separately verified
+entry point unless the complete return route is clear in the new orientation.
 
 - **Derive, don't guess**: `{"mid": ["s0.west.x", "s0.east.x"]}` is the stock centre;
   `{"diff": ["s0.east.x", "s0.west.x"], "scale": 0.5, "plus": "axis.z_contact"}` the B90 face

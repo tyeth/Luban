@@ -86,6 +86,33 @@ from the park height. Find unknown surfaces with a sensor-gated march. Bracket t
 coarsely and refine them to the required tolerance; avoid dense resampling of known flat banks.
 Use the previous job response's `next_event_index` for long-polling `since_event`.
 
+### Include the milling datum in the probing plan
+
+Before removing the probe, establish how the work frame will be set and rechecked against
+accessible, stable features. Choose a practical reference with verified probe-ball, stylus,
+body and fixture access; record XYZ, axis orientation, B setup, tool identity, measurement
+uncertainty and the CAD-to-work registration. A single top contact does not establish X/Y or
+orientation. A derived centre can be appropriate if accessible measurements locate it and
+provide a repeatable check; it need not be physically visited at Z0.
+
+The inspection follow-up exposed a separate readiness gap: the review model used a stored
+rotary-axis origin, then was mapped to a coherent live G54 snapshot. Neither step established
+an accessible datum's provenance and recheck. Plan and verify those references before CAM
+release or the tool swap, rather than treating a matching model/offset as sufficient.
+
+`goto_work_origin` moves only XY at the current Z, subject to transport guards. It does not
+set the work origin, raise first, descend to Z0 or certify unseen fixture clearance. Verify
+the complete return route, first program moves and cutter/holder sweep for the actual setup.
+Preserve valid datum registration through the measured tool change; length transfer does not
+repair missing X/Y, an unknown old-tool Z reference or unverified indexed-B registration.
+One verified WCS can serve multiple B orientations in the same mounting: retain it and account
+for the measured rotary transform in CAM. A changed face height does not require re-zeroing,
+and per-angle datum probing is not mandatory when the existing registration remains valid.
+Rotation can obstruct the previous zero or approach despite that valid reference. Do not
+return to work zero automatically: verify the route at the new B or retain the WCS and use
+another clear entry point. A reference location does not have to be visited to use its frame.
+See the canonical [work-datum guidance](../../../../../.claude/skills/cnc-motion-rules/references/work-datums.md).
+
 ### Existing local continuation and composition limits
 
 Local continuation is already implemented across the toolset. The agent-facing
