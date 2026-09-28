@@ -17,6 +17,16 @@ refusal is the rule catching you, so fix the plan and never work around it. Moti
 explicit instruction in the operator's latest message and then their click on the staged job's
 confirm page in Luban; chat alone is not a gate.
 
+## CNC evidence and persistent handoffs
+
+Before modelling a cut or requesting more probing, read the
+[measurement-evidence rules](.agents/skills/cnc-motion-rules/references/measurement-evidence.md).
+Retrieve and reconcile existing surveys first. Never repeat a covered measurement merely
+because an agent lost context. Estimates and unresolved contradictions cannot become cutting
+inputs; a CAD/NC agreement using shared assumptions is not independent physical validation.
+Handoffs and memories must retain evidence links, applicability, uncertainty and unresolved
+contradictions, not bare axis/stock constants. These rules apply across chats and tool changes.
+
 ## Skills
 
 The skills live in [`.agents/skills/`](.agents/skills/README.md). `.claude/skills` is a symlink to

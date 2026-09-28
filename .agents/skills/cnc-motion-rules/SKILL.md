@@ -10,6 +10,13 @@ tool refuses you, it is this document catching you — fix the plan, never work 
 **The operator's time is the scarce resource**: every rule below is applied so that a lawful
 plan reaches the confirm page in the fewest operator interactions, not the most.
 
+**Measured evidence governs cutting geometry.** Before modelling/registering a cut or asking
+for more probing, read [measurement evidence](references/measurement-evidence.md). Retrieve
+and reconcile saved surveys first; do not repeat covered measurements because of lost context.
+Unresolved estimates or contradictory contacts block geometry release. CAD and NC sharing the
+same assumptions cannot independently validate each other; check posted engagement against
+original measurements, including each indexed first pass and its uncertainty.
+
 ## 0. Before ANY motion — the checklist
 
 Run through it every time, and state the answers in your reply in one short block (a line per

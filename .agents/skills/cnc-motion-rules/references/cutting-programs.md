@@ -5,6 +5,14 @@ before a CAM cutting file — FreeCAD Path, Fusion, hand-assembled — goes to `
 Planning guidance under `cnc-motion-rules` §7; it grants no motion authority. Probing programs
 are a different pipeline: `cnc-probing/references/cam-probing.md`.
 
+## Reconcile evidence before constructing the model
+
+Apply [measurement evidence](measurement-evidence.md) first: recover completed surveys,
+resolve conflicting axis/stock assumptions and record the registration with its measurement
+sources. Reuse saved independent checks. Model/post agreement alone cannot release a cut.
+The release record must bound actual engagement at every indexed first pass and later level
+against measured starting stock, including uncertainty; nominal stepdown differences do not.
+
 ## Retained connections: prove them in 3D, never from a section
 
 A tab, bridge or neck is proven only by subtracting the cutter's actual sweeps from the measured

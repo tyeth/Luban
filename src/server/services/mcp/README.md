@@ -965,6 +965,19 @@ now carries `partial` (completed stations / contacts / ops) and the runner wrapp
 not only for stops. A program treats a stop as program-wide regardless of `on_fail`. The tool
 waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping, job}`.
 
+## Cutting geometry and saved measurement evidence
+
+The static G-code validator checks syntax/motion properties and coordinate extents; it does
+not prove stock placement, a rotary-axis fit or actual depth of material engagement. A separate
+NC parser that compares with the same CAM model still shares that model's assumptions.
+Before releasing cutting files, follow the
+[measurement-evidence rules](../../../../.agents/skills/cnc-motion-rules/references/measurement-evidence.md):
+recover original survey/job results, reconcile measured and inferred geometry, retain source
+and calibration provenance, and compare posted cutter engagement with measured starting stock
+at each index, including uncertainty. An unresolved contradiction blocks geometry release.
+Existing measurements must be reused; a model disagreement does not mandate re-probing.
+These are agent release requirements, not new runtime checks in `validate_gcode`.
+
 ## Safety model (operator-defined, non-negotiable)
 
 - **Every staged job declares its coordinate frame, or it is refused** (2026-09-14, after a
@@ -1109,8 +1122,10 @@ waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping,
 - **Four-face survey (2026-09-05, 71.3 mm probe, machine coords, toolhead Z at contact)**: B0
   top 207.8, B180 206.9, B90 219.6, B270 219.9 at (170, 199); section ≈ 71.9 × 47.2; sides at
   B180 X134.2/133.5 (W) and 205.3/206.0 (E) at Y150/Y250; end Y129.2 at X190, Y128.7 at X150;
-  stock centre X ≈ 169.7; **rotary axis physical Z ≈ 112.4, X ≈ 169.7** (now the geometry
-  settings). Stock yawed ~0.4° (free end toward +X), centreline rising ~0.3 mm/100 mm toward the
+  stock centre X ≈ 169.7; **historical rotary-axis estimate physical Z ≈ 112.4, X ≈ 169.7**. These are
+  survey-era values, not current calibration or cutting constants. Later mounting/contact
+  evidence contradicted using this estimate for the September 28 cut; reconcile applicable
+  measurements before CAM uses any stored axis. Stock yawed ~0.4° (free end toward +X), centreline rising ~0.3 mm/100 mm toward the
   tailstock. Full report on the box: `~/luban-evidence/REPORT-four-face-scan-2026-09-05.md`.
 - **Chuck fixed hole (probe_circle INSIDE mode, 8 points, rms 0.021, max residual 0.041)**:
   centre (168.974, 290.969), hole − tip 3.734. Cross-feature constraint: air-blast post
