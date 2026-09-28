@@ -1,6 +1,6 @@
 ---
 name: cnc-probing
-description: "Plan and run touch-probe measurements through Luban MCP: top profiles, flatness, walls, pockets, edges, holes, stock outlines and probe calibration. Choose bounded local continuation and measurement density to answer the machining question. Load cnc-motion-rules first; CAM probing programs use references/cam-probing.md."
+description: "Plan and run touch-probe measurements through Luban MCP: top profiles, flatness, walls, pockets, edges, holes, stock outlines, probe calibration and the rotary-axis check. Choose bounded local continuation, stylus reach and measurement density to answer the machining question. Load cnc-motion-rules first; CAM probing programs use references/cam-probing.md."
 ---
 
 # CNC probing: the touch probe
@@ -17,7 +17,7 @@ description: "Plan and run touch-probe measurements through Luban MCP: top profi
 | Park / procedure traverse height | machine Z328 | ordinary transport and successful procedure completion; local links use the procedure’s own envelope |
 | Probe effective length | `geometry.probe.effectiveLength` | never a remembered figure; measure if unset |
 | Tool setter | surface machine Z100.5; trigger 175.5 with the 75 mm reference | `run_tool_setter` |
-| Rotary axis | `geometry.rotary` (axisX ≈ 170, axisZ physical ≈ 112) | B-dependent stock heights |
+| Rotary axis | `geometry.rotary` — a HISTORICAL estimate tied to the probe length, clamping and date it was measured with (this jig: 2026-09-05, 71.3 mm probe, raw stock; ~1 mm off for a later clamping) | physical Z, never a toolhead target; before CAM rotates about it, check it against opposite-face contacts — [rotary-axis](references/rotary-axis.md) |
 | Chuck jaws | reach ~Y269 | a `keep_out` volume for programs |
 | Tailstock | inside the `rotary-axis` box, Y < ~110; height UNMEASURED | measure it (see below), then `set_landmark` |
 
@@ -31,6 +31,14 @@ removed. A top profile alone does not register the milling WCS. Reuse completed 
 only while the tool, workholding, B orientation and datum remain applicable. A width measured away from the cut is a reference,
 not the cut's verified contour. Preserve partial results and refine the gaps instead of rerunning
 whole scans. Produce a reviewable geometry/cut proposal as those constraints become known.
+
+**Stylus reach bounds every descent beside a wall or into a groove.** The limit is the exposed
+stylus length (measured or operator-stated for the fitted probe, never remembered) minus the
+ball diameter and a stated margin, measured DOWN from the highest surface under the probe BODY
+— the rim the body lands on, not the floor the ball is heading for. Write the limit in the plan
+(e.g. exposed 21, ball 2.5, margin 2: no floor contact more than 16.5 mm below the highest rim
+under the body) and give every march there a `max_travel_mm` that respects it. Readings at
+another B angle are in the rotated pose ([rotary-axis](references/rotary-axis.md)).
 
 **Known surface:** use the valid measured contact to set a guarded `start_z_machine` a little
 above it and `expected_z_machine` at the contact. Do not repeat a long fine search from machine
@@ -219,7 +227,8 @@ returns to that probe's start, then raises to park before the next step. Results
 
 Geometry is NEVER a prerequisite: a program that references only its own earlier ops needs
 nothing stored. Only `axis.*` references need the rotary axis and probe length — measure and
-store them yourself (`set_probe_geometry`) or write the program without them. Rotary stock is
+store them yourself (`set_probe_geometry`) or write the program without them; a stored axis is
+historical until checked ([rotary-axis](references/rotary-axis.md)). Rotary stock is
 B-dependent (square stock ~12 mm higher at B90); every result carries its B. This changes the
 surface coordinates, not the validity of an established common WCS. Keep one verified work
 frame for indexed cuts when the mounting and rotary registration remain valid; probe only

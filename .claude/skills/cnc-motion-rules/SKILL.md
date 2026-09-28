@@ -216,8 +216,9 @@ re-probing the datum. CAM must account for the measured rotary axis and B orient
 common frame. After rotation, the previous zero or its approach may be obstructed: retain the
 WCS as a reference, but do not return there without checking access in the new orientation.
 Use a separate verified entry point when access is blocked or unverified. `goto_work_origin`
-is XY at the current Z, not an automatic raise or a move to work Z0; datum choice never
-replaces clearance.
+is XY at the current Z, not an automatic raise or a move to work Z0 — a return near work zero
+is preceded by its own retract to machine Z328, and every plan states its traverse height;
+datum choice never replaces clearance.
 
 **Gantry top is machine Z328.** Work Z0 is wherever the operator put it — on this rig it has
 been the stock top and it has been Z328.
@@ -405,6 +406,12 @@ threads. Its offline `convert_thread_milling_gcode` flow translates supported
 Machining Doctor output into a separate Snapmaker program. Never submit the raw
 controller export. Review the result, then use the sequence below on the returned
 text unchanged. Ordinary Luban exports still pass through unchanged.
+
+**A CAM cutting file you or FreeCAD generated is released, not just validated.** Read
+[cutting programs](references/cutting-programs.md) first: the post word list the MCP accepts,
+the independent parse from first move to final retraction, how tabs and bridges are proven in
+3D, and what an in-file `B` word does (it passes through unguarded; prefer one file per index
+with `rotate_b` between). The probing emitter is not a cutting post.
 
 This is what the machine is for, and it is one approval:
 

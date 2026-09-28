@@ -61,7 +61,9 @@ supported touchscreen/Luban workflow. `apply_tool_length_offset` transfers an es
 Z reference across tools. Do not inject G92/G10 or choose another workspace to hide a
 registration mismatch. Re-read the selected live frame after setting it
 and check an accessible reference with a predicted coordinate/tolerance, not merely the
-zero display. Keep that check separate from the measurements used to construct the datum.
+zero display. Keep that check separate from the measurements used to construct the datum: a
+contact that fed the origin cannot also verify it (an origin set as rim + 30 and "checked" by
+re-probing the rim is circular — use another face, an edge, or the opposite-angle rim).
 
 Before removing the probe, record the measured registration, reference check, remaining
 uncertainty and the reference orientation needed to recheck it. Preserve the established
@@ -90,6 +92,17 @@ request additional probing only where evidence is missing or the setup has chang
 a mandatory per-angle cycle. Model rotation and translation must account for the measured
 axis, which need not pass through work zero. Do not assume the controller rotates the XYZ
 work frame or applies tool-centre-point compensation simply because a B command was sent.
+The stored axis is historical until checked against opposite-face contacts for THIS clamping
+and probe length (`cnc-probing/references/rotary-axis.md`); a 1 mm axis error is a 1 mm error
+in every rotated toolpath, so state the probe-length basis of each value before CAM uses it.
+
+**Each indexed visit is its own setup.** A visit at B90, a visit at B270 and a later finishing
+visit at B90 are three setups: each takes the previous setup's output as its input stock, has
+its own registered WCS reference and an inspectable toolpath, and is released as its own file.
+Do not merge the first cuts and the finishing cuts at an angle into one setup because the angle
+matches. Readings taken at another angle are in the rotated pose: rotate them about the
+measured axis before mixing them with B0 coordinates; a B180 physical Z is not a B0 coordinate.
+Retained-connection proofs and file release: `cutting-programs.md`.
 
 **Retained reference does not mean retained access.** Rotation can put stock, a jaw or an
 overhang over the old work-zero location or its approach. Do not automatically call
@@ -110,8 +123,10 @@ or clearance after indexing.
 ## Work zero is not a clearance move
 
 `goto_work_origin` stages **XY only at the current toolhead Z**. It neither raises nor moves
-to work Z0. It refuses an untrusted offset, ordinary transport below the motion floor,
-out-of-travel destinations and mapped landmark conflicts. These checks do not certify an
+to work Z0: every return to, or approach near, work zero is preceded by its own `move_z` to
+the park height (machine Z328; the floor is Z320), and the plan says so and states its
+traverse height in machine Z. It refuses an untrusted offset, ordinary transport below the
+motion floor, out-of-travel destinations and mapped landmark conflicts. These checks do not certify an
 unmapped fixture or the whole cutter/holder envelope. A good datum still requires a checked
 route from the actual starting position, B orientation and tool; no datum makes every future
 return safe. If that route is blocked, do not visit the origin; retain the reference and plan
@@ -127,6 +142,8 @@ A setup is ready for cutting only when datum measurement and recheck, model/work
 registration, fitted-tool Z transfer, indexed orientations and complete approach/cut/exit
 clearances are established for the exact program. Otherwise identify the specific missing
 measurement or setup action; an attractive review model or numeric offset is not readiness.
+The release route for the file itself — post word list, `validate_gcode`, the independent
+parse from first move to final retraction, B words — is `cutting-programs.md`.
 
 
 ## Set a measured origin without travelling to zero

@@ -96,4 +96,6 @@ fall in a hole (a rim around a window) are DROPPED with a warning, never snapped
 points instead. Pass the MEASURED model-to-machine `App.Placement` with `frame="machine"` for a
 re-clamped part; CAD coordinates alone only ever describe the nominal. `describe(doc, spec)` is the dry
 run. `run_probing_gcode` and `get_inspection_report` are still HARDWARE-UNTESTED: the first run is
-three points on a known flat face, not a real inspection.
+three points on a known flat face, not a real inspection. The emitter is for PROBING only: a
+cutting file comes from a real Path Job with a verified post and is released per
+`cnc-motion-rules/references/cutting-programs.md`.
