@@ -119,7 +119,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         const module = load('../../../../app/ui/components/McpHealth/index.tsx', {
             react: React,
             '../../../../shared/lib/mcpHealth': healthModule,
-            '../Toast': { toast, ToastContainer: (props: object) => React.createElement('toast-container', props) },
+            '../Toast': { toast, ToastContainer: (props: object) => React.createElement('div', { ...props, 'data-test': 'health-toast-container' }) },
             '../../../api': { getMcpHealth: async () => { if (fail) { throw new Error('offline'); } return { body: snapshot }; } },
             '../../../lib/uni-api': { Event: { emit: (event: string, data: { activeTab: string }) => calls.push(`${event}:${data.activeTab}`) } },
         }, {
@@ -133,7 +133,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             await act(async () => { await fn(); });
         };
         assert.deepStrictEqual(calls, ['add']);
-        const container = root.root.findByType('toast-container');
+        const container = root.root.findByProps({ 'data-test': 'health-toast-container' });
         assert.strictEqual(container.props.enableMultiContainer, true);
         assert.strictEqual(container.props.containerId, 'mcp-health');
         const buttons = renderer.create(content).root.findAllByType('button');
