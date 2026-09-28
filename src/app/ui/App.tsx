@@ -178,6 +178,7 @@ class App extends React.PureComponent<AppProps, AppState> {
                         <Route component={HomePage} />
                     </Switch>
                     <ToastContainer
+                        enableMultiContainer
                         position="top-center"
                         autoClose={5000}
                         hideProgressBar

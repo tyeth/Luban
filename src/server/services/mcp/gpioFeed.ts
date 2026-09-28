@@ -296,6 +296,7 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
     public async connect(): Promise<void> {
         return new Promise((resolve, reject) => {
             let settled = false;
+            let recovering = false;
             const settle = (err: Error | null) => {
                 if (settled) {
                     return;
@@ -354,8 +355,21 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
                 // the board: USBDEVFS_RESET rebinds the kernel driver and needs
                 // no root (the device node carries a plugdev ACL).
                 if (this.progress.stage === 'imported' && !this.progress.pinsDone.length) {
-                    this.lastBridgeReset = await resetStrandedBridges(this.cfg.python);
-                    detail += describeBridgeReset(this.lastBridgeReset);
+                    // A live libusb monitor owns the HID interface as usbfs.
+                    // Release that claim before checking for a stranded bridge,
+                    // and defer close/reconnect until recovery has completed.
+                    recovering = true;
+                    const stopped = await this.stopChildForRecovery(child);
+                    if (!this.ended && stopped) {
+                        this.lastBridgeReset = await resetStrandedBridges(this.cfg.python);
+                        detail += describeBridgeReset(this.lastBridgeReset);
+                    } else if (!stopped) {
+                        detail += ' USB reset skipped because the monitor did not exit.';
+                    }
+                }
+                if (this.ended) {
+                    settle(new Error('GPIO connection ended during startup recovery'));
+                    return;
                 }
                 const err = new Error(detail);
                 settle(err);
@@ -414,6 +428,9 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
                 this.ready = false;
                 if (this.child === child) {
                     this.child = null;
+                }
+                if (recovering) {
+                    return;
                 }
                 const err = new Error(`GPIO monitor exited (${signal || `code ${code}`})${this.detailSuffix()}`);
                 if (!settled) {
@@ -486,6 +503,7 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
         }
         if (message.t === 'ready') {
             this.ready = true;
+            this.bumpWatchdog();
             this.boardId = String(message.board || 'unknown');
             const bound = PROBE_CHANNELS
                 .filter((channel) => this.cfg.pins[channel])
@@ -540,12 +558,14 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
         }
     }
 
-    /** Any stdout traffic proves liveness; silence past STALL_MS is death. */
+    /** After ready, stdout traffic proves liveness; startup has its own recovery deadline. */
     private bumpWatchdog(): void {
         if (this.stallTimer) {
             clearTimeout(this.stallTimer);
         }
-        if (this.ended) {
+        // Progress output can precede a stuck pin configuration. Do not let
+        // the heartbeat deadline kill it before READY_TIMEOUT_MS can recover USB.
+        if (this.ended || !this.ready) {
             return;
         }
         this.stallTimer = setTimeout(() => {
@@ -565,6 +585,26 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
         this.emit('error', err);
         this.killChild();
         this.emit('close');
+    }
+
+    /** Release our libusb claim before the reset helper inspects driver binding. */
+    private async stopChildForRecovery(child: ChildProcess): Promise<boolean> {
+        return new Promise((resolve) => {
+            let forceTimer: NodeJS.Timeout;
+            let exitTimer: NodeJS.Timeout;
+            const onExit = () => {
+                clearTimeout(forceTimer);
+                clearTimeout(exitTimer);
+                resolve(true);
+            };
+            forceTimer = setTimeout(() => child.kill('SIGKILL'), 1000);
+            exitTimer = setTimeout(() => {
+                child.removeListener('exit', onExit);
+                resolve(false);
+            }, 5000);
+            child.once('exit', onExit);
+            this.killChild();
+        });
     }
 
     private killChild(): void {
