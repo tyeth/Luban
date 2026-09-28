@@ -1251,6 +1251,35 @@ button opts into pairing. Saved tokens are still preferred by that button.
 checks, transport errors and fresh homing completion verification still apply. Procedures do
 not inherit this override. It does not permit later motion using an old report.
 
+### Finding connection evidence on the Pi
+
+Read existing logs without creating a renderer/socket connection or changing machine state.
+Identify the running server PID and its stdout/stderr destination first: a different app
+instance or a restarted process can have different logs. On the installed Pi instance checked
+on 2026-09-28, the evidence is split across these sources:
+
+| Source | Evidence and limits |
+|---|---|
+| `~/.config/snapmaker-luban/Logs/server.log` | `ConnectionOpen`, channel `Connecting` / `Connected` / `Ready`, closure, MCP calls and raw M114 replies, and heartbeat-gap warnings. Lifecycle labels alone do not prove fresh status. |
+| Server stdout/stderr (this launch: `/tmp/luban-launch.log`) | The same lifecycle/MCP events plus worker `beat status=200`, `204`, and transport errors. Worker status lines were absent from the persistent server log on this installation; inspect both. Successful responses are logged every tenth poll, not every poll. |
+| `get_position` and `get_mcp_diagnostics` | Current report age/reliability, heartbeat count and timestamp, rejection reasons and gaps. A gap is recorded when a subsequent beat arrives, so zero recorded gaps does not prove uninterrupted polling. |
+| Saved machine `lastConnectedAt` in `machine.json` | Corroborating connection metadata only; not proof of continuing polling. Never dump credentials, edit this file, or use its tokens in direct requests. |
+
+Log timestamps ending in `Z` are UTC. On September 28, UK time is UTC+1: a search
+from 09:00 UK starts at 08:00Z. Preserve both the original timestamp and the converted time.
+If an operator-reported reconnect is absent, record the discrepancy; do not conclude that
+it did not happen or that credentials expired. An authentication-wait response on one attempted
+session does not establish that an existing saved token was invalidated/replaced, or that a
+prompt actually appeared on the touchscreen.
+
+Verified example, 2026-09-28: the operator's Pi Luban reconnect produced `ConnectionOpen` at
+11:55:08.050Z and `Ready` by 11:55:08.238Z in both logs; saved `lastConnectedAt` was
+11:55:08.347Z. The launch log then recorded repeated `beat status=200`. MCP reported
+`reliability: heartbeat` with a sub-two-second report age. At 11:59:31Z, M114 returned
+`X:60.05 Y:111.37 Z:22.80` (work frame), count fields and `ok`, with the exchange in both logs.
+The operator confirmed no touchscreen re-authentication was required. This establishes the
+new session's liveness, not the cause of the earlier morning incident.
+
 ## Development workflow (learned the hard way)
 
 - **Build**: Node 16 (`/c/dev/software/snapmaker/.tools/node-v16.20.2-win-x64`), python
