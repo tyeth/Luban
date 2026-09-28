@@ -968,8 +968,8 @@ waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping,
   trusting chat. `G92`, mixed frames, out-of-travel Z and a work-frame absolute `Z0` are loud
   warnings. Every MCP emitter declares too (`G53;` in every planner preview, an explicit `G54;`
   before a work-frame `move_z` / `move_and_capture`). See "Coordinate frames and the position
-  of record" below. Agent guidance: `.claude/skills/cnc-motion-rules/SKILL.md` (canonical) and
-  `.claude/skills/README.md`.
+  of record" below. Agent guidance: `.agents/skills/cnc-motion-rules/SKILL.md` (canonical) and
+  `.agents/skills/README.md`.
 - **Compound motion and all cutting goes out as gcode FILES** through the same
   `prepare_print`/`start_print` path as Luban's Start button, so the controller job state
   machine and the enclosure **door interlock** apply (fork issue #23). The direct
@@ -999,7 +999,7 @@ waits up to `wait_ms` (default 20 s) and returns `{ok: true, stopped | stopping,
   returns `position_verified: false` with a poll instruction. `capture: false` = verified
   move without a frame.
 - The endmill is ALWAYS in the collet; the rotary is fitted and may hold stock. Report
-  dimensions with uncertainty. See `.claude/skills/cnc-visual-alignment/` for the full
+  dimensions with uncertainty. See `.agents/skills/cnc-visual-alignment/` for the full
   vision methodology.
 
 ## Machine facts (hardware-verified 2026-08-30)
@@ -1226,7 +1226,7 @@ returns the tool over the setter, and the second run adds `start_from_current: t
 (skips travel, verified over the centre within 1.5 mm). Never combine flow B with
 `apply_tool_length_offset` — it would double-apply.
 
-Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
+Full agent guidance in `.agents/skills/tool-change/SKILL.md`.
 
 ## HTTP connection recovery and authentication
 
@@ -1536,7 +1536,7 @@ toolhead camera. Everything a fresh install needs:
 reviewable Snapmaker G0/G1 programs offline. See [thread-milling support](docs/thread-milling.md)
 for firmware findings, generator option coverage, required declarations, spindle
 modes, examples and limitations. The dedicated
-[`cnc-thread-milling` skill](../../../../.claude/skills/cnc-thread-milling/SKILL.md)
+[`cnc-thread-milling` skill](../../../../.agents/skills/cnc-thread-milling/SKILL.md)
 covers cutter geometry, internal bore/external boss review, multiple features and
 tool changes under `cnc-motion-rules`. Running a converted file uses the existing
 job approval flow. See the [baseline evaluation review](docs/thread-milling-evaluation.md)

@@ -1,4 +1,9 @@
-# Claude skills for the Luban MCP CNC surface
+# Agent skills for the Luban MCP CNC surface
+
+The skills live here in `.agents/skills/`, where Codex and other AGENTS.md-aware agents look;
+`.claude/skills` is a symlink to this directory so Claude Code loads the same files. A clone
+without symlink support (Windows without Developer Mode, or `core.symlinks=false`) checks the link
+out as a small text file, so point Claude Code at this directory by hand there.
 
 Load order matters. **`cnc-motion-rules` is canonical and comes first**; the other skills assume
 it and point back to it rather than repeating it.

@@ -94,7 +94,7 @@ rubrics and are not a before/after test of this skill.
 
 ## Rubric corrections for the next evaluation
 
-The [updated scenario set](../../../../../.claude/skills/cnc-thread-milling/evals/evals.json)
+The [updated scenario set](../../../../../.agents/skills/cnc-thread-milling/evals/evals.json)
 retains the three baseline scenarios with corrected expectations and adds external
 LH/conventional, multiple external bosses on the standard head, and refusal/reference
 cases. These are unexecuted next-run cases, not new passing results.

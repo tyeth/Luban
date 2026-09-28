@@ -4,9 +4,9 @@
 explicit absolute G0/G1 program for Snapmaker. It runs offline: no connection,
 origin modification, staging or motion. The source file is not modified.
 
-Use the dedicated [cnc-thread-milling skill](../../../../../.claude/skills/cnc-thread-milling/SKILL.md)
-for the agent workflow, with [cnc-motion-rules](../../../../../.claude/skills/cnc-motion-rules/SKILL.md)
-loaded first. The [setup reference](../../../../../.claude/skills/cnc-thread-milling/references/setup.md)
+Use the dedicated [cnc-thread-milling skill](../../../../../.agents/skills/cnc-thread-milling/SKILL.md)
+for the agent workflow, with [cnc-motion-rules](../../../../../.agents/skills/cnc-motion-rules/SKILL.md)
+loaded first. The [setup reference](../../../../../.agents/skills/cnc-thread-milling/references/setup.md)
 covers cutter measurements, generator fields, internal/external preparation and
 multiple-feature datums. Successful conversion is not approval of cutter geometry,
 stock preparation, collision clearance or thread fit.
@@ -62,7 +62,7 @@ The two required declarations have specific meanings:
   including the sample's initial G0 Z20. It does not apply a tool-length offset.
   Confirm which tool established work Z and which is fitted now; `originOffset`
   alone cannot establish that history. Complete the applicable
-  [tool-change flow](../../../../../.claude/skills/tool-change/SKILL.md) or operator
+  [tool-change flow](../../../../../.agents/skills/tool-change/SKILL.md) or operator
   re-reference before declaring this true. Offline conversion cannot verify it.
 
 Review `gcode`, `changes`, `warnings`, `sourceSpindleRpm` and `validation`. The
@@ -115,7 +115,7 @@ machine Z for G54, and `start_gcode_job` verifies G54's offset before streaming
 
 ## Multiple features and completion
 
-Choose and verify [accessible work references](../../../../../.claude/skills/cnc-motion-rules/references/work-datums.md)
+Choose and verify [accessible work references](../../../../../.agents/skills/cnc-motion-rules/references/work-datums.md)
 before removing the probe. A feature's generator coordinates must be registered to the
 measured work frame, including tool-tip Z and B orientation; a live offset alone is not
 physical datum evidence. Check approach, tool/holder clearance and repeatable datum access.
@@ -135,7 +135,7 @@ inter-feature travel. Custom multi-feature CAM needs its own complete review.
 Count one approval per feature plus the actual tool-change stages. Do not count
 read-only calls, conversion or polling as approvals; distinguish conditional
 branches and multiply repeated stages explicitly. The
-[setup reference](../../../../../.claude/skills/cnc-thread-milling/references/setup.md)
+[setup reference](../../../../../.agents/skills/cnc-thread-milling/references/setup.md)
 works through six holes and two swaps, including the legitimate measurement-reuse
 condition. It never substitutes stored probe length for a live setter reading.
 
