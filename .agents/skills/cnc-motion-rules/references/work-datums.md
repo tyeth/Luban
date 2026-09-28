@@ -4,6 +4,11 @@ Read before choosing a CAM work coordinate system (WCS), registering a model for
 or declaring a setup ready for the probe-to-cutter swap. This is planning guidance under
 `cnc-motion-rules`, not a new origin-write or motion permission.
 
+First apply [measurement evidence](measurement-evidence.md): retrieve existing datum and
+survey records, derive missing geometry from them, and reconcile contradictory assumptions.
+Re-use valid saved reference checks; verification does not automatically require another
+contact. A fresh controller state check does not invalidate a historical physical survey.
+
 ## Select a datum that can be established and checked
 
 Prefer accessible, stable reference surfaces/features that can be probed in the mounted
@@ -93,8 +98,10 @@ a mandatory per-angle cycle. Model rotation and translation must account for the
 axis, which need not pass through work zero. Do not assume the controller rotates the XYZ
 work frame or applies tool-centre-point compensation simply because a B command was sent.
 The stored axis is historical until checked against opposite-face contacts for THIS clamping
-and probe length (`cnc-probing/references/rotary-axis.md`); a 1 mm axis error is a 1 mm error
-in every rotated toolpath, so state the probe-length basis of each value before CAM uses it.
+and measurement-time probe calibration
+([rotary-axis](../../cnc-probing/references/rotary-axis.md)). Reconcile saved contacts first.
+Axis-location error contributes (I-R) times the error: zero at B0 and twice the transverse
+error at B180. State its propagated uncertainty before CAM uses it; B0 agreement is insufficient.
 
 **Each indexed visit is its own setup.** A visit at B90, a visit at B270 and a later finishing
 visit at B90 are three setups: each takes the previous setup's output as its input stock, has

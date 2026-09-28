@@ -21,6 +21,15 @@ description: "Plan and run touch-probe measurements through Luban MCP: top profi
 | Chuck jaws | reach ~Y269 | a `keep_out` volume for programs |
 | Tailstock | inside the `rotary-axis` box, Y < ~110; height UNMEASURED | measure it (see below), then `set_landmark` |
 
+## Recover existing measurements before planning more
+
+Read [measurement evidence](../cnc-motion-rules/references/measurement-evidence.md) before
+requesting a repeat or diagnosing missing registration. Retrieve original job/survey results
+and handoffs, derive what they constrain, and resolve contradictions before choosing new
+measurements. Do not re-probe covered quantities. Name the precise missing or invalidated
+constraint and why saved evidence cannot supply it before proposing the smallest targeted
+probe. A model discrepancy, lost context or new B index is not evidence that a survey expired.
+
 ## Choose measurements that answer the machining question
 
 Start with the deliverable: which boundaries, depths, remaining material and fixture clearances
@@ -28,7 +37,8 @@ must be known to propose the cut? Include the
 [work datum and its recheck](../cnc-motion-rules/references/work-datums.md): identify accessible
 references for XYZ/orientation, verify probe-body access and measure them before the probe is
 removed. A top profile alone does not register the milling WCS. Reuse completed measurements
-only while the tool, workholding, B orientation and datum remain applicable. A width measured away from the cut is a reference,
+with their original calibration and applicable workholding/datum context; a measured tool
+transfer or known B transform preserves reusable physical geometry. A width measured away from the cut is a reference,
 not the cut's verified contour. Preserve partial results and refine the gaps instead of rerunning
 whole scans. Produce a reviewable geometry/cut proposal as those constraints become known.
 

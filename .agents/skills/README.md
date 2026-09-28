@@ -20,6 +20,11 @@ For a plain transit or a Snapmaker-ready file, `cnc-motion-rules` alone is enoug
 A thread-milling controller export also needs `cnc-thread-milling` before submission.
 See the [engineering guide](../../src/server/services/mcp/docs/thread-milling.md).
 
+Before cutting geometry or a repeat survey, read
+[measurement evidence](cnc-motion-rules/references/measurement-evidence.md): saved contacts
+constrain the model, contradictions block release, and shared model assumptions do not make
+an independent check. Reuse completed measurements; acquire only a demonstrated remaining gap.
+
 Rules of the house that every skill shares:
 
 - Operator law is never overridden on model judgment. A refusal from a tool is the rule catching you.
