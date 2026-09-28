@@ -65,6 +65,34 @@ jobs:
             ref: refs/tags/${{ needs.release.outputs.tag }}
         secrets: inherit
 
+    release-tooling:
+        name: Publish MCP Tooling List
+        needs: release
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - name: Checkout release source
+              uses: actions/checkout@v4
+              with:
+                  ref: refs/tags/${{ needs.release.outputs.tag }}
+
+            - name: Generate list and update release notes
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+                  RELEASE_TAG: ${{ needs.release.outputs.tag }}
+              run: |
+                  gh release view "$RELEASE_TAG" --json body --jq .body > "$RUNNER_TEMP/release-notes-before.md"
+                  python3 scripts/generate_mcp_tooling.py \
+                      --tag "$RELEASE_TAG" \
+                      --repository "$GITHUB_REPOSITORY" \
+                      --output "$RUNNER_TEMP/MCP-TOOLS.md" \
+                      --notes-input "$RUNNER_TEMP/release-notes-before.md" \
+                      --notes-output "$RUNNER_TEMP/release-notes-after.md"
+                  gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/MCP-TOOLS.md" --clobber
+                  gh release edit "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes-after.md"
+
     build-windows:
         needs: release
         if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'windows' || inputs.platforms == 'all'
