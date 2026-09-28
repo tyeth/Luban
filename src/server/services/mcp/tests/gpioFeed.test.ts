@@ -14,6 +14,7 @@ function fixture() {
     let nextId = 0;
     let resets = 0;
     let kills = 0;
+    let closes = 0;
     type Timer = { at: number; callback: () => void | Promise<void> };
     const timers = new Map<number, Timer>();
     const child = Object.assign(new EventEmitter(), {
@@ -31,7 +32,12 @@ function fixture() {
         './probeTransport': transport,
         './probeFeedHealth': health,
         './usbBridgeReset': {
-            resetStrandedBridges: async () => { resets++; return { reset: [], skipped: [], error: null }; },
+            resetStrandedBridges: async () => {
+                assert.strictEqual(kills, 1, 'release the monitor USB claim before checking for a stranded bridge');
+                assert.strictEqual(closes, 0, 'do not reconnect before USB recovery completes');
+                resets++;
+                return { reset: [], skipped: [], error: null };
+            },
             describeBridgeReset: () => ' USB recovery attempted.',
         },
     };
@@ -57,6 +63,7 @@ function fixture() {
         ...exports.resolveGpioFeedConfig(), pins: { toolsetter: { pin: 'D2', pull: 'up' }, overtravel: null, probe: null },
     });
     const errors: string[] = [];
+    feed.on('close', () => { closes++; });
     feed.on('error', (error: Error) => errors.push(error.message));
     const result = feed.connect().then(() => null, (error: Error) => error);
     const send = (message: object) => child.stdout.emit('data', Buffer.from(`${JSON.stringify(message)}\n`));
