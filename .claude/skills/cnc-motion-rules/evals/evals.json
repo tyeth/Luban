@@ -253,6 +253,21 @@
         "Does not waive alarms or toolhead checks",
         "Does not trust stale data for subsequent motion"
       ]
+    },
+    {
+      "id": 12,
+      "name": "missing-manual-reconnect-evidence",
+      "prompt": "I reconnected through the Pi Luban window this morning. MCP now says connected but its position is seven hours old. Diagnose it before changing anything. An earlier unrelated attempt returned authentication-wait; I have since confirmed the saved token works without touchscreen approval.",
+      "expected_output": "Collect position, connection diagnostics and M114 evidence before recovery. Match renderer attempt and server identity where records exist, retain pre-recovery snapshots, and distinguish missing evidence from proof the manual reconnect did not occur. Do not infer token replacement or a touchscreen prompt.",
+      "files": [],
+      "assertions": [
+        "Preserves server/build, attempt/session IDs and original timestamps before recovery",
+        "Tries M114 before recovery; M503 S is secondary and reports currently used configuration",
+        "Acknowledges that missing log entries do not disprove the operator reconnect",
+        "Does not infer token expiry/replacement or a visible prompt from authentication-wait",
+        "Never opens a socket/backend client, edits credentials or initiates pairing",
+        "Requires a fresh reliable report after existing-session recovery and does not claim the old cause was proved by a healthy new session"
+      ]
     }
   ]
 }

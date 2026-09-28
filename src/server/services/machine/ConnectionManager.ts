@@ -53,6 +53,9 @@ import SacpChannelBase from './channels/SacpChannel';
 import { L2WLaserToolModule } from '../../../app/machines/snapmaker-2-toolheads';
 import { octo } from './adaptor/Octo';
 
+import { connectionDiagnostics, diagnosticId } from './connectionDiagnostics';
+import { safeIdentifier, safeTarget } from './connectionDiagnosticState';
+
 const log = logger('lib:ConnectionManager');
 
 const ensureRange = (value, min, max) => {
@@ -60,6 +63,9 @@ const ensureRange = (value, min, max) => {
 };
 
 interface ConnectionOpenOptions {
+    attemptId?: string;
+    clientAt?: number;
+    clientConnected?: boolean;
     connectionType: ConnectionType;
     address: string;
     host?: string;
@@ -230,12 +236,14 @@ class ConnectionManager {
 
     // TODO: Refactor this
     public onConnection = (socket: SocketServer) => {
+        connectionDiagnostics.record('renderer_connected');
         sstpHttpChannel.onConnection();
         this.scheduledTasksHandle = new ScheduledTasks(socket);
     };
 
     // TODO: Refactor this
     public onDisconnection = (socket: SocketServer) => {
+        connectionDiagnostics.record('renderer_disconnected');
         sstpHttpChannel.onDisconnection();
         textSerialChannel.onDisconnection(socket);
         this.scheduledTasksHandle.cancelTasks();
@@ -270,6 +278,7 @@ class ConnectionManager {
      */
     private onChannelConnecting = (options: ConnectionConnectingOptions) => {
         log.info('channel: Connecting');
+        connectionDiagnostics.record('channel_connecting', { reason: options?.requireAuth ? 'authentication_wait' : 'opening' });
 
         this.socket && this.socket.emit(SocketEvent.ConnectionConnecting, {
             requireAuth: options?.requireAuth || false,
@@ -284,6 +293,7 @@ class ConnectionManager {
      */
     private onChannelConnected = () => {
         log.info('channel: Connected');
+        connectionDiagnostics.record('channel_connected');
 
         this.socket && this.socket.emit(SocketEvent.ConnectionOpen, {
             code: 200,
@@ -303,6 +313,7 @@ class ConnectionManager {
      */
     private onChannelReady = async (data: { machineIdentifier?: string }) => {
         log.info('channel: Ready');
+        connectionDiagnostics.record('channel_ready');
 
         const machineIdentifier = data?.machineIdentifier;
 
@@ -364,12 +375,21 @@ class ConnectionManager {
 
     /** Restore a retained HTTP session, never authenticate or choose a new machine. */
     public async recoverMachineConnection(): Promise<void> {
+        connectionDiagnostics.capture('before_existing_session_recovery', diagnosticId());
+        connectionDiagnostics.record('recovery_requested');
         if (this.channel && this.channel !== sstpHttpChannel) {
+            connectionDiagnostics.record('recovery_failed', { reason: 'different_transport' });
             throw new Error('Recovery is supported only for the existing HTTP machine session.');
         }
         const previousChannel = this.channel;
-        await sstpHttpChannel.verifyExistingSession();
+        try {
+            await sstpHttpChannel.verifyExistingSession();
+        } catch (error) {
+            connectionDiagnostics.record('recovery_failed', { reason: 'session_verification_failed' });
+            throw error;
+        }
         if (this.channel !== previousChannel) {
+            connectionDiagnostics.record('recovery_failed', { reason: 'session_changed' });
             throw new Error('Connection changed during recovery; nothing was restarted.');
         }
         this.unbindChannelEvents();
@@ -378,10 +398,12 @@ class ConnectionManager {
         this.protocol = NetworkProtocol.HTTP;
         this.bindChannelEvents();
         sstpHttpChannel.resumeVerifiedSession();
+        connectionDiagnostics.record('recovery_session_verified');
         octo.onStart();
     }
 
     private onChannelDisconnected = () => {
+        connectionDiagnostics.record('channel_disconnected');
         // A transport loss must invalidate the server state even with no UI
         // listening. Clear synchronously so reconnect cannot inherit it.
         const instance = this.machineInstance;
@@ -423,9 +445,24 @@ class ConnectionManager {
     /**
      * Connection open.
      */
-    public connectionOpen = async (socket: SocketServer, options: ConnectionOpenOptions) => {
+    public connectionOpen = async (socket: SocketServer, options: ConnectionOpenOptions,
+        acknowledge?: (receipt: { attemptId: string; instanceId: string; build: string }) => void) => {
+        const attemptId = safeIdentifier(options.attemptId) || diagnosticId();
+        options = { ...options, attemptId };
+        connectionDiagnostics.beginAttempt(attemptId, {
+            target: safeTarget(options.host || options.address),
+            protocol: safeIdentifier(options.protocol),
+            clientAt: Number.isFinite(options.clientAt) ? options.clientAt : undefined,
+            clientConnected: options.clientConnected === true,
+            tokenPresent: Boolean(options.token?.trim()),
+            allowPairing: options.allowPairing === true,
+        });
+        if (typeof acknowledge === 'function') {
+            acknowledge({ attemptId, instanceId: connectionDiagnostics.identity.instanceId, build: connectionDiagnostics.identity.build });
+        }
         if (options.connectionType === ConnectionType.WiFi && options.protocol === NetworkProtocol.HTTP
             && !options.token?.trim() && options.allowPairing !== true) {
+            connectionDiagnostics.record('connection_refused', { attemptId, reason: 'no_saved_token' });
             socket.emit(SocketEvent.ConnectionOpen, {
                 code: 401,
                 msg: 'No saved machine token. Automatic pairing is disabled; use the Connect button in Luban explicitly.',
@@ -474,6 +511,7 @@ class ConnectionManager {
         }
 
         log.info(`Detected protocol: ${this.protocol}`);
+        connectionDiagnostics.record('protocol_detected', { attemptId, protocol: this.protocol });
 
         if (this.protocol === NetworkProtocol.Unknown) {
             this.socket && this.socket.emit(SocketEvent.ConnectionOpen, {
@@ -495,7 +533,14 @@ class ConnectionManager {
 
         log.info(`ConnectionOpen: type = ${connectionType}, channel = ${this.channel.constructor.name}.`);
         const openedChannel = this.channel;
-        const connected = await openedChannel.connectionOpen(options);
+        let connected: boolean;
+        try {
+            connected = await openedChannel.connectionOpen(options);
+        } catch (error) {
+            connectionDiagnostics.record('connection_failed', { attemptId, reason: 'channel_open_threw' });
+            throw error;
+        }
+        connectionDiagnostics.record('connection_open_result', { attemptId, reason: connected ? 'opened' : 'refused' });
         if (!connected) {
             if (this.channel === openedChannel) {
                 this.onChannelDisconnected();
@@ -509,6 +554,8 @@ class ConnectionManager {
      * Connection close.
      */
     public connectionClose = async (socket: SocketServer, options: ConnectionCloseOptions) => {
+        connectionDiagnostics.capture('before_connection_close', diagnosticId());
+        connectionDiagnostics.record('connection_close_requested', { reason: options?.force ? 'force' : 'normal' });
         octo.onStop();
 
         if (!this.channel) {

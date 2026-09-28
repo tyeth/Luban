@@ -14,8 +14,8 @@ session.
 - `get_position` — the machine POSITION OF RECORD: judged machine coordinates with `reliability` (verified | heartbeat | cached-offset | awaiting-resync | stale), the frame it rests on and `reasons`, plus the raw work report and originOffset. Motion refuses unless verified/heartbeat/cached-offset; never derive machine = work − offset yourself.
 - `query_firmware_position` — raw `M114`; use when `get_position` looks suspect. Empty replies and transport failures are errors.
 - `query_firmware_configuration` — secondary read-only `M503 S` diagnostic of configuration currently in use, not necessarily EEPROM values. Prefer `M114` for fresh position.
-- `recover_machine_connection` — verify the retained HTTP session with a status GET and restart heartbeat polling. Never sends `/connect`, changes credentials or initiates touchscreen pairing. Refuses missing/expired sessions; no raw-backend fallback. Re-read fresh position after recovery.
-- `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures; `machinePosition` counts rejected heartbeats by reason (out-of-bounds, frame-flip, no-offset-yet), resyncs and disconnects.
+- `recover_machine_connection` — automatically preserve a diagnostic snapshot, then verify the retained HTTP session with a status GET and restart heartbeat polling. Never sends `/connect`, changes credentials or initiates touchscreen pairing. Refuses missing/expired sessions; no raw-backend fallback. Re-read fresh position after recovery.
+- `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures; `connection` contains server/build identity, attempt/session IDs, worker lifecycle, poll/report ages, recent events and pre-recovery snapshots; `machinePosition` counts rejected heartbeats by reason (out-of-bounds, frame-flip, no-offset-yet), resyncs and disconnects.
 - `get_job_timing` — where a job's time went, from its event log; works for running, done and failed jobs.
 
 ## G-code jobs

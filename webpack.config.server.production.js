@@ -2,8 +2,18 @@ const crypto = require('crypto');
 const path = require('path');
 const webpack = require('webpack');
 const TerserPlugin = require('terser-webpack-plugin');
+const { execFileSync } = require('child_process');
 const babelConfig = require('./babel.config');
 const pkg = require('./package.json');
+
+let connectionRevision = 'unknown';
+try {
+    connectionRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: __dirname, encoding: 'utf8' }).trim();
+    if (execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: __dirname, encoding: 'utf8' }).trim()) {
+        connectionRevision += '-dirty';
+    }
+} catch { /* Release archives may not contain .git; the build timestamp still distinguishes builds. */ }
+const connectionBuild = `${connectionRevision}@${new Date().toISOString()}`;
 
 const NODE_MODULES = path.resolve(__dirname, 'node_modules');
 
@@ -69,7 +79,8 @@ module.exports = {
     },
     plugins: [
         new webpack.DefinePlugin({
-            'global.PUBLIC_PATH': JSON.stringify(publicPath)
+            'global.PUBLIC_PATH': JSON.stringify(publicPath),
+            LUBAN_CONNECTION_BUILD: JSON.stringify(connectionBuild)
         })
     ],
     module: {

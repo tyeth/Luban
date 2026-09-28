@@ -19,6 +19,8 @@ import workerManager from '../../task-manager/workerManager';
 import { ConnectionType, EventOptions } from '../types';
 import Channel, { CncChannelInterface, ExecuteGcodeResult, FileChannelInterface, LaserChannelInterface, UploadFileOptions } from './Channel';
 import { ChannelEvent } from './ChannelEvent';
+import { connectionDiagnostics, diagnosticId } from '../connectionDiagnostics';
+import { httpEvidence } from '../connectionDiagnosticState';
 
 let waitConfirm: boolean;
 const log = logger('machine:channels:SstpHttpChannel');
@@ -171,7 +173,7 @@ class SstpHttpChannel extends Channel implements
         this.isGcodeExecuting = false;
     };
 
-    public async connectionOpen(options: { address: string; host: string; token: string; allowPairing?: boolean }): Promise<boolean> {
+    public async connectionOpen(options: { address: string; host: string; token: string; allowPairing?: boolean; attemptId?: string }): Promise<boolean> {
         const { host, token } = options;
         // Only an explicit operator pairing action may send an empty token.
         // Do this before changing the existing session or making any request.
@@ -184,13 +186,16 @@ class SstpHttpChannel extends Channel implements
         }
         if (options.allowPairing !== true) {
             try {
-                await this.verifySession(host, token);
+                await this.verifySession(host, token, options.attemptId);
             } catch (error) {
                 this.socket && this.socket.emit(SocketEvent.ConnectionOpen, { code: 401, msg: (error as Error).message });
                 return false;
             }
         }
-        this.stopHeartBeat();
+        connectionDiagnostics.capture('before_connection_open', diagnosticId());
+        this.stopHeartBeat('connection_open');
+        const sessionId = diagnosticId();
+        connectionDiagnostics.beginSession(sessionId, options.attemptId);
         this.latestMachineState = null;
         this.host = host;
         this.token = token;
@@ -201,18 +206,24 @@ class SstpHttpChannel extends Channel implements
         log.debug(`wifi host="${this.host}"`);
         return new Promise((resolve) => {
             const api = `${this.host}/api/v1/connect`;
+            const startedAt = Date.now();
             request
                 .post(api)
                 .timeout(3000)
                 .send(this.token ? `token=${this.token}` : '')
                 .end((err, res) => {
+                    connectionDiagnostics.record('connect_response', { ...httpEvidence(err, res),
+                        sessionId,
+                        attemptId: options.attemptId,
+                        durationMs: Date.now() - startedAt,
+                        tokenReturned: Boolean(res?.body?.token) });
                     if (res?.body?.token) {
                         this.token = res.body.token;
                     }
 
                     const result = _getResult(err, res);
                     if (err) {
-                        log.debug(`err="${err}"`);
+                        log.debug('Machine connect request failed; see connection diagnostics for status.');
                         this.socket && this.socket.emit(SocketEvent.ConnectionOpen, result);
                         resolve(false);
                         return;
@@ -323,7 +334,7 @@ class SstpHttpChannel extends Channel implements
     public async connectionClose(options: { force: boolean }): Promise<boolean> {
         // TODO: cancel intervals on instance
         this.clearAllInterval();
-        this.stopHeartBeat();
+        this.stopHeartBeat('connection_close');
         this.latestMachineState = null;
         this.init();
 
@@ -352,12 +363,23 @@ class SstpHttpChannel extends Channel implements
         }
     }
 
-    private async verifySession(host: string, token: string): Promise<void> {
+    private async verifySession(host: string, token: string, attemptId?: string): Promise<void> {
+        const startedAt = Date.now();
+        const active = connectionDiagnostics.snapshot();
+        const trace = {
+            attemptId: attemptId || active.attemptId,
+            sessionId: attemptId ? undefined : active.sessionId,
+            requestId: diagnosticId(),
+        };
+        connectionDiagnostics.record('session_check_requested', trace);
         const result: Result = await new Promise(resolve => {
             request.get(`${host}/api/v1/status`)
                 .query({ token })
                 .timeout(3000)
-                .end((err: Error | null, res: request.Response) => resolve(_getResult(err, res)));
+                .end((err: Error | null, res: request.Response) => {
+                    connectionDiagnostics.record('session_check_response', { ...trace, ...httpEvidence(err, res), durationMs: Date.now() - startedAt });
+                    resolve(_getResult(err, res));
+                });
         });
         if (result.code !== 200 || !result.data || typeof (result.data as { status?: unknown }).status !== 'string') {
             // Never print the request error: it can contain a token in the URL.
@@ -383,33 +405,51 @@ class SstpHttpChannel extends Channel implements
     }
 
     public async startHeartbeat(): Promise<void> {
-        this.stopHeartBeat();
+        this.stopHeartBeat('heartbeat_restart');
 
         waitConfirm = true;
         const generation = this.heartbeatGeneration;
+        connectionDiagnostics.startWorker(generation);
         this.heartBeatWorker = workerManager.heartBeat([{
             host: this.host,
             token: this.token
-        }], (result: { status?: string; msg?: string; res?: request.Response }) => {
+        }], (result: { status?: string; msg?: string; res?: request.Response; errorCode?: string;
+            timedOut?: boolean; durationMs?: number; httpStatus?: number; reason?: string }) => {
             if (generation !== this.heartbeatGeneration) {
                 return;
             }
-            if (result.status === 'offline') {
-                log.info(`[wifi connection offline]: msg=${result.msg}`);
+            if (result.status === 'poll-start') {
+                connectionDiagnostics.pollStarted();
+                return;
+            }
+            if (result.status === 'poll-error') {
+                connectionDiagnostics.poll({ httpStatus: result.httpStatus,
+                    errorCode: result.errorCode,
+                    timedOut: result.timedOut,
+                    durationMs: result.durationMs }, false);
+                return;
+            }
+            if (result.status === 'offline' || result.status === 'worker-exit') {
+                connectionDiagnostics.record(result.status === 'worker-exit' ? 'heartbeat_worker_exit' : 'heartbeat_offline', {
+                    reason: result.reason, errorCode: result.errorCode,
+                });
+                log.info('[wifi connection offline]: see connection diagnostics');
                 this.clearAllInterval();
-                this.stopHeartBeat();
+                this.stopHeartBeat(result.status);
                 this.latestMachineState = null;
                 this.init();
                 this.emit(ChannelEvent.Disconnected);
                 return;
             }
             const { data, code } = _getResult(null, result.res);
+            const accepted = code === 200 && typeof data?.status === 'string';
+            connectionDiagnostics.poll({ ...httpEvidence(null, result.res), durationMs: result.durationMs }, accepted);
 
-            // No Content
-            // wait for authentication
-            if (Object.keys(data).length === 0 || code === 204) {
+            // Only the controller's 204 response denotes authentication-wait. A malformed
+            // or failed status must not be presented as evidence of a touchscreen prompt.
+            if (!accepted) {
                 this.emit(ChannelEvent.Connecting, {
-                    requireAuth: true,
+                    requireAuth: code === 204,
                 });
                 return;
             }
@@ -457,7 +497,8 @@ class SstpHttpChannel extends Channel implements
         return Promise.resolve();
     }
 
-    private stopHeartBeat = () => {
+    private stopHeartBeat = (reason: string) => {
+        if (this.heartBeatWorker) { connectionDiagnostics.stopWorker(reason); }
         this.heartbeatGeneration++;
         this.heartBeatWorker && this.heartBeatWorker.terminate();
         this.heartBeatWorker = null;
@@ -465,6 +506,13 @@ class SstpHttpChannel extends Channel implements
 
     private _executeGcode = async (gcode: string) => {
         const api = `${this.host}/api/v1/execute_code`;
+        const startedAt = Date.now();
+        const { sessionId, attemptId } = connectionDiagnostics.snapshot();
+        let phase = 'gcode';
+        if (gcode.trim() === 'M114') { phase = 'M114'; }
+        if (gcode.trim() === 'M503 S') { phase = 'M503_S'; }
+        const requestId = diagnosticId();
+        connectionDiagnostics.record('command_requested', { sessionId, attemptId, requestId, phase });
         return new Promise((resolve) => {
             const req = request.post(api);
             req.timeout(300000)
@@ -472,7 +520,16 @@ class SstpHttpChannel extends Channel implements
                 .send(`code=${gcode}`)
                 // .send(formData)
                 .end((err, res) => {
-                    resolve(_getResult(err, res));
+                    connectionDiagnostics.record('command_response', { ...httpEvidence(err, res),
+                        requestId,
+                        sessionId,
+                        attemptId,
+                        phase,
+                        durationMs: Date.now() - startedAt });
+                    // Request errors can embed credentials in their URL. Retain status/code, never the raw message.
+                    const result = _getResult(err, res);
+                    if (err) { result.msg = httpEvidence(err, res).errorCode || 'transport_error'; }
+                    resolve(result);
                 });
         });
     };

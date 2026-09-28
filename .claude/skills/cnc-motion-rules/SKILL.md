@@ -260,6 +260,19 @@ values; use it when the position query fails or to inspect current configuration
 A fresh M114 is in the selected workspace; it does not independently verify the machine-frame
 position or validate an old origin offset.
 
+**Preserve evidence before recovery.** Read `get_mcp_diagnostics.connection`: keep the server
+instance/build identity, attempt/session IDs, heartbeat poll/report timestamps and recent events
+alongside `get_position` and the M114 result. The recovery tool automatically captures the
+connection diagnostic state before verification/restart, even if recovery fails; read preserved
+captures via `get_mcp_diagnostics.connection.captures`. Do not reconnect first and then claim to
+have diagnosed the old session. A healthy new session cannot prove the earlier failure's cause.
+For missing UI reconnect events, compare the existing renderer's recorded attempt/server ID
+with MCP and the persistent connection log, using the
+[debugging guide](references/connection-diagnostics.md).
+If that renderer evidence is unavailable, state the gap rather than dismissing the operator's
+reconnect. Authentication-wait does not prove an old saved token expired, changed, or caused
+a visible touchscreen prompt.
+
 For a stopped heartbeat, use `recover_machine_connection`. It checks the existing HTTP session
 and restarts polling without calling the pairing endpoint. It never requests a new token or
 causes touchscreen pairing. Re-read `get_position` and require fresh reliable data afterwards.

@@ -12,6 +12,7 @@ import { machineStore } from '../../store/local-storage';
 import { ConnectResult, MachineAgent } from './MachineAgent';
 import baseActions from './actions-base';
 import { ConnectionType } from './state';
+import { beginConnectionAttempt } from './connectionDiagnostics';
 
 
 
@@ -208,6 +209,7 @@ const resetMachineState = (connectionType = ConnectionType.WiFi) => {
 const connect = (agent: MachineAgent, allowPairing: boolean = false) => {
     return async (dispatch, getState) => {
         // Update selected agent
+        const attempt = beginConnectionAttempt(controller.connected);
         const oldAgent: MachineAgent = getState().workspace.server;
         if (!isEqual(agent, oldAgent)) {
             dispatch(setSelectedAgent(agent));
@@ -224,7 +226,7 @@ const connect = (agent: MachineAgent, allowPairing: boolean = false) => {
             connectionStatus: CONNECTION_STATUS_CONNECTING,
         }));
 
-        const { code, msg }: ConnectResult = await agent.connect(allowPairing);
+        const { code, msg }: ConnectResult = await agent.connect(allowPairing, attempt);
 
         const connectionStatus = getState().workspace.connectionStatus;
         if (connectionStatus !== CONNECTION_STATUS_CONNECTING) {

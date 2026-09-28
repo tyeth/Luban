@@ -6,6 +6,7 @@ import vm from 'vm';
 import ts from 'typescript';
 import * as procedureLimits from '../procedureLimits';
 import { reliableForMotion } from '../machinePosition';
+import { ConnectionDiagnosticState, httpEvidence, safeIdentifier, safeTarget } from '../../machine/connectionDiagnosticState';
 
 function load(file: string, dependencies: Record<string, unknown>) {
     const source = fs.readFileSync(path.join(__dirname, '../../machine', file), 'utf8');
@@ -19,6 +20,7 @@ function load(file: string, dependencies: Record<string, unknown>) {
         clearInterval,
         clearTimeout,
         Date,
+        process: { env: { NODE_ENV: 'test' } },
         require: (name: string) => {
             if (!(name in dependencies)) { throw new Error(`Unstubbed dependency: ${name}`); }
             return dependencies[name];
@@ -42,6 +44,8 @@ const events = { Connecting: 'connecting', Connected: 'connected', Ready: 'ready
 const logger = () => ({ info: () => undefined, warn: () => undefined, debug: () => undefined });
 
 function fixture() {
+    const diagnostics = new ConnectionDiagnosticState({ instanceId: 'test', pid: 1, startedAt: 0, version: 'test', build: 'test' }, () => undefined);
+    const diagnosticModule = { connectionDiagnostics: diagnostics, diagnosticId: () => 'diagnostic-id' };
     const workers: Array<{ callback: (value: object) => void; terminated: boolean; terminate: () => void }> = [];
     const sent: string[] = [];
     const replies: Array<{ err?: object; res?: object }> = [];
@@ -72,6 +76,8 @@ function fixture() {
             workers.push(worker);
             return worker;
         } },
+        '../connectionDiagnostics': diagnosticModule,
+        '../connectionDiagnosticState': { httpEvidence },
         '../types': { ConnectionType: { WiFi: 'wifi' } },
         './Channel': Channel,
         './ChannelEvent': { ChannelEvent: events },
@@ -80,7 +86,7 @@ function fixture() {
     const channel = new HttpChannel();
     channel.socket = new EventEmitter();
     channel.getGcodePrintingInfo = () => ({});
-    return { channel, workers, replies, sent, requests };
+    return { channel, workers, replies, sent, requests, diagnostics, diagnosticModule };
 }
 
 function cameraFixture() {
@@ -118,6 +124,64 @@ function cameraFixture() {
 const online = { status: 'online', res: { status: 200, body: { status: 'IDLE', x: 1, y: 2, z: 3, homed: true } } };
 
 export const tests: Array<[string, () => void | Promise<void>]> = [
+    ['heartbeat worker rejection and exit propagate, while deliberate cancellation does not look like a crash', async () => {
+        for (const reason of ['worker_completed', 'worker_rejected', 'cancelled']) {
+            let resolveWorker: () => void = () => undefined;
+            let rejectWorker: (error: Error) => void = () => undefined;
+            const promise = new Promise<void>((resolve, reject) => { resolveWorker = resolve; rejectWorker = reject; });
+            const handle = Object.assign(promise, { cancel: () => rejectWorker(new Error('cancelled token=secret')) });
+            const manager = load('../task-manager/workerManager.ts', {
+                workerpool: { pool: () => ({ exec: () => handle }) },
+                '../../DataStorage': { tmpDir: '/tmp', fontDir: '/tmp' },
+            }).default;
+            const messages: Array<{ status: string; reason: string }> = [];
+            const worker = manager.heartBeat([], (message: { status: string; reason: string }) => messages.push(message));
+            if (reason === 'cancelled') { worker.terminate(); } else if (reason === 'worker_completed') { resolveWorker(); } else {
+                rejectWorker(new Error('worker failed http://host?token=secret'));
+            }
+            await Promise.resolve();
+            assert.strictEqual(messages.length, reason === 'cancelled' ? 0 : 1);
+            if (messages.length) { assert.strictEqual(messages[0].reason, reason); }
+            assert(!JSON.stringify(messages).includes('secret'));
+        }
+    }],
+    ['malformed heartbeat is retained as evidence without being labelled authentication-wait', async () => {
+        const { channel, workers, diagnostics } = fixture();
+        const authStates: boolean[] = [];
+        channel.on(events.Connecting, (event: { requireAuth: boolean }) => authStates.push(event.requireAuth));
+        await channel.startHeartbeat();
+        workers[0].callback({ status: 'poll-start' });
+        workers[0].callback({ status: 'online', res: { status: 200, body: {} } });
+        assert.strictEqual(channel.getLatestMachineState(), null);
+        assert.strictEqual(authStates[0], false);
+        assert.strictEqual(typeof diagnostics.snapshot().heartbeat.lastPollStartedAt, 'number');
+        workers[0].callback({ status: 'online', res: { status: 204, body: {} } });
+        assert.strictEqual(authStates[1], true);
+    }],
+    ['unexpected heartbeat worker exit clears cached state and retains the reason', async () => {
+        const { channel, workers, diagnostics } = fixture();
+        await channel.startHeartbeat();
+        workers[0].callback(online);
+        let disconnected = false;
+        channel.on(events.Disconnected, () => { disconnected = true; });
+        workers[0].callback({ status: 'worker-exit', reason: 'worker_rejected' });
+        assert(disconnected);
+        assert.strictEqual(channel.getLatestMachineState(), null);
+        assert.strictEqual(diagnostics.snapshot().heartbeat.polling, false);
+        assert(diagnostics.snapshot().recent.some(e => e.event === 'heartbeat_worker_exit' && e.reason === 'worker_rejected'));
+    }],
+    ['failed commands retain status and timing evidence without leaking error URLs', async () => {
+        const { channel, replies, diagnostics } = fixture();
+        replies.push({ err: { code: 'ETIMEDOUT', timeout: 3000, message: 'http://host?token=secret' } });
+        const result = await channel.executeGcode('M114');
+        assert.strictEqual(result.result, -1);
+        assert(!result.text.includes('secret'));
+        const event = diagnostics.snapshot().recent.find(e => e.event === 'command_response');
+        assert.strictEqual(event?.phase, 'M114');
+        assert.strictEqual(event?.errorCode, 'ETIMEDOUT');
+        assert.strictEqual(event?.timedOut, true);
+        assert.strictEqual(typeof event?.durationMs, 'number');
+    }],
     ['HTTP failures propagate and stop a multi-line command, instead of returning success', async () => {
         for (const failure of [
             { err: { message: 'Unauthorized' }, res: { status: 401, text: 'Unauthorized' } },
@@ -177,7 +241,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.deepStrictEqual(sent, ['G53']);
     }],
     ['blank or invalid tokens never start automatic pairing, or overwrite an existing session', async () => {
-        const { channel, requests, replies } = fixture();
+        const { channel, requests, replies, diagnostics } = fixture();
         channel.host = 'http://existing';
         channel.token = 'saved';
         const errors: string[] = [];
@@ -187,10 +251,11 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         }
         assert.strictEqual(requests.length, 0);
         replies.push({ err: { message: 'Unauthorized token=secret' }, res: { status: 401 } });
-        assert.strictEqual(await channel.connectionOpen({ host: 'http://new', token: 'expired' }), false);
+        assert.strictEqual(await channel.connectionOpen({ host: 'http://new', token: 'expired', attemptId: 'new-attempt' }), false);
         assert.deepStrictEqual(requests, [{ method: 'GET', url: 'http://new/api/v1/status' }]);
         assert.strictEqual(channel.host, 'http://existing');
         assert.strictEqual(channel.token, 'saved');
+        assert(diagnostics.snapshot().recent.some(e => e.event === 'session_check_response' && e.attemptId === 'new-attempt'));
         assert(errors.every(error => !error.includes('secret')));
     }],
     ['retained-session recovery uses GET only and refuses missing, expired and pending-pairing sessions', async () => {
@@ -253,7 +318,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert(commands.every(command => command === 'M503 S'));
     }],
     ['disconnect clears server state; authenticated recovery restores polling without pairing', async () => {
-        const { channel, replies, requests, workers } = fixture();
+        const { channel, replies, requests, workers, diagnosticModule } = fixture();
         const source = fs.readFileSync(path.join(__dirname, '../../machine/ConnectionManager.ts'), 'utf8');
         const dependencies = stubImports(source);
         let closed = 0;
@@ -261,6 +326,8 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         Object.assign(dependencies, {
             '../../../lib/logger': logger,
             '../../lib/logger': logger,
+            './connectionDiagnostics': diagnosticModule,
+            './connectionDiagnosticState': { safeIdentifier, safeTarget },
             './types': { ConnectionType: { WiFi: 'wifi' } },
             './ProtocolDetector': { NetworkProtocol: { Unknown: 'Unknown', HTTP: 'HTTP' }, SerialPortProtocol: {} },
             './channels/ChannelEvent': { ChannelEvent: events },
@@ -277,6 +344,13 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         };
         manager.bindChannelEvents();
         assert.strictEqual(manager.getConnectionStatus().connected, true);
+        let receipt: { attemptId: string; instanceId: string } | undefined;
+        await manager.connectionOpen({ emit: () => undefined }, {
+            connectionType: 'wifi', protocol: 'HTTP', token: '', attemptId: 'ui-attempt',
+        }, (value: { attemptId: string; instanceId: string }) => { receipt = value; });
+        assert.strictEqual(receipt?.attemptId, 'ui-attempt');
+        assert.strictEqual(receipt?.instanceId, 'test');
+        assert(diagnosticModule.connectionDiagnostics.snapshot().recent.some(e => e.event === 'connection_refused' && e.attemptId === 'ui-attempt'));
         channel.emit(events.Disconnected);
         assert.strictEqual(manager.getConnectionStatus().connected, false);
         assert.strictEqual(manager.getConnectionStatus().machineReady, false);
@@ -285,6 +359,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.strictEqual(stopped, 1);
         await assert.rejects(manager.recoverMachineConnection(), /No existing HTTP machine session/);
         assert.strictEqual(manager.getConnectionStatus().connected, false);
+        assert(diagnosticModule.connectionDiagnostics.snapshot().captures.some(c => c.reason === 'before_existing_session_recovery'));
         channel.host = 'http://existing';
         channel.token = 'saved';
         channel.state.series = 'Snapmaker 2.0 A350';

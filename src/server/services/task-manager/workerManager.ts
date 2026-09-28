@@ -65,8 +65,19 @@ Object.entries(WorkerMethods).forEach(([, method]) => {
                 }
             }
         });
+        let cancelled = false;
+        if (method === WorkerMethods.heartBeat) {
+            // Polling should remain alive until explicitly cancelled. Observe rejection as well as
+            // resolution: a crashed worker otherwise leaves a connected flag and an old position.
+            handle.then(() => {
+                if (!cancelled) { onmessage?.({ status: 'worker-exit', reason: 'worker_completed' }); }
+            }, () => {
+                if (!cancelled) { onmessage?.({ status: 'worker-exit', reason: 'worker_rejected' }); }
+            });
+        }
         return {
             terminate: () => {
+                cancelled = true;
                 handle.cancel();
             }
         };
