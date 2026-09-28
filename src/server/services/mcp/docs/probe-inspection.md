@@ -111,12 +111,12 @@ and per-angle datum probing is not mandatory when the existing registration rema
 Rotation can obstruct the previous zero or approach despite that valid reference. Do not
 return to work zero automatically: verify the route at the new B or retain the WCS and use
 another clear entry point. A reference location does not have to be visited to use its frame.
-See the canonical [work-datum guidance](../../../../../.claude/skills/cnc-motion-rules/references/work-datums.md).
+See the canonical [work-datum guidance](../../../../../.agents/skills/cnc-motion-rules/references/work-datums.md).
 
 ### Existing local continuation and composition limits
 
 Local continuation is already implemented across the toolset. The agent-facing
-[planning reference](../../../../../.claude/skills/cnc-probing/references/planning.md)
+[planning reference](../../../../../.agents/skills/cnc-probing/references/planning.md)
 compares all measurement families and their return boundaries. Implementation anchors:
 
 - `probeSurface.ts`: guarded or stepped local links between top stations.
