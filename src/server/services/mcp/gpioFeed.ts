@@ -486,6 +486,7 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
         }
         if (message.t === 'ready') {
             this.ready = true;
+            this.bumpWatchdog();
             this.boardId = String(message.board || 'unknown');
             const bound = PROBE_CHANNELS
                 .filter((channel) => this.cfg.pins[channel])
@@ -540,12 +541,14 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
         }
     }
 
-    /** Any stdout traffic proves liveness; silence past STALL_MS is death. */
+    /** After ready, stdout traffic proves liveness; startup has its own recovery deadline. */
     private bumpWatchdog(): void {
         if (this.stallTimer) {
             clearTimeout(this.stallTimer);
         }
-        if (this.ended) {
+        // Progress output can precede a stuck pin configuration. Do not let
+        // the heartbeat deadline kill it before READY_TIMEOUT_MS can recover USB.
+        if (this.ended || !this.ready) {
             return;
         }
         this.stallTimer = setTimeout(() => {

@@ -3,9 +3,10 @@ import React, { useEffect, useRef, useState } from 'react';
 import { McpHealth, McpHealthChanges, McpHealthIssue } from '../../../../shared/lib/mcpHealth';
 import api from '../../../api';
 import UniApi from '../../../lib/uni-api';
-import { toast } from '../Toast';
+import { ToastContainer, toast } from '../Toast';
 
 const POLL_MS = 5000;
+const CONTAINER_ID = 'mcp-health';
 
 /** Poll Luban's main API, not either MCP port; a broken listener must remain reportable. */
 function useMcpHealth(): McpHealth | null {
@@ -47,12 +48,15 @@ function useMcpHealth(): McpHealth | null {
 
 function IssueContent({ issue }: { issue: McpHealthIssue }) {
     return (
-        <div>
+        <div className="mcp-health-notice">
             <strong>{issue.title}</strong>
-            <p style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{issue.message}</p>
-            <button type="button" onClick={() => UniApi.Event.emit('appbar-menu:preferences.show', { activeTab: 'mcp' })}>
-                Open MCP Settings
-            </button>
+            <p className="mcp-health-notice-message">{issue.message}</p>
+            <div className="mcp-health-notice-actions">
+                <button type="button" onClick={() => UniApi.Event.emit('appbar-menu:preferences.show', { activeTab: 'mcp' })}>
+                    Open MCP Settings
+                </button>
+                <button type="button" onClick={() => toast.dismiss(`mcp-health-${issue.id}`)}>Dismiss</button>
+            </div>
         </div>
     );
 }
@@ -66,7 +70,7 @@ export const McpHealthNotifications: React.FC = () => {
         const delta = changes.current.update(health);
         for (const issue of delta.added) {
             toast(<IssueContent issue={issue} />, {
-                toastId: `mcp-health-${issue.id}`, type: issue.severity, autoClose: false, closeOnClick: false,
+                containerId: CONTAINER_ID, toastId: `mcp-health-${issue.id}`, type: issue.severity, autoClose: false, closeOnClick: false,
             });
         }
         for (const issue of delta.updated) {
@@ -77,7 +81,7 @@ export const McpHealthNotifications: React.FC = () => {
         }
         for (const issue of delta.removed) { toast.dismiss(`mcp-health-${issue.id}`); }
         for (const issue of delta.recovered) {
-            toast.success(`MCP issue cleared: ${issue.title}`, { autoClose: 5000 });
+            toast.success(`MCP issue cleared: ${issue.title}`, { containerId: CONTAINER_ID, autoClose: 5000 });
         }
     }, [health]);
     useEffect(() => () => {
@@ -85,7 +89,18 @@ export const McpHealthNotifications: React.FC = () => {
             toast.dismiss(`mcp-health-${issue.id}`);
         }
     }, []);
-    return null;
+    return (
+        <ToastContainer
+            enableMultiContainer
+            containerId={CONTAINER_ID}
+            className="mcp-health-notifications"
+            position="top-center"
+            autoClose={false}
+            hideProgressBar
+            closeOnClick={false}
+            draggable={false}
+        />
+    );
 };
 
 /** Dismissing a toast never hides the current fault from Settings. */

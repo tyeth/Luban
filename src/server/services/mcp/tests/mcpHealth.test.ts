@@ -119,7 +119,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         const module = load('../../../../app/ui/components/McpHealth/index.tsx', {
             react: React,
             '../../../../shared/lib/mcpHealth': healthModule,
-            '../Toast': { toast },
+            '../Toast': { toast, ToastContainer: (props: object) => React.createElement('toast-container', props) },
             '../../../api': { getMcpHealth: async () => { if (fail) { throw new Error('offline'); } return { body: snapshot }; } },
             '../../../lib/uni-api': { Event: { emit: (event: string, data: { activeTab: string }) => calls.push(`${event}:${data.activeTab}`) } },
         }, {
@@ -133,12 +133,20 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             await act(async () => { await fn(); });
         };
         assert.deepStrictEqual(calls, ['add']);
-        const button = renderer.create(content).root.findByType('button');
-        button.props.onClick();
+        const container = root.root.findByType('toast-container');
+        assert.strictEqual(container.props.enableMultiContainer, true);
+        assert.strictEqual(container.props.containerId, 'mcp-health');
+        const buttons = renderer.create(content).root.findAllByType('button');
+        const settingsButton = buttons.find((button) => button.children.includes('Open MCP Settings'));
+        assert(settingsButton);
+        settingsButton.props.onClick();
         assert(calls.includes('appbar-menu:preferences.show:mcp'));
         await tick();
         assert.strictEqual(calls.filter((c) => c === 'add').length, 1);
-        visible.clear(); // User dismissed it; retry text must not reopen it.
+        const dismissButton = buttons.find((button) => button.children.includes('Dismiss'));
+        assert(dismissButton);
+        dismissButton.props.onClick();
+        assert.strictEqual(visible.size, 0); // Actual dismiss action; retry text must not reopen it.
         snapshot = deriveMcpHealth({ ...healthy, probe: { ...disconnected, lastError: 'still disconnected', connecting: true } });
         await tick();
         assert.strictEqual(calls.filter((c) => c === 'add').length, 1);
