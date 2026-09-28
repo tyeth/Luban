@@ -1228,6 +1228,108 @@ returns the tool over the setter, and the second run adds `start_from_current: t
 
 Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
 
+## HTTP connection recovery and authentication
+
+A stopped heartbeat must clear the server's channel, readiness and cached position, not only
+notify the renderer. New renderer/client connections must not stop the machine heartbeat.
+HTTP command errors are propagated and abort the remaining command batch and queued work;
+reconnecting cannot resume commands from the old session.
+
+Use `query_firmware_position` (`M114`), or `query_firmware_configuration` (`M503 S`), to check
+for a fresh raw reply. M114 is the primary position query; M503 S reports currently used
+configuration, not necessarily EEPROM values. Empty text and `result: 0` alone do not prove liveness.
+`recover_machine_connection` verifies the retained HTTP session through `/status` and restarts
+polling, with no `/connect` request, new token or pairing prompt. Credentials are never returned.
+Missing/expired sessions stop recovery with guidance to use Luban's saved-token connection flow.
+Agents must not use raw socket/backend requests, blank tokens, credential edits or
+`allowPairing` to work around that refusal. The generic HTTP connection API rejects blank tokens
+by default and checks supplied credentials before `/connect`; only the explicit network Connect
+button opts into pairing. Saved tokens are still preferred by that button.
+
+`home` refuses stale/incoherent position by default. On the operator's explicit demand,
+`ignore_stale_position: true` bypasses only stale-position rejection. Alarms, idle/toolhead
+checks, transport errors and fresh homing completion verification still apply. Procedures do
+not inherit this override. It does not permit later motion using an old report.
+
+### Correlated connection diagnostics
+
+`get_mcp_diagnostics.connection` is read-only and includes the server instance ID, PID,
+startup time, app version and production build revision/timestamp, the active HTTP attempt and
+session IDs, worker state, poll-start/response/report timestamps, the last 160 events, and up to
+five snapshots captured before recovery or connection replacement. An unbundled development
+server identifies its build as `development-unbundled`, not a production revision.
+
+The same structured events are persisted in `Logs/connection-diagnostics.log` under Luban's
+user data directory (on this Pi, `~/.config/snapmaker-luban/Logs/`). It rotates at 5 MiB with
+three files and is not cleared at startup. Preserve rotated siblings too. Existing lifecycle
+and MCP command logs remain in `server.log`; worker stdout is no longer the only source of
+heartbeat response evidence. In-memory histories reset on server restart; the log's instance
+IDs distinguish runs. All event times are epoch milliseconds; outer log timestamps are UTC.
+
+Each UI connection action creates an `attemptId` before saved-token lookup and records
+`connect_action`, `connection_emit` and the server acknowledgement. The matching controller
+response is recorded server-side as `connect_response` with the attempt/session IDs.
+The last 50 renderer entries survive reloads in local storage under
+`luban.connectionAttempts.v1`. This is deliberately independent of server delivery. When
+investigating an absent server event, inspect this key in the **existing** renderer's developer
+tools (`localStorage.getItem('luban.connectionAttempts.v1')`), without opening a new socket or
+changing credentials. If storage was unavailable or history was evicted, absence proves nothing.
+The server acknowledgement contains its instance/build identity; compare that identity with
+MCP before treating their records as one session. Neither a UI response nor `channel_ready`
+alone proves a fresh machine report.
+
+| Trace evidence | What to check next |
+|---|---|
+| UI attempt with no matching server receipt | Renderer socket connectivity/delivery, correct server instance, retained log coverage; do not infer a failed machine token. |
+| Receipt, but no `protocol_detected` / `connect_response` | Protocol detection or opening stage; match the attempt ID before interpreting another attempt's result. |
+| `connect_response`, but no `first_heartbeat` | Worker start, HTTP status/error and `channel_connecting` reason; authentication-wait is not proof a touchscreen prompt appeared or an older token expired. |
+| `heartbeat_worker_stopped` / `heartbeat_worker_exit` | Recorded stop/exit reason. Explicit restart/close is distinguishable from unexpected completion/rejection. |
+| `heartbeat_overdue` while the worker is expected to run | Compare poll-start, response and accepted-report times to distinguish no polling, unanswered requests and responses without usable status. This warning fires once after 10 seconds without a usable report, even if no later beat arrives. |
+| `command_requested` without matching `command_response` | An outstanding request; completed requests carry a request ID, HTTP status, sanitised error code, timeout flag, elapsed time and response byte count. |
+
+Status/error transitions are logged immediately; unchanged heartbeat responses are sampled
+at most once per 20 seconds. No request URLs, tokens, response bodies or raw error messages are
+included in this structured history. `tokenPresent` / `tokenReturned` are booleans, not proof
+of credential validity or replacement. Ordinary command logs still contain M114's raw reply.
+
+Before changing the connection, read `get_connection_status`, `get_position`, and
+`get_mcp_diagnostics`, then try M114 (`query_firmware_position`); use M503 S only as the
+secondary diagnostic. Preserve timestamps and errors. `recover_machine_connection` automatically
+writes a `connection_snapshot` **before** its verification/restart, including failed recovery
+attempts. Its preserved snapshots remain available through `get_mcp_diagnostics.connection.captures`.
+A successful recovery still requires a new reliable position report. Never substitute raw
+socket requests, credential edits or pairing. A new healthy session cannot retrospectively
+establish the cause of an earlier incident whose evidence is missing.
+
+### Finding connection evidence on the Pi
+
+Read existing logs without creating a renderer/socket connection or changing machine state.
+Identify the running server PID and its stdout/stderr destination first: a different app
+instance or a restarted process can have different logs. On the installed Pi instance checked
+on 2026-09-28, the evidence is split across these sources:
+
+| Source | Evidence and limits |
+|---|---|
+| `~/.config/snapmaker-luban/Logs/server.log` | `ConnectionOpen`, channel `Connecting` / `Connected` / `Ready`, closure, MCP calls and raw M114 replies, and heartbeat-gap warnings. Lifecycle labels alone do not prove fresh status. |
+| Server stdout/stderr (this launch: `/tmp/luban-launch.log`) | The same lifecycle/MCP events plus worker `beat status=200`, `204`, and transport errors. Worker status lines were absent from the persistent server log on this installation; inspect both. Successful responses are logged every tenth poll, not every poll. |
+| `get_position` and `get_mcp_diagnostics` | Current report age/reliability, heartbeat count and timestamp, rejection reasons and gaps. A gap is recorded when a subsequent beat arrives, so zero recorded gaps does not prove uninterrupted polling. |
+| Saved machine `lastConnectedAt` in `machine.json` | Corroborating connection metadata only; not proof of continuing polling. Never dump credentials, edit this file, or use its tokens in direct requests. |
+
+Log timestamps ending in `Z` are UTC. On September 28, UK time is UTC+1: a search
+from 09:00 UK starts at 08:00Z. Preserve both the original timestamp and the converted time.
+If an operator-reported reconnect is absent, record the discrepancy; do not conclude that
+it did not happen or that credentials expired. An authentication-wait response on one attempted
+session does not establish that an existing saved token was invalidated/replaced, or that a
+prompt actually appeared on the touchscreen.
+
+Verified example, 2026-09-28: the operator's Pi Luban reconnect produced `ConnectionOpen` at
+11:55:08.050Z and `Ready` by 11:55:08.238Z in both logs; saved `lastConnectedAt` was
+11:55:08.347Z. The launch log then recorded repeated `beat status=200`. MCP reported
+`reliability: heartbeat` with a sub-two-second report age. At 11:59:31Z, M114 returned
+`X:60.05 Y:111.37 Z:22.80` (work frame), count fields and `ok`, with the exchange in both logs.
+The operator confirmed no touchscreen re-authentication was required. This establishes the
+new session's liveness, not the cause of the earlier morning incident.
+
 ## Development workflow (learned the hard way)
 
 - **Build**: Node 16 (`/c/dev/software/snapmaker/.tools/node-v16.20.2-win-x64`), python

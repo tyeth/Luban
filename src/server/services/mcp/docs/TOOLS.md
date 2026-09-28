@@ -12,8 +12,10 @@ session.
 - `get_connection_status` — is Luban connected to a machine, over what channel.
 - `get_machine_profile` — kinematics, work envelope, toolhead module offsets and `connectedHead` (`headType`, `toolHead`, possibly null). `toolHeads` lists compatible heads, not the currently fitted one; generic `headType: "cnc"` alone cannot choose thread-milling spindle mode.
 - `get_position` — the machine POSITION OF RECORD: judged machine coordinates with `reliability` (verified | heartbeat | cached-offset | awaiting-resync | stale), the frame it rests on and `reasons`, plus the raw work report and originOffset. Motion refuses unless verified/heartbeat/cached-offset; never derive machine = work − offset yourself.
-- `query_firmware_position` — raw `M114`; use when `get_position` looks suspect.
-- `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures; `machinePosition` counts rejected heartbeats by reason (out-of-bounds, frame-flip, no-offset-yet), resyncs and disconnects.
+- `query_firmware_position` — raw `M114`; use when `get_position` looks suspect. Empty replies and transport failures are errors.
+- `query_firmware_configuration` — secondary read-only `M503 S` diagnostic of configuration currently in use, not necessarily EEPROM values. Prefer `M114` for fresh position.
+- `recover_machine_connection` — automatically preserve a diagnostic snapshot, then verify the retained HTTP session with a status GET and restart heartbeat polling. Never sends `/connect`, changes credentials or initiates touchscreen pairing. Refuses missing/expired sessions; no raw-backend fallback. Re-read fresh position after recovery.
+- `get_mcp_diagnostics` — event-loop stalls and timing evidence for slow or aborted procedures; `connection` contains server/build identity, attempt/session IDs, worker lifecycle, poll/report ages, recent events and pre-recovery snapshots; `machinePosition` counts rejected heartbeats by reason (out-of-bounds, frame-flip, no-offset-yet), resyncs and disconnects.
 - `get_job_timing` — where a job's time went, from its event log; works for running, done and failed jobs.
 
 ## G-code jobs
@@ -28,7 +30,7 @@ session.
 
 ## Transport and direct motion
 
-- `home` — machine home (`G53;G28;G54`; also homes B). Default first step after (re)connecting; raises Z first and clears the NOT-HOMED state. It is not a remedy for a `get_position` reliability of `awaiting-resync` or `stale` — a rejected or aged beat is a reporting fault, not a position fault, and motion is refused until the record recovers on its own (next coherent beat, ~2 s).
+- `home {ignore_stale_position?: boolean}` — machine home (`G53;G28;G54`; also homes B). Default first step after (re)connecting; raises Z first and clears the NOT-HOMED state. It is not a remedy for a `get_position` reliability of `awaiting-resync` or `stale` — a rejected or aged beat is a reporting fault, not a position fault, and motion is refused until the record recovers on its own (next coherent beat, ~2 s).
 - `set_workspace_origin {workspace, origin_machine: {x,y,z}, datum_reference, reason}` — HUMAN-GATED replacement of all XYZ in an explicit G54–G59.3 workspace. Origin is measured machine coordinates, with Z as TOOLHEAD Z for the fitted tool. No motion or need to visit zero. Checks unchanged staging state, requires firmware selection acknowledgement and two fresh readbacks; no B/E write or automatic rollback. Leaves the named workspace active and invalidates earlier staged jobs. See [workspaces](workspaces.md).
 - `select_workspace {workspace, reason}` — HUMAN-GATED selection/readback of an existing G54–G59.3 workspace without rewriting its origin. Prefer one WCS; additional workspaces only when necessary, particularly for existing G-code jobs. Standard MCP procedures may reselect G54, so verify/reselect before submitting the file.
 - `goto_work_origin` — STAGE XY to work X0 Y0 at the current toolhead Z; no automatic raise, Z0 descent, datum setting or physical registration check. The confirm page shows the MACHINE destination; untrusted offsets, insufficient transport height, travel and mapped landmark conflicts are refused. Check the actual route and fitted tool/holder against fixtures. After B rotation, a retained WCS can remain valid while access to zero is obstructed; use another verified entry without re-zeroing. Distinct from `home`, which runs on the call.
@@ -127,3 +129,5 @@ viewing remains available at `list_cameras.stream.stream_url`; it does not synch
 to a contact. Stepped surface links use bounded ball-radius backoff along verified incoming
 paths and sensor-check their rises. Nested probe holds stop the whole program, including
 `on_fail: skip`. See [probe inspection](probe-inspection.md) for schemas, limits and recovery details.
+
+`home.ignore_stale_position` defaults to false. Set true only on an explicit operator demand to home despite stale data. It does not waive alarms, idle/toolhead checks, incoherent positions or fresh completion verification.

@@ -647,9 +647,12 @@ async function stageGotoWorkOrigin(args: { reason?: string; feed_rate?: number; 
  * identical heartbeats that report homed and idle. With the rotary fitted G28
  * also homes B: whoever calls this has told the operator the stock will turn.
  */
-export async function homeMachine(tool: string, waitUntilHomed: boolean = true): Promise<object> {
+export async function homeMachine(tool: string, waitUntilHomed: boolean = true, ignoreStalePosition: boolean = false): Promise<object> {
     probeFeedService.assertNoOvertravel();
     const before = getPositionSnapshot();
+    if (!ignoreStalePosition || before.reliability !== 'stale') {
+        assertFreshHeartbeat(tool);
+    }
     if (before.machineStatus !== 'idle') {
         throw new McpToolError(`Machine is ${before.machineStatus || 'in an unknown state'}, not idle.`);
     }
@@ -1230,6 +1233,25 @@ export function registerCameraTools(registry: ToolRegistry): void {
     });
 
     registry.register({
+        name: 'query_firmware_configuration',
+        description: 'Read the configuration currently used by the firmware with M503 S (not necessarily EEPROM values). No motion or settings changes. '
+            + 'Use as a liveness diagnostic if M114 returns no position text. An empty reply or transport error '
+            + 'is a failure, never proof of a live machine. Does not reconnect or initiate pairing.',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        handler: async () => {
+            const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+            if (!channel || typeof channel.executeGcode !== 'function') {
+                throw new McpToolError('No machine connected, or the channel does not support direct commands.');
+            }
+            const executed = await sendGcodeVisible(channel, 'query_firmware_configuration', 'M503 S');
+            if (executed.result !== 0 || !executed.text?.trim() || /^ok\s*$/i.test(executed.text.trim())) {
+                throw new McpToolError(`M503 S returned no configuration or failed: ${executed.text || executed.result}. No fresh machine data was obtained.`);
+            }
+            return { raw: executed.text, result: executed.result };
+        },
+    });
+
+    registry.register({
         name: 'query_firmware_position',
         description: 'Ask the firmware directly for its position report (M114) and return the RAW '
             + 'controller response alongside the heartbeat-derived view. This is the authoritative '
@@ -1243,7 +1265,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
             }
             const executed = await sendGcodeVisible(channel, 'query_firmware_position', 'M114');
             const raw = executed.text || null;
-            if (!raw || !/X:-?\d/.test(raw)) {
+            if (executed.result !== 0 || !raw || !/X:-?\d/.test(raw)) {
                 // An "ok" with no position text is not a position report - it
                 // is the dead-connection signature (observed live 2026-09-02:
                 // the machine had disconnected without the server noticing).
@@ -1262,7 +1284,8 @@ export function registerCameraTools(registry: ToolRegistry): void {
             const firmwareWork = match
                 ? { x: Number(match[1]), y: Number(match[2]), z: Number(match[3]) }
                 : null;
-            const offset = heartbeat ? heartbeat.originOffset : null;
+            const offset = heartbeat && reliableForMotion(heartbeat.reliability) && heartbeat.frame === 'work-frame'
+                ? heartbeat.originOffset : null;
             const derivedMachine = firmwareWork && offset
                 ? {
                     x: Number((firmwareWork.x - offset.x).toFixed(3)),
@@ -1276,7 +1299,7 @@ export function registerCameraTools(registry: ToolRegistry): void {
                 firmware_work: firmwareWork,
                 derived_machine: derivedMachine,
                 note: 'M114 reports WORK coordinates in the selected workspace - primarily a '
-                    + 'liveness/frame check. derived_machine = firmware work - heartbeat originOffset; '
+                    + 'liveness/frame check. derived_machine is null unless the heartbeat has a reliable work frame; '
                     + 'work origins are volatile (reset on machine reboot), so record MACHINE '
                     + 'coordinates only.',
                 heartbeat,
@@ -1294,10 +1317,17 @@ export function registerCameraTools(registry: ToolRegistry): void {
             + 'WARNING: with the rotary module '
             + 'fitted, G28 also homes B - stock indexed on the rotary WILL rotate (observed -45 to 0 '
             + 'on hardware); warn the operator first. Requires an idle machine with the toolhead '
-            + 'off. Waits for the firmware to report homed.',
+            + 'off. Waits for the firmware to report homed. Stale position is refused by default; '
+            + 'ignore_stale_position may be true ONLY when the operator explicitly demands homing despite stale data. '
+            + 'This does not bypass alarms, toolhead/idle checks or verification after homing.',
         inputSchema: {
             type: 'object',
             properties: {
+                ignore_stale_position: {
+                    type: 'boolean',
+                    default: false,
+                    description: 'Only on the operator explicit demand to home despite stale position. Bypasses stale-position rejection only; all other guards and fresh completion verification remain.',
+                },
                 wait_until_moved: {
                     type: 'boolean',
                     description: 'Default true: block ~15-20s until the firmware reports homed and '
@@ -1307,7 +1337,9 @@ export function registerCameraTools(registry: ToolRegistry): void {
             },
             additionalProperties: false,
         },
-        handler: async (args: { wait_until_moved?: boolean }) => homeMachine('home', args.wait_until_moved !== false),
+        handler: async (args: { wait_until_moved?: boolean; ignore_stale_position?: boolean }) => (
+            homeMachine('home', args.wait_until_moved !== false, args.ignore_stale_position === true)
+        ),
     });
 
     registry.register({
