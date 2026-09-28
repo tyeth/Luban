@@ -32,6 +32,15 @@ serves them, and `LUBAN_MCP_PORT` (env) overrides everything for one run.
 A project-scope `.mcp.json` at the repo root points Claude Code sessions at
 `http://127.0.0.1:40889/mcp` automatically.
 
+Outside this checkout, the repo is also a Codex / ChatGPT plugin marketplace:
+`.agents/plugins/marketplace.json` lists one plugin, `luban-cnc`, whose root is `.agents/`
+(manifest `.agents/.codex-plugin/plugin.json`). It bundles the skills in `.agents/skills/` and
+the same MCP server, from `.agents/.mcp.json`, which must match the root `.mcp.json`;
+`test/pluginMarketplace.js` checks the wiring. Add it with `codex plugin marketplace add
+tyeth/Luban --ref startup/base` (or a local path), then `codex plugin add luban-cnc@luban`; the
+ChatGPT desktop app reads the same marketplace. The server is loopback-only, so the Luban app
+must be running on the same machine with MCP enabled.
+
 ## Installing
 
 - **Release/CI builds**: the fork publishes no releases — installers come from CI
