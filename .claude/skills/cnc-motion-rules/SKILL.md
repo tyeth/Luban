@@ -20,7 +20,8 @@ item, quoting the tool result — not an essay):
    `isHomed` true, `machineStatus` idle. `get_stored_state` for landmarks, limits, geometry.
    Not homed → homing is itself a motion (law 1), and it also homes B: stock on the rotary
    rotates — say so before calling it. `home` runs on the call, with no confirm page (law 6):
-   the operator's word in chat is its whole authority, so get that word first.
+   the operator's word in chat is its whole authority, so get that word first. Only an explicit
+   demand to home despite stale data permits `home {ignore_stale_position: true}` (§3).
 2. **Frame.** Every number you plan with is MACHINE frame, or the job declares the WORK frame
    and the MCP resolves it (§2). Never convert a file's coordinates by hand. No bare `Z`.
 3. **Height.** Any XY move over 1 mm runs at or above the MOTION FLOOR — machine **Z320**
@@ -40,8 +41,9 @@ item, quoting the tool result — not an essay):
 5. **Tool.** A tool or the probe is ALWAYS in the spindle. Where is its tip at the Z you plan?
 6. **Authority.** An explicit imperative in the operator's LATEST message is necessary — not
    sufficient. It authorises STAGING; the click on the confirm page authorises the motion. An
-   imperative on a rejected or stale position ("home it to fix the reading") is still refused
-   by the tools, and you say why (§3). **Staging is half a call, and the LINK comes first.**
+   imperative on a rejected position is still refused by the tools (§3). Stale data has one
+   narrow exception: the operator explicitly demands homing despite it; then, and only then,
+   `home {ignore_stale_position: true}` is allowed. This is not authority for any other motion. **Staging is half a call, and the LINK comes first.**
    The moment a staging tool returns, reply with one sentence and the `confirm_url` as the
    last line, and END THE TURN — the operator cannot click a link they have not seen. Only
    then wait: `start_gcode_job {job_id, wait_for_approval_ms}` as a BACKGROUND poll, or
@@ -126,7 +128,7 @@ item, quoting the tool result — not an essay):
    `probe_program`. **Two tools move on the call itself, with no confirm page** (operator
    ruling, 2026-09-21): `home` — homing is safe: Z rises first, then every axis to its switch,
    B included; it still needs the operator's explicit word (law 1) and a reliable position
-   (§3), and you say the stock will turn before calling it — and `move_and_capture`, the
+   unless they explicitly demand the stale-position exception (§3), and you say the stock will turn before calling it — and `move_and_capture`, the
    ≤ 100 mm vision nudge, which is Z-gated inside the tool (law 7). Everything else that moves
    the head reaches the operator as a page. **Order:
    stage → deliver the confirm URL as the LAST LINE of your message, alone, plain, one
@@ -247,7 +249,35 @@ The MCP keeps ONE judged machine position. Read it; never compute your own from 
 | `cached-offset` | Beat carried a missing/zero offset; the last complete offset was reused | allowed; re-read once before a position CHECK |
 | `awaiting-resync` | The beat was REJECTED (out of bounds, frame-flip signature, or no offset yet) and the record is held at the last accepted position with its age | **refused** by every motion tool |
 | `heartbeat` + `frame: machine-frame` | Three consecutive beats read as a legal MACHINE position while the work reading was impossible: the controller is stuck in the machine workspace. The raw fields ARE the position | allowed — but the work coordinates and the offset are not to be trusted until `restore_work_frame` |
-| `stale` | No report for > 10 s (period 2 s) — the connection has likely dropped unnoticed | **refused** — reconnect and re-verify |
+| `stale` | No report for > 10 s (period 2 s) — the connection has likely dropped unnoticed | **refused**, except user-demanded homing below — recover the session and re-verify |
+
+**A stale connection is not a pairing request.** Diagnose through MCP: `get_connection_status`,
+`get_position`, `get_mcp_diagnostics`, then `query_firmware_position` (`M114`) for a fresh
+controller reply. An empty reply or a bare success code is NOT evidence that the machine is
+alive. `M114` is the primary fresh-position query. `query_firmware_configuration` sends read-only
+`M503 S` as a secondary diagnostic of configuration currently in use, not necessarily EEPROM
+values; use it when the position query fails or to inspect current configuration.
+A fresh M114 is in the selected workspace; it does not independently verify the machine-frame
+position or validate an old origin offset.
+
+For a stopped heartbeat, use `recover_machine_connection`. It checks the existing HTTP session
+and restarts polling without calling the pairing endpoint. It never requests a new token or
+causes touchscreen pairing. Re-read `get_position` and require fresh reliable data afterwards.
+If this tool is unavailable, has no retained session, or reports expired credentials: STOP
+recovery and report that limitation. The operator can reconnect through Luban's saved-token
+flow. Never invent an alternative by opening a socket/backend client, sending `/connect`,
+passing a blank token, changing credentials, or requesting touchscreen approval. A general
+"fix the connection" instruction does not authorise pairing. Only the operator's explicit
+Connect action in Luban may initiate pairing; agents never set `allowPairing` themselves.
+This applies to connection diagnosis as well as motion; being a read-only diagnostic does
+not authorise changing the transport or authentication state.
+
+**User-demanded homing with stale data.** `home` defaults `ignore_stale_position` to false.
+Only when the operator explicitly insists on homing despite the stale report may the agent set
+it true, after announcing that B will also home and rotate mounted stock. It bypasses only the
+stale-position refusal: connection, idle/toolhead checks, alarms, command errors and fresh
+completion verification still apply. It never blesses old coordinates, waives an incoherent
+frame refusal or permits later motion on stale data. A generic repair request is not this demand.
 
 **Nothing you do performs the resync, with one exception.** The server clears
 `awaiting-resync` when a coherent beat arrives (normally the next one, 2 s). Homing does not

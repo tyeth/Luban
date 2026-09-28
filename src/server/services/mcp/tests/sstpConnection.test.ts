@@ -1,0 +1,301 @@
+import assert from 'assert';
+import { EventEmitter } from 'events';
+import fs from 'fs';
+import path from 'path';
+import vm from 'vm';
+import ts from 'typescript';
+import * as procedureLimits from '../procedureLimits';
+import { reliableForMotion } from '../machinePosition';
+
+function load(file: string, dependencies: Record<string, unknown>) {
+    const source = fs.readFileSync(path.join(__dirname, '../../machine', file), 'utf8');
+    const compiled = ts.transpileModule(source, { compilerOptions: {
+        module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2019, esModuleInterop: true,
+    } });
+    const exports = {} as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+    vm.runInNewContext(compiled.outputText, {
+        exports,
+        setInterval,
+        clearInterval,
+        clearTimeout,
+        Date,
+        require: (name: string) => {
+            if (!(name in dependencies)) { throw new Error(`Unstubbed dependency: ${name}`); }
+            return dependencies[name];
+        },
+    });
+    return exports;
+}
+
+function stubImports(source: string): Record<string, unknown> {
+    const dependencies: Record<string, unknown> = {};
+    const pattern = /from ['"]([^'"]+)['"]/g;
+    let match = pattern.exec(source);
+    while (match !== null) {
+        dependencies[match[1]] = {};
+        match = pattern.exec(source);
+    }
+    return dependencies;
+}
+
+const events = { Connecting: 'connecting', Connected: 'connected', Ready: 'ready', Disconnected: 'disconnected', ErrorReport: 'error-report' };
+const logger = () => ({ info: () => undefined, warn: () => undefined, debug: () => undefined });
+
+function fixture() {
+    const workers: Array<{ callback: (value: object) => void; terminated: boolean; terminate: () => void }> = [];
+    const sent: string[] = [];
+    const replies: Array<{ err?: object; res?: object }> = [];
+    const requests: Array<{ method: string; url: string }> = [];
+    const request = (method: string, url: string) => {
+        requests.push({ method, url });
+        const req = {
+            timeout: () => req,
+            query: () => req,
+            send: (value: string) => { if (value.startsWith('code=')) { sent.push(value.slice(5)); } return req; },
+            end: (callback: (err?: object, res?: object) => void) => { const reply = replies.shift(); callback(reply?.err, reply?.res); },
+        };
+        return req;
+    };
+    class Channel extends EventEmitter {
+        public socket = new EventEmitter();
+    }
+    const module = load('channels/SstpHttpChannel.ts', {
+        lodash: { includes: (items: unknown[], value: unknown) => items.includes(value), isNil: (value: unknown) => value == null, isEqual: () => false },
+        superagent: { post: (url: string) => request('POST', url), get: (url: string) => request('GET', url) },
+        '../../../../app/communication/socket-events': { ConnectionOpen: 'connection:open' },
+        '../../../../app/constants/machines': {},
+        '../../../../app/machines/snapmaker-2-toolheads': {},
+        '../../../constants': {},
+        '../../../lib/logger': logger,
+        '../../task-manager/workerManager': { heartBeat: (_args: unknown, callback: (value: object) => void) => {
+            const worker = { callback, terminated: false, terminate: () => { worker.terminated = true; } };
+            workers.push(worker);
+            return worker;
+        } },
+        '../types': { ConnectionType: { WiFi: 'wifi' } },
+        './Channel': Channel,
+        './ChannelEvent': { ChannelEvent: events },
+    });
+    const HttpChannel = module.default;
+    const channel = new HttpChannel();
+    channel.socket = new EventEmitter();
+    channel.getGcodePrintingInfo = () => ({});
+    return { channel, workers, replies, sent, requests };
+}
+
+function cameraFixture() {
+    const source = fs.readFileSync(path.join(__dirname, '../tools/camera.ts'), 'utf8');
+    const dependencies = stubImports(source);
+    const commands: string[] = [];
+    const replies: Array<{ result: number; text?: string }> = [];
+    const state = { machineStatus: 'idle', reliability: 'stale', headPower: 0, frame: 'work-frame', originOffset: { x: 10, y: 20, z: 30 } };
+    const alarm = { tripped: false };
+    Object.assign(dependencies, {
+        '../../../lib/logger': logger,
+        '../procedureLimits': procedureLimits,
+        '../machinePosition': { reliableForMotion },
+        '../index': { mcpBroadcast: () => undefined },
+        '../positionOfRecord': { bumpGcodeSequence: () => 1, noteDirectGcodeStart: () => undefined, noteDirectGcodeEnd: () => undefined },
+        '../diagnostics': { recordGcodeTiming: () => undefined },
+        '../registry': { McpToolError: Error },
+        '../probeFeed': { probeFeedService: {
+            assertNoOvertravel: () => { if (alarm.tripped) { throw new Error('alarm'); } },
+            motionBegin: () => undefined,
+            motionEnd: () => undefined,
+        } },
+        './machine': {
+            getPositionSnapshot: () => state,
+            assertFreshHeartbeat: () => { throw new Error('Refusing home: unreliable heartbeat'); },
+        },
+        '../../machine/ConnectionManager': { connectionManager: {
+            getLatestMachineState: () => state,
+            getCurrentChannel: () => ({ executeGcode: async (gcode: string) => { commands.push(gcode); return replies.shift() || { result: 0 }; } }),
+        } },
+    });
+    return { camera: load('../mcp/tools/camera.ts', dependencies), state, commands, alarm, replies };
+}
+
+const online = { status: 'online', res: { status: 200, body: { status: 'IDLE', x: 1, y: 2, z: 3, homed: true } } };
+
+export const tests: Array<[string, () => void | Promise<void>]> = [
+    ['HTTP failures propagate and stop a multi-line command, instead of returning success', async () => {
+        for (const failure of [
+            { err: { message: 'Unauthorized' }, res: { status: 401, text: 'Unauthorized' } },
+            { err: { message: 'Timeout', code: 'ETIMEDOUT' } },
+            { res: { status: 500, text: 'Internal error' } },
+        ]) {
+            const { channel, replies, sent } = fixture();
+            replies.push(failure);
+            const result = await channel.executeGcode('G53\nG28\nG54');
+            assert.strictEqual(result.result, -1);
+            assert(result.text.includes('Controller request failed'));
+            assert.deepStrictEqual(sent, ['G53']);
+        }
+    }],
+    ['successful controller text is retained for M114 and M503 S', async () => {
+        const { channel, replies } = fixture();
+        replies.push({ res: { status: 200, text: 'X:1 Y:2 Z:3' } }, { res: { status: 200, text: 'configuration' } });
+        const result = await channel.executeGcode('M114\nM503 S');
+        assert.strictEqual(result.result, 0);
+        assert.strictEqual(result.text, 'X:1 Y:2 Z:3\nconfiguration');
+    }],
+    ['opening a client preserves polling; offline clears position and emits a server disconnect', async () => {
+        const { channel, workers } = fixture();
+        await channel.startHeartbeat();
+        workers[0].callback(online);
+        assert(channel.getLatestMachineState());
+        channel.onConnection();
+        assert.strictEqual(workers[0].terminated, false);
+        let disconnected = 0;
+        channel.on(events.Disconnected, () => { disconnected++; });
+        workers[0].callback({ status: 'offline', msg: 'Timeout' });
+        assert.strictEqual(workers[0].terminated, true);
+        assert.strictEqual(channel.getLatestMachineState(), null);
+        assert.strictEqual(disconnected, 1);
+        workers[0].callback(online);
+        assert.strictEqual(channel.getLatestMachineState(), null);
+        await channel.startHeartbeat();
+        workers[0].callback(online);
+        assert.strictEqual(channel.getLatestMachineState(), null);
+        workers[1].callback(online);
+        assert(channel.getLatestMachineState());
+    }],
+    ['reconnect cancels queued commands and cannot send the tail of an old batch', async () => {
+        const { channel } = fixture();
+        let finish: (value: { code: number; text: string }) => void = () => assert.fail('No pending request');
+        const sent: string[] = [];
+        channel._executeGcode = async (command: string) => {
+            sent.push(command);
+            return new Promise<{ code: number; text: string }>(resolve => { finish = resolve; });
+        };
+        const active = channel.executeGcode('G53\nG28');
+        const queued = channel.executeGcode('G54');
+        channel.init();
+        assert.strictEqual((await queued).result, -1);
+        finish({ code: 200, text: 'ok' });
+        assert.strictEqual((await active).result, -1);
+        assert.deepStrictEqual(sent, ['G53']);
+    }],
+    ['blank or invalid tokens never start automatic pairing, or overwrite an existing session', async () => {
+        const { channel, requests, replies } = fixture();
+        channel.host = 'http://existing';
+        channel.token = 'saved';
+        const errors: string[] = [];
+        channel.socket.on('connection:open', (result: { msg: string }) => errors.push(result.msg));
+        for (const token of ['', '   ']) {
+            assert.strictEqual(await channel.connectionOpen({ host: 'http://new', token }), false);
+        }
+        assert.strictEqual(requests.length, 0);
+        replies.push({ err: { message: 'Unauthorized token=secret' }, res: { status: 401 } });
+        assert.strictEqual(await channel.connectionOpen({ host: 'http://new', token: 'expired' }), false);
+        assert.deepStrictEqual(requests, [{ method: 'GET', url: 'http://new/api/v1/status' }]);
+        assert.strictEqual(channel.host, 'http://existing');
+        assert.strictEqual(channel.token, 'saved');
+        assert(errors.every(error => !error.includes('secret')));
+    }],
+    ['retained-session recovery uses GET only and refuses missing, expired and pending-pairing sessions', async () => {
+        const { channel, replies, requests } = fixture();
+        await assert.rejects(channel.verifyExistingSession(), /No existing HTTP machine session/);
+        assert.strictEqual(requests.length, 0);
+        channel.host = 'http://existing';
+        channel.token = 'saved';
+        channel.state.series = 'Snapmaker 2.0 A350';
+        for (const res of [{ status: 401 }, { status: 204, body: {} }, { status: 200, body: {} }]) {
+            replies.push({ res });
+            await assert.rejects(channel.verifyExistingSession(), /No pairing was attempted/);
+        }
+        replies.push({ res: online.res });
+        await channel.verifyExistingSession();
+        assert(requests.every(req => req.method === 'GET' && req.url.endsWith('/api/v1/status')));
+    }],
+    ['homing override is stale-only: default, incoherence, running spindle, busy state and alarm still refuse', async () => {
+        const { camera, state, commands, alarm } = cameraFixture();
+        await assert.rejects(camera.homeMachine('home'), /unreliable heartbeat/);
+        assert.strictEqual(commands.length, 0);
+        const result = await camera.homeMachine('home', false, true);
+        assert.strictEqual(result.position_verified, false);
+        assert.deepStrictEqual(commands, ['G53;\nG28;\nG54;']);
+        state.reliability = 'awaiting-resync';
+        await assert.rejects(camera.homeMachine('home', false, true), /unreliable heartbeat/);
+        state.reliability = 'stale';
+        state.headPower = 100;
+        await assert.rejects(camera.homeMachine('home', false, true), /Toolhead appears to be on/);
+        state.headPower = 0;
+        state.machineStatus = 'running';
+        await assert.rejects(camera.homeMachine('home', false, true), /not idle/);
+        state.machineStatus = 'idle';
+        alarm.tripped = true;
+        await assert.rejects(camera.homeMachine('home', false, true), /alarm/);
+        assert.strictEqual(commands.length, 1);
+    }],
+    ['fresh M114 does not combine its work coordinates with a stale heartbeat offset', async () => {
+        const { camera, commands, replies } = cameraFixture();
+        const tools = new Map();
+        camera.registerCameraTools({ register: (tool: { name: string }) => tools.set(tool.name, tool) });
+        replies.push({ result: 0, text: 'X:1 Y:2 Z:3' });
+        const result = await tools.get('query_firmware_position').handler({});
+        assert.strictEqual(result.firmware_work.x, 1);
+        assert.strictEqual(result.derived_machine, null);
+        assert.deepStrictEqual(commands, ['M114']);
+    }],
+    ['M503 S exposes current configuration text and rejects empty, bare ok and transport failures', async () => {
+        const { camera, commands, replies } = cameraFixture();
+        const tools = new Map();
+        camera.registerCameraTools({ register: (tool: { name: string }) => tools.set(tool.name, tool) });
+        const query = tools.get('query_firmware_configuration').handler;
+        for (const reply of [{ result: 0 }, { result: 0, text: 'ok' }, { result: -1, text: 'Unauthorized' }]) {
+            replies.push(reply);
+            await assert.rejects(query({}), /No fresh machine data/);
+        }
+        replies.push({ result: 0, text: 'M92 X80 Y80 Z400' });
+        const result = await query({});
+        assert.strictEqual(result.raw, 'M92 X80 Y80 Z400');
+        assert(commands.every(command => command === 'M503 S'));
+    }],
+    ['disconnect clears server state; authenticated recovery restores polling without pairing', async () => {
+        const { channel, replies, requests, workers } = fixture();
+        const source = fs.readFileSync(path.join(__dirname, '../../machine/ConnectionManager.ts'), 'utf8');
+        const dependencies = stubImports(source);
+        let closed = 0;
+        let stopped = 0;
+        Object.assign(dependencies, {
+            '../../../lib/logger': logger,
+            '../../lib/logger': logger,
+            './types': { ConnectionType: { WiFi: 'wifi' } },
+            './ProtocolDetector': { NetworkProtocol: { Unknown: 'Unknown', HTTP: 'HTTP' }, SerialPortProtocol: {} },
+            './channels/ChannelEvent': { ChannelEvent: events },
+            './channels/SstpHttpChannel': { sstpHttpChannel: channel },
+            './adaptor/Octo': { octo: { onStop: () => { stopped++; }, onStart: () => undefined } },
+        });
+        const manager = load('ConnectionManager.ts', dependencies).connectionManager;
+        manager.channel = channel;
+        manager.machineIdentifier = 'Snapmaker 2.0 A350';
+        manager.machineInstance = { onClosed: async () => { closed++; } };
+        manager.onChannelReady = async () => {
+            manager.machineInstance = { onClosed: async () => undefined };
+            await channel.startHeartbeat();
+        };
+        manager.bindChannelEvents();
+        assert.strictEqual(manager.getConnectionStatus().connected, true);
+        channel.emit(events.Disconnected);
+        assert.strictEqual(manager.getConnectionStatus().connected, false);
+        assert.strictEqual(manager.getConnectionStatus().machineReady, false);
+        assert.strictEqual(manager.getCurrentChannel(), null);
+        assert.strictEqual(closed, 1);
+        assert.strictEqual(stopped, 1);
+        await assert.rejects(manager.recoverMachineConnection(), /No existing HTTP machine session/);
+        assert.strictEqual(manager.getConnectionStatus().connected, false);
+        channel.host = 'http://existing';
+        channel.token = 'saved';
+        channel.state.series = 'Snapmaker 2.0 A350';
+        replies.push({ res: { status: 401 } });
+        await assert.rejects(manager.recoverMachineConnection(), /No pairing was attempted/);
+        assert.strictEqual(manager.getConnectionStatus().connected, false);
+        replies.push({ res: online.res });
+        await manager.recoverMachineConnection();
+        assert.strictEqual(manager.getConnectionStatus().connected, true);
+        workers[0].callback(online);
+        assert(manager.getLatestMachineState());
+        assert(requests.every(req => req.method === 'GET'));
+    }],
+];

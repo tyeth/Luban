@@ -339,7 +339,7 @@ const NetworkConnection: React.FC = () => {
         // connect to agent
         try {
             const { code, msg } = await dispatch(
-                connectActions.connect(selectedAgent)
+                connectActions.connect(selectedAgent, true)
             ) as unknown as { code: number | string; msg: string; };
 
             if (msg) {

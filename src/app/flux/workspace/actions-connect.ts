@@ -205,7 +205,7 @@ const resetMachineState = (connectionType = ConnectionType.WiFi) => {
 /**
  * Connect to machine.
  */
-const connect = (agent: MachineAgent) => {
+const connect = (agent: MachineAgent, allowPairing: boolean = false) => {
     return async (dispatch, getState) => {
         // Update selected agent
         const oldAgent: MachineAgent = getState().workspace.server;
@@ -224,7 +224,7 @@ const connect = (agent: MachineAgent) => {
             connectionStatus: CONNECTION_STATUS_CONNECTING,
         }));
 
-        const { code, msg }: ConnectResult = await agent.connect();
+        const { code, msg }: ConnectResult = await agent.connect(allowPairing);
 
         const connectionStatus = getState().workspace.connectionStatus;
         if (connectionStatus !== CONNECTION_STATUS_CONNECTING) {

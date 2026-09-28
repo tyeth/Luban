@@ -1228,6 +1228,29 @@ returns the tool over the setter, and the second run adds `start_from_current: t
 
 Full agent guidance in `.claude/skills/tool-change/SKILL.md`.
 
+## HTTP connection recovery and authentication
+
+A stopped heartbeat must clear the server's channel, readiness and cached position, not only
+notify the renderer. New renderer/client connections must not stop the machine heartbeat.
+HTTP command errors are propagated and abort the remaining command batch and queued work;
+reconnecting cannot resume commands from the old session.
+
+Use `query_firmware_position` (`M114`), or `query_firmware_configuration` (`M503 S`), to check
+for a fresh raw reply. M114 is the primary position query; M503 S reports currently used
+configuration, not necessarily EEPROM values. Empty text and `result: 0` alone do not prove liveness.
+`recover_machine_connection` verifies the retained HTTP session through `/status` and restarts
+polling, with no `/connect` request, new token or pairing prompt. Credentials are never returned.
+Missing/expired sessions stop recovery with guidance to use Luban's saved-token connection flow.
+Agents must not use raw socket/backend requests, blank tokens, credential edits or
+`allowPairing` to work around that refusal. The generic HTTP connection API rejects blank tokens
+by default and checks supplied credentials before `/connect`; only the explicit network Connect
+button opts into pairing. Saved tokens are still preferred by that button.
+
+`home` refuses stale/incoherent position by default. On the operator's explicit demand,
+`ignore_stale_position: true` bypasses only stale-position rejection. Alarms, idle/toolhead
+checks, transport errors and fresh homing completion verification still apply. Procedures do
+not inherit this override. It does not permit later motion using an old report.
+
 ## Development workflow (learned the hard way)
 
 - **Build**: Node 16 (`/c/dev/software/snapmaker/.tools/node-v16.20.2-win-x64`), python

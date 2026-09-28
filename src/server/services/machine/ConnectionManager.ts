@@ -62,6 +62,9 @@ const ensureRange = (value, min, max) => {
 interface ConnectionOpenOptions {
     connectionType: ConnectionType;
     address: string;
+    host?: string;
+    token?: string;
+    allowPairing?: boolean;
     port?: string;
     baudRate?: number;
     protocol?: NetworkProtocol | SerialPortProtocol;
@@ -359,11 +362,46 @@ class ConnectionManager {
         }
     }
 
+    /** Restore a retained HTTP session, never authenticate or choose a new machine. */
+    public async recoverMachineConnection(): Promise<void> {
+        if (this.channel && this.channel !== sstpHttpChannel) {
+            throw new Error('Recovery is supported only for the existing HTTP machine session.');
+        }
+        const previousChannel = this.channel;
+        await sstpHttpChannel.verifyExistingSession();
+        if (this.channel !== previousChannel) {
+            throw new Error('Connection changed during recovery; nothing was restarted.');
+        }
+        this.unbindChannelEvents();
+        this.channel = sstpHttpChannel;
+        this.connectionType = ConnectionType.WiFi;
+        this.protocol = NetworkProtocol.HTTP;
+        this.bindChannelEvents();
+        sstpHttpChannel.resumeVerifiedSession();
+        octo.onStart();
+    }
+
+    private onChannelDisconnected = () => {
+        // A transport loss must invalidate the server state even with no UI
+        // listening. Clear synchronously so reconnect cannot inherit it.
+        const instance = this.machineInstance;
+        this.unbindChannelEvents();
+        this.channel = null;
+        this.machineIdentifier = null;
+        this.machineInstance = null;
+        octo.onStop();
+        if (instance) {
+            instance.onClosed().catch(err => log.warn(`Disconnect cleanup failed: ${err.message}`));
+        }
+        this.socket && this.socket.emit('connection:close', { code: 200, data: {}, msg: '', text: '' });
+    };
+
     private bindChannelEvents(): void {
         if (!this.channel) {
             return;
         }
 
+        this.channel.on(ChannelEvent.Disconnected, this.onChannelDisconnected);
         this.channel.on(ChannelEvent.Connecting, this.onChannelConnecting);
         this.channel.on(ChannelEvent.Connected, this.onChannelConnected);
         this.channel.on(ChannelEvent.Ready, this.onChannelReady);
@@ -375,6 +413,7 @@ class ConnectionManager {
             return;
         }
 
+        this.channel.off(ChannelEvent.Disconnected, this.onChannelDisconnected);
         this.channel.off(ChannelEvent.Connecting, this.onChannelConnecting);
         this.channel.off(ChannelEvent.Connected, this.onChannelConnected);
         this.channel.off(ChannelEvent.Ready, this.onChannelReady);
@@ -385,6 +424,14 @@ class ConnectionManager {
      * Connection open.
      */
     public connectionOpen = async (socket: SocketServer, options: ConnectionOpenOptions) => {
+        if (options.connectionType === ConnectionType.WiFi && options.protocol === NetworkProtocol.HTTP
+            && !options.token?.trim() && options.allowPairing !== true) {
+            socket.emit(SocketEvent.ConnectionOpen, {
+                code: 401,
+                msg: 'No saved machine token. Automatic pairing is disabled; use the Connect button in Luban explicitly.',
+            });
+            return;
+        }
         // Cancel subscriptions
         if (this.channel) {
             this.unbindChannelEvents();
@@ -447,7 +494,14 @@ class ConnectionManager {
         this.channel.setSocket(socket);
 
         log.info(`ConnectionOpen: type = ${connectionType}, channel = ${this.channel.constructor.name}.`);
-        await this.channel.connectionOpen(options);
+        const openedChannel = this.channel;
+        const connected = await openedChannel.connectionOpen(options);
+        if (!connected) {
+            if (this.channel === openedChannel) {
+                this.onChannelDisconnected();
+            }
+            return;
+        }
         octo.onStart();
     };
 

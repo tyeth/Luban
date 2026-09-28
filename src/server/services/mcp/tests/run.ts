@@ -11,6 +11,7 @@
  * legacy JS, and these modules must stay importable without the Luban
  * server (config/settings.base is ESM-only and breaks ts-node).
  */
+import { tests as sstpConnectionTests } from './sstpConnection.test';
 import { tests as bootstrapPlanTests } from './bootstrapPlan.test';
 import { tests as camLinksTests } from './camLinks.test';
 import { tests as cameraGeometryTests } from './cameraGeometry.test';
@@ -51,6 +52,7 @@ import { tests as wallFollowTests } from './wallFollow.test';
 type TestCase = [string, () => void | Promise<void>];
 
 const suites: Array<[string, TestCase[]]> = [
+    ['sstpConnection', sstpConnectionTests],
     ['validator', validatorTests],
     ['workspace', workspaceTests],
     ['threadMilling', threadMillingTests],

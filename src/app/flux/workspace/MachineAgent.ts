@@ -85,7 +85,7 @@ export class MachineAgent extends EventEmitter {
         this.token = token;
     }
 
-    public async connect(): Promise<ConnectResult> {
+    public async connect(allowPairing: boolean = false): Promise<ConnectResult> {
         if (this.isNetworkedMachine) {
             log.info(`Connecting to machine ${this.address}...`);
             log.info(`- protocol = ${this.protocol}`);
@@ -101,6 +101,7 @@ export class MachineAgent extends EventEmitter {
                     host: this.host,
                     address: this.address,
                     token: this.token,
+                    allowPairing,
                     port: this.port,
                     baudRate: this.baudRate,
                     protocol: this.protocol,

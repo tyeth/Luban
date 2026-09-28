@@ -2,7 +2,7 @@ import { connectionManager } from '../../machine/ConnectionManager';
 import { diagnosticsSnapshot } from '../diagnostics';
 import { getPositionOfRecord, getTrustedOffset } from '../positionOfRecord';
 import { probeFeedService } from '../probeFeed';
-import { ToolRegistry } from '../registry';
+import { McpToolError, ToolRegistry } from '../registry';
 import { currentGcodeSequence } from './camera';
 import { machinePositionDiagnostics } from './machine';
 
@@ -21,6 +21,28 @@ export function registerStatusTools(registry: ToolRegistry): void {
         },
         handler: async () => {
             return connectionManager.getConnectionStatus();
+        },
+    });
+
+    registry.register({
+        name: 'recover_machine_connection',
+        description: 'Recover stopped HTTP heartbeat polling using only the machine session already held by Luban. '
+            + 'Verifies that session with a read-only status request, then restarts polling. No motion, no /connect '
+            + 'request, no new authentication and no touchscreen pairing prompt. Refuses missing/expired credentials '
+            + 'or a different active transport. Never use raw backend/socket requests, blank tokens or stored-token '
+            + 'edits as a fallback. After success read get_position and require a fresh report before motion.',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        handler: async () => {
+            try {
+                await connectionManager.recoverMachineConnection();
+            } catch (error) {
+                throw new McpToolError((error as Error).message);
+            }
+            return {
+                recovered: true,
+                connection: connectionManager.getConnectionStatus(),
+                note: 'Existing session verified; heartbeat polling restarted. Read get_position for a fresh report. No motion or pairing was requested.',
+            };
         },
     });
 
