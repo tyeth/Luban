@@ -28,7 +28,7 @@ import { connectionManager } from '../machine/ConnectionManager';
 import { listAudioSources, ffmpegBinary } from './audioDevices';
 import { AudioSource, describeSourceChoice, matchAudioDevice } from './audioSelection';
 import { McpJob, jobManager } from './jobs';
-import { LineKind, ProgramLine, SpindleProgram, lineContext, parseSpindleProgram } from './spindleProgram';
+import { LineKind, Point3, ProgramLine, SpindleProgram, inferExecutingLine, parseSpindleProgram } from './spindleProgram';
 import { AudioRecorder, RecorderStats } from './spindleAudio';
 import {
     EpochSummary,
@@ -71,15 +71,26 @@ const AUDIO_TAIL_MS = 1500;
 const DEFAULT_QUERY_POINTS = 2000;
 const MAX_QUERY_POINTS = 20000;
 
+// `line` is the EXECUTING line inferred from the reported position against
+// the file's path (spindleProgram.ts); `parserLine` is what the controller
+// reports as currentLine, which runs far ahead. x/y/z are the reported
+// coordinates in the file's frame at 0.02 mm; `match` says how the line was
+// found (0 unmatched / held, 1 on a segment, 2 at a segment end).
 const STATUS_COLUMNS: ColumnSpec[] = [
     { name: 't', type: 'u32' },
     { name: 'line', type: 'u32' },
+    { name: 'parserLine', type: 'u32' },
+    { name: 'x', type: 'i16', scale: 50 },
+    { name: 'y', type: 'i16', scale: 50 },
+    { name: 'z', type: 'i16', scale: 50 },
+    { name: 'match', type: 'u8' },
     { name: 'rpm', type: 'i16' },
     { name: 'target', type: 'i16' },
     { name: 'commandedS', type: 'i16' },
     { name: 'pollMs', type: 'u16' },
     { name: 'source', type: 'u8' },
 ];
+const MATCH_CODES: { [match: string]: number } = { unmatched: 0, segment: 1, endpoint: 2 };
 
 const AUDIO_COLUMNS: ColumnSpec[] = [
     { name: 't', type: 'u32' },
@@ -204,7 +215,20 @@ class TelemetrySession {
 
     private currentLine: number | null = null;
 
+    private parserLine: number | null = null;
+
     private currentContext: ProgramLine | null = null;
+
+    /** How the executing line was found on the last report. */
+    private lastMatch: 'segment' | 'endpoint' | 'unmatched' | null = null;
+
+    private unmatchedSamples = 0;
+
+    /** Status samples whose RPM field read exactly 0 while the file commanded a speed. */
+    private zeroRpmSamples = 0;
+
+    /** The file's frame: work-frame coordinates compare directly with the report; a G53 file needs machine = work - offset. */
+    private readonly fileFrame: 'work' | 'machine';
 
     private lastKind: LineKind | null = null;
 
@@ -258,6 +282,8 @@ class TelemetrySession {
             log.warn(`telemetry: cannot read ${job.filePath}: ${(err as Error).message}`);
         }
         this.program = parseSpindleProgram(text);
+        const declared = job.validation && job.validation.frame ? job.validation.frame.declared : null;
+        this.fileFrame = declared === 'machine' ? 'machine' : 'work';
         this.status = new TelemetryRing(STATUS_COLUMNS, { maxSamples: cfg.sampleLimit, initialCapacity: 1024 });
         this.audio = cfg.audioEnabled ? new TelemetryRing(AUDIO_COLUMNS, { maxSamples: cfg.sampleLimit, initialCapacity: 4096 }) : null;
     }
@@ -357,36 +383,79 @@ class TelemetrySession {
             this.lastStatusScalars = scalarKeys(data);
         }
         this.statusSamples += 1;
-
         if (line && line.value > 0) {
-            this.currentLine = line.value;
-            const ctx = lineContext(this.program, line.value);
-            this.currentContext = ctx;
-            const kind = ctx ? ctx.kind : null;
-            if (kind !== this.lastKind) {
-                this.lastKind = kind;
-                this.lastKindChangeAt = at;
+            this.parserLine = line.value;
+        }
+
+        // The executing line comes from the reported position, never from
+        // currentLine alone (the parser runs the whole file ahead).
+        const position = this.reportedPosition(data);
+        const inferred = position ? inferExecutingLine(this.program, position, this.parserLine, this.currentLine) : null;
+        if (inferred) {
+            this.lastMatch = inferred.match;
+            if (inferred.match === 'unmatched') {
+                this.unmatchedSamples += 1;
             }
-            const epoch = ctx ? ctx.epoch : -1;
-            if (epoch !== this.lastEpoch) {
-                this.lastEpoch = epoch;
-                this.lastEpochChangeAt = at;
+            if (inferred.match !== 'unmatched' || this.currentContext === null) {
+                this.currentLine = inferred.line;
+                const ctx = inferred.context;
+                this.currentContext = ctx;
+                const kind = ctx.kind;
+                if (kind !== this.lastKind) {
+                    this.lastKind = kind;
+                    this.lastKindChangeAt = at;
+                }
+                const epoch = ctx.epoch;
+                if (epoch !== this.lastEpoch) {
+                    this.lastEpoch = epoch;
+                    this.lastEpochChangeAt = at;
+                }
             }
         }
         const ctx = this.currentContext;
         const commandedS = ctx && ctx.s !== null ? ctx.s : NaN;
+        if (rpm && rpm.value === 0 && Number.isFinite(commandedS)) {
+            this.zeroRpmSamples += 1;
+        }
         this.status.push({
             t: at - this.startedAt,
             line: this.currentLine === null ? NaN : this.currentLine,
+            parserLine: this.parserLine === null ? NaN : this.parserLine,
+            x: position ? position.x : NaN,
+            y: position ? position.y : NaN,
+            z: position ? position.z : NaN,
+            match: inferred ? MATCH_CODES[inferred.match] : NaN,
             rpm: rpm ? rpm.value : NaN,
             target: target ? target.value : NaN,
             commandedS,
             pollMs,
             source,
         });
-        if (rpm && ctx && ctx.s !== null && ctx.s > 0) {
+        if (rpm && rpm.value > 0 && ctx && ctx.s !== null && ctx.s > 0) {
             this.judgeStatusSample(rpm.value, ctx, at);
         }
+    }
+
+    /** The reported coordinates in the file's frame (the status reports the selected workspace; a G53 file wants machine = work - offset). */
+    private reportedPosition(data: Record<string, unknown>): Point3 | null {
+        const x = Number(data.x);
+        const y = Number(data.y);
+        const z = Number(data.z);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+            return null;
+        }
+        const point: Point3 = { x, y, z: Number.isFinite(z) ? z : NaN };
+        if (this.fileFrame === 'machine') {
+            const ox = Number(data.offsetX);
+            const oy = Number(data.offsetY);
+            const oz = Number(data.offsetZ);
+            if (!Number.isFinite(ox) || !Number.isFinite(oy)) {
+                return null;
+            }
+            // Telemetry alignment only - never a position of record.
+            return { x: x - ox, y: y - oy, z: Number.isFinite(z) && Number.isFinite(oz) ? z - oz : NaN };
+        }
+        return point;
     }
 
     /**
@@ -557,7 +626,7 @@ class TelemetrySession {
             status: status ? { ...status, ageMs: tNow - status.t } : null,
             audio: audio ? { ...audio, ageMs: tNow - audio.t, device: this.audioSource ? this.audioSource.entry : null, error: this.audioError } : null,
             spark: {
-                status: tail(this.status, ['rpm', 'target', 'commandedS']),
+                status: tail(this.status, ['rpm', 'target', 'commandedS', 'line']),
                 audio: tail(this.audio, ['rpm', 'rel', 'levelDb', 'chatterDb']),
             },
             events: this.eventCounts,
@@ -670,7 +739,12 @@ class TelemetrySession {
             targetField: this.targetField,
             lineField: this.lineField,
             statusScalarsSeen: this.rpmField ? undefined : this.lastStatusScalars,
+            lineSource: 'executing line inferred from the reported position against the file path; parserLine is the controller\'s currentLine, which runs ahead',
             currentLine: this.currentLine,
+            parserLine: this.parserLine,
+            lastMatch: this.lastMatch,
+            unmatchedSamples: this.unmatchedSamples,
+            zeroRpmSamples: this.zeroRpmSamples,
             poll: this.config.statusPollMs ? {
                 periodMs: this.config.statusPollMs,
                 count: this.poll.count,
@@ -808,13 +882,19 @@ class TelemetrySession {
             t_origin: 'ms since telemetry start (job start); status.t and audio.t share it',
             max_points: maxPoints,
             series_retained: !this.ringsReleased,
-            status: series(this.status, ['line', 'rpm', 'target', 'commandedS', 'pollMs', 'source']),
+            status: series(this.status, ['line', 'parserLine', 'x', 'y', 'z', 'match', 'rpm', 'target', 'commandedS', 'pollMs', 'source']),
             audio: series(this.audio, ['rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role', 'levelDb']),
             audio_file: this.audioFilePath(),
             audio_device: this.audioSource ? this.audioSource.entry : null,
             epochs: this.summary().audio?.epochs || [],
             legend: {
-                status: { source: '0 = heartbeat report, 1 = telemetry poll', commandedS: 'S in effect at the reported line' },
+                status: {
+                    source: '0 = heartbeat report, 1 = telemetry poll',
+                    line: 'EXECUTING line inferred from x/y/z against the file path (parserLine = the controller\'s currentLine, far ahead)',
+                    match: '0 unmatched (line held), 1 on a segment, 2 at a segment end (dwell / spindle lines after it)',
+                    commandedS: 'S in effect at the executing line',
+                    rpm: 'the controller\'s spindleSpeed field: 250 RPM steps and mostly 0 on the A350 (2026-09-29); zeros are excluded from the per-S statistics',
+                },
                 audio: { role: '0 off, 1 spin-up, 2 transition, 3 baseline (unloaded), 4 cut', rel: 'rolling-median RPM / unloaded baseline', chatterDb: 'strongest non-harmonic tone over the band median', runoutDb: '1x gain - 4x gain vs baseline' },
             },
         };
@@ -856,7 +936,12 @@ export interface TelemetrySummary {
         targetField: string | null;
         lineField: string | null;
         statusScalarsSeen?: { [key: string]: unknown } | null;
+        lineSource: string;
         currentLine: number | null;
+        parserLine: number | null;
+        lastMatch: 'segment' | 'endpoint' | 'unmatched' | null;
+        unmatchedSamples: number;
+        zeroRpmSamples: number;
         poll: {
             periodMs: number; count: number; errors: number; skippedBusy: number; meanMs: number | null; maxMs: number;
             bytesTotal: number; bytesPerSecond: number | null; requestsPerSecond: number | null; controllerBusyPercent: number | null;

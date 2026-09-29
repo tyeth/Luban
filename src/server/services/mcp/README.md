@@ -1220,8 +1220,13 @@ matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-j
 - **Tracker**: mono 16 kHz, 0.15 s Hann frames every 0.05 s, NFFT 16384; each candidate rev
   frequency in 0.80–1.05 × S/60 scored by weighted log power at harmonics {1: 0.6, 2: 0.6,
   3: 0.4, 4: 1.0 (tooth pass), 8: 0.5}, parabolic refinement. Commanded S comes from the `M3 S`
-  words at the line the controller reports (`currentLine`), so alignment needs no timeline
-  guess; feed moves (G1/G2/G3) are "cut", everything else after a 2 s spin-up is "baseline",
+  words at the line the controller is EXECUTING. That line is inferred from the reported
+  x/y/z against the file's own path (`inferExecutingLine`), bounded above by the controller's
+  `currentLine`: measured 2026-09-29, the A350 reports the PARSER position - 85 of 104 lines
+  one second into a five-minute job, the whole file by 44 s - so keying on it read `M5` while
+  the cut was running. A head at a segment's end is placed on the dwell / spindle lines that
+  follow it (the `G4` after an `M3 S`), so an S change is dated by the move before it ending;
+  feed moves (G1/G2/G3) are "cut", everything else after a 2 s spin-up is "baseline",
   and 0.5 s after every reported line-kind change is neither. Per commanded S (an *epoch*):
   HOLD / BLIP / STRUGGLE / NO-LOCK exactly as the reference `grade()`; runout index = (1× gain
   while cutting) − (4× gain), dB vs baseline, flag above −3 dB; chatter = strongest cut-only
@@ -1251,6 +1256,10 @@ matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-j
   report) against the commanded S with the load percentage, the noise level (dBFS), the chatter
   index and the reported line, plus two-minute min/max sparklines - dips below 97 % of S in red,
   chatter peaks over 12 dB in orange - and the job's event tally.
+- **Status RPM on the A350 (verified 2026-09-29)**: the field is `spindleSpeed`, in 250 RPM
+  steps, and it reads 0 on most reports while the spindle runs (773 of 843 samples of job
+  ad892e15b651; the rest 7250-8250 at S8000). Zeros are counted (`zeroRpmSamples`) and excluded
+  from the per-S statistics; the microphone is the RPM source that matters.
 - **Status field names**: the SSTP/HTTP status payload is spread into the machine state
   untouched, so the RPM field is whatever the controller calls it. The session tries
   `cncCurrentSpindleSpeed`, `spindleSpeed`, `currentSpindleSpeed`, `currRpm`, … (SACP writes
