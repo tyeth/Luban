@@ -101,8 +101,32 @@ const STATUS_COLUMNS: ColumnSpec[] = [
 const MATCH_CODES: { [match: string]: number } = { unmatched: 0, segment: 1, endpoint: 2 };
 const ESTIMATE_CODES: { [mode: string]: number } = { time: 0, 'queue-upper': 1, 'queue-lower': 2, anchor: 3 };
 
+/** Bits of the audio ring's `flags` column. */
+export const FRAME_FLAGS = { locked: 1, clipped: 2, contested: 4, ambiguous: 8, gantryLike: 16 };
+
+/**
+ * The modal feed the controller is left holding by the last file job this
+ * process saw run (its last F word): the A350 runs a file's leading G0s at
+ * it (measured 2026-09-29, jobs d8006b17b237 / b3e8f3dd0e34). Unknown
+ * after a Luban restart or a machine power cycle - the estimator then
+ * assumes true rapids, which makes the spindle context start late, never
+ * early.
+ */
+let lastModalFeed: number | null = null;
+
+function lastFeedOf(program: SpindleProgram): number | null {
+    for (let i = program.lines.length - 1; i >= 0; i--) {
+        const feed = program.lines[i].feed;
+        if (feed !== null && feed > 0) {
+            return feed;
+        }
+    }
+    return null;
+}
+
 const AUDIO_COLUMNS: ColumnSpec[] = [
     { name: 't', type: 'u32' },
+    { name: 'flags', type: 'u8' },
     { name: 'rpm', type: 'i16' },
     { name: 'confidence', type: 'u8', scale: 10 },
     { name: 'rel', type: 'u8', scale: 100 },
@@ -309,9 +333,19 @@ class TelemetrySession {
             log.warn(`telemetry: cannot read ${job.filePath}: ${(err as Error).message}`);
         }
         this.program = parseSpindleProgram(text);
-        this.estimator = new ExecutionEstimator(this.program, text, cfg.plannerLeadBlocks);
         const declared = job.validation && job.validation.frame ? job.validation.frame.declared : null;
         this.fileFrame = declared === 'machine' ? 'machine' : 'work';
+        this.estimator = new ExecutionEstimator(this.program, text, cfg.plannerLeadBlocks);
+        this.estimator.setInitialFeed(lastModalFeed);
+        // The head's position BEFORE the file runs gives the leading moves
+        // their real durations; it is the last heartbeat report, taken now
+        // rather than from the first sample (which may already show the
+        // planner's queued target). Telemetry alignment only.
+        const before = connectionManager.getLatestMachineState();
+        const startPosition = before ? this.reportedPosition(before as Record<string, unknown>) : null;
+        if (startPosition && Number.isFinite(startPosition.z)) {
+            this.estimator.setStartPosition(startPosition);
+        }
         this.status = new TelemetryRing(STATUS_COLUMNS, { maxSamples: cfg.sampleLimit, initialCapacity: 1024 });
         this.audio = cfg.audioEnabled ? new TelemetryRing(AUDIO_COLUMNS, { maxSamples: cfg.sampleLimit, initialCapacity: 4096 }) : null;
     }
@@ -634,6 +668,9 @@ class TelemetrySession {
         const wall = (this.audioOriginWall === null ? this.startedAt : this.audioOriginWall) + frame.tMs;
         this.audio.push({
             t: wall - this.startedAt,
+            flags: (frame.locked ? FRAME_FLAGS.locked : 0) | (frame.clipped ? FRAME_FLAGS.clipped : 0)
+                | (frame.contested ? FRAME_FLAGS.contested : 0) | (frame.ambiguous ? FRAME_FLAGS.ambiguous : 0)
+                | (frame.gantryLike ? FRAME_FLAGS.gantryLike : 0),
             rpm: frame.rpm,
             confidence: Math.min(25, frame.confidence),
             rel: frame.rel,
@@ -691,6 +728,7 @@ class TelemetrySession {
             },
             events: this.eventCounts,
             windowMs: LIVE_WINDOW_MS,
+            spectrum: this.analyser ? this.analyser.latestSpectrum() : null,
         };
     }
 
@@ -720,6 +758,7 @@ class TelemetrySession {
         if (this.stopping) {
             return;
         }
+        lastModalFeed = lastFeedOf(this.program) || lastModalFeed;
         this.stopping = true;
         for (const timer of this.timers) {
             clearInterval(timer);
@@ -952,7 +991,7 @@ class TelemetrySession {
             max_points: maxPoints,
             series_retained: !this.ringsReleased,
             status: series(this.status, ['line', 'queuedLine', 'estimate', 'leadBlocks', 'parserLine', 'x', 'y', 'z', 'match', 'rpm', 'target', 'commandedS', 'pollMs', 'source']),
-            audio: series(this.audio, ['rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role', 'levelDb', 'motionHz', 'motionDb',
+            audio: series(this.audio, ['flags', 'rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role', 'levelDb', 'motionHz', 'motionDb',
                 'band0', 'band1', 'band2', 'band3', 'band4', 'band5', 'band6', 'band7']),
             audio_file: this.audioFilePath(),
             audio_device: this.audioSource ? this.audioSource.entry : null,
@@ -968,6 +1007,8 @@ class TelemetrySession {
                     rpm: 'the controller\'s spindleSpeed field: 250 RPM steps and mostly 0 on the A350 (2026-09-29); zeros are excluded from the per-S statistics',
                 },
                 audio: {
+                    flags: 'bits: 1 locked (rpm trusted), 2 clipped, 4 contested by a stronger motion comb, 8 ambiguous (rapid on a gantry harmonic), '
+                        + '16 gantry-like shape (2x >= 1x + 10 dB: the Y/Z axes at F500 sing a 125 Hz comb, not the spindle)',
                     role: '0 off, 1 spin-up, 2 transition, 3 baseline (unloaded), 4 cut',
                     rel: 'rolling-median RPM / loaded reference',
                     chatterDb: 'strongest non-harmonic tone over the band median',
@@ -995,6 +1036,8 @@ export interface TelemetryLive {
     };
     events: { [kind: string]: number };
     windowMs: number;
+    /** The latest audio frame's spectrum on a log frequency axis (max per bin, dB), for the camera page's spectrogram. */
+    spectrum: { hz: number[]; db: number[] } | null;
 }
 
 export interface TelemetrySummary {

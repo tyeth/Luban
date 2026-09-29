@@ -22,6 +22,35 @@ function raster(passes: number): { text: string; program: ReturnType<typeof pars
 }
 
 export const tests: Array<[string, () => void]> = [
+    ['the modal feed survives between files: leading G0s before any F run at the previous job\'s F', () => {
+        // Job b3e8f3dd0e34: park at work (-40.5, 128.2, 116), the file's first two lines are G0s
+        // with no F, the previous job ended on F500. The 117 mm traverse took ~14 s, not 2.3 s.
+        const { text, program } = raster(3);
+        const start = { x: -40.5, y: 128.2, z: 116 };
+        const rapid = lineDurationsMs(program, text, start);
+        const modal = lineDurationsMs(program, text, start, 500);
+        assert.equal(Math.round(rapid[2]), 2340, 'a true rapid: 117 mm at 3000 mm/min');
+        assert.equal(Math.round(modal[2]), 14040, 'the same G0 at the inherited F500');
+        assert.equal(Math.round(modal[3]), 12720, 'the 106 mm Z descent at F500 too');
+        assert.equal(Math.round(modal[7]), 9720, 'later lines with their own F are unchanged');
+        const est = new ExecutionEstimator(program, text, 16);
+        est.setInitialFeed(500);
+        est.setStartPosition(start);
+        // The matcher reports the dwell (line 6) as soon as the two G0s are queued: a sync, frozen.
+        est.update(0, null);
+        let e = est.update(500, 6);
+        assert.equal(e.line, 3, 'on the XY traverse');
+        e = est.update(10000, 6);
+        assert.equal(e.line, 3, 'still on the XY traverse at 10 s');
+        assert.equal(program.lines[e.line - 1].s, null, 'no spindle context');
+        e = est.update(20000, 6);
+        assert.equal(e.line, 4, 'on the Z descent at 20 s');
+        e = est.update(28000, 6);
+        assert.equal(e.line, 6, 'the dwell after M3 from ~26.8 s');
+        e = est.update(60000, 6);
+        assert.equal(e.line, 6, 'held at the frozen sync however late the clock runs');
+    }],
+
     ['a G0 after an F word travels at that feed; the estimate never runs more than a block past the queue-implied head', () => {
         const text = ['G90', 'M3 S8000', 'G0 X0 Y0', 'G1 X81 F500', 'G0 X0', 'G1 X81', 'G0 X0', 'G1 X81', 'G0 X0'].join('\n');
         const program = parseSpindleProgram(text);

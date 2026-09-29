@@ -47,7 +47,7 @@ export interface ExecutionEstimate {
  * and the spindle context would begin while the gantry is still travelling
  * with the spindle off (the 2026-09-29 "8000 RPM before M3" reading).
  */
-export function lineDurationsMs(program: SpindleProgram, text: string, start?: Point3 | null): number[] {
+export function lineDurationsMs(program: SpindleProgram, text: string, start?: Point3 | null, initialFeed?: number | null): number[] {
     const raw = String(text || '').split(/\r?\n/);
     const fill = (point: Point3): Point3 => ({
         x: Number.isFinite(point.x) || !start ? point.x : start.x,
@@ -66,9 +66,15 @@ export function lineDurationsMs(program: SpindleProgram, text: string, start?: P
             }
             // G0 on the A350's CNC firmware travels at the modal feed once one
             // has been set (measured 2026-09-29, job beb4bf0a3d22: 81 mm
-            // returns took ~9.7 s = F500, not the 1.6 s a true rapid would);
-            // only before any F word does the rapid default apply.
-            const feed = line.feed ? line.feed : RAPID_MM_PER_MIN;
+            // returns took ~9.7 s = F500, not the 1.6 s a true rapid would),
+            // and the modal feed SURVIVES between files: the leading G0s of
+            // jobs d8006b17b237 and b3e8f3dd0e34 ran at the previous job's
+            // F500 (a 106 mm Z descent took 12.7 s). Before any F word the
+            // caller's `initialFeed` (the last F of the previous file job)
+            // applies, else the rapid default - which over-estimates speed,
+            // so the spindle context begins late rather than early.
+            const inherited = initialFeed && initialFeed > 0 ? initialFeed : RAPID_MM_PER_MIN;
+            const feed = line.feed ? line.feed : inherited;
             return (Math.sqrt(d2) / feed) * 60000;
         }
         if (line.kind === 'dwell') {
@@ -120,6 +126,9 @@ export class ExecutionEstimator {
      */
     private syncBlock = 0;
 
+    /** The modal feed in force when the file starts (the previous file's last F), null when unknown. */
+    private initialFeed: number | null = null;
+
     public constructor(program: SpindleProgram, text: string, leadBlocks = DEFAULT_PLANNER_LEAD_BLOCKS) {
         this.program = program;
         this.text = text;
@@ -140,7 +149,13 @@ export class ExecutionEstimator {
             return;
         }
         this.startPosition = { ...start };
-        this.durations = lineDurationsMs(this.program, this.text, start);
+        this.durations = lineDurationsMs(this.program, this.text, start, this.initialFeed);
+    }
+
+    /** The modal feed the controller still holds from the previous file: leading G0s before any F run at it. */
+    public setInitialFeed(feed: number | null): void {
+        this.initialFeed = feed !== null && Number.isFinite(feed) && feed > 0 ? feed : null;
+        this.durations = lineDurationsMs(this.program, this.text, this.startPosition, this.initialFeed);
     }
 
     /** The motion line one block after `line` (the file's end when there is none). */
@@ -194,6 +209,16 @@ export class ExecutionEstimator {
         const own = this.program.lines[queued - 1];
         if (own.kind === 'dwell' || own.kind === 'spindle') {
             return true;
+        }
+        // A comment reported after a sync (before any motion) is that sync.
+        for (let line = queued - 1; line >= 1; line--) {
+            const entry = this.program.lines[line - 1];
+            if (entry.motion) {
+                break;
+            }
+            if (entry.kind === 'dwell' || entry.kind === 'spindle') {
+                return true;
+            }
         }
         for (let line = queued + 1; line <= count; line++) {
             const entry = this.program.lines[line - 1];

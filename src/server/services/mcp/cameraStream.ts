@@ -95,12 +95,34 @@ const PANEL_CSS = `#wrap{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-s
 #tele .lbl{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
 #tele .row{display:flex;justify-content:space-between;gap:8px;margin:6px 0 2px}
 #tele svg{width:100%;height:46px;display:block;background:#0d0d0d;border:1px solid #2a2a2a}
+#tele canvas{width:100%;height:96px;display:block;background:#0d0d0d;border:1px solid #2a2a2a;image-rendering:pixelated}
 #tele .warn{color:#f77}#tele .ok{color:#7c7}#tele .dim{color:#777}`;
-const PANEL_HTML = '<aside id="tele"><h3>Spindle telemetry</h3><div id="tele-body" class="dim">waiting for a file job...</div></aside>';
+const PANEL_HTML = '<aside id="tele"><h3>Spindle telemetry</h3><div id="tele-body" class="dim">waiting for a file job...</div>'
+    + '<div class="lbl" id="tele-wf-lbl" style="display:none;margin-top:6px">spectrogram, last 5 min: 30 Hz (bottom) - 8 kHz, log; '
+    + 'brightness = dB over the frame median; cyan = spindle 1x / 4x, pink = gantry tone</div>'
+    + '<canvas id="tele-wf" width="300" height="96" style="display:none"></canvas></aside>';
 const PANEL_JS = `(function(){
   var body=document.getElementById('tele-body');
   if(!body){return;}
   function fmt(v,d){return (v==null||isNaN(v))?'-':Number(v).toFixed(d||0);}
+  var wf=document.getElementById('tele-wf'),wfl=document.getElementById('tele-wf-lbl'),wfCtx=wf?wf.getContext('2d'):null,wfLast=null;
+  function wfRow(hz){return 95-Math.round(Math.log(Math.max(30,Math.min(8000,hz))/30)/Math.log(8000/30)*95);}
+  function waterfall(sp,rpm,motionHz,stamp){
+    // One 1 px column per new audio frame: a scrolling log-frequency spectrogram, each column
+    // scaled to its own median so comb lines stand out at any overall level (octave-band bars
+    // saturated as soon as the cut or the gantry got loud).
+    if(!wfCtx||!sp||!sp.db||sp.db.length<96){return;}
+    if(stamp===wfLast){return;}wfLast=stamp;
+    wf.style.display='block';wfl.style.display='block';
+    wfCtx.drawImage(wf,-1,0);
+    var vals=sp.db.slice().sort(function(a,b){return a-b;}),med=vals[vals.length>>1];
+    var img=wfCtx.createImageData(1,96);
+    for(var i=0;i<96;i++){var r=Math.max(0,Math.min(1,(sp.db[i]-med)/30)),o=(95-i)*4;
+      img.data[o]=Math.round(255*r*r);img.data[o+1]=Math.round(220*r);img.data[o+2]=Math.round(40+90*(1-r));img.data[o+3]=255;}
+    wfCtx.putImageData(img,299,0);
+    if(rpm){wfCtx.fillStyle='#4ff';wfCtx.fillRect(299,wfRow(rpm/60),1,1);wfCtx.fillRect(299,wfRow(rpm/15),1,1);}
+    if(motionHz){wfCtx.fillStyle='#f6f';wfCtx.fillRect(299,wfRow(motionHz),1,1);}
+  }
   function spark(s,opt){
     // Polyline of s.v over s.t; points failing opt.bad(v) get a red dot, opt.hot(v) an orange one.
     if(!s||!s.t||s.t.length<2){return '<svg viewBox="0 0 300 46"></svg>';}
@@ -140,10 +162,7 @@ const PANEL_JS = `(function(){
       +'<div><div class="lbl">its level (dB)</div><div class="big">'+fmt(au.motionDb,0)+'</div></div>'
       +'<div><div class="lbl">spindle 1x</div><div class="big">'+(rpm?fmt(rpm/60,0):'-')+' Hz</div></div></div>';
     h+='<div class="lbl">motion tone, last 2 min (Hz; the spindle is masked out of this fit)</div>'+spark(sa.motionHz,{min:0,max:400,color:'#c9c'});
-    var bands=[];for(var bi=0;bi<8;bi++){var bv=au['band'+bi];bands.push(bv==null||isNaN(bv)?-120:bv);}
-    var bl=['50','100','200','400','800','1.6k','3.2k','6.4k'],bb='';
-    for(var bj=0;bj<8;bj++){var hgt=Math.max(1,Math.min(40,(bands[bj]+90)*0.5));bb+='<rect x="'+(bj*37+2)+'" y="'+(42-hgt)+'" width="33" height="'+hgt+'" fill="#68a"/><text x="'+(bj*37+18)+'" y="45" font-size="6" fill="#999" text-anchor="middle">'+bl[bj]+'</text>';}
-    h+='<div class="lbl">spectrum now (dB per octave band, 50 Hz - 8 kHz)</div><svg viewBox="0 0 300 46" preserveAspectRatio="none">'+bb+'</svg>';
+    waterfall(s.spectrum,src==='mic'?rpm:null,au.motionHz,au.t);
     h+='<div class="lbl">noise level, last 2 min</div>'+spark(sa.levelDb,{min:-80,max:0,color:'#8c8'});
     h+='<div class="lbl">chatter index (orange: &gt; 12 dB over the band)</div>'+spark(sa.chatterDb,{min:0,max:30,ref:12,hot:function(v){return v>12;},color:'#ca8'});
     var ev=s.events||{},flags=[];['spindle_sag','spindle_blip','spindle_reach','chatter','runout','spindle_nolock'].forEach(function(k){if(ev[k])flags.push(k+' x'+ev[k]);});

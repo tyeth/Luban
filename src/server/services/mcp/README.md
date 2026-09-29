@@ -1192,11 +1192,11 @@ path is untouched, and file-job streaming is unchanged (the machine runs the fil
 only reads what the controller reports). Files: `telemetryConfig.ts` (settings, limits),
 `spindleProgram.ts` (commanded S + motion kind per line), `spindleTracker.ts` (the
 harmonic-comb tracker, a streaming port of `endmill_burn_calibration/rpm_from_audio.py` whose
-`--selftest` the unit suite reproduces; sags are judged against the LOADED reference - the best 0.3 s
-  rolling median sustained while cutting - because the A350 idles ~6.5 % under S8000 and runs at
-  S once loaded, measured 2026-09-29; a spindle whose best loaded speed is under S is "not
-  reaching", one that drops from it is sagging; the unloaded baseline serves reach-at-idle and the spectral
-  comparisons), `telemetryRing.ts` (typed-array rings, min/max
+`--selftest` the unit suite reproduces; sags are judged against the UNLOADED baseline - the
+  rolling median of the most recent settled free frames - as the operator's rule and the reference
+  script do, with the best sustained loaded median reported beside it; measured 2026-09-29 the A350
+  reaches ~8010-8030 RPM within 2 s of `M3 S8000` and a 1 mm skim at F500 runs it at 7980-8000),
+  `telemetryRing.ts` (typed-array rings, min/max
 downsampling), `audioSelection.ts` / `audioDevices.ts` (capture-source listing and strict
 matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-job session),
 `tools/telemetry.ts`.
@@ -1267,17 +1267,27 @@ matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-j
   job keeps its whole shape. The last 4 sessions keep their rings; older ones keep the summary.
 - **The gantry is tracked as its own thing.** Every frame - spindle on or off - also fits a
   MOTION comb: the strongest harmonic series with a fundamental in 20–400 Hz, with the spindle's
-  harmonics masked out (`motionHz` / `motionDb`; the A350 sings at 205 Hz and multiples at its
-  rapid speed, lower at cutting feeds), plus eight octave-band levels 50 Hz–8 kHz (`band0..7`).
-  A spindle candidate that coincides with a stronger motion-comb harmonic is `contested` and not
-  a lock, and the leading moves of a file get their real durations from the head's position at
-  job start, so the spindle search only begins when the `M3` is actually executing (2026-09-29:
-  a rapid from the park was reported as 8000 RPM before the spindle had started).
+  harmonics masked out (`motionHz` / `motionDb`; measured 2026-09-29 at F500 the A350's X axis
+  sings a 205-208 Hz comb and its Y and Z axes a 124.5 Hz comb whose second harmonic is 15-17 dB
+  over the fundamental), plus eight octave-band levels 50 Hz–8 kHz (`band0..7`) and a `flags`
+  column (locked / clipped / contested / ambiguous / gantry-like). Three things keep the gantry
+  out of the RPM: a candidate that coincides with a stronger motion-comb harmonic is `contested`;
+  during a rapid a candidate on a harmonic of the gantry's own comb is `ambiguous`; and a
+  candidate whose 2x line is 10 dB or more above its 1x has the gantry's shape (`gantryLike`) -
+  the spindle's fundamental is its strongest low harmonic idle and cutting - so it is never a
+  lock whatever the estimated context says. The estimated context itself starts from the head's
+  position before the job and the modal feed the controller still holds from the previous file
+  (the A350 runs a file's leading `G0`s at it: a 106 mm Z descent took 12.7 s), so the spindle
+  search does not begin while the head is still travelling to the `M3` (2026-09-29: two jobs
+  reported 7470-8000 RPM from the gantry alone before the spindle had started).
 - **Camera page panel**: with telemetry on, `/camera` gains a side panel fed by
   `/telemetry/live.json` (1 Hz, read-only): RPM (microphone when tracked, else the controller's
   report) against the commanded S with the load percentage, the noise level (dBFS), the chatter
   index and the reported line, plus two-minute min/max sparklines - dips below 97 % of S in red,
-  chatter peaks over 12 dB in orange - and the job's event tally.
+  chatter peaks over 12 dB in orange - the gantry tone, a scrolling five-minute spectrogram
+  (30 Hz–8 kHz on a log axis, each column scaled to its own median so the spindle comb, the
+  gantry comb and the mains hum read as separate lines; cyan ticks at the spindle's 1x / 4x,
+  pink at the gantry tone) and the job's event tally.
 - **Status RPM on the A350 (verified 2026-09-29)**: the field is `spindleSpeed`, in 250 RPM
   steps, and it reads 0 on most reports while the spindle runs (773 of 843 samples of job
   ad892e15b651; the rest 7250-8250 at S8000). Zeros are counted (`zeroRpmSamples`) and excluded

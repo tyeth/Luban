@@ -38,6 +38,10 @@ export const WINDOW_SAMPLES = Math.round(WINDOW_S * SAMPLE_RATE);
 export const HOP_SAMPLES = Math.round(HOP_S * SAMPLE_RATE);
 export const BIN_HZ = SAMPLE_RATE / NFFT;
 export const NBINS = NFFT / 2 + 1;
+/** The live spectrogram's axis: log-spaced bins from 30 Hz (mains hum and gantry combs) to 8 kHz. */
+export const SPECTRUM_BINS = 96;
+export const SPECTRUM_LO_HZ = 30;
+export const SPECTRUM_HI_HZ = 8000;
 /** harmonic -> weight (4 = tooth pass of a 4-flute cutter) */
 export const HARMONICS: Array<[number, number]> = [[1, 0.6], [2, 0.6], [3, 0.4], [4, 1.0], [8, 0.5]];
 /** Search f_rev within this x commanded S/60. */
@@ -100,15 +104,14 @@ export const RULES = {
     settleRel: 0.003,
     settleWindowMs: 1500,
     /**
-     * Sags are judged against the LOADED reference: the highest 0.3 s rolling
-     * median the spindle has sustained while cutting in this epoch. On the
-     * A350 the spindle idles ~6.5 % under S8000 and is at S within a second
-     * of cutting (measured 2026-09-29: idle 7477, cutting 8000), so the
-     * unloaded baseline is neither where a cut starts from nor what a sag
-     * falls from; it stays the reference for reach-at-idle and for the
-     * spectral (chatter / runout) comparisons. A spindle whose best
-     * sustained loaded speed is under S is "not reaching" (reach flag); one
-     * that drops from it is sagging.
+     * Sags are judged against the UNLOADED baseline (the operator's rule and
+     * the reference script): the rolling median of the most recent settled
+     * free frames. The best sustained loaded median is reported beside it,
+     * not used. Measured 2026-09-29 (job d8006b17b237): the A350's 200 W
+     * spindle at S8000 reaches ~8010-8030 RPM within 2 s of M3 and holds it
+     * unloaded; a 1 mm x 4 mm skim at F500 runs it at 7980-8000 (0.3 %).
+     * The "7477 RPM soft-start plateau" read earlier that day was the Z
+     * axis descending at the modal F500 - a gantry comb at 125 Hz.
      */
     /** RMS level at or above this (dBFS) is clipping; reported, and the frame's spectrum is not trusted. */
     clipDb: -0.5,
@@ -117,7 +120,18 @@ export const RULES = {
     contestedMarginLn: Math.log(4),
     /** While moving, a spindle candidate within this fraction of a gantry-comb harmonic is ambiguous. */
     ambiguousRel: 0.02,
-    /** The idle baseline is the median of the most recent settled free frames (3 s): a soft-start plateau is replaced once the spindle reaches speed. */
+    /**
+     * A candidate whose 2x line is at least this many dB above its 1x line
+     * has the gantry's shape, not the spindle's: the A350's Y and Z axes at
+     * F500 sing a 124.5 Hz comb (= 7470 RPM, inside the S8000 band) with the
+     * 249 Hz second harmonic 15-17 dB over the fundamental (jobs
+     * b3e8f3dd0e34, d8006b17b237), while the spindle's fundamental is its
+     * strongest low harmonic idle and cutting (1x +29, 2x +23 dB idle at
+     * 8010; 1x +26, 2x +15 cutting). Recorded, never a lock.
+     */
+    gantryShapeDb: 10,
+    gantryShapeFrames: 5,
+    /** The idle baseline is the median of the most recent settled free frames (3 s): it follows the spindle while it is still settling. */
     baselineRecentFrames: 60,
     minBaselineFrames: 5,
     minCutFrames: 5,
@@ -380,6 +394,8 @@ export interface FrameResult {
     contested: boolean;
     /** The head was moving and the spindle candidate sits on a harmonic of the gantry's own (unmasked) comb: recorded, not used as RPM. */
     ambiguous: boolean;
+    /** The candidate's 2x line dominates its 1x by RULES.gantryShapeDb: the Y/Z gantry comb, whatever the context says. Never a lock. */
+    gantryLike: boolean;
 }
 
 /** Is `hz` within the spindle's harmonic mask (+-2.5 % or +-MASK_MIN_HZ of any k x fRev)? */
@@ -587,7 +603,7 @@ class Epoch {
      * The reference a cut's rolling median is judged against: the operator's
      * rule and the reference script use the UNLOADED baseline, and with the
      * rolling idle baseline (the most recent settled free frames) that is the
-     * spindle's settled speed, not its soft-start plateau. The best sustained
+     * spindle's settled speed even if it was still ramping. The best sustained
      * loaded median is reported beside it but not used: a single high
      * mis-lock cluster made it 8280 on job beb4bf0a3d22 and every honest
      * 8000 read as a 3.4 % sag.
@@ -729,6 +745,36 @@ export class SpindleAudioAnalyser {
 
     public frames = 0;
 
+    /** The last few frames' (2x - 1x) dB for the gantry shape test. */
+    private shapeHistory: number[] = [];
+
+    /**
+     * The last analysed frame's spectrum on a log frequency axis, SPECTRUM_LO_HZ
+     * to SPECTRUM_HI_HZ in `bins` bins (the strongest FFT bin in each, dB):
+     * the camera page's spectrogram, where the spindle's comb, the gantry's
+     * comb and the mains hum are separate lines.
+     */
+    public latestSpectrum(bins = SPECTRUM_BINS): { hz: number[]; db: number[] } | null {
+        if (!this.frames) {
+            return null;
+        }
+        const ratio = SPECTRUM_HI_HZ / SPECTRUM_LO_HZ;
+        const hz: number[] = [];
+        const db: number[] = [];
+        for (let i = 0; i < bins; i++) {
+            const centre = SPECTRUM_LO_HZ * ratio ** (i / (bins - 1));
+            const b0 = Math.max(1, Math.round((SPECTRUM_LO_HZ * ratio ** ((i - 0.5) / (bins - 1))) / BIN_HZ));
+            const b1 = Math.max(b0, Math.min(NBINS - 1, Math.round((SPECTRUM_LO_HZ * ratio ** ((i + 0.5) / (bins - 1))) / BIN_HZ)));
+            let best = -Infinity;
+            for (let b = b0; b <= b1; b++) {
+                best = Math.max(best, this.logPower[b]);
+            }
+            hz.push(Math.round(centre));
+            db.push(Math.round((10 * best) / Math.LN10));
+        }
+        return { hz, db };
+    }
+
     public clippedFrames = 0;
 
     public totalCostMs = 0;
@@ -803,6 +849,7 @@ export class SpindleAudioAnalyser {
             bands: [],
             contested: false,
             ambiguous: false,
+            gantryLike: false,
         };
         // Loudness of the raw frame, cheap and always available: the camera
         // page's noise meter, and a sanity check that the microphone hears.
@@ -885,8 +932,8 @@ export class SpindleAudioAnalyser {
             }
             // During a RAPID the gantry's own comb is fitted unmasked too; a
             // spindle candidate sitting on one of its harmonics cannot be told
-            // from it (the A350's X rapid sings at 125 Hz = 7480 RPM, exactly
-            // the spindle's soft-start plateau): recorded, not RPM. Rapids
+            // from it (the A350's Y and Z axes at F500 sing a 125 Hz comb =
+            // 7470 RPM, inside the S8000 band): recorded, not RPM. Rapids
             // carry no load, so nothing is judged from them anyway; feed moves
             // are left alone - while cutting the spindle IS the strongest comb.
             if (ctx.kind === 'rapid') {
@@ -926,7 +973,30 @@ export class SpindleAudioAnalyser {
         // A lock needs confidence, a candidate away from the band's edges and
         // an unclipped frame; a spin-up needs the RPM to have settled, not
         // just time to have passed (the A350 ramps its spindle for ~20 s).
-        const locked = comb.confidence >= RULES.minConfidence && !comb.edge && !result.clipped && !result.contested && !result.ambiguous;
+        // The gantry's shape test needs no context at all: its comb has a
+        // dominant second harmonic, the spindle's has a dominant fundamental.
+        // (Job b3e8f3dd0e34: the head traversed for 6 s, the spindle never
+        // turned, and the estimator's context said "dwell after M3".)
+        {
+            const lineDb = (k: number): number => {
+                const centre = Math.round((k * fRev) / BIN_HZ);
+                let best = -Infinity;
+                for (let b = Math.max(1, centre - 3); b <= Math.min(NBINS - 1, centre + 3); b++) {
+                    best = Math.max(best, this.logPower[b]);
+                }
+                return (10 * best) / Math.LN10;
+            };
+            // Smoothed over the last five frames (0.25 s): the per-frame
+            // difference wanders +-5 dB around its 15-17 dB mean on the real
+            // Z descent and let one frame in ten through unsmoothed.
+            this.shapeHistory.push(lineDb(2) - lineDb(1));
+            if (this.shapeHistory.length > RULES.gantryShapeFrames) {
+                this.shapeHistory.shift();
+            }
+            result.gantryLike = median(this.shapeHistory) >= RULES.gantryShapeDb;
+        }
+        const locked = comb.confidence >= RULES.minConfidence && !comb.edge && !result.clipped
+            && !result.contested && !result.ambiguous && !result.gantryLike;
         result.locked = locked;
         if (locked && ctx.kind !== 'feed') {
             epoch.spinHistory.push([tMs, comb.rpm]);
@@ -1452,6 +1522,10 @@ export interface SynthEpoch {
     gantryFree?: [number, number];
     /** What the free phase is reported as: a still spindle dwell (default) or rapid moves. */
     freeKind?: 'dwell' | 'rapid';
+    /** Spindle tone amplitude factor (default 1; 0 = the spindle never turns, the context lying notwithstanding). */
+    spindleAmp?: number;
+    /** Relative amplitudes of the gantry tones' harmonics 1..n (default 1/k). The A350's Y/Z comb is 2x-dominant. */
+    gantryShape?: number[];
 }
 
 export interface SynthResult {
@@ -1525,6 +1599,7 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
         phase += (2 * Math.PI * rpm) / 60 / SAMPLE_RATE;
         let x = 0;
         const amps: Array<[number, number]> = [[1, 0.3], [2, 0.2], [3, 0.1], [4, 0.25], [8, 0.1]];
+        const spindleAmp = ep.spec.spindleAmp === undefined ? 1 : ep.spec.spindleAmp;
         for (const [k, amp] of amps) {
             let a = amp;
             if (cutting) {
@@ -1533,17 +1608,19 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
                     a = ep.spec.runoutAmp;
                 }
             }
-            x += a * Math.sin(k * phase);
+            x += spindleAmp * a * Math.sin(k * phase);
         }
+        const gantryHarmonic = (k: number): number => (ep.spec.gantryShape ? (ep.spec.gantryShape[k - 1] || 0) : 1 / k);
+        const gantryN = ep.spec.gantryShape ? ep.spec.gantryShape.length : 6;
         const freePhase = tt >= ep.baselineAt && tt < ep.cutAt;
         if (freePhase && ep.spec.gantryFree) {
-            for (let k = 1; k <= 6; k++) {
-                x += (ep.spec.gantryFree[1] / k) * Math.sin(2 * Math.PI * k * ep.spec.gantryFree[0] * tt + k);
+            for (let k = 1; k <= gantryN; k++) {
+                x += ep.spec.gantryFree[1] * gantryHarmonic(k) * Math.sin(2 * Math.PI * k * ep.spec.gantryFree[0] * tt + k);
             }
         }
         if (cutting && ep.spec.gantry) {
-            for (let k = 1; k <= 6; k++) {
-                x += (ep.spec.gantry[1] / k) * Math.sin(2 * Math.PI * k * ep.spec.gantry[0] * tt + k);
+            for (let k = 1; k <= gantryN; k++) {
+                x += ep.spec.gantry[1] * gantryHarmonic(k) * Math.sin(2 * Math.PI * k * ep.spec.gantry[0] * tt + k);
             }
         }
         if (cutting && ep.spec.chatter) {

@@ -188,11 +188,17 @@ function segmentDistance(p: Point3, a: Point3, b: Point3): { distance: number; a
  * Candidates are the motion lines between `lastLine` (execution never goes
  * backwards) and `parserLine` (the controller cannot execute what it has
  * not read). The closest segment within `toleranceMm` wins; ties go to the
- * later line. A head sitting at a segment's END may already be inside the
- * non-motion lines that follow (a dwell after `M3 S`, `M5`), so the answer
- * then advances to the last such line before the next motion line, still
- * bounded by the parser line. Nothing within tolerance (mid-report, a
- * position the file never visits) keeps `lastLine` and says `unmatched`.
+ * later line, except that a segment the head has just finished beats one
+ * that merely starts at the same point. A head sitting at a segment's END
+ * may already be inside the non-motion lines that follow (a dwell after
+ * `M3 S`, `M5`), so the answer then advances to the last such line before
+ * the next motion line - but not past a planner sync (`G4`, `M3`/`M5`): the
+ * queue cannot be beyond a sync until it executes, and the comment lines
+ * after it are not "queued". Still bounded by the parser line. `lastLine`
+ * only ratchets the search to the last MOTION line at or before it, so a
+ * head reported at a sync can be re-matched to the segment it finished.
+ * Nothing within tolerance (mid-report, a position the file never visits)
+ * keeps `lastLine` and says `unmatched`.
  */
 export function inferExecutingLine(
     program: SpindleProgram,
@@ -206,7 +212,13 @@ export function inferExecutingLine(
         return null;
     }
     const upper = parserLine !== null && Number.isFinite(parserLine) ? Math.min(count, Math.max(1, Math.round(parserLine))) : count;
-    const lower = lastLine !== null && Number.isFinite(lastLine) ? Math.min(upper, Math.max(1, Math.round(lastLine))) : 1;
+    let lower = 1;
+    if (lastLine !== null && Number.isFinite(lastLine)) {
+        lower = Math.min(upper, Math.max(1, Math.round(lastLine)));
+        while (lower > 1 && !program.lines[lower - 1].motion) {
+            lower -= 1;
+        }
+    }
     let best: { line: number; distance: number; atEnd: boolean; atStart: boolean } | null = null;
     for (let line = lower; line <= upper; line++) {
         const entry = program.lines[line - 1];
@@ -232,10 +244,21 @@ export function inferExecutingLine(
     let line = best.line;
     let match: LineMatch = 'segment';
     if (best.atEnd) {
-        // Advance through the non-motion lines that follow, up to the parser line.
+        // Advance through the non-motion lines that follow, up to the parser
+        // line, stopping at the last planner sync among them (the comments
+        // after a dwell are not queued; job b3e8f3dd0e34 read as "live" on
+        // the comment after its 20 s dwell and the estimate ran ahead).
         let next = line;
+        let sync = 0;
         while (next + 1 <= upper && !program.lines[next].motion) {
             next += 1;
+            const kind = program.lines[next - 1].kind;
+            if (kind === 'dwell' || kind === 'spindle') {
+                sync = next;
+            }
+        }
+        if (sync) {
+            next = sync;
         }
         if (next > line) {
             line = next;

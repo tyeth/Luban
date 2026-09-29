@@ -343,6 +343,47 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(last.reachFlag, false);
     }],
 
+    ['a 2x-dominant gantry comb inside the band is never the spindle, even when the context says dwell (job b3e8f3dd0e34)', () => {
+        // The spindle never turns; the Y axis traverses at F500 singing 124.5 Hz with its second
+        // harmonic 17 dB over the fundamental; the (wrong) context says "dwell after M3 S8000".
+        const synth = synthesise([{
+            s: 8000,
+            feed: 500,
+            spinUpS: 0,
+            baselineS: 8,
+            cutS: 0.3,
+            recoverS: 0,
+            spindleAmp: 0,
+            gantryFree: [124.5, 0.6],
+            gantryShape: [0.14, 1, 0.12, 0.6, 0.15, 0.2, 0.05, 0.1],
+        }]);
+        const frames: FrameResult[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onFrame: (frame) => frames.push(frame) });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        const searched = frames.filter((frame) => frame.role !== 'off');
+        const flagged = searched.filter((frame) => frame.gantryLike);
+        assert.ok(searched.length > 100, `searched ${searched.length}`);
+        assert.ok(flagged.length > searched.length * 0.8, `gantry-like ${flagged.length} of ${searched.length}`);
+        assert.ok(searched.every((frame) => !frame.locked), 'no frame locks on the gantry');
+        assert.equal(summary.baselineRpm, null, 'no idle baseline from the gantry');
+        assert.equal(summary.reachFlag, false, 'no false "not reaching" event');
+    }],
+
+    ['the spindle\'s own 1x-dominant comb is not gantry-like', () => {
+        const synth = synthesise([{ s: 8000, feed: 500, spinUpS: 1, baselineS: 4, cutS: 4, recoverS: 1 }]);
+        const frames: FrameResult[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onFrame: (frame) => frames.push(frame) });
+        analyser.push(synth.samples);
+        analyser.finish();
+        const locked = frames.filter((frame) => frame.locked);
+        const flagged = frames.filter((frame) => frame.role !== 'off' && frame.gantryLike);
+        assert.ok(locked.length > 100, `locked ${locked.length}`);
+        assert.ok(flagged.length < 3, `gantry-like ${flagged.length}`);
+        const spectrum = analyser.latestSpectrum();
+        assert.ok(spectrum && spectrum.db.length === 96 && spectrum.hz[0] === 30 && spectrum.hz[95] === 8000, 'log spectrum for the live view');
+    }],
+
     ['analysis cost is bounded per frame', () => {
         const { frames } = run();
         const cost = frames.map((frame) => frame.costMs);

@@ -33,6 +33,23 @@ M5
 G0 Z50`;
 
 export const tests: Array<[string, () => void]> = [
+    ['a comment after a dwell is not queued: the match stops at the sync (job b3e8f3dd0e34)', () => {
+        const program = parseSpindleProgram([
+            'G21', 'G90', 'G54', 'G0 X-40.5 Y11.2', 'G0 Z10', 'M3 S8000', 'G4 P20000', '; plunge in air to the new plane',
+            'G1 Z-6.0 F200', '; pass 1', 'G1 X40.5 Y11.2 F500',
+        ].join('\n'));
+        const atEnd = program.lineCount;
+        let hit = inferExecutingLine(program, { x: -40.5, y: 11.2, z: 10 }, atEnd, null);
+        assert.equal(hit?.line, 7, 'the dwell, not the comment after it');
+        assert.equal(hit?.match, 'endpoint');
+        hit = inferExecutingLine(program, { x: -40.5, y: 11.2, z: 10 }, atEnd, 7);
+        assert.equal(hit?.line, 7, 'and it stays there while the position is frozen');
+        // Once the plunge is queued the reported position is ITS end.
+        hit = inferExecutingLine(program, { x: -40.5, y: 11.2, z: -6 }, atEnd, 7);
+        assert.equal(hit?.line, 10, 'the comment after the plunge: no sync in that run, so it is a live queue');
+        assert.equal(hit?.match, 'endpoint');
+    }],
+
     ['commanded S follows the M3 S words and M5 clears it', () => {
         const program = parseSpindleProgram(E4);
         const lines = E4.split('\n');
@@ -123,6 +140,11 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(hit?.line, 6, 'advanced to the dwell after M3');
         assert.equal(hit?.match, 'endpoint');
         assert.equal(hit?.context.kind, 'dwell');
+        // Reported again at the same point with the dwell as the last line: still the dwell,
+        // not the plunge that starts there (the queue cannot pass a sync until it executes).
+        hit = inferExecutingLine(program, { x: -40.5, y: 11.2, z: 10 }, parserAtEnd, 6);
+        assert.equal(hit?.line, 6, 'held at the sync');
+        assert.equal(hit?.match, 'endpoint');
         assert.equal(hit?.context.s, 8000);
         // The same position while the parser had only read up to line 4: the rapid's end, spindle still off.
         hit = inferExecutingLine(program, { x: -40.5, y: 11.2, z: 10 }, 4, null);
