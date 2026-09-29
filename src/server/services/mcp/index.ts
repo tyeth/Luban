@@ -23,6 +23,7 @@ import { registerMachineTools } from './tools/machine';
 import { registerProbeTools } from './tools/probe';
 import { registerProbingTools } from './tools/probing';
 import { registerStatusTools } from './tools/status';
+import { registerTelemetryTools } from './tools/telemetry';
 import { registerToolSetterTools } from './tools/toolsetter';
 import { registerWorkspaceTools } from './tools/workspace';
 import { registerThreadMillingTools } from './tools/threadMilling';
@@ -248,6 +249,7 @@ function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
     registerCalibrationTools(registry);
     registerLandmarkTools(registry);
     registerProbeTools(registry);
+    registerTelemetryTools(registry);
     registerToolSetterTools(registry, baseUrl);
     registerWorkspaceTools(registry, baseUrl);
     registerProbingTools(registry, baseUrl);

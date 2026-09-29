@@ -1,0 +1,212 @@
+import { strict as assert } from 'assert';
+
+import {
+    EpochSummary,
+    Fft,
+    FrameResult,
+    NFFT,
+    SpindleAudioAnalyser,
+    SpindleEvent,
+    SynthEpoch,
+    combTrack,
+    synthesise,
+} from '../spindleTracker';
+
+// The reference selftest's ladder, shortened: the same faults injected in
+// the same way (a 5 % 0.4 s blip, a sustained 6 % sag, a one-flute-dominant
+// cut, a 1290 Hz non-harmonic tone) and the same expectations.
+const LADDER: SynthEpoch[] = [
+    { s: 18000, feed: 200, spinUpS: 2.5, baselineS: 3, cutS: 8, recoverS: 1.5, droop: 0.005, blip: [3.0, 0.4, 0.05] },
+    { s: 12000, feed: 200, spinUpS: 2.5, baselineS: 3, cutS: 8, recoverS: 1.5, droop: 0.005, chatter: [1290, 0.25] },
+    { s: 18000, feed: 350, spinUpS: 2.5, baselineS: 3, cutS: 8, recoverS: 1.5, droop: 0.005, runoutAmp: 1.2 },
+    { s: 8000, feed: 200, spinUpS: 2.5, baselineS: 3, cutS: 8, recoverS: 1.5, droop: 0.005, sag: [1.0, 0.06] },
+];
+
+interface Run {
+    summaries: EpochSummary[];
+    events: SpindleEvent[];
+    frames: FrameResult[];
+}
+
+let cached: Run | null = null;
+
+function run(): Run {
+    if (cached) {
+        return cached;
+    }
+    const synth = synthesise(LADDER);
+    const events: SpindleEvent[] = [];
+    const frames: FrameResult[] = [];
+    const analyser = new SpindleAudioAnalyser({
+        contextAt: synth.contextAt,
+        onEvent: (event) => events.push(event),
+        onFrame: (frame) => frames.push(frame),
+    });
+    // Feed in uneven chunks, as a pipe would.
+    let offset = 0;
+    const chunk = 3001;
+    while (offset < synth.samples.length) {
+        analyser.push(synth.samples.subarray(offset, Math.min(offset + chunk, synth.samples.length)));
+        offset += chunk;
+    }
+    cached = { summaries: analyser.finish(), events, frames };
+    return cached;
+}
+
+function byEpoch(kind: string): number[] {
+    return run().events.filter((event) => event.kind === kind).map((event) => event.epoch);
+}
+
+export const tests: Array<[string, () => void]> = [
+    ['the FFT of a pure tone peaks at its bin', () => {
+        const fft = new Fft(NFFT);
+        const re = new Float64Array(NFFT);
+        const im = new Float64Array(NFFT);
+        const bin = 1000;
+        for (let i = 0; i < NFFT; i++) {
+            re[i] = Math.cos((2 * Math.PI * bin * i) / NFFT);
+        }
+        fft.transform(re, im);
+        let best = 0;
+        for (let k = 1; k < NFFT / 2; k++) {
+            if (re[k] * re[k] + im[k] * im[k] > re[best] * re[best] + im[best] * im[best]) {
+                best = k;
+            }
+        }
+        assert.equal(best, bin);
+        assert.ok(Math.abs(re[bin] - NFFT / 2) < 1e-6);
+    }],
+
+    ['the comb locks onto a synthetic harmonic series within 0.1 %', () => {
+        const rpm = 17640; // 2 % below commanded, inside the search band
+        const fRev = rpm / 60;
+        const binHz = 16000 / NFFT;
+        const logPower = new Float64Array(NFFT / 2 + 1).fill(Math.log(1e-6));
+        for (const k of [1, 2, 3, 4, 8]) {
+            logPower[Math.round((k * fRev) / binHz)] = Math.log(1);
+        }
+        const result = combTrack(logPower, 18000);
+        assert.ok(Math.abs(result.rpm - rpm) / rpm < 0.001, `tracked ${result.rpm}`);
+        assert.ok(result.confidence > 2, `confidence ${result.confidence}`);
+    }],
+
+    ['every epoch is tracked: baselines within 0.5 % of the commanded S', () => {
+        const { summaries } = run();
+        assert.equal(summaries.length, 4);
+        summaries.forEach((summary, i) => {
+            assert.ok(summary.baselineRpm !== null, `epoch ${i} has a baseline`);
+            assert.ok(Math.abs((summary.baselineRpm as number) / LADDER[i].s - 1) < 0.005, `epoch ${i} baseline ${summary.baselineRpm}`);
+            assert.equal(summary.baselineSource, 'epoch');
+            assert.equal(summary.reachFlag, false);
+            assert.ok(summary.cutFrames > 100, `epoch ${i} cut frames ${summary.cutFrames}`);
+        });
+    }],
+
+    ['verdicts: blip, hold, hold, struggle - as the reference selftest expects', () => {
+        const { summaries } = run();
+        assert.deepEqual(summaries.map((s) => s.verdict), ['BLIP', 'HOLD', 'HOLD', 'STRUGGLE']);
+        const blip = summaries[0];
+        assert.ok((blip.minRel as number) < 0.97 && (blip.minRel as number) > 0.93, `blip depth ${blip.minRel}`);
+        assert.ok(blip.longestBelow97Ms < 1000, `blip length ${blip.longestBelow97Ms}`);
+        assert.ok((blip.medianDrop as number) < 0.03);
+        const sag = summaries[3];
+        assert.ok((sag.medianDrop as number) > 0.03, `sag median drop ${sag.medianDrop}`);
+        assert.ok(sag.timeBelow95Ms > 5000, `sag time below 95 % ${sag.timeBelow95Ms}`);
+    }],
+
+    ['events: one blip, one sag, no reach failures, one epoch summary each', () => {
+        assert.deepEqual(byEpoch('spindle_blip'), [0]);
+        assert.deepEqual(byEpoch('spindle_sag'), [3]);
+        assert.deepEqual(byEpoch('spindle_reach'), []);
+        assert.deepEqual(byEpoch('spindle_nolock'), []);
+        assert.deepEqual(byEpoch('spindle_epoch'), [0, 1, 2, 3]);
+        const sag = run().events.find((event) => event.kind === 'spindle_sag') as SpindleEvent;
+        assert.ok(sag.tMs < run().summaries[3].endMs, 'the sag is reported while the cut is still running, not at the end');
+    }],
+
+    ['chatter is flagged only where the non-harmonic tone was injected, at its frequency', () => {
+        const { summaries } = run();
+        assert.deepEqual(summaries.map((s) => s.chatterFlag), [false, true, false, false]);
+        assert.deepEqual(byEpoch('chatter'), [1]);
+        const chatter = summaries[1];
+        assert.ok(Math.abs((chatter.chatterHz as number) - 1290) < 15, `chatter at ${chatter.chatterHz} Hz`);
+        assert.ok((chatter.chatterRibMm as number) > 0.002 && (chatter.chatterRibMm as number) < 0.003, `rib ${chatter.chatterRibMm}`);
+    }],
+
+    ['a blip is not chatter: the per-frame mask follows the tracked RPM through the dip', () => {
+        const { summaries, frames } = run();
+        assert.equal(summaries[0].chatterFlag, false);
+        // Frames inside the blip keep their chatter index below the flag
+        // threshold; the frames straddling the RPM step (two combs at once)
+        // carry no index at all rather than a false one.
+        const dip = frames.filter((frame) => frame.epoch === 0 && frame.role === 'cut' && frame.rel < 0.97);
+        assert.ok(dip.length >= 4, `dip frames ${dip.length}`);
+        assert.ok(dip.some((frame) => !Number.isNaN(frame.chatterExcessDb)), 'steady frames inside the dip are indexed');
+        for (const frame of dip) {
+            assert.ok(Number.isNaN(frame.chatterExcessDb) || frame.chatterExcessDb < 12,
+                `frame at ${frame.tMs} ms: chatter index ${frame.chatterExcessDb} dB during the blip`);
+        }
+    }],
+
+    ['runout is flagged only in the one-flute-dominant epoch', () => {
+        const { summaries } = run();
+        assert.deepEqual(summaries.map((s) => s.runoutFlag), [false, false, true, false]);
+        assert.deepEqual(byEpoch('runout'), [2]);
+        assert.ok((summaries[2].runoutIndexDb as number) > -3);
+        assert.ok((summaries[0].runoutIndexDb as number) < -3, `clean epoch runout index ${summaries[0].runoutIndexDb}`);
+        assert.ok(Math.abs((summaries[2].revRibMm as number) - 350 / 18000) < 1e-6);
+    }],
+
+    ['frames outside the spindle epochs are off and untracked', () => {
+        const { frames } = run();
+        const off = frames.filter((frame) => frame.role === 'off');
+        assert.ok(off.length > 5);
+        assert.ok(off.every((frame) => Number.isNaN(frame.rpm)));
+        const roles = new Set(frames.map((frame) => frame.role));
+        for (const role of ['spinup', 'transition', 'baseline', 'cut']) {
+            assert.ok(roles.has(role as FrameResult['role']), `saw ${role} frames`);
+        }
+    }],
+
+    ['a cut with no baseline of its own borrows the previous epoch at the same S, else the commanded S', () => {
+        const synth = synthesise([
+            { s: 12000, feed: 200, spinUpS: 2.5, baselineS: 3, cutS: 3, recoverS: 0.5 },
+            { s: 12000, feed: 200, spinUpS: 0, baselineS: 0, cutS: 3, recoverS: 0.5 },
+            { s: 9000, feed: 200, spinUpS: 0, baselineS: 0, cutS: 3, recoverS: 0.5 },
+        ]);
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt });
+        analyser.push(synth.samples);
+        const summaries = analyser.finish();
+        assert.equal(summaries[0].baselineSource, 'epoch');
+        assert.equal(summaries[1].baselineSource, 'previous-epoch');
+        assert.equal(summaries[2].baselineSource, 'commanded');
+        assert.ok(summaries[1].verdict === 'HOLD' || summaries[1].verdict === 'BLIP');
+    }],
+
+    ['silence while "cutting" is NO-LOCK, never a sag', () => {
+        const synth = synthesise([{ s: 15000, feed: 200, spinUpS: 2.5, baselineS: 3, cutS: 4, recoverS: 0.5 }]);
+        // Replace the cut with noise only.
+        const [cutStart, cutEnd] = synth.cuts[0];
+        const from = Math.round((cutStart / 1000) * 16000);
+        const to = Math.round((cutEnd / 1000) * 16000);
+        let seed = 7;
+        for (let i = from; i < to; i++) {
+            seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+            synth.samples[i] = (seed / 4294967296 - 0.5) * 0.2;
+        }
+        const events: SpindleEvent[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onEvent: (event) => events.push(event) });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        assert.equal(summary.verdict, 'NO-LOCK');
+        assert.ok(!events.some((event) => event.kind === 'spindle_sag'));
+        assert.ok(events.some((event) => event.kind === 'spindle_nolock'));
+    }],
+
+    ['analysis cost is bounded per frame', () => {
+        const { frames } = run();
+        const cost = frames.map((frame) => frame.costMs);
+        const mean = cost.reduce((a, b) => a + b, 0) / cost.length;
+        assert.ok(mean < 25, `mean ${mean.toFixed(2)} ms per 50 ms frame`);
+    }],
+];

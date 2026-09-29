@@ -50,6 +50,11 @@ import { tests as workspaceTests } from './workspace.test';
 import { tests as validatorTests } from './validator.test';
 import { tests as wallClearanceTests } from './wallClearance.test';
 import { tests as wallFollowTests } from './wallFollow.test';
+import { tests as audioSelectionTests } from './audioSelection.test';
+import { tests as spindleProgramTests } from './spindleProgram.test';
+import { tests as spindleTrackerTests } from './spindleTracker.test';
+import { tests as telemetryConfigTests } from './telemetryConfig.test';
+import { tests as telemetryRingTests } from './telemetryRing.test';
 
 type TestCase = [string, () => void | Promise<void>];
 
@@ -93,6 +98,11 @@ const suites: Array<[string, TestCase[]]> = [
     ['cornerFit', cornerFitTests],
     ['perimeterAnalysis', perimeterAnalysisTests],
     ['perimeterTrace', perimeterTraceTests],
+    ['telemetryRing', telemetryRingTests],
+    ['telemetryConfig', telemetryConfigTests],
+    ['spindleProgram', spindleProgramTests],
+    ['spindleTracker', spindleTrackerTests],
+    ['audioSelection', audioSelectionTests],
 ];
 
 async function main(): Promise<void> {

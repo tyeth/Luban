@@ -1183,7 +1183,85 @@ when a beat was rejected); `get_mcp_diagnostics.machinePosition` counts rejected
 resyncs and disconnects. Unit tests: `tests/machinePosition.test.ts` (the recorded incidents are
 the fixtures).
 
-## Tool surface (48)
+## Spindle telemetry (2026-09-29)
+
+Did the 200 W spindle hold its commanded RPM under load, and did the cut chatter or run
+out — answered from the job record, with the operator recording nothing. **Opt-in, observes
+only**: it never pauses, stops or commands the machine, the heartbeat / position-of-record
+path is untouched, and file-job streaming is unchanged (the machine runs the file; telemetry
+only reads what the controller reports). Files: `telemetryConfig.ts` (settings, limits),
+`spindleProgram.ts` (commanded S + motion kind per line), `spindleTracker.ts` (the
+harmonic-comb tracker, a streaming port of `endmill_burn_calibration/rpm_from_audio.py` whose
+`--selftest` the unit suite reproduces), `telemetryRing.ts` (typed-array rings, min/max
+downsampling), `audioSelection.ts` / `audioDevices.ts` (capture-source listing and strict
+matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-job session),
+`tools/telemetry.ts`.
+
+- **Settings** (Settings → MCP Server → Spindle telemetry, configstore or env):
+  `mcpSpindleTelemetry` / `LUBAN_MCP_SPINDLE_TELEMETRY` records every status report during a
+  file job (time, reported RPM, target RPM, the line the controller is on and the S that line
+  commands). `mcpSpindleStatusPollMs` / `LUBAN_MCP_SPINDLE_STATUS_POLL_MS` (200–2000, empty =
+  off) adds read-only `/api/v1/status` polls during file jobs only, via
+  `SstpHttpChannel.fetchStatus()`, which deliberately does NOT update `latestMachineState` so
+  every safety judge keeps its 2 s cadence. `mcpSpindleAudio` / `LUBAN_MCP_SPINDLE_AUDIO` records
+  the microphone named by `mcpAudioDevice` / `LUBAN_MCP_AUDIO_DEVICE` to
+  `<userData>/mcp-audio/<job>_<name>.flac` and tracks it live. `mcpTelemetrySampleLimit` /
+  `LUBAN_MCP_TELEMETRY_SAMPLE_LIMIT` caps each ring (default 1 000 000 samples; 10 000–4 000 000).
+  With telemetry on the job event log default rises to 200 000 (max now 1 000 000 for everyone).
+- **The microphone is never guessed.** `list_audio_devices` reports every capture source
+  (`pw-dump` → `pactl list short sources` → `arecord -l` on Linux, `ffmpeg -list_devices` on
+  Windows) as `pulse:<node>` / `alsa:hw:CARD=…,DEV=n` / `dshow:<name>` entries with built-in /
+  USB hints; the operator stores one (exact entry, alias, or a substring matching exactly one),
+  and a job whose device does not resolve records a `spindle_audio_unavailable` event instead of
+  falling back to the laptop's own microphone. snapcnclaptop (2026-09-29) has exactly one
+  source, the built-in ALC269VC (`pulse:alsa_input.pci-0000_00_0e.0.analog-stereo`); neither USB
+  camera exposes audio, so a microphone near the head has to be added for the audio channel to
+  mean much. The device used is recorded on every job (`telemetry.audio.device`).
+- **Tracker**: mono 16 kHz, 0.15 s Hann frames every 0.05 s, NFFT 16384; each candidate rev
+  frequency in 0.80–1.05 × S/60 scored by weighted log power at harmonics {1: 0.6, 2: 0.6,
+  3: 0.4, 4: 1.0 (tooth pass), 8: 0.5}, parabolic refinement. Commanded S comes from the `M3 S`
+  words at the line the controller reports (`currentLine`), so alignment needs no timeline
+  guess; feed moves (G1/G2/G3) are "cut", everything else after a 2 s spin-up is "baseline",
+  and 0.5 s after every reported line-kind change is neither. Per commanded S (an *epoch*):
+  HOLD / BLIP / STRUGGLE / NO-LOCK exactly as the reference `grade()`; runout index = (1× gain
+  while cutting) − (4× gain), dB vs baseline, flag above −3 dB; chatter = strongest cut-only
+  tone in 300–6000 Hz that is not a rotation harmonic, with the harmonics masked **per frame at
+  that frame's tracked RPM** (mask ≥ ±20 Hz, the window's own resolution), flagged at > 12 dB
+  over the band median and > 10 dB over the baseline, reported with the implied rib spacing
+  vf/f. Frames whose RPM moved > 1 % since the previous or the next frame (one hop of
+  lookahead) are excluded from the spectral statistics — a dip straddles two combs and would
+  otherwise read as chatter. The dip rules only run on a majority-locked 0.3 s window, so
+  noise that happens to score cannot manufacture a sag.
+- **Events** (low volume, `tool: spindle-telemetry`): `telemetry_started`, `spindle_reach`
+  (unloaded > 2 % off S), `spindle_blip` (dip > 3 % under 1 s; first 10 per epoch), `spindle_sag`
+  (rolling median < 97 % for > 1 s, emitted *while* it is happening, or loaded median > 3 % down
+  at epoch end), `chatter`, `runout`, `spindle_nolock`, `spindle_epoch` (the verdict per S),
+  `spindle_audio_started` / `_unavailable` / `_error`, `telemetry_finished`. The controller's own
+  RPM report gets the same coarse judgement (`source: status`). **Alerts only.**
+- **Reading it**: `get_gcode_job_status.telemetry` is the summary — samples, rates, audio device,
+  per commanded S the unloaded / loaded median, min, time below 95 %, the verdicts and flags,
+  the poll cost and the analysis cost. `get_job_telemetry {job_id, since_ms?, until_ms?,
+  max_points?}` returns the series (status: line / rpm / target / commandedS / pollMs / source;
+  audio: rpm / confidence / rel / chatterDb / chatterHz / runoutDb / role) downsampled so each
+  bucket keeps its min and max, plus the FLAC path. Rings hold 16 B per status sample and 13 B
+  per audio frame; at the cap a ring halves its rate (every second sample dropped) so a long
+  job keeps its whole shape. The last 4 sessions keep their rings; older ones keep the summary.
+- **Status field names**: the SSTP/HTTP status payload is spread into the machine state
+  untouched, so the RPM field is whatever the controller calls it. The session tries
+  `cncCurrentSpindleSpeed`, `spindleSpeed`, `currentSpindleSpeed`, `currRpm`, … (SACP writes
+  `cncCurrentSpindleSpeed`; serial Marlin `currRpm`) and records the name it found as
+  `telemetry.status.rpmField`; when none matches it lists the scalar keys the controller did
+  send (`statusScalarsSeen`) so the list can be extended from evidence. Not yet verified live
+  against the A350's HTTP payload (2026-09-29).
+- **Measured cost** (snapcnclaptop, Celeron N4020, 2026-09-29): a status poll is ~25 ms and
+  ~361 B (idle payload) — at 200 ms that is 5 req/s, ≈ 2 KB/s plus headers and ≈ 12 % of the
+  controller's HTTP time; at 500 ms 2 req/s / ≈ 5 %. ffmpeg pulse → FLAC + f32le pipe: 5–8 % of
+  one core, 55 MB RSS, ~170 kbit/s on disk for room noise. The tracker in the server process:
+  5.96 ms per 50 ms frame mean (max 55 ms at JIT warm-up) with node 18 = ≈ 6 % of one core live,
+  +~10 MB RSS. The session also reports the server process's own CPU share over the job
+  (`telemetry.server.cpuPercent`) and ffmpeg's (`telemetry.audio.ffmpegCpuPercent`, /proc).
+
+## Tool surface (66)
 
 `get_connection_status` · `get_machine_profile` (kinematics, module offsets) ·
 `get_position` (both frames, warnings on incoherent reporting) ·
@@ -1231,7 +1309,10 @@ line: per-station contact, best-fit line slope, flatness) · `probe_surface_grid
 −Z grid: Z matrix, best-fit plane + residuals, ASCII height map) — the two surface scans hop
 at `last contact + z_safe_delta_mm` (cap 20) within `max_hop_mm` (cap 60), see "Surface
 scans" above · `survey_bed` (camera grid at the current Z or stated `z_levels`, landmarks
-honoured by dropping / lifting with the reasons reported).
+honoured by dropping / lifting with the reasons reported) · **spindle telemetry** (read-only):
+`list_audio_devices` (every capture source with the operator's configured one; never chooses)
+· `get_job_telemetry` (a file job's status-RPM and microphone-RPM / chatter / runout series,
+min/max-downsampled, plus the FLAC path — the summary rides on `get_gcode_job_status`).
 
 ## Tool change workflows
 
@@ -1447,7 +1528,9 @@ new session's liveness, not the cause of the earlier morning incident.
   report still showing that position is stale by definition (never drift evidence — the
   4.5 s deadline still aborts if nothing ever catches up). Unit checks replay the abort.
 - **Buffer sizes** (Settings → MCP Server → Diagnostic buffers, or env): `mcpJobEventLimit` /
-  `LUBAN_MCP_JOB_EVENT_LIMIT` (default 2000, 400–100000 events per job) and
+  `LUBAN_MCP_JOB_EVENT_LIMIT` (default 2000 — 200 000 while spindle telemetry is on — 400–1 000 000
+  events per job; the dense telemetry series never go through the event log, see "Spindle
+  telemetry") and
   `mcpDiagnosticsRecentLimit` / `LUBAN_MCP_DIAGNOSTICS_RECENT_LIMIT` (default 40, 10–10000 per
   list). Applied immediately. Measured (cdbc29371b97, 8-station path, z_safe_delta 20, coarse 1,
   fine 0.1, 3 confirm passes): 763 events ≈ 100 fixed + ~85 per station; budget
