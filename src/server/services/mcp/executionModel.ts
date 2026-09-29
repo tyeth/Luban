@@ -113,7 +113,11 @@ export class ExecutionEstimator {
 
     private lastEstimate = 1;
 
-    /** Block ordinal of the last true sync (job start = 0, a dwell end = the blocks before it): the planner cannot be further ahead than what it queued since. */
+    /**
+     * Block ordinal of the last true sync (job start = 0, a dwell end = the
+     * blocks before it): the planner cannot be further ahead than what it
+     * has queued since.
+     */
     private syncBlock = 0;
 
     public constructor(program: SpindleProgram, text: string, leadBlocks = DEFAULT_PLANNER_LEAD_BLOCKS) {
