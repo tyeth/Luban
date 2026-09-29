@@ -213,6 +213,57 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(mean(off) < -20, `quiet lead-in ${mean(off).toFixed(1)} dBFS`);
     }],
 
+    ['a spindle far below its band reads NO-LOCK, never STRUGGLE: an edge lock is not a measurement', () => {
+        // Runs at 0.2 below S: the comb can only fall to the band's edge.
+        const synth = synthesise([{ s: 15000, feed: 200, spinUpS: 2.5, baselineS: 3, cutS: 5, recoverS: 0.5, droop: 0.2 }]);
+        const events: SpindleEvent[] = [];
+        const frames: FrameResult[] = [];
+        const analyser = new SpindleAudioAnalyser({
+            contextAt: synth.contextAt,
+            onEvent: (event) => events.push(event),
+            onFrame: (frame) => frames.push(frame),
+        });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        assert.notEqual(summary.verdict, 'STRUGGLE');
+        assert.ok(!events.some((event) => event.kind === 'spindle_sag'), 'no sag from edge locks');
+        const cut = frames.filter((frame) => frame.role === 'cut');
+        assert.ok(cut.length > 50);
+        assert.ok(cut.every((frame) => !frame.locked), 'edge-locked frames are unlocked');
+    }],
+
+    ['the baseline waits for the spin-up to settle, not just for the clock', () => {
+        // A 12 s ramp (the A350 takes ~20 s): baseline frames must start only after it.
+        const synth = synthesise([{ s: 12000, feed: 200, spinUpS: 16, baselineS: 3, cutS: 5, recoverS: 0.5, rampS: 12 }]);
+        const frames: FrameResult[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onFrame: (frame) => frames.push(frame) });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        const firstBaseline = frames.find((frame) => frame.role === 'baseline');
+        assert.ok(firstBaseline, 'a baseline exists');
+        // The epoch starts 0.5 s into the recording; the ramp ends 12 s later.
+        assert.ok((firstBaseline as FrameResult).tMs >= 500 + 12000, `baseline began at ${(firstBaseline as FrameResult).tMs} ms`);
+        assert.ok(Math.abs((summary.baselineRpm as number) / 12000 - 1) < 0.005, `baseline ${summary.baselineRpm}`);
+        assert.equal(summary.verdict, 'HOLD');
+        assert.equal(summary.reachFlag, false);
+    }],
+
+    ['clipped frames are flagged and never locked', () => {
+        const synth = synthesise([{ s: 12000, feed: 200, spinUpS: 2.5, baselineS: 3, cutS: 3, recoverS: 0.5 }]);
+        // Drive the signal into hard clipping.
+        for (let i = 0; i < synth.samples.length; i++) {
+            synth.samples[i] = Math.max(-1, Math.min(1, synth.samples[i] * 400));
+        }
+        const frames: FrameResult[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onFrame: (frame) => frames.push(frame) });
+        analyser.push(synth.samples);
+        analyser.finish();
+        const clipped = frames.filter((frame) => frame.clipped);
+        assert.ok(clipped.length > frames.length / 2, `clipped ${clipped.length} of ${frames.length}`);
+        assert.ok(clipped.every((frame) => !frame.locked));
+        assert.equal(analyser.clippedFrames, clipped.length);
+    }],
+
     ['analysis cost is bounded per frame', () => {
         const { frames } = run();
         const cost = frames.map((frame) => frame.costMs);

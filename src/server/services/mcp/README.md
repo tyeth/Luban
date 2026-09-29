@@ -1241,7 +1241,12 @@ matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-j
   vf/f. Frames whose RPM moved > 1 % since the previous or the next frame (one hop of
   lookahead) are excluded from the spectral statistics — a dip straddles two combs and would
   otherwise read as chatter. The dip rules only run on a majority-locked 0.3 s window, so
-  noise that happens to score cannot manufacture a sag.
+  noise that happens to score cannot manufacture a sag; a comb that falls to the search band's
+  edge (within 1 %) is a failed lock, not a dip (a clipped run on 2026-09-29 "sagged" to exactly
+  0.80 × S), a clipped frame (RMS ≥ −0.5 dBFS) is never a lock and raises one
+  `audio_clipping` event per job, and the baseline waits until the free-running RPM has
+  SETTLED (1 s median within 0.5 % of the second before) - the A350 ramps its spindle for
+  ~20 s after `M3`, so a 3 s spin-up dwell is still on the ramp.
 - **Events** (low volume, `tool: spindle-telemetry`): `telemetry_started`, `spindle_reach`
   (unloaded > 2 % off S), `spindle_blip` (dip > 3 % under 1 s; first 10 per epoch), `spindle_sag`
   (rolling median < 97 % for > 1 s, emitted *while* it is happening, or loaded median > 3 % down

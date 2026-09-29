@@ -75,6 +75,18 @@ export const RULES = {
     reachRel: 0.02,
     /** Comb confidence below this = no lock (frame ignored by the rules). */
     minConfidence: 2.0,
+    /**
+     * A tracked RPM within this fraction of the search band's edges is a
+     * failed lock, not a measurement: a clipped or noisy frame falls to the
+     * edge (measured 2026-09-29: every "dip" of a clipped run bottomed at
+     * exactly 0.80 x S) and would otherwise read as a sag.
+     */
+    edgeLockRel: 0.01,
+    /** Baseline frames also need the RPM settled: the 1 s median within this of the median 1 s earlier (the A350 ramps ~20 s). */
+    settleRel: 0.005,
+    settleWindowMs: 1000,
+    /** RMS level at or above this (dBFS) is clipping; reported, and the frame's spectrum is not trusted. */
+    clipDb: -0.5,
     minBaselineFrames: 5,
     minCutFrames: 5,
     runoutIndexDb: -3.0,
@@ -178,6 +190,8 @@ export interface CombResult {
     rpm: number;
     /** (best score - median score) / std over the candidate scores. */
     confidence: number;
+    /** The best candidate sat within RULES.edgeLockRel of the search band's edge: not a lock. */
+    edge: boolean;
 }
 
 /**
@@ -228,7 +242,8 @@ export function combTrack(logPower: Float64Array, sCommanded: number, scores: Fl
     const std = Math.sqrt(Math.max(0, sumSq / CANDIDATES - mean * mean));
     const sorted = Float64Array.from(scores).sort();
     const medianScore = sorted[CANDIDATES >> 1];
-    return { rpm: 60 * f, confidence: (scores[best] - medianScore) / (std + 1e-9) };
+    const edge = f <= lo * (1 + RULES.edgeLockRel) || f >= hi * (1 - RULES.edgeLockRel);
+    return { rpm: 60 * f, confidence: (scores[best] - medianScore) / (std + 1e-9), edge };
 }
 
 // ------------------------------------------------------------ band helpers
@@ -317,6 +332,10 @@ export interface FrameResult {
     costMs: number;
     /** Frame loudness: RMS of the raw samples in dBFS (0 = full scale), every frame including 'off'. */
     levelDb: number;
+    /** The frame's RMS reached RULES.clipDb: the microphone gain is too high. */
+    clipped: boolean;
+    /** The comb fell to the search band's edge (or was clipped / unconfident): no RPM lock this frame. */
+    locked: boolean;
 }
 
 export type SpindleEventKind = 'spindle_sag' | 'spindle_blip' | 'spindle_reach' | 'chatter' | 'runout' | 'spindle_nolock' | 'spindle_epoch';
@@ -442,6 +461,31 @@ class Epoch {
     /** Lock flags of the last few cut frames; the dip rules run only on a majority-locked window. */
     public lockHistory: boolean[] = [];
 
+    /** Locked RPM readings of free frames, for the spin-up settle test. */
+    public spinHistory: Array<[number, number]> = [];
+
+    /** Once settled, an epoch stays settled (a load dip is not a spin-up). */
+    public settled = false;
+
+    /** Has the 1 s median of free-frame RPM stopped moving relative to the second before? */
+    public isSettled(tMs: number): boolean {
+        if (this.settled) {
+            return true;
+        }
+        const recent = this.spinHistory.filter(([at]) => tMs - at <= RULES.settleWindowMs).map(([, rpm]) => rpm);
+        const earlier = this.spinHistory.filter(([at]) => tMs - at > RULES.settleWindowMs && tMs - at <= 2 * RULES.settleWindowMs).map(([, rpm]) => rpm);
+        if (recent.length < 5 || earlier.length < 5) {
+            return false;
+        }
+        const a = median(recent);
+        const b = median(earlier);
+        if (Math.abs(a - b) / a <= RULES.settleRel) {
+            this.settled = true;
+            return true;
+        }
+        return false;
+    }
+
     public constructor(index: number, s: number, startMs: number) {
         this.index = index;
         this.s = s;
@@ -536,6 +580,8 @@ export class SpindleAudioAnalyser {
 
     public frames = 0;
 
+    public clippedFrames = 0;
+
     public totalCostMs = 0;
 
     public maxCostMs = 0;
@@ -600,6 +646,8 @@ export class SpindleAudioAnalyser {
             runoutIndexDb: NaN,
             costMs: 0,
             levelDb: NaN,
+            clipped: false,
+            locked: false,
         };
         // Loudness of the raw frame, cheap and always available: the camera
         // page's noise meter, and a sanity check that the microphone hears.
@@ -609,6 +657,10 @@ export class SpindleAudioAnalyser {
             sumSq += v * v;
         }
         result.levelDb = 10 * Math.log10(sumSq / WINDOW_SAMPLES + 1e-12);
+        result.clipped = result.levelDb >= RULES.clipDb;
+        if (result.clipped) {
+            this.clippedFrames += 1;
+        }
         if (!ctx || ctx.s === null || ctx.s <= 0 || ctx.epoch < 0) {
             this.commit(NaN);
             if (this.current) {
@@ -666,13 +718,23 @@ export class SpindleAudioAnalyser {
         const chatterExcess = n > 0 ? bestDb - median(this.maskedDb.subarray(0, n)) : NaN;
         const chatterHz = n > 0 ? (BAND_LO_BIN + bestBin) * BIN_HZ : NaN;
 
-        // Role of the frame within the epoch.
+        // A lock needs confidence, a candidate away from the band's edges and
+        // an unclipped frame; a spin-up needs the RPM to have settled, not
+        // just time to have passed (the A350 ramps its spindle for ~20 s).
+        const locked = comb.confidence >= RULES.minConfidence && !comb.edge && !result.clipped;
+        result.locked = locked;
+        if (locked && ctx.kind !== 'feed') {
+            epoch.spinHistory.push([tMs, comb.rpm]);
+            if (epoch.spinHistory.length > 200) {
+                epoch.spinHistory.shift();
+            }
+        }
         let role: FrameRole;
         if (ctx.sinceTransitionMs < RULES.transitionGuardMs) {
             role = 'transition';
         } else if (ctx.kind === 'feed') {
             role = 'cut';
-        } else if (ctx.sinceEpochMs >= RULES.spinUpMs) {
+        } else if (ctx.sinceEpochMs >= RULES.spinUpMs && epoch.isSettled(tMs)) {
             role = 'baseline';
         } else {
             role = 'spinup';
@@ -690,7 +752,7 @@ export class SpindleAudioAnalyser {
             started,
             epoch,
             role,
-            locked: comb.confidence >= RULES.minConfidence,
+            locked,
             transient,
             fRev,
             p1: peakDb(this.power, fRev),
@@ -1158,6 +1220,8 @@ export interface SynthEpoch {
     runoutAmp?: number;
     /** A non-harmonic chatter tone while cutting: [Hz, amplitude]. */
     chatter?: [number, number];
+    /** Spin-up ramp length in seconds (default min(1.5, spinUpS)): the A350 takes ~20 s. */
+    rampS?: number;
 }
 
 export interface SynthResult {
@@ -1207,14 +1271,14 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
         const tt = i / SAMPLE_RATE;
         const ep = schedule.find((e) => tt >= e.start && tt < e.end);
         if (!ep) {
-            samples[i] = 0.02 * noise();
+            samples[i] = 0.005 * noise();
             continue;
         }
         const cutting = tt >= ep.cutAt && tt < ep.cutEnd;
         let rpm = ep.s;
         // Spin-up ramp over the first 1.5 s of a spin-up phase.
         const since = tt - ep.start;
-        const ramp = Math.min(1.5, ep.spec.spinUpS);
+        const ramp = ep.spec.rampS !== undefined ? ep.spec.rampS : Math.min(1.5, ep.spec.spinUpS);
         if (ramp > 0 && since < ramp) {
             rpm = ep.s * (0.7 + 0.3 * (since / ramp));
         }
@@ -1245,7 +1309,9 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
             x += ep.spec.chatter[1] * Math.sin(2 * Math.PI * ep.spec.chatter[0] * tt);
         }
         x += noise() * 0.05 * (cutting ? 4 : 1);
-        samples[i] = x;
+        // Keep the synthetic well inside full scale (about -12 dBFS while
+        // cutting): a real recording that reaches 0 dBFS is clipping.
+        samples[i] = 0.25 * x;
     }
     const contextAt = (tMs: number): FrameContext | null => {
         const tt = tMs / 1000;

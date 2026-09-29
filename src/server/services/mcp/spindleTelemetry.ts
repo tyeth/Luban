@@ -271,6 +271,10 @@ class TelemetrySession {
 
     private audioFrames = 0;
 
+    private clippedFrames = 0;
+
+    private clippingWarned = false;
+
     private epochSummaries: EpochSummary[] = [];
 
     private recorderStats: RecorderStats | null = null;
@@ -599,6 +603,21 @@ class TelemetrySession {
 
     private onFrame(frame: FrameResult): void {
         this.audioFrames += 1;
+        if (frame.clipped) {
+            this.clippedFrames += 1;
+            // One warning per job, once clipping is clearly not a stray transient.
+            if (!this.clippingWarned && this.audioFrames >= 200 && this.clippedFrames >= 0.01 * this.audioFrames) {
+                this.clippingWarned = true;
+                this.appendEvent('audio_clipping', {
+                    source: 'audio',
+                    clippedFrames: this.clippedFrames,
+                    frames: this.audioFrames,
+                    levelDb: Math.round(frame.levelDb),
+                    note: `microphone clipping (${this.clippedFrames} of ${this.audioFrames} frames at full scale): reduce the capture gain - `
+                        + 'clipped frames are not trusted for RPM, so sags cannot be judged while it lasts',
+                });
+            }
+        }
         if (!this.audio) {
             return;
         }
@@ -832,6 +851,7 @@ class TelemetrySession {
                 samples: stats ? stats.samples : 0,
                 durationS: stats ? round(stats.samples / SAMPLE_RATE, 1) : null,
                 frames: this.audioFrames,
+                clippedFrames: this.clippedFrames,
                 kept: this.audio ? this.audio.length : null,
                 decimation: this.audio ? this.audio.decimation : null,
                 frameHz: 1 / HOP_S,
@@ -989,6 +1009,7 @@ export interface TelemetrySummary {
         samples: number;
         durationS: number | null;
         frames: number;
+        clippedFrames: number;
         kept: number | null;
         decimation: number | null;
         frameHz: number;
