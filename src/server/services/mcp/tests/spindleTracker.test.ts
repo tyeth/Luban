@@ -271,23 +271,24 @@ export const tests: Array<[string, () => void]> = [
         const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onEvent: (event) => events.push(event) });
         analyser.push(synth.samples);
         const [summary] = analyser.finish();
-        assert.equal(summary.verdict, 'HOLD');
-        assert.equal(summary.reachFlag, false, 'the loaded speed is on S');
+        assert.equal(summary.verdict, 'HOLD', 'the cut never drops below the unloaded speed');
+        assert.equal(summary.reachFlag, true, 'operator rule: unloaded more than 2 % off S is a reach failure (the cut started on the plateau)');
         assert.ok(Math.abs((summary.loadedRefRpm as number) - 8000) < 40, `loaded ref ${summary.loadedRefRpm}`);
         assert.ok(Math.abs((summary.idleError as number) + 0.065) < 0.01, `idle error ${summary.idleError}`);
         assert.ok(Math.abs((summary.baselineRpm as number) - 7480) < 40, `idle ${summary.baselineRpm}`);
         assert.ok(!events.some((event) => event.kind === 'spindle_sag'));
-        assert.ok(events.some((event) => event.kind === 'spindle_reach'), 'the idle offset is still announced once');
+        assert.ok(events.some((event) => event.kind === 'spindle_reach'), 'the idle offset is announced once');
     }],
 
-    ['a spindle that never reaches S under load is flagged REACH, not sagging', () => {
+    ['a spindle that reaches S unloaded but drops 8 % under load is STRUGGLING, with no reach flag', () => {
         const synth = synthesise([{ s: 8000, feed: 500, spinUpS: 2.5, baselineS: 4, cutS: 8, recoverS: 1, droop: 0.08 }]);
         const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt });
         analyser.push(synth.samples);
         const [summary] = analyser.finish();
-        assert.equal(summary.reachFlag, true);
-        assert.ok((summary.reachError as number) < -0.06, `reach ${summary.reachError}`);
-        assert.equal(summary.verdict, 'HOLD', 'steady under load, just low');
+        assert.equal(summary.reachFlag, false, 'unloaded it is on S');
+        assert.equal(summary.verdict, 'STRUGGLE');
+        assert.ok((summary.medianDrop as number) > 0.06, `median drop ${summary.medianDrop}`);
+        assert.ok(Math.abs((summary.loadedRefRpm as number) - 7360) < 60, `loaded ${summary.loadedRefRpm}`);
     }],
 
     ['the gantry tone is tracked as its own thing and does not disturb the spindle lock', () => {

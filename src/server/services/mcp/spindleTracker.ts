@@ -583,9 +583,17 @@ class Epoch {
     /** The best 0.3 s rolling-median RPM sustained while cutting: the loaded reference. */
     public loadedRef: number | null = null;
 
-    /** The reference a cut's rolling median is judged against, once a full rolling window of locked cutting exists. */
+    /**
+     * The reference a cut's rolling median is judged against: the operator's
+     * rule and the reference script use the UNLOADED baseline, and with the
+     * rolling idle baseline (the most recent settled free frames) that is the
+     * spindle's settled speed, not its soft-start plateau. The best sustained
+     * loaded median is reported beside it but not used: a single high
+     * mis-lock cluster made it 8280 on job beb4bf0a3d22 and every honest
+     * 8000 read as a 3.4 % sag.
+     */
     public sagReference(): number | null {
-        return this.loadedRef;
+        return this.baseline();
     }
 
     /** Called with each full rolling window's median while cutting; the reference only ever rises. */
@@ -1024,7 +1032,7 @@ export class SpindleAudioAnalyser {
                 }
             }
             const reference = locked && lockedInWindow * 2 > window && epoch.rolling.length >= Math.ceil(window / 2)
-                ? epoch.sagReference() : null;
+                ? (this.resolveBaseline(epoch), epoch.sagReference()) : null;
             if (reference !== null) {
                 const rel = median(epoch.rolling) / reference;
                 result.rel = rel;
@@ -1316,11 +1324,11 @@ export class SpindleAudioAnalyser {
         if (epoch.baselineRpm.length >= RULES.minBaselineFrames) {
             summary.idleError = (baseline as number) / epoch.s - 1;
         }
-        if (epoch.loadedRef !== null) {
-            summary.reachError = epoch.loadedRef / epoch.s - 1;
-            summary.reachFlag = Math.abs(summary.reachError) > RULES.reachRel;
-        } else if (summary.idleError !== null) {
+        if (summary.idleError !== null) {
             summary.reachError = summary.idleError;
+            summary.reachFlag = Math.abs(summary.reachError) > RULES.reachRel;
+        } else if (epoch.loadedRef !== null) {
+            summary.reachError = epoch.loadedRef / epoch.s - 1;
             summary.reachFlag = Math.abs(summary.reachError) > RULES.reachRel;
         }
         if (epoch.cutConf.length < RULES.minCutFrames) {

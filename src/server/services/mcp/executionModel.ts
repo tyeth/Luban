@@ -64,7 +64,11 @@ export function lineDurationsMs(program: SpindleProgram, text: string, start?: P
                     d2 += (to[axis] - from[axis]) ** 2;
                 }
             }
-            const feed = line.kind === 'feed' && line.feed ? line.feed : RAPID_MM_PER_MIN;
+            // G0 on the A350's CNC firmware travels at the modal feed once one
+            // has been set (measured 2026-09-29, job beb4bf0a3d22: 81 mm
+            // returns took ~9.7 s = F500, not the 1.6 s a true rapid would);
+            // only before any F word does the rapid default apply.
+            const feed = line.feed ? line.feed : RAPID_MM_PER_MIN;
             return (Math.sqrt(d2) / feed) * 60000;
         }
         if (line.kind === 'dwell') {
@@ -109,6 +113,9 @@ export class ExecutionEstimator {
 
     private lastEstimate = 1;
 
+    /** Block ordinal of the last true sync (job start = 0, a dwell end = the blocks before it): the planner cannot be further ahead than what it queued since. */
+    private syncBlock = 0;
+
     public constructor(program: SpindleProgram, text: string, leadBlocks = DEFAULT_PLANNER_LEAD_BLOCKS) {
         this.program = program;
         this.text = text;
@@ -132,9 +139,24 @@ export class ExecutionEstimator {
         this.durations = lineDurationsMs(this.program, this.text, start);
     }
 
-    /** Line at which the queued line's block minus `lead` blocks starts (the earliest the head can be). */
+    /** The motion line one block after `line` (the file's end when there is none). */
+    private nextBlockLine(line: number): number {
+        const count = this.program.lines.length;
+        for (let next = line + 1; next <= count; next++) {
+            if (this.program.lines[next - 1].motion) {
+                return next;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * The block the head is on when the queue's last block is `queued`: the
+     * planner holds `lead` blocks including the executing one, and cannot
+     * hold more than it has queued since the last sync.
+     */
     private lowerBound(queued: number): number {
-        const target = this.blockIndex[queued - 1] - this.lead;
+        const target = Math.max(this.syncBlock + 1, this.blockIndex[queued - 1] - (this.lead - 1));
         if (target <= 0) {
             return 1;
         }
@@ -143,7 +165,7 @@ export class ExecutionEstimator {
                 return line;
             }
         }
-        return 1;
+        return queued;
     }
 
     /** Walk the file's timing from the anchor: the line in progress at tMs. */
@@ -210,6 +232,7 @@ export class ExecutionEstimator {
                     }
                     this.anchorLine = dwellLine;
                     this.anchorAtMs = tMs;
+                    this.syncBlock = this.blockIndex[dwellLine - 1];
                     mode = 'anchor';
                 }
                 this.lastQueued = queued;
@@ -221,8 +244,14 @@ export class ExecutionEstimator {
         let leadBlocks: number | null = null;
         if (queued !== null) {
             const lower = this.lowerBound(queued);
-            if (estimate > queued) {
-                estimate = queued;
+            // While the queue is live the head executes the block `lead`
+            // behind the queued one; the timing model may run at most one
+            // block past that. Only a frozen queue (the file's end, or a
+            // sync draining) lets the head close the whole gap.
+            const frozen = tMs - this.queuedSinceMs >= FREEZE_MS && this.syncFollows(queued);
+            const upper = frozen ? queued : Math.min(queued, this.nextBlockLine(lower));
+            if (estimate > upper) {
+                estimate = upper;
                 mode = 'queue-upper';
                 this.anchorLine = estimate - 1;
                 this.anchorAtMs = tMs;

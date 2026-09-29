@@ -22,6 +22,23 @@ function raster(passes: number): { text: string; program: ReturnType<typeof pars
 }
 
 export const tests: Array<[string, () => void]> = [
+    ['a G0 after an F word travels at that feed; the estimate never runs more than a block past the queue-implied head', () => {
+        const text = ['G90', 'M3 S8000', 'G0 X0 Y0', 'G1 X81 F500', 'G0 X0', 'G1 X81', 'G0 X0', 'G1 X81', 'G0 X0'].join('\n');
+        const program = parseSpindleProgram(text);
+        const ms = lineDurationsMs(program, text, { x: 0, y: 0, z: 0 });
+        assert.equal(Math.round(ms[4]), 9720, 'the G0 return runs at the modal F500');
+        assert.equal(Math.round(ms[2]), 0, 'a G0 before any F is a true rapid from the start point (0 mm here)');
+        // A live queue 2 blocks ahead: with lead 2 the head is on block(queued) - 2 and may be at most one block further.
+        const est = new ExecutionEstimator(program, text, 2);
+        est.setStartPosition({ x: 0, y: 0, z: 0 });
+        est.update(0, null);
+        est.update(1000, 6);
+        const e = est.update(60000, 6); // the clock says everything is long done
+        // Queue on block 4 (line 6) with lead 2: the head is on block 3 (line 5), allowed one block past it.
+        assert.ok(e.line <= 6, `bounded to one block past the queue-implied head: line ${e.line}`);
+        assert.equal(e.mode, 'queue-upper');
+    }],
+
     ['line durations: feed moves by length / F, rapids at the rapid feed, dwells by P', () => {
         const { text, program } = raster(2);
         const ms = lineDurationsMs(program, text);
@@ -62,16 +79,16 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(e.line <= 6, `at t = 0 the zero-length setup lines are done and the dwell is in progress: line ${e.line}`);
         // Dwell over at ~3.5 s, plunge to ~6.8 s; the planner fills 16 blocks
         // at once: the reported position is pass 8's end.
-        e = est.update(7000, passLine(8));
+        e = est.update(7000, passLine(7));
         assert.ok(e.line >= 7 && e.line <= passLine(0), `during the plunge / start of pass 1: line ${e.line}`);
-        // 30 s later (t = 37 s): pass 4 is executing (3.1 passes since 6.8 s); the queue reports pass 11.
-        e = est.update(37000, passLine(11));
+        // 30 s later (t = 37 s): pass 4 is executing (3.1 passes since 6.3 s); the queue reports pass 10.
+        e = est.update(37000, passLine(10));
         assert.equal(e.line, passLine(3), `pass 4 at 37 s: line ${e.line}`);
         assert.equal(e.mode, 'time');
-        assert.ok(e.leadBlocks !== null && e.leadBlocks >= 14 && e.leadBlocks <= 16, `lead ${e.leadBlocks}`);
-        // Never past the queue: a wildly late report still caps the estimate.
+        assert.ok(e.leadBlocks !== null && e.leadBlocks >= 13 && e.leadBlocks <= 16, `lead ${e.leadBlocks}`);
+        // Never past the queue-implied head: a wildly late clock is capped a block past it, not at the queue.
         e = est.update(400000, passLine(12));
-        assert.equal(e.line, passLine(12));
+        assert.ok(e.line < passLine(12) && e.line >= passLine(4), `capped near the head: line ${e.line}`);
         assert.equal(e.mode, 'queue-upper');
     }],
 
@@ -93,7 +110,7 @@ export const tests: Array<[string, () => void]> = [
         est.update(0, null);
         // Steady state: the queue 8 passes ahead of the cutter (a pass is 10.2 s).
         for (let t = 7000; t <= 215000; t += 5000) {
-            const q = Math.min(29, Math.floor((t - 6300) / 10200) + 8);
+            const q = Math.min(29, Math.floor((t - 6300) / 10200) + 7);
             est.update(t, passLine(q));
         }
         // The queue reaches the last pass at ~220 s; the matcher then sits on
