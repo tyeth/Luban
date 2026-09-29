@@ -264,6 +264,32 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(analyser.clippedFrames, clipped.length);
     }],
 
+    ['a spindle that idles under S but runs at S once loaded: HOLD, no reach flag, idle offset reported', () => {
+        // The A350 at S8000 (2026-09-29): idle 7477, loaded 8000.
+        const synth = synthesise([{ s: 8000, feed: 500, spinUpS: 2.5, baselineS: 4, cutS: 8, recoverS: 1, droop: 0.0, idleRel: 0.935 }]);
+        const events: SpindleEvent[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onEvent: (event) => events.push(event) });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        assert.equal(summary.verdict, 'HOLD');
+        assert.equal(summary.reachFlag, false, 'the loaded speed is on S');
+        assert.ok(Math.abs((summary.loadedRefRpm as number) - 8000) < 40, `loaded ref ${summary.loadedRefRpm}`);
+        assert.ok(Math.abs((summary.idleError as number) + 0.065) < 0.01, `idle error ${summary.idleError}`);
+        assert.ok(Math.abs((summary.baselineRpm as number) - 7480) < 40, `idle ${summary.baselineRpm}`);
+        assert.ok(!events.some((event) => event.kind === 'spindle_sag'));
+        assert.ok(events.some((event) => event.kind === 'spindle_reach'), 'the idle offset is still announced once');
+    }],
+
+    ['a spindle that never reaches S under load is flagged REACH, not sagging', () => {
+        const synth = synthesise([{ s: 8000, feed: 500, spinUpS: 2.5, baselineS: 4, cutS: 8, recoverS: 1, droop: 0.08 }]);
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        assert.equal(summary.reachFlag, true);
+        assert.ok((summary.reachError as number) < -0.06, `reach ${summary.reachError}`);
+        assert.equal(summary.verdict, 'HOLD', 'steady under load, just low');
+    }],
+
     ['analysis cost is bounded per frame', () => {
         const { frames } = run();
         const cost = frames.map((frame) => frame.costMs);

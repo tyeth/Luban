@@ -83,8 +83,19 @@ export const RULES = {
      */
     edgeLockRel: 0.01,
     /** Baseline frames also need the RPM settled: the 1 s median within this of the median 1 s earlier (the A350 ramps ~20 s). */
-    settleRel: 0.005,
-    settleWindowMs: 1000,
+    settleRel: 0.003,
+    settleWindowMs: 1500,
+    /**
+     * Sags are judged against the LOADED reference: the highest 0.3 s rolling
+     * median the spindle has sustained while cutting in this epoch. On the
+     * A350 the spindle idles ~6.5 % under S8000 and is at S within a second
+     * of cutting (measured 2026-09-29: idle 7477, cutting 8000), so the
+     * unloaded baseline is neither where a cut starts from nor what a sag
+     * falls from; it stays the reference for reach-at-idle and for the
+     * spectral (chatter / runout) comparisons. A spindle whose best
+     * sustained loaded speed is under S is "not reaching" (reach flag); one
+     * that drops from it is sagging.
+     */
     /** RMS level at or above this (dBFS) is clipping; reported, and the frame's spectrum is not trusted. */
     clipDb: -0.5,
     minBaselineFrames: 5,
@@ -361,9 +372,13 @@ export interface EpochSummary {
     cutFrames: number;
     baselineRpm: number | null;
     baselineSource: 'epoch' | 'previous-epoch' | 'commanded';
-    /** baseline / commanded - 1 */
+    /** loadedRef / commanded - 1 once a loaded reference exists, else idle / commanded - 1. */
     reachError: number | null;
     reachFlag: boolean;
+    /** Unloaded (idle) RPM / commanded - 1: how far the free-running spindle sits from S. */
+    idleError: number | null;
+    /** The regulated speed under load: the best 0.3 s rolling median sustained while cutting. */
+    loadedRefRpm: number | null;
     cutMedianRpm: number | null;
     cutMinRpm: number | null;
     /** 1 - median(cut / baseline) */
@@ -453,6 +468,21 @@ class Epoch {
     public baselineSource: EpochSummary['baselineSource'] = 'epoch';
 
     public baselineOverride: number | null = null;
+
+    /** The best 0.3 s rolling-median RPM sustained while cutting: the loaded reference. */
+    public loadedRef: number | null = null;
+
+    /** The reference a cut's rolling median is judged against, once a full rolling window of locked cutting exists. */
+    public sagReference(): number | null {
+        return this.loadedRef;
+    }
+
+    /** Called with each full rolling window's median while cutting; the reference only ever rises. */
+    public noteLoaded(rollingMedian: number): void {
+        if (this.loadedRef === null || rollingMedian > this.loadedRef) {
+            this.loadedRef = rollingMedian;
+        }
+    }
 
     public lastSurfaceCheckMs = 0;
 
@@ -818,10 +848,18 @@ export class SpindleAudioAnalyser {
             // rolling window locked, so noise frames that happen to score
             // cannot manufacture a sag out of random RPM readings.
             const lockedInWindow = epoch.lockHistory.filter(Boolean).length;
-            const baseline = locked && lockedInWindow * 2 > window && epoch.rolling.length >= Math.ceil(window / 2)
-                ? this.resolveBaseline(epoch) : null;
-            if (baseline !== null) {
-                const rel = median(epoch.rolling) / baseline;
+            if (locked) {
+                // Resolve (and record the source of) the idle baseline the
+                // spectral comparisons and the summary use.
+                this.resolveBaseline(epoch);
+                if (epoch.rolling.length >= window && lockedInWindow === window) {
+                    epoch.noteLoaded(median(epoch.rolling));
+                }
+            }
+            const reference = locked && lockedInWindow * 2 > window && epoch.rolling.length >= Math.ceil(window / 2)
+                ? epoch.sagReference() : null;
+            if (reference !== null) {
+                const rel = median(epoch.rolling) / reference;
                 result.rel = rel;
                 epoch.cutRel.push(rel);
                 this.trackDip(epoch, rel, tMs);
@@ -898,7 +936,8 @@ export class SpindleAudioAnalyser {
                 sCommanded: epoch.s,
                 baselineRpm: Math.round(baseline),
                 reachError: Number(err.toFixed(4)),
-                note: `unloaded spindle at ${Math.round(baseline)} RPM, ${(100 * err).toFixed(1)} % off the commanded S${epoch.s}`,
+                note: `unloaded spindle at ${Math.round(baseline)} RPM, ${(100 * err).toFixed(1)} % off the commanded S${epoch.s} `
+                    + '(idle speed; the loaded speed is judged separately)',
             });
         }
     }
@@ -1104,9 +1143,17 @@ export class SpindleAudioAnalyser {
             chatterFlag: epoch.chatterEmitted,
             chatterRibMm: null,
             revRibMm: epoch.feed ? epoch.feed / epoch.s : null,
+            idleError: null,
+            loadedRefRpm: epoch.loadedRef,
         };
         if (epoch.baselineRpm.length >= RULES.minBaselineFrames) {
-            summary.reachError = (baseline as number) / epoch.s - 1;
+            summary.idleError = (baseline as number) / epoch.s - 1;
+        }
+        if (epoch.loadedRef !== null) {
+            summary.reachError = epoch.loadedRef / epoch.s - 1;
+            summary.reachFlag = Math.abs(summary.reachError) > RULES.reachRel;
+        } else if (summary.idleError !== null) {
+            summary.reachError = summary.idleError;
             summary.reachFlag = Math.abs(summary.reachError) > RULES.reachRel;
         }
         if (epoch.cutConf.length < RULES.minCutFrames) {
@@ -1222,6 +1269,8 @@ export interface SynthEpoch {
     chatter?: [number, number];
     /** Spin-up ramp length in seconds (default min(1.5, spinUpS)): the A350 takes ~20 s. */
     rampS?: number;
+    /** Free-running speed as a fraction of S (the A350 idles at ~0.935 x S8000); loaded speed is S x (1 - droop). */
+    idleRel?: number;
 }
 
 export interface SynthResult {
@@ -1275,7 +1324,7 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
             continue;
         }
         const cutting = tt >= ep.cutAt && tt < ep.cutEnd;
-        let rpm = ep.s;
+        let rpm = cutting || ep.spec.idleRel === undefined ? ep.s : ep.s * ep.spec.idleRel;
         // Spin-up ramp over the first 1.5 s of a spin-up phase.
         const since = tt - ep.start;
         const ramp = ep.spec.rampS !== undefined ? ep.spec.rampS : Math.min(1.5, ep.spec.spinUpS);

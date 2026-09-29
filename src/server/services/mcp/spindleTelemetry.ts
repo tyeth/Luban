@@ -820,6 +820,8 @@ class TelemetrySession {
                     baselineSource: epoch.baselineSource,
                     reachError: round(epoch.reachError, 4),
                     reachFlag: epoch.reachFlag,
+                    idleError: round(epoch.idleError, 4),
+                    loadedRefRpm: round(epoch.loadedRefRpm, 0),
                     cutMedianRpm: round(epoch.cutMedianRpm, 0),
                     cutMinRpm: round(epoch.cutMinRpm, 0),
                     medianDrop: round(epoch.medianDrop, 4),
@@ -895,9 +897,11 @@ class TelemetrySession {
             },
             seriesRetained: !this.ringsReleased,
             events: this.eventCounts,
-            note: 'Alerts only: telemetry never pauses or stops the machine. Verdicts per commanded S: HOLD (within 3 % of the '
-                + 'unloaded baseline, no dip > 3 %), BLIP (dips > 3 % shorter than 1 s), STRUGGLE (median > 3 % down or > 1 s '
-                + 'below 97 %), REACH flag (unloaded > 2 % off S), NO-LOCK (comb not trackable). get_job_telemetry returns the series.',
+            note: 'Alerts only: telemetry never pauses or stops the machine. Verdicts per commanded S, judged against the LOADED '
+                + 'reference (the best 0.3 s rolling median sustained while cutting; the A350 idles ~6.5 % under S and reaches S once '
+                + 'loaded): HOLD (within 3 %, no dip > 3 %), BLIP (dips > 3 % shorter than 1 s), STRUGGLE (median > 3 % down or > 1 s '
+                + 'below 97 %), REACH flag (loaded speed > 2 % off S; idleError reports the free-running offset), NO-LOCK (comb not '
+                + 'trackable). get_job_telemetry returns the series.',
         };
     }
 

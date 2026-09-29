@@ -1192,7 +1192,11 @@ path is untouched, and file-job streaming is unchanged (the machine runs the fil
 only reads what the controller reports). Files: `telemetryConfig.ts` (settings, limits),
 `spindleProgram.ts` (commanded S + motion kind per line), `spindleTracker.ts` (the
 harmonic-comb tracker, a streaming port of `endmill_burn_calibration/rpm_from_audio.py` whose
-`--selftest` the unit suite reproduces), `telemetryRing.ts` (typed-array rings, min/max
+`--selftest` the unit suite reproduces; sags are judged against the LOADED reference - the best 0.3 s
+  rolling median sustained while cutting - because the A350 idles ~6.5 % under S8000 and runs at
+  S once loaded, measured 2026-09-29; a spindle whose best loaded speed is under S is "not
+  reaching", one that drops from it is sagging; the unloaded baseline serves reach-at-idle and the spectral
+  comparisons), `telemetryRing.ts` (typed-array rings, min/max
 downsampling), `audioSelection.ts` / `audioDevices.ts` (capture-source listing and strict
 matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-job session),
 `tools/telemetry.ts`.
