@@ -67,6 +67,28 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(later.line >= e.line, 'monotonic');
     }],
 
+    ['the end of the file is not a sync: the head keeps running its buffered passes after the queue reads M5', () => {
+        const { text, program, passLine } = raster(30);
+        const est = new ExecutionEstimator(program, text, 16);
+        est.update(0, null);
+        // Steady state: the queue 8 passes ahead of the cutter (a pass is 10.2 s).
+        for (let t = 7000; t <= 215000; t += 5000) {
+            const q = Math.min(29, Math.floor((t - 6300) / 10200) + 8);
+            est.update(t, passLine(q));
+        }
+        // The queue reaches the last pass at ~220 s; the matcher then sits on
+        // the file's trailing M5 (a non-motion line) while the head still has
+        // eight passes (~80 s) to run.
+        const last = program.lines.length; // M5
+        est.update(220000, passLine(29));
+        est.update(226000, last);
+        const mid = est.update(260000, last);
+        assert.ok(mid.line >= passLine(22) && mid.line < passLine(29), `on a buffered pass at 260 s: line ${mid.line}`);
+        assert.equal(mid.mode, 'time');
+        const done = est.update(400000, last);
+        assert.equal(done.line, last, 'eventually at the end');
+    }],
+
     ['a dwell is a planner sync: the frozen reported position resuming re-anchors the clock', () => {
         // Two cuts separated by a 4 s dwell (E4 style).
         const text = ['G90', 'M3 S8000', 'G0 X0 Y0', 'G1 X50 F500', 'G4 P4000', 'G1 X0 F500', 'G4 P4000', 'M5'].join('\n');

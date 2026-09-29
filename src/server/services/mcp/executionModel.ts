@@ -166,9 +166,13 @@ export class ExecutionEstimator {
 
         if (queued !== null) {
             if (this.lastQueued === null || queued !== this.lastQueued) {
-                // The queue advanced. If it had been frozen at a sync point, the
-                // head has just finished that dwell: an exact anchor.
-                if (this.lastQueued !== null && queued > this.lastQueued
+                // The queue took a NEW MOVE. If it had been frozen at a sync
+                // point, the head has just finished that dwell: an exact anchor.
+                // (The position matcher also "advances" onto the non-motion
+                // lines after a segment's end - the M5 at the end of a file
+                // while the head still has a buffer of moves to run - and
+                // that is not the planner moving on.)
+                if (this.lastQueued !== null && queued > this.lastQueued && !!this.program.lines[queued - 1].motion
                     && tMs - this.queuedSinceMs >= FREEZE_MS && this.syncFollows(this.lastQueued)) {
                     let dwellLine = this.lastQueued;
                     for (let line = this.lastQueued + 1; line < queued; line++) {
