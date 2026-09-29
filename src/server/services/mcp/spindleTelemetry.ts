@@ -90,7 +90,12 @@ const AUDIO_COLUMNS: ColumnSpec[] = [
     { name: 'chatterHz', type: 'u16' },
     { name: 'runoutDb', type: 'i8', scale: 2 },
     { name: 'role', type: 'u8' },
+    { name: 'levelDb', type: 'i8' },
 ];
+
+/** Sparkline window and resolution served to the camera page. */
+const LIVE_WINDOW_MS = 120000;
+const LIVE_POINTS = 240;
 
 const ROLE_CODES: { [role: string]: number } = { off: 0, spinup: 1, transition: 2, baseline: 3, cut: 4 };
 
@@ -517,7 +522,47 @@ class TelemetrySession {
             chatterHz: frame.chatterHz,
             runoutDb: frame.runoutIndexDb,
             role: ROLE_CODES[frame.role],
+            levelDb: frame.levelDb,
         });
+    }
+
+    /**
+     * The latest sample of each stream plus min/max-downsampled tails of the
+     * last two minutes, for the camera page's side panel (polled at 1 Hz).
+     */
+    public live(): TelemetryLive {
+        const tNow = (this.endedAt || Date.now()) - this.startedAt;
+        const tail = (ring: TelemetryRing | null, columns: string[]) => {
+            if (!ring || !ring.length) {
+                return null;
+            }
+            const from = ring.lowerBound('t', Math.max(0, tNow - LIVE_WINDOW_MS));
+            const t = ring.series('t', from);
+            const out: { [column: string]: { t: number[]; v: number[] } } = {};
+            for (const column of columns) {
+                const down = downsampleMinMax(t, ring.series(column, from), LIVE_POINTS);
+                out[column] = { t: down.t, v: down.v };
+            }
+            return out;
+        };
+        const last = (ring: TelemetryRing | null) => (ring && ring.length ? ring.at(ring.length - 1) : null);
+        const status = last(this.status);
+        const audio = last(this.audio);
+        return {
+            jobId: this.job.id,
+            jobName: this.job.name,
+            state: this.state,
+            startedAt: this.startedAt,
+            tNowMs: tNow,
+            status: status ? { ...status, ageMs: tNow - status.t } : null,
+            audio: audio ? { ...audio, ageMs: tNow - audio.t, device: this.audioSource ? this.audioSource.entry : null, error: this.audioError } : null,
+            spark: {
+                status: tail(this.status, ['rpm', 'target', 'commandedS']),
+                audio: tail(this.audio, ['rpm', 'rel', 'levelDb', 'chatterDb']),
+            },
+            events: this.eventCounts,
+            windowMs: LIVE_WINDOW_MS,
+        };
     }
 
     private onSpindleEvent(event: SpindleEvent): void {
@@ -764,7 +809,7 @@ class TelemetrySession {
             max_points: maxPoints,
             series_retained: !this.ringsReleased,
             status: series(this.status, ['line', 'rpm', 'target', 'commandedS', 'pollMs', 'source']),
-            audio: series(this.audio, ['rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role']),
+            audio: series(this.audio, ['rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role', 'levelDb']),
             audio_file: this.audioFilePath(),
             audio_device: this.audioSource ? this.audioSource.entry : null,
             epochs: this.summary().audio?.epochs || [],
@@ -774,6 +819,22 @@ class TelemetrySession {
             },
         };
     }
+}
+
+export interface TelemetryLive {
+    jobId: string;
+    jobName: string;
+    state: 'recording' | 'finished' | 'failed';
+    startedAt: number;
+    tNowMs: number;
+    status: { [column: string]: number } | null;
+    audio: { [column: string]: number | string | null } | null;
+    spark: {
+        status: { [column: string]: { t: number[]; v: number[] } } | null;
+        audio: { [column: string]: { t: number[]; v: number[] } } | null;
+    };
+    events: { [kind: string]: number };
+    windowMs: number;
 }
 
 export interface TelemetrySummary {
@@ -855,6 +916,14 @@ export class SpindleTelemetryService {
     public summary(jobId: string): TelemetrySummary | null {
         const session = this.sessions.get(jobId);
         return session ? session.summary() : null;
+    }
+
+    /** The recording session (else the most recent one) for the camera page's panel. */
+    public live(): { enabled: boolean; audioEnabled: boolean; audioDevice: string | null; session: TelemetryLive | null } {
+        const cfg = currentTelemetryConfig();
+        const ordered = [...this.sessions.values()].sort((a, b) => b.startedAt - a.startedAt);
+        const session = ordered.find((s) => s.state === 'recording') || ordered[0] || null;
+        return { enabled: cfg.enabled, audioEnabled: cfg.audioEnabled, audioDevice: cfg.audioDevice, session: session ? session.live() : null };
     }
 
     public status(): object {

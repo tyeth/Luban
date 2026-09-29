@@ -1246,6 +1246,11 @@ matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-j
   bucket keeps its min and max, plus the FLAC path. Rings hold 16 B per status sample and 13 B
   per audio frame; at the cap a ring halves its rate (every second sample dropped) so a long
   job keeps its whole shape. The last 4 sessions keep their rings; older ones keep the summary.
+- **Camera page panel**: with telemetry on, `/camera` gains a side panel fed by
+  `/telemetry/live.json` (1 Hz, read-only): RPM (microphone when tracked, else the controller's
+  report) against the commanded S with the load percentage, the noise level (dBFS), the chatter
+  index and the reported line, plus two-minute min/max sparklines - dips below 97 % of S in red,
+  chatter peaks over 12 dB in orange - and the job's event tally.
 - **Status field names**: the SSTP/HTTP status payload is spread into the machine state
   untouched, so the RPM field is whatever the controller calls it. The session tries
   `cncCurrentSpindleSpeed`, `spindleSpeed`, `currentSpindleSpeed`, `currRpm`, … (SACP writes

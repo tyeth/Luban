@@ -203,6 +203,16 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(events.some((event) => event.kind === 'spindle_nolock'));
     }],
 
+    ['every frame carries a loudness, and cutting is louder than the quiet lead-in', () => {
+        const { frames } = run();
+        assert.ok(frames.every((frame) => Number.isFinite(frame.levelDb)));
+        const off = frames.filter((frame) => frame.role === 'off').map((frame) => frame.levelDb);
+        const cut = frames.filter((frame) => frame.role === 'cut').map((frame) => frame.levelDb);
+        const mean = (values: number[]) => values.reduce((a, b) => a + b, 0) / values.length;
+        assert.ok(mean(cut) > mean(off) + 6, `cut ${mean(cut).toFixed(1)} dBFS vs off ${mean(off).toFixed(1)} dBFS`);
+        assert.ok(mean(off) < -20, `quiet lead-in ${mean(off).toFixed(1)} dBFS`);
+    }],
+
     ['analysis cost is bounded per frame', () => {
         const { frames } = run();
         const cost = frames.map((frame) => frame.costMs);

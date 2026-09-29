@@ -315,6 +315,8 @@ export interface FrameResult {
     runoutIndexDb: number;
     /** Wall-clock cost of analysing this frame, ms. */
     costMs: number;
+    /** Frame loudness: RMS of the raw samples in dBFS (0 = full scale), every frame including 'off'. */
+    levelDb: number;
 }
 
 export type SpindleEventKind = 'spindle_sag' | 'spindle_blip' | 'spindle_reach' | 'chatter' | 'runout' | 'spindle_nolock' | 'spindle_epoch';
@@ -597,7 +599,16 @@ export class SpindleAudioAnalyser {
             chatterHz: NaN,
             runoutIndexDb: NaN,
             costMs: 0,
+            levelDb: NaN,
         };
+        // Loudness of the raw frame, cheap and always available: the camera
+        // page's noise meter, and a sanity check that the microphone hears.
+        let sumSq = 0;
+        for (let i = 0; i < WINDOW_SAMPLES; i++) {
+            const v = this.buffer[offset + i];
+            sumSq += v * v;
+        }
+        result.levelDb = 10 * Math.log10(sumSq / WINDOW_SAMPLES + 1e-12);
         if (!ctx || ctx.s === null || ctx.s <= 0 || ctx.epoch < 0) {
             this.commit(NaN);
             if (this.current) {
