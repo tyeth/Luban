@@ -111,6 +111,16 @@ const AUDIO_COLUMNS: ColumnSpec[] = [
     { name: 'runoutDb', type: 'i8', scale: 2 },
     { name: 'role', type: 'u8' },
     { name: 'levelDb', type: 'i8' },
+    { name: 'motionHz', type: 'u16' },
+    { name: 'motionDb', type: 'i8' },
+    { name: 'band0', type: 'i8' },
+    { name: 'band1', type: 'i8' },
+    { name: 'band2', type: 'i8' },
+    { name: 'band3', type: 'i8' },
+    { name: 'band4', type: 'i8' },
+    { name: 'band5', type: 'i8' },
+    { name: 'band6', type: 'i8' },
+    { name: 'band7', type: 'i8' },
 ];
 
 /** Sparkline window and resolution served to the camera page. */
@@ -632,6 +642,16 @@ class TelemetrySession {
             runoutDb: frame.runoutIndexDb,
             role: ROLE_CODES[frame.role],
             levelDb: frame.levelDb,
+            motionHz: frame.motionHz,
+            motionDb: frame.motionDb,
+            band0: frame.bands[0],
+            band1: frame.bands[1],
+            band2: frame.bands[2],
+            band3: frame.bands[3],
+            band4: frame.bands[4],
+            band5: frame.bands[5],
+            band6: frame.bands[6],
+            band7: frame.bands[7],
         });
     }
 
@@ -667,7 +687,7 @@ class TelemetrySession {
             audio: audio ? { ...audio, ageMs: tNow - audio.t, device: this.audioSource ? this.audioSource.entry : null, error: this.audioError } : null,
             spark: {
                 status: tail(this.status, ['rpm', 'target', 'commandedS', 'line']),
-                audio: tail(this.audio, ['rpm', 'rel', 'levelDb', 'chatterDb']),
+                audio: tail(this.audio, ['rpm', 'rel', 'levelDb', 'chatterDb', 'motionHz', 'motionDb']),
             },
             events: this.eventCounts,
             windowMs: LIVE_WINDOW_MS,
@@ -932,7 +952,8 @@ class TelemetrySession {
             max_points: maxPoints,
             series_retained: !this.ringsReleased,
             status: series(this.status, ['line', 'queuedLine', 'estimate', 'leadBlocks', 'parserLine', 'x', 'y', 'z', 'match', 'rpm', 'target', 'commandedS', 'pollMs', 'source']),
-            audio: series(this.audio, ['rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role', 'levelDb']),
+            audio: series(this.audio, ['rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role', 'levelDb', 'motionHz', 'motionDb',
+                'band0', 'band1', 'band2', 'band3', 'band4', 'band5', 'band6', 'band7']),
             audio_file: this.audioFilePath(),
             audio_device: this.audioSource ? this.audioSource.entry : null,
             epochs: this.summary().audio?.epochs || [],
@@ -946,7 +967,15 @@ class TelemetrySession {
                     commandedS: 'S in effect at the executing line',
                     rpm: 'the controller\'s spindleSpeed field: 250 RPM steps and mostly 0 on the A350 (2026-09-29); zeros are excluded from the per-S statistics',
                 },
-                audio: { role: '0 off, 1 spin-up, 2 transition, 3 baseline (unloaded), 4 cut', rel: 'rolling-median RPM / unloaded baseline', chatterDb: 'strongest non-harmonic tone over the band median', runoutDb: '1x gain - 4x gain vs baseline' },
+                audio: {
+                    role: '0 off, 1 spin-up, 2 transition, 3 baseline (unloaded), 4 cut',
+                    rel: 'rolling-median RPM / loaded reference',
+                    chatterDb: 'strongest non-harmonic tone over the band median',
+                    runoutDb: '1x gain - 4x gain vs baseline',
+                    motionHz: 'fundamental of the strongest harmonic series in 20-400 Hz with the spindle masked (gantry / frame tone), every frame',
+                    motionDb: 'that series\' strongest harmonic, 10 log10 power',
+                    band0_7: 'level (dB) in 50-100, 100-200, 200-400, 400-800, 800-1600, 1600-3200, 3200-6400, 6400-8000 Hz, every frame',
+                },
             },
         };
     }

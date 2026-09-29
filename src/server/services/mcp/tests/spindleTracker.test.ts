@@ -290,6 +290,23 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(summary.verdict, 'HOLD', 'steady under load, just low');
     }],
 
+    ['the gantry tone is tracked as its own thing and does not disturb the spindle lock', () => {
+        const synth = synthesise([{ s: 8000, feed: 500, spinUpS: 2.5, baselineS: 3, cutS: 6, recoverS: 1, gantry: [205, 0.4] }]);
+        const frames: FrameResult[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onFrame: (frame) => frames.push(frame) });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        const cut = frames.filter((frame) => frame.role === 'cut' && frame.locked);
+        assert.ok(cut.length > 60, `locked cut frames ${cut.length}`);
+        const motion = cut.map((frame) => frame.motionHz).sort((a, b) => a - b);
+        assert.ok(Math.abs(motion[motion.length >> 1] - 205) < 2, `motion comb ${motion[motion.length >> 1]} Hz`);
+        assert.ok(Math.abs((summary.cutMedianRpm as number) - 8000) < 40, `spindle ${summary.cutMedianRpm}`);
+        assert.equal(summary.verdict, 'HOLD');
+        assert.ok(frames.every((frame) => frame.bands.length === 8));
+        const off = frames.filter((frame) => frame.role === 'off');
+        assert.ok(off.every((frame) => Number.isFinite(frame.motionHz)), 'the motion comb is fitted with the spindle off too');
+    }],
+
     ['analysis cost is bounded per frame', () => {
         const { frames } = run();
         const cost = frames.map((frame) => frame.costMs);

@@ -19,7 +19,7 @@
 //
 // Pure: no server imports, unit-tested in tests/executionModel.test.ts.
 
-import { SpindleProgram } from './spindleProgram';
+import { Point3, SpindleProgram } from './spindleProgram';
 
 export const DEFAULT_PLANNER_LEAD_BLOCKS = 16;
 /** Rapid feed assumed for G0 timing (A350: ~3000 mm/min on XY). */
@@ -39,12 +39,25 @@ export interface ExecutionEstimate {
     leadBlocks: number | null;
 }
 
-/** ms each line takes to execute: motion length / feed, dwell P (ms) or S (s), else 0. */
-export function lineDurationsMs(program: SpindleProgram, text: string): number[] {
+/**
+ * ms each line takes to execute: motion length / feed, dwell P (ms) or S (s),
+ * else 0. Axes a file never states before a move (the traverse from the park
+ * height at the start of every job) are taken from `start`, the head's
+ * position when the job began - without it those moves would take no time
+ * and the spindle context would begin while the gantry is still travelling
+ * with the spindle off (the 2026-09-29 "8000 RPM before M3" reading).
+ */
+export function lineDurationsMs(program: SpindleProgram, text: string, start?: Point3 | null): number[] {
     const raw = String(text || '').split(/\r?\n/);
+    const fill = (point: Point3): Point3 => ({
+        x: Number.isFinite(point.x) || !start ? point.x : start.x,
+        y: Number.isFinite(point.y) || !start ? point.y : start.y,
+        z: Number.isFinite(point.z) || !start ? point.z : start.z,
+    });
     return program.lines.map((line, index) => {
         if (line.motion) {
-            const { from, to } = line.motion;
+            const from = fill(line.motion.from);
+            const to = fill(line.motion.to);
             let d2 = 0;
             for (const axis of ['x', 'y', 'z'] as const) {
                 if (Number.isFinite(from[axis]) && Number.isFinite(to[axis])) {
@@ -72,7 +85,11 @@ export function lineDurationsMs(program: SpindleProgram, text: string): number[]
 export class ExecutionEstimator {
     private readonly program: SpindleProgram;
 
-    private readonly durations: number[];
+    private durations: number[];
+
+    private readonly text: string;
+
+    private startPosition: Point3 | null = null;
 
     private readonly lead: number;
 
@@ -94,6 +111,7 @@ export class ExecutionEstimator {
 
     public constructor(program: SpindleProgram, text: string, leadBlocks = DEFAULT_PLANNER_LEAD_BLOCKS) {
         this.program = program;
+        this.text = text;
         this.durations = lineDurationsMs(program, text);
         this.lead = Math.max(1, Math.round(leadBlocks));
         let blocks = 0;
@@ -103,6 +121,15 @@ export class ExecutionEstimator {
             }
             return blocks;
         });
+    }
+
+    /** Where the head was when the job started (file frame): gives the leading moves their real durations. Once only. */
+    public setStartPosition(start: Point3): void {
+        if (this.startPosition) {
+            return;
+        }
+        this.startPosition = { ...start };
+        this.durations = lineDurationsMs(this.program, this.text, start);
     }
 
     /** Line at which the queued line's block minus `lead` blocks starts (the earliest the head can be). */

@@ -34,6 +34,26 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(Math.round(ms[8]), 480, '4 mm step');
     }],
 
+    ['the traverse from the park takes real time: no spindle context before M3 actually runs', () => {
+        const { text, program } = raster(3);
+        const est = new ExecutionEstimator(program, text, 16);
+        // Head parked at work (-100, 100, 116) when the job starts.
+        est.setStartPosition({ x: -100, y: 100, z: 116 });
+        const ms = lineDurationsMs(program, text, { x: -100, y: 100, z: 116 });
+        assert.equal(Math.round(ms[2]), 2138, 'G0 X-40.5 Y11.2 from (-100, 100): 106.9 mm at 3000 mm/min');
+        assert.equal(Math.round(ms[3]), 2120, 'G0 Z10 from Z116: 106 mm');
+        est.update(0, null);
+        let e = est.update(1000, null);
+        assert.equal(e.line, 3, 'still on the XY traverse');
+        assert.equal(program.lines[e.line - 1].s, null, 'spindle off');
+        e = est.update(3000, null);
+        assert.equal(e.line, 4, 'on the Z drop');
+        assert.equal(program.lines[e.line - 1].s, null);
+        e = est.update(4500, null);
+        assert.equal(e.line, 6, 'the dwell after M3');
+        assert.equal(program.lines[e.line - 1].s, 8000);
+    }],
+
     ['the queue leads by the buffer depth; the estimate follows the file timing behind it', () => {
         const { text, program, passLine } = raster(30);
         const est = new ExecutionEstimator(program, text, 16);

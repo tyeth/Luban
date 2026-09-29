@@ -1265,6 +1265,14 @@ matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-j
   bucket keeps its min and max, plus the FLAC path. Rings hold 16 B per status sample and 13 B
   per audio frame; at the cap a ring halves its rate (every second sample dropped) so a long
   job keeps its whole shape. The last 4 sessions keep their rings; older ones keep the summary.
+- **The gantry is tracked as its own thing.** Every frame - spindle on or off - also fits a
+  MOTION comb: the strongest harmonic series with a fundamental in 20–400 Hz, with the spindle's
+  harmonics masked out (`motionHz` / `motionDb`; the A350 sings at 205 Hz and multiples at its
+  rapid speed, lower at cutting feeds), plus eight octave-band levels 50 Hz–8 kHz (`band0..7`).
+  A spindle candidate that coincides with a stronger motion-comb harmonic is `contested` and not
+  a lock, and the leading moves of a file get their real durations from the head's position at
+  job start, so the spindle search only begins when the `M3` is actually executing (2026-09-29:
+  a rapid from the park was reported as 8000 RPM before the spindle had started).
 - **Camera page panel**: with telemetry on, `/camera` gains a side panel fed by
   `/telemetry/live.json` (1 Hz, read-only): RPM (microphone when tracked, else the controller's
   report) against the commanded S with the load percentage, the noise level (dBFS), the chatter

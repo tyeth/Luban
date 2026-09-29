@@ -44,6 +44,20 @@ export const HARMONICS: Array<[number, number]> = [[1, 0.6], [2, 0.6], [3, 0.4],
 export const SEARCH_BAND: [number, number] = [0.80, 1.05];
 const CANDIDATES = 500;
 export const CHATTER_BAND_HZ: [number, number] = [300, 6000];
+/**
+ * The MOTION comb: the gantry (steppers, lead screws, frame) sings its own
+ * harmonic series - 205 Hz and multiples at the A350's rapid speed, lower
+ * at cutting feeds - and it must be seen as a separate thing from the
+ * spindle, not mistaken for it. Every frame fits the strongest comb whose
+ * fundamental lies in MOTION_BAND_HZ with the spindle's harmonics masked
+ * out; a spindle candidate whose fundamental coincides with a stronger
+ * motion harmonic is not a lock.
+ */
+export const MOTION_BAND_HZ: [number, number] = [20, 400];
+const MOTION_HARMONICS = 8;
+const MOTION_CANDIDATES = 760;
+/** Octave-ish level bands recorded per frame (Hz edges). */
+export const LEVEL_BANDS_HZ = [50, 100, 200, 400, 800, 1600, 3200, 6400, 8000];
 const HARMONIC_MASK_REL = 0.025;
 /**
  * A 0.15 s Hann window resolves +-13 Hz (main lobe), wider than 2.5 % of the
@@ -98,6 +112,9 @@ export const RULES = {
      */
     /** RMS level at or above this (dBFS) is clipping; reported, and the frame's spectrum is not trusted. */
     clipDb: -0.5,
+    /** A spindle lock below this confidence is contested when a confident motion comb out-powers it by contestedMarginLn (ln 4 = 6 dB). */
+    contestedSpindleConfidence: 3.0,
+    contestedMarginLn: Math.log(4),
     minBaselineFrames: 5,
     minCutFrames: 5,
     runoutIndexDb: -3.0,
@@ -347,6 +364,94 @@ export interface FrameResult {
     clipped: boolean;
     /** The comb fell to the search band's edge (or was clipped / unconfident): no RPM lock this frame. */
     locked: boolean;
+    /** Fundamental of the strongest harmonic series in MOTION_BAND_HZ with the spindle masked (gantry / frame tone), Hz. */
+    motionHz: number;
+    /** Level of that series' strongest harmonic, dBFS-ish (10 log10 power). */
+    motionDb: number;
+    /** Prominence of the motion comb over the candidate scores. */
+    motionConf: number;
+    /** Level per LEVEL_BANDS_HZ band (dB), every frame. */
+    bands: number[];
+    /** The spindle candidate coincided with a stronger motion-comb harmonic: not trusted as the spindle. */
+    contested: boolean;
+}
+
+/** Is `hz` within the spindle's harmonic mask (+-2.5 % or +-MASK_MIN_HZ of any k x fRev)? */
+function nearSpindleHarmonic(hz: number, fRev: number | null): boolean {
+    if (fRev === null || !(fRev > 0)) {
+        return false;
+    }
+    const k = Math.round(hz / fRev);
+    if (k < 1) {
+        return false;
+    }
+    const f = k * fRev;
+    return Math.abs(hz - f) <= Math.max(HARMONIC_MASK_REL * f, MASK_MIN_HZ);
+}
+
+/** Strongest harmonic series with a fundamental in MOTION_BAND_HZ, skipping bins on the spindle's harmonics (any frequency). */
+export function motionComb(logPower: Float64Array, spindleFRev: number | null): { hz: number; confidence: number; peakDb: number; meanLog: number } {
+    const lo = MOTION_BAND_HZ[0];
+    const hi = MOTION_BAND_HZ[1];
+    const stepHz = (hi - lo) / (MOTION_CANDIDATES - 1);
+    const scores = new Float64Array(MOTION_CANDIDATES);
+    let best = 0;
+    for (let c = 0; c < MOTION_CANDIDATES; c++) {
+        const f = lo + c * stepHz;
+        let score = 0;
+        let used = 0;
+        for (let k = 1; k <= MOTION_HARMONICS; k++) {
+            const bin = Math.round((k * f) / BIN_HZ);
+            if (bin >= NBINS - 1) {
+                break;
+            }
+            if (nearSpindleHarmonic(k * f, spindleFRev)) {
+                continue;
+            }
+            score += logPower[bin];
+            used += 1;
+        }
+        scores[c] = used ? score / used : -Infinity;
+        if (scores[c] > scores[best]) {
+            best = c;
+        }
+    }
+    let sum = 0;
+    let sumSq = 0;
+    let n = 0;
+    for (let c = 0; c < MOTION_CANDIDATES; c++) {
+        if (Number.isFinite(scores[c])) {
+            sum += scores[c];
+            sumSq += scores[c] * scores[c];
+            n += 1;
+        }
+    }
+    const mean = n ? sum / n : 0;
+    const std = n ? Math.sqrt(Math.max(0, sumSq / n - mean * mean)) : 1;
+    const f = lo + best * stepHz;
+    let peak = -Infinity;
+    for (let k = 1; k <= MOTION_HARMONICS; k++) {
+        const bin = Math.round((k * f) / BIN_HZ);
+        if (bin < NBINS && logPower[bin] > peak) {
+            peak = logPower[bin];
+        }
+    }
+    return { hz: f, confidence: (scores[best] - mean) / (std + 1e-9), peakDb: (10 * peak) / Math.LN10, meanLog: scores[best] };
+}
+
+/** dB level in each LEVEL_BANDS_HZ band of a power spectrum. */
+export function bandLevels(power: Float64Array): number[] {
+    const out: number[] = [];
+    for (let b = 0; b + 1 < LEVEL_BANDS_HZ.length; b++) {
+        const lo = Math.ceil(LEVEL_BANDS_HZ[b] / BIN_HZ);
+        const hi = Math.min(NBINS - 1, Math.floor(LEVEL_BANDS_HZ[b + 1] / BIN_HZ));
+        let sum = 0;
+        for (let k = lo; k <= hi; k++) {
+            sum += power[k];
+        }
+        out.push(10 * Math.log10(sum / Math.max(1, hi - lo + 1) + 1e-18));
+    }
+    return out;
 }
 
 export type SpindleEventKind = 'spindle_sag' | 'spindle_blip' | 'spindle_reach' | 'chatter' | 'runout' | 'spindle_nolock' | 'spindle_epoch';
@@ -678,6 +783,11 @@ export class SpindleAudioAnalyser {
             levelDb: NaN,
             clipped: false,
             locked: false,
+            motionHz: NaN,
+            motionDb: NaN,
+            motionConf: 0,
+            bands: [],
+            contested: false,
         };
         // Loudness of the raw frame, cheap and always available: the camera
         // page's noise meter, and a sanity check that the microphone hears.
@@ -690,6 +800,19 @@ export class SpindleAudioAnalyser {
         result.clipped = result.levelDb >= RULES.clipDb;
         if (result.clipped) {
             this.clippedFrames += 1;
+        }
+        // The spectrum is computed for EVERY frame: the gantry and the
+        // room are recorded whether or not the spindle is commanded on.
+        framePower(this.fft, this.buffer, offset, this.re, this.im, this.power);
+        for (let k = 0; k < NBINS; k++) {
+            this.logPower[k] = Math.log(this.power[k] + 1e-18);
+        }
+        result.bands = bandLevels(this.power);
+        if (!ctx || ctx.s === null || ctx.s <= 0 || ctx.epoch < 0) {
+            const motion = motionComb(this.logPower, null);
+            result.motionHz = motion.hz;
+            result.motionDb = motion.peakDb;
+            result.motionConf = motion.confidence;
         }
         if (!ctx || ctx.s === null || ctx.s <= 0 || ctx.epoch < 0) {
             this.commit(NaN);
@@ -713,10 +836,6 @@ export class SpindleAudioAnalyser {
             epoch.feed = ctx.feed;
         }
 
-        framePower(this.fft, this.buffer, offset, this.re, this.im, this.power);
-        for (let k = 0; k < NBINS; k++) {
-            this.logPower[k] = Math.log(this.power[k] + 1e-18);
-        }
         const comb = combTrack(this.logPower, ctx.s, this.scores);
         result.rpm = comb.rpm;
         result.confidence = comb.confidence;
@@ -728,6 +847,28 @@ export class SpindleAudioAnalyser {
         // remaining tone over the band median, and the masked power kept for
         // the epoch's cut / baseline mean spectra.
         harmonicMask(fRev, this.mask);
+        {
+            const motion = motionComb(this.logPower, fRev);
+            result.motionHz = motion.hz;
+            result.motionDb = motion.peakDb;
+            result.motionConf = motion.confidence;
+            // A marginal spindle lock while a confident motion comb is at
+            // least 6 dB stronger than the spindle's own harmonics is the
+            // gantry being heard, not the spindle: not a lock.
+            if (motion.confidence >= RULES.minConfidence && comb.confidence < RULES.contestedSpindleConfidence) {
+                let spindleMean = 0;
+                let used = 0;
+                for (const [k] of HARMONICS) {
+                    const bin = Math.round((k * fRev) / BIN_HZ);
+                    if (bin < NBINS) {
+                        spindleMean += this.logPower[bin];
+                        used += 1;
+                    }
+                }
+                spindleMean = used ? spindleMean / used : -Infinity;
+                result.contested = motion.meanLog - spindleMean >= RULES.contestedMarginLn;
+            }
+        }
         const maskedPower = new Float64Array(BAND_BINS);
         let n = 0;
         let bestDb = -Infinity;
@@ -751,7 +892,7 @@ export class SpindleAudioAnalyser {
         // A lock needs confidence, a candidate away from the band's edges and
         // an unclipped frame; a spin-up needs the RPM to have settled, not
         // just time to have passed (the A350 ramps its spindle for ~20 s).
-        const locked = comb.confidence >= RULES.minConfidence && !comb.edge && !result.clipped;
+        const locked = comb.confidence >= RULES.minConfidence && !comb.edge && !result.clipped && !result.contested;
         result.locked = locked;
         if (locked && ctx.kind !== 'feed') {
             epoch.spinHistory.push([tMs, comb.rpm]);
@@ -1271,6 +1412,8 @@ export interface SynthEpoch {
     rampS?: number;
     /** Free-running speed as a fraction of S (the A350 idles at ~0.935 x S8000); loaded speed is S x (1 - droop). */
     idleRel?: number;
+    /** A gantry tone while the head moves (the cut window): [fundamental Hz, amplitude], harmonics 1..6. */
+    gantry?: [number, number];
 }
 
 export interface SynthResult {
@@ -1353,6 +1496,11 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
                 }
             }
             x += a * Math.sin(k * phase);
+        }
+        if (cutting && ep.spec.gantry) {
+            for (let k = 1; k <= 6; k++) {
+                x += (ep.spec.gantry[1] / k) * Math.sin(2 * Math.PI * k * ep.spec.gantry[0] * tt + k);
+            }
         }
         if (cutting && ep.spec.chatter) {
             x += ep.spec.chatter[1] * Math.sin(2 * Math.PI * ep.spec.chatter[0] * tt);

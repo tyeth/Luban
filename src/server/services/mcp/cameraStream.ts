@@ -136,6 +136,14 @@ const PANEL_JS = `(function(){
     h+='<div class="row"><div><div class="lbl">noise (dBFS)</div><div class="big">'+fmt(au.levelDb,0)+'</div></div>'
       +'<div><div class="lbl">chatter idx (dB)</div><div class="big '+(au.chatterDb>12?'warn':'')+'">'+fmt(au.chatterDb,0)+'</div></div>'
       +'<div><div class="lbl">line</div><div class="big">'+fmt(st.line,0)+'</div></div></div>';
+    h+='<div class="row"><div><div class="lbl">gantry / frame tone</div><div class="big">'+fmt(au.motionHz,0)+' Hz</div></div>'
+      +'<div><div class="lbl">its level (dB)</div><div class="big">'+fmt(au.motionDb,0)+'</div></div>'
+      +'<div><div class="lbl">spindle 1x</div><div class="big">'+(rpm?fmt(rpm/60,0):'-')+' Hz</div></div></div>';
+    h+='<div class="lbl">motion tone, last 2 min (Hz; the spindle is masked out of this fit)</div>'+spark(sa.motionHz,{min:0,max:400,color:'#c9c'});
+    var bands=[];for(var bi=0;bi<8;bi++){var bv=au['band'+bi];bands.push(bv==null||isNaN(bv)?-120:bv);}
+    var bl=['50','100','200','400','800','1.6k','3.2k','6.4k'],bb='';
+    for(var bj=0;bj<8;bj++){var hgt=Math.max(1,Math.min(40,(bands[bj]+90)*0.5));bb+='<rect x="'+(bj*37+2)+'" y="'+(42-hgt)+'" width="33" height="'+hgt+'" fill="#68a"/><text x="'+(bj*37+18)+'" y="45" font-size="6" fill="#999" text-anchor="middle">'+bl[bj]+'</text>';}
+    h+='<div class="lbl">spectrum now (dB per octave band, 50 Hz - 8 kHz)</div><svg viewBox="0 0 300 46" preserveAspectRatio="none">'+bb+'</svg>';
     h+='<div class="lbl">noise level, last 2 min</div>'+spark(sa.levelDb,{min:-80,max:0,color:'#8c8'});
     h+='<div class="lbl">chatter index (orange: &gt; 12 dB over the band)</div>'+spark(sa.chatterDb,{min:0,max:30,ref:12,hot:function(v){return v>12;},color:'#ca8'});
     var ev=s.events||{},flags=[];['spindle_sag','spindle_blip','spindle_reach','chatter','runout','spindle_nolock'].forEach(function(k){if(ev[k])flags.push(k+' x'+ev[k]);});
