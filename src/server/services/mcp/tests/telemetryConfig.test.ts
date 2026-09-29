@@ -24,7 +24,8 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(cfg.audioDevice, null);
         assert.equal(cfg.sampleLimit, DEFAULT_TELEMETRY_SAMPLE_LIMIT);
         assert.equal(cfg.jobEventLimit, DEFAULT_JOB_EVENT_LIMIT);
-        assert.deepEqual(Object.values(cfg.sources), ['default', 'default', 'default', 'default', 'default', 'default']);
+        assert.equal(cfg.plannerLeadBlocks, 16);
+        assert.deepEqual(Object.values(cfg.sources), ['default', 'default', 'default', 'default', 'default', 'default', 'default']);
     }],
 
     ['the job event default rises 100x with telemetry on, stored values still win', () => {

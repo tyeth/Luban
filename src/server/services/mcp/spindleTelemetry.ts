@@ -28,6 +28,7 @@ import { connectionManager } from '../machine/ConnectionManager';
 import { listAudioSources, ffmpegBinary } from './audioDevices';
 import { AudioSource, describeSourceChoice, matchAudioDevice } from './audioSelection';
 import { McpJob, jobManager } from './jobs';
+import { ExecutionEstimator } from './executionModel';
 import { LineKind, Point3, ProgramLine, SpindleProgram, inferExecutingLine, parseSpindleProgram } from './spindleProgram';
 import { AudioRecorder, RecorderStats } from './spindleAudio';
 import {
@@ -71,14 +72,21 @@ const AUDIO_TAIL_MS = 1500;
 const DEFAULT_QUERY_POINTS = 2000;
 const MAX_QUERY_POINTS = 20000;
 
-// `line` is the EXECUTING line inferred from the reported position against
-// the file's path (spindleProgram.ts); `parserLine` is what the controller
-// reports as currentLine, which runs far ahead. x/y/z are the reported
-// coordinates in the file's frame at 0.02 mm; `match` says how the line was
-// found (0 unmatched / held, 1 on a segment, 2 at a segment end).
+// `line` is the estimated EXECUTING line (executionModel.ts: file timing
+// from the last sync, bounded by the queue); `queuedLine` is the line whose
+// segment the reported x/y/z sit on - the planner's queued position, which
+// leads the head by up to `plannerLeadBlocks` moves; `parserLine` is the
+// controller's currentLine, further ahead still. x/y/z are the reported
+// coordinates in the file's frame at 0.02 mm; `match` says how the queued
+// line was found (0 unmatched / held, 1 on a segment, 2 at a segment end);
+// `estimate` how the executing line was (0 time, 1 queue upper bound,
+// 2 queue lower bound, 3 dwell anchor); `leadBlocks` queued - executing.
 const STATUS_COLUMNS: ColumnSpec[] = [
     { name: 't', type: 'u32' },
     { name: 'line', type: 'u32' },
+    { name: 'queuedLine', type: 'u32' },
+    { name: 'estimate', type: 'u8' },
+    { name: 'leadBlocks', type: 'u8' },
     { name: 'parserLine', type: 'u32' },
     { name: 'x', type: 'i16', scale: 50 },
     { name: 'y', type: 'i16', scale: 50 },
@@ -91,6 +99,7 @@ const STATUS_COLUMNS: ColumnSpec[] = [
     { name: 'source', type: 'u8' },
 ];
 const MATCH_CODES: { [match: string]: number } = { unmatched: 0, segment: 1, endpoint: 2 };
+const ESTIMATE_CODES: { [mode: string]: number } = { time: 0, 'queue-upper': 1, 'queue-lower': 2, anchor: 3 };
 
 const AUDIO_COLUMNS: ColumnSpec[] = [
     { name: 't', type: 'u32' },
@@ -215,7 +224,11 @@ class TelemetrySession {
 
     private currentLine: number | null = null;
 
+    private queuedLine: number | null = null;
+
     private parserLine: number | null = null;
+
+    private readonly estimator: ExecutionEstimator;
 
     private currentContext: ProgramLine | null = null;
 
@@ -282,6 +295,7 @@ class TelemetrySession {
             log.warn(`telemetry: cannot read ${job.filePath}: ${(err as Error).message}`);
         }
         this.program = parseSpindleProgram(text);
+        this.estimator = new ExecutionEstimator(this.program, text, cfg.plannerLeadBlocks);
         const declared = job.validation && job.validation.frame ? job.validation.frame.declared : null;
         this.fileFrame = declared === 'machine' ? 'machine' : 'work';
         this.status = new TelemetryRing(STATUS_COLUMNS, { maxSamples: cfg.sampleLimit, initialCapacity: 1024 });
@@ -387,29 +401,33 @@ class TelemetrySession {
             this.parserLine = line.value;
         }
 
-        // The executing line comes from the reported position, never from
-        // currentLine alone (the parser runs the whole file ahead).
+        // The reported x/y/z is the planner's QUEUED position (up to a buffer
+        // of moves ahead of the head) and currentLine is the parser's; the
+        // executing line is estimated from the file's timing, bounded by both.
         const position = this.reportedPosition(data);
-        const inferred = position ? inferExecutingLine(this.program, position, this.parserLine, this.currentLine) : null;
+        const inferred = position ? inferExecutingLine(this.program, position, this.parserLine, this.queuedLine) : null;
         if (inferred) {
             this.lastMatch = inferred.match;
             if (inferred.match === 'unmatched') {
                 this.unmatchedSamples += 1;
+            } else {
+                this.queuedLine = inferred.line;
             }
-            if (inferred.match !== 'unmatched' || this.currentContext === null) {
-                this.currentLine = inferred.line;
-                const ctx = inferred.context;
-                this.currentContext = ctx;
-                const kind = ctx.kind;
-                if (kind !== this.lastKind) {
-                    this.lastKind = kind;
-                    this.lastKindChangeAt = at;
-                }
-                const epoch = ctx.epoch;
-                if (epoch !== this.lastEpoch) {
-                    this.lastEpoch = epoch;
-                    this.lastEpochChangeAt = at;
-                }
+        }
+        const estimate = this.estimator.update(at - this.startedAt, this.queuedLine);
+        if (estimate.line !== this.currentLine || this.currentContext === null) {
+            this.currentLine = estimate.line;
+            const ctx = this.program.lines[estimate.line - 1] || null;
+            this.currentContext = ctx;
+            const kind = ctx ? ctx.kind : null;
+            if (kind !== this.lastKind) {
+                this.lastKind = kind;
+                this.lastKindChangeAt = at;
+            }
+            const epoch = ctx ? ctx.epoch : -1;
+            if (epoch !== this.lastEpoch) {
+                this.lastEpoch = epoch;
+                this.lastEpochChangeAt = at;
             }
         }
         const ctx = this.currentContext;
@@ -420,6 +438,9 @@ class TelemetrySession {
         this.status.push({
             t: at - this.startedAt,
             line: this.currentLine === null ? NaN : this.currentLine,
+            queuedLine: this.queuedLine === null ? NaN : this.queuedLine,
+            estimate: ESTIMATE_CODES[estimate.mode],
+            leadBlocks: estimate.leadBlocks === null ? NaN : Math.min(254, Math.max(0, estimate.leadBlocks)),
             parserLine: this.parserLine === null ? NaN : this.parserLine,
             x: position ? position.x : NaN,
             y: position ? position.y : NaN,
@@ -739,8 +760,11 @@ class TelemetrySession {
             targetField: this.targetField,
             lineField: this.lineField,
             statusScalarsSeen: this.rpmField ? undefined : this.lastStatusScalars,
-            lineSource: 'executing line inferred from the reported position against the file path; parserLine is the controller\'s currentLine, which runs ahead',
+            lineSource: 'executing line ESTIMATED from the file timing anchored at the job start and at dwell ends, bounded by the queued line '
+                + '(the reported x/y/z is the planner\'s queued position, up to plannerLeadBlocks moves ahead) and by parserLine (currentLine, further ahead)',
             currentLine: this.currentLine,
+            queuedLine: this.queuedLine,
+            plannerLeadBlocks: this.config.plannerLeadBlocks,
             parserLine: this.parserLine,
             lastMatch: this.lastMatch,
             unmatchedSamples: this.unmatchedSamples,
@@ -840,6 +864,7 @@ class TelemetrySession {
                 statusPollMs: this.config.statusPollMs,
                 audioEnabled: this.config.audioEnabled,
                 sampleLimit: this.config.sampleLimit,
+                plannerLeadBlocks: this.config.plannerLeadBlocks,
             },
             program: { lines: this.program.lineCount, epochs: this.program.epochs },
             status,
@@ -882,7 +907,7 @@ class TelemetrySession {
             t_origin: 'ms since telemetry start (job start); status.t and audio.t share it',
             max_points: maxPoints,
             series_retained: !this.ringsReleased,
-            status: series(this.status, ['line', 'parserLine', 'x', 'y', 'z', 'match', 'rpm', 'target', 'commandedS', 'pollMs', 'source']),
+            status: series(this.status, ['line', 'queuedLine', 'estimate', 'leadBlocks', 'parserLine', 'x', 'y', 'z', 'match', 'rpm', 'target', 'commandedS', 'pollMs', 'source']),
             audio: series(this.audio, ['rpm', 'confidence', 'rel', 'chatterDb', 'chatterHz', 'runoutDb', 'role', 'levelDb']),
             audio_file: this.audioFilePath(),
             audio_device: this.audioSource ? this.audioSource.entry : null,
@@ -890,8 +915,10 @@ class TelemetrySession {
             legend: {
                 status: {
                     source: '0 = heartbeat report, 1 = telemetry poll',
-                    line: 'EXECUTING line inferred from x/y/z against the file path (parserLine = the controller\'s currentLine, far ahead)',
-                    match: '0 unmatched (line held), 1 on a segment, 2 at a segment end (dwell / spindle lines after it)',
+                    line: 'estimated EXECUTING line (file timing from the last sync, bounded by the queue); queuedLine = the line whose segment the reported x/y/z sit on (planner queue, up to plannerLeadBlocks ahead); parserLine = currentLine (further ahead)',
+                    estimate: '0 timing, 1 capped at the queued line, 2 raised to queued minus the buffer, 3 re-anchored at a dwell end',
+                    leadBlocks: 'motion blocks between the executing estimate and the queued line',
+                    match: '0 unmatched (queued line held), 1 on a segment, 2 at a segment end (dwell / spindle lines after it)',
                     commandedS: 'S in effect at the executing line',
                     rpm: 'the controller\'s spindleSpeed field: 250 RPM steps and mostly 0 on the A350 (2026-09-29); zeros are excluded from the per-S statistics',
                 },
@@ -923,7 +950,7 @@ export interface TelemetrySummary {
     startedAt: number;
     endedAt: number | null;
     wallMs: number;
-    config: { statusPollMs: number; audioEnabled: boolean; sampleLimit: number };
+    config: { statusPollMs: number; audioEnabled: boolean; sampleLimit: number; plannerLeadBlocks: number };
     program: { lines: number; epochs: Array<{ index: number; line: number; s: number }> };
     status: {
         samples: number;
@@ -938,6 +965,8 @@ export interface TelemetrySummary {
         statusScalarsSeen?: { [key: string]: unknown } | null;
         lineSource: string;
         currentLine: number | null;
+        queuedLine: number | null;
+        plannerLeadBlocks: number;
         parserLine: number | null;
         lastMatch: 'segment' | 'endpoint' | 'unmatched' | null;
         unmatchedSamples: number;

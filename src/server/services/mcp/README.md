@@ -1220,12 +1220,17 @@ matching), `spindleAudio.ts` (ffmpeg recorder), `spindleTelemetry.ts` (the per-j
 - **Tracker**: mono 16 kHz, 0.15 s Hann frames every 0.05 s, NFFT 16384; each candidate rev
   frequency in 0.80–1.05 × S/60 scored by weighted log power at harmonics {1: 0.6, 2: 0.6,
   3: 0.4, 4: 1.0 (tooth pass), 8: 0.5}, parabolic refinement. Commanded S comes from the `M3 S`
-  words at the line the controller is EXECUTING. That line is inferred from the reported
-  x/y/z against the file's own path (`inferExecutingLine`), bounded above by the controller's
-  `currentLine`: measured 2026-09-29, the A350 reports the PARSER position - 85 of 104 lines
-  one second into a five-minute job, the whole file by 44 s - so keying on it read `M5` while
-  the cut was running. A head at a segment's end is placed on the dwell / spindle lines that
-  follow it (the `G4` after an `M3 S`), so an S change is dated by the move before it ending;
+  words at the line the controller is EXECUTING. Nothing the controller reports IS that line
+  (measured 2026-09-29): `currentLine` is the parser's position (the whole file within 44 s of a
+  five-minute job), and x/y/z are the end of the last QUEUED move - the planner keeps 16 blocks
+  ahead (`mcpSpindlePlannerLeadBlocks` / `LUBAN_MCP_SPINDLE_PLANNER_LEAD`), so on a raster of
+  10 s passes the reported position led the cutter by eight passes. `executionModel.ts`
+  therefore simulates the file's timing (segment length / feed, dwell P) from the last exact
+  anchor - the job start, or a dwell end, visible as the frozen reported position advancing
+  again - and keeps the estimate between the queued line (`inferExecutingLine` on x/y/z
+  against the file path) minus the buffer depth and the queued line itself. Put a `G4` before
+  anything whose timing matters: a dwell is a planner sync. An S change is dated by the move
+  before it ending;
   feed moves (G1/G2/G3) are "cut", everything else after a 2 s spin-up is "baseline",
   and 0.5 s after every reported line-kind change is neither. Per commanded S (an *epoch*):
   HOLD / BLIP / STRUGGLE / NO-LOCK exactly as the reference `grade()`; runout index = (1× gain

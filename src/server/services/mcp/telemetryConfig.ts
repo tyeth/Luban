@@ -42,7 +42,16 @@ export const TELEMETRY_KEYS = {
     audioDevice: { env: 'LUBAN_MCP_AUDIO_DEVICE', key: 'mcpAudioDevice' },
     sampleLimit: { env: 'LUBAN_MCP_TELEMETRY_SAMPLE_LIMIT', key: 'mcpTelemetrySampleLimit' },
     jobEventLimit: { env: 'LUBAN_MCP_JOB_EVENT_LIMIT', key: 'mcpJobEventLimit' },
+    plannerLeadBlocks: { env: 'LUBAN_MCP_SPINDLE_PLANNER_LEAD', key: 'mcpSpindlePlannerLeadBlocks' },
 };
+
+// The controller reports the end of the last QUEUED move, not the head:
+// the planner keeps this many moves ahead (Marlin BLOCK_BUFFER_SIZE, 16 on
+// the A350 as measured 2026-09-29). executionModel.ts bounds its estimate
+// of the executing line by it.
+export const DEFAULT_PLANNER_LEAD_BLOCKS = 16;
+export const MIN_PLANNER_LEAD_BLOCKS = 1;
+export const MAX_PLANNER_LEAD_BLOCKS = 64;
 
 export type SettingSource = 'env' | 'config' | 'default';
 
@@ -57,7 +66,9 @@ export interface TelemetryConfig {
     audioDevice: string | null;
     sampleLimit: number;
     jobEventLimit: number;
-    sources: { [field in 'enabled' | 'statusPollMs' | 'audioEnabled' | 'audioDevice' | 'sampleLimit' | 'jobEventLimit']: SettingSource };
+    /** Planner look-ahead in motion blocks (the reported position leads the head by this much). */
+    plannerLeadBlocks: number;
+    sources: { [field in 'enabled' | 'statusPollMs' | 'audioEnabled' | 'audioDevice' | 'sampleLimit' | 'jobEventLimit' | 'plannerLeadBlocks']: SettingSource };
 }
 
 type Env = { [name: string]: string | undefined };
@@ -108,6 +119,7 @@ export function resolveTelemetryConfig(env: Env, get: Getter): TelemetryConfig {
     const device = pick(env, get, 'audioDevice');
     const samples = pick(env, get, 'sampleLimit');
     const events = pick(env, get, 'jobEventLimit');
+    const lead = pick(env, get, 'plannerLeadBlocks');
     const isEnabled = parseFlag(enabled.raw);
     const pollValue = Number(poll.raw);
     return {
@@ -117,6 +129,7 @@ export function resolveTelemetryConfig(env: Env, get: Getter): TelemetryConfig {
         audioDevice: present(device.raw) ? String(device.raw).trim() : null,
         sampleLimit: clampInt(samples.raw, MIN_TELEMETRY_SAMPLE_LIMIT, MAX_TELEMETRY_SAMPLE_LIMIT, DEFAULT_TELEMETRY_SAMPLE_LIMIT),
         jobEventLimit: resolveJobEventLimit(events.raw, isEnabled),
+        plannerLeadBlocks: clampInt(lead.raw, MIN_PLANNER_LEAD_BLOCKS, MAX_PLANNER_LEAD_BLOCKS, DEFAULT_PLANNER_LEAD_BLOCKS),
         sources: {
             enabled: enabled.source,
             statusPollMs: poll.source,
@@ -124,6 +137,7 @@ export function resolveTelemetryConfig(env: Env, get: Getter): TelemetryConfig {
             audioDevice: device.source,
             sampleLimit: samples.source,
             jobEventLimit: events.source,
+            plannerLeadBlocks: lead.source,
         },
     };
 }
