@@ -307,6 +307,41 @@ export const tests: Array<[string, () => void]> = [
         assert.ok(off.every((frame) => Number.isFinite(frame.motionHz)), 'the motion comb is fitted with the spindle off too');
     }],
 
+    ['a rapid singing at the spindle plateau frequency is ambiguous, not RPM', () => {
+        // Spindle plateau 0.935 x S8000 = 7480 RPM = 124.7 Hz; the X rapid also makes a 124.7 Hz series.
+        const synth = synthesise([{
+            s: 8000, feed: 500, spinUpS: 2.5, baselineS: 4, cutS: 4, recoverS: 1, idleRel: 0.935, gantryFree: [124.7, 0.5], freeKind: 'rapid',
+        }]);
+        const frames: FrameResult[] = [];
+        const analyser = new SpindleAudioAnalyser({ contextAt: synth.contextAt, onFrame: (frame) => frames.push(frame) });
+        analyser.push(synth.samples);
+        const [summary] = analyser.finish();
+        // The free phase (rapid moves with the 124.7 Hz gantry series) starts 3.0 s in; the 0.5 s of settled
+        // still spindle before it is a legitimate baseline.
+        const rapid = frames.filter((frame) => frame.tMs >= 3100 && frame.tMs < 6900 && frame.sCommanded === 8000);
+        const flagged = rapid.filter((frame) => frame.ambiguous);
+        assert.ok(flagged.length > 0.8 * rapid.length, `ambiguous ${flagged.length} of ${rapid.length} rapid frames`);
+        assert.ok(flagged.every((frame) => !frame.locked));
+        assert.ok(summary.baselineFrames <= 14, `only the still frames before the rapid form the baseline: ${summary.baselineFrames}`);
+        const cut = frames.filter((frame) => frame.role === 'cut' && frame.locked);
+        assert.ok(cut.length > 40, 'cutting (spindle at S, no gantry tone on the spindle) still locks');
+    }],
+
+    ['the idle baseline follows the spindle up off its soft-start plateau', () => {
+        // Two back-to-back epochs at the same S: 12 s free at the plateau (0.935 x S), then 8 s free at S before the cut.
+        // The rolling baseline must be the settled 8000, not the plateau, and there is no reach flag.
+        const two = synthesise([
+            { s: 8000, feed: 500, spinUpS: 0, baselineS: 12, cutS: 0.3, recoverS: 0, idleRel: 0.935 },
+            { s: 8000, feed: 500, spinUpS: 0, baselineS: 8, cutS: 4, recoverS: 1 },
+        ]);
+        const analyser = new SpindleAudioAnalyser({ contextAt: two.contextAt });
+        analyser.push(two.samples);
+        const summaries = analyser.finish();
+        const last = summaries[summaries.length - 1];
+        assert.ok(Math.abs((last.baselineRpm as number) - 8000) < 40, `baseline ${last.baselineRpm} (the settled 8000, not the plateau)`);
+        assert.equal(last.reachFlag, false);
+    }],
+
     ['analysis cost is bounded per frame', () => {
         const { frames } = run();
         const cost = frames.map((frame) => frame.costMs);

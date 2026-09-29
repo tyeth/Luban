@@ -115,6 +115,10 @@ export const RULES = {
     /** A spindle lock below this confidence is contested when a confident motion comb out-powers it by contestedMarginLn (ln 4 = 6 dB). */
     contestedSpindleConfidence: 3.0,
     contestedMarginLn: Math.log(4),
+    /** While moving, a spindle candidate within this fraction of a gantry-comb harmonic is ambiguous. */
+    ambiguousRel: 0.02,
+    /** The idle baseline is the median of the most recent settled free frames (3 s): a soft-start plateau is replaced once the spindle reaches speed. */
+    baselineRecentFrames: 60,
     minBaselineFrames: 5,
     minCutFrames: 5,
     runoutIndexDb: -3.0,
@@ -374,6 +378,8 @@ export interface FrameResult {
     bands: number[];
     /** The spindle candidate coincided with a stronger motion-comb harmonic: not trusted as the spindle. */
     contested: boolean;
+    /** The head was moving and the spindle candidate sits on a harmonic of the gantry's own (unmasked) comb: recorded, not used as RPM. */
+    ambiguous: boolean;
 }
 
 /** Is `hz` within the spindle's harmonic mask (+-2.5 % or +-MASK_MIN_HZ of any k x fRev)? */
@@ -631,7 +637,7 @@ class Epoch {
     /** The unloaded RPM this epoch's cuts are judged against. */
     public baseline(): number | null {
         if (this.baselineRpm.length >= RULES.minBaselineFrames) {
-            return median(this.baselineRpm);
+            return median(this.baselineRpm.slice(-RULES.baselineRecentFrames));
         }
         return this.baselineOverride;
     }
@@ -788,6 +794,7 @@ export class SpindleAudioAnalyser {
             motionConf: 0,
             bands: [],
             contested: false,
+            ambiguous: false,
         };
         // Loudness of the raw frame, cheap and always available: the camera
         // page's noise meter, and a sanity check that the microphone hears.
@@ -868,6 +875,25 @@ export class SpindleAudioAnalyser {
                 spindleMean = used ? spindleMean / used : -Infinity;
                 result.contested = motion.meanLog - spindleMean >= RULES.contestedMarginLn;
             }
+            // During a RAPID the gantry's own comb is fitted unmasked too; a
+            // spindle candidate sitting on one of its harmonics cannot be told
+            // from it (the A350's X rapid sings at 125 Hz = 7480 RPM, exactly
+            // the spindle's soft-start plateau): recorded, not RPM. Rapids
+            // carry no load, so nothing is judged from them anyway; feed moves
+            // are left alone - while cutting the spindle IS the strongest comb.
+            if (ctx.kind === 'rapid') {
+                const free = motionComb(this.logPower, null);
+                if (free.confidence >= RULES.minConfidence && free.hz > 0) {
+                    // Either way round: the spindle line on a gantry harmonic,
+                    // or the gantry fundamental on a spindle harmonic.
+                    const up = fRev / free.hz;
+                    const down = free.hz / fRev;
+                    const kUp = Math.round(up);
+                    const kDown = Math.round(down);
+                    result.ambiguous = (kUp >= 1 && Math.abs(up - kUp) <= RULES.ambiguousRel * kUp)
+                        || (kDown >= 1 && Math.abs(down - kDown) <= RULES.ambiguousRel * kDown);
+                }
+            }
         }
         const maskedPower = new Float64Array(BAND_BINS);
         let n = 0;
@@ -892,7 +918,7 @@ export class SpindleAudioAnalyser {
         // A lock needs confidence, a candidate away from the band's edges and
         // an unclipped frame; a spin-up needs the RPM to have settled, not
         // just time to have passed (the A350 ramps its spindle for ~20 s).
-        const locked = comb.confidence >= RULES.minConfidence && !comb.edge && !result.clipped && !result.contested;
+        const locked = comb.confidence >= RULES.minConfidence && !comb.edge && !result.clipped && !result.contested && !result.ambiguous;
         result.locked = locked;
         if (locked && ctx.kind !== 'feed') {
             epoch.spinHistory.push([tMs, comb.rpm]);
@@ -1040,7 +1066,7 @@ export class SpindleAudioAnalyser {
      * the same S; failing that the commanded S itself, flagged as such.
      */
     private resolveBaseline(epoch: Epoch): number | null {
-        const own = epoch.baselineRpm.length >= RULES.minBaselineFrames ? median(epoch.baselineRpm) : null;
+        const own = epoch.baselineRpm.length >= RULES.minBaselineFrames ? epoch.baseline() : null;
         if (own !== null) {
             epoch.baselineSource = 'epoch';
             epoch.baselineOverride = null;
@@ -1053,7 +1079,7 @@ export class SpindleAudioAnalyser {
             const previous = this.epochs[i];
             if (previous !== epoch && previous.s === epoch.s && previous.baselineRpm.length >= RULES.minBaselineFrames) {
                 epoch.baselineSource = 'previous-epoch';
-                epoch.baselineOverride = median(previous.baselineRpm);
+                epoch.baselineOverride = previous.baseline();
                 return epoch.baselineOverride;
             }
         }
@@ -1067,7 +1093,7 @@ export class SpindleAudioAnalyser {
             return;
         }
         epoch.reachEmitted = true;
-        const baseline = median(epoch.baselineRpm);
+        const baseline = epoch.baseline() as number;
         const err = baseline / epoch.s - 1;
         if (Math.abs(err) > RULES.reachRel) {
             this.emit({
@@ -1414,6 +1440,10 @@ export interface SynthEpoch {
     idleRel?: number;
     /** A gantry tone while the head moves (the cut window): [fundamental Hz, amplitude], harmonics 1..6. */
     gantry?: [number, number];
+    /** A gantry tone during the free phase: [fundamental Hz, amplitude]. */
+    gantryFree?: [number, number];
+    /** What the free phase is reported as: a still spindle dwell (default) or rapid moves. */
+    freeKind?: 'dwell' | 'rapid';
 }
 
 export interface SynthResult {
@@ -1497,6 +1527,12 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
             }
             x += a * Math.sin(k * phase);
         }
+        const freePhase = tt >= ep.baselineAt && tt < ep.cutAt;
+        if (freePhase && ep.spec.gantryFree) {
+            for (let k = 1; k <= 6; k++) {
+                x += (ep.spec.gantryFree[1] / k) * Math.sin(2 * Math.PI * k * ep.spec.gantryFree[0] * tt + k);
+            }
+        }
         if (cutting && ep.spec.gantry) {
             for (let k = 1; k <= 6; k++) {
                 x += (ep.spec.gantry[1] / k) * Math.sin(2 * Math.PI * k * ep.spec.gantry[0] * tt + k);
@@ -1524,7 +1560,7 @@ export function synthesise(epochs: SynthEpoch[], seed = 1): SynthResult {
         } else if (tt >= ep.cutEnd) {
             transitionAt = ep.cutEnd;
         } else if (tt >= ep.baselineAt) {
-            kind = 'rapid';
+            kind = ep.spec.freeKind || 'dwell';
             transitionAt = ep.baselineAt;
         }
         return {
