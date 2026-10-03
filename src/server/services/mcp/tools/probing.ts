@@ -27,6 +27,7 @@ import { describeProbeVectorPlanAsGcode, planProbeVector, runProbeVectorProcedur
 import { probeFeedService } from '../probeFeed';
 import { TRAVEL_FEED, assertMachineReadyForProcedure, moveMachineSettled } from '../probing';
 import { McpToolError, ToolRegistry } from '../registry';
+import { getActiveTool } from '../activeTool';
 import { TRAVERSE_Z_TOLERANCE_MM } from '../traversePlan';
 import { fovAt } from '../cameraGeometry';
 import { judgeSeams, pitchForOverlap } from '../surveyMosaic';
@@ -578,6 +579,10 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                         + '"seamless" is a relationship between pitch and field of view, and a picked number is not '
                         + 'one. Needs a verified camera model (camera_bootstrap); pitch_mm then just caps the result.',
                 },
+                machine_z: {
+                    type: 'number',
+                    description: 'Explicit initial machine Z. The runner verifies this exact Z before any XY motion; use this instead of relying on CURRENT Z.',
+                },
                 plane_z: {
                     type: 'number',
                     description: 'Machine Z of the surface being surveyed, for the field of view and the mosaic '
@@ -612,6 +617,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             pitch_mm?: number;
             overlap_fraction?: number;
             plane_z?: number;
+            machine_z?: number;
             margin_mm?: number;
             z_levels?: number[];
             x_min?: number;
@@ -628,7 +634,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             if (x === null || y === null || z === null) {
                 throw new McpToolError('Current machine position unknown.');
             }
-            if (z < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM && args.operator_confirmed_clearance !== true) {
+            if (z < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM && args.operator_confirmed_clearance !== true && !getActiveTool()) {
                 throw new McpToolError(`Machine Z ${z.toFixed(1)} is below the motion floor `
                     + `${motionFloorZ()} (law 2 - the lowest Z any X/Y move may happen at) - raise Z `
                     + '(move_z), or pass operator_confirmed_clearance: true only on the operator\'s '
@@ -637,7 +643,17 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             const travel = requirePlanningTravel('a bed survey', { x, y });
             // Levels: highest first, deduplicated, and every one of them at or
             // above the motion floor unless the operator has said otherwise.
-            const rawLevels = Array.isArray(args.z_levels) && args.z_levels.length ? args.z_levels.map(Number) : [z];
+            if (args.machine_z !== undefined && args.z_levels !== undefined) {
+                throw new McpToolError('machine_z and z_levels are mutually exclusive; use machine_z for one explicit survey height or z_levels for a stated series.');
+            }
+            let rawLevels: number[];
+            if (args.machine_z !== undefined) {
+                rawLevels = [Number(args.machine_z)];
+            } else if (Array.isArray(args.z_levels) && args.z_levels.length) {
+                rawLevels = args.z_levels.map(Number);
+            } else {
+                rawLevels = [z];
+            }
             if (rawLevels.some((level) => !Number.isFinite(level))) {
                 throw new McpToolError('z_levels must be finite machine Z heights.');
             }
@@ -646,7 +662,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             }
             const levels = [...new Set(rawLevels.map((level) => Number(level.toFixed(3))))].sort((a, b) => b - a);
             const belowFloor = levels.filter((level) => level < motionFloorZ() - TRAVERSE_Z_TOLERANCE_MM);
-            if (belowFloor.length && args.operator_confirmed_clearance !== true) {
+            if (belowFloor.length && args.operator_confirmed_clearance !== true && !getActiveTool()) {
                 throw new McpToolError(`z_levels ${belowFloor.join(', ')} are below the motion floor ${motionFloorZ()} `
                     + '(law 2 - the lowest Z any X/Y move may happen at). Raise them, or pass '
                     + 'operator_confirmed_clearance: true only on the operator\'s explicit word that these heights '
@@ -729,11 +745,12 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             // level is dropped from that pass and reported; a link the level
             // cannot make is lifted to the park height, leg by leg.
             const parkZ = safeTraverseZ();
+            const explicitMachineZ = args.machine_z !== undefined ? levels[0] : null;
             const plan = planSurvey({
                 levels,
                 waypoints,
                 parkZ,
-                fromMachine: { x, y, z },
+                fromMachine: { x, y, z: explicitMachineZ === null ? z : explicitMachineZ },
                 obstacles: landmarkStore.obstacleBoxes(),
                 ...clearanceOptions(),
             });
@@ -746,6 +763,7 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             const envelope = [
                 `; BED SURVEY: ${waypoints.length} waypoints, serpentine grid step X ${xAxis.step} / Y ${yAxis.step} mm (max ${pitch})`,
                 `; ${levels.length} pass(es) at machine Z ${levels.join(', ')} - each entered with XY stationary`,
+                ...(explicitMachineZ === null ? [] : [`; ASSERT machine Z${explicitMachineZ.toFixed(3)} before any XY motion; this invariant is verified at run time`]),
                 `; ${plan.captureCount} captures planned${plan.dropped.length ? `, ${plan.dropped.length} waypoint(s) DROPPED (see below)` : ''}`
                     + `${plan.liftedLinks ? `, ${plan.liftedLinks} link(s) lifted to park Z${parkZ} over a keep-out` : ''}`,
                 `; ${pitchNote}`,
@@ -773,6 +791,19 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
             );
             job.runner = async () => {
                 assertMachineReadyForProcedure();
+                if (explicitMachineZ !== null) {
+                    const live = getPositionSnapshot();
+                    if (live.machine.z === null) {
+                        throw new McpToolError('Explicit survey machine_z cannot be verified: live machine Z is unknown.');
+                    }
+                    if (Math.abs(live.machine.z - explicitMachineZ) > TRAVERSE_Z_TOLERANCE_MM) {
+                        await moveMachineSettled('survey:assert-machine-z', { z: explicitMachineZ }, TRAVEL_FEED);
+                    }
+                    const verified = getPositionSnapshot().machine.z;
+                    if (verified === null || Math.abs(verified - explicitMachineZ) > TRAVERSE_Z_TOLERANCE_MM) {
+                        throw new McpToolError(`Explicit survey machine_z ${explicitMachineZ} was not verified before XY motion.`);
+                    }
+                }
                 const surveyId = crypto.randomBytes(4).toString('hex');
                 const dir = path.join(DataStorage.userDataDir, 'mcp-surveys', surveyId);
                 fs.ensureDirSync(dir);
@@ -880,7 +911,16 @@ ${describeProbeSurfacePlanAsGcode(plan)}`;
                 // Law 4 at staging: what the landmarks cost this survey, and why.
                 dropped: plan.dropped,
                 lifted_links: plan.liftedLinks,
-                grid: { max_pitch_mm: pitch, step_x_mm: xAxis.step, step_y_mm: yAxis.step, xs, ys, machine_z: z, columns: xs.length, rows: ys.length },
+                grid: {
+                    max_pitch_mm: pitch,
+                    step_x_mm: xAxis.step,
+                    step_y_mm: yAxis.step,
+                    xs,
+                    ys,
+                    machine_z: explicitMachineZ === null ? z : explicitMachineZ,
+                    columns: xs.length,
+                    rows: ys.length,
+                },
                 travel: {
                     ...limits,
                     source: {

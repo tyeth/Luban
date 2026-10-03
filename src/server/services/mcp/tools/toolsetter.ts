@@ -1,6 +1,7 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
 import { connectionManager } from '../../machine/ConnectionManager';
+import { describeActiveTool, setActiveTool } from '../activeTool';
 import { jobManager } from '../jobs';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -104,7 +105,52 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
         description: 'The stored tool setter reference (centre, trigger Z, bit lengths, tool-change '
             + 'park position) and the last two measurements. Read-only.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        handler: async () => ({ config: getToolSetterConfig(), measurements: getMeasurements() }),
+        handler: async () => ({ config: getToolSetterConfig(), measurements: getMeasurements(), active_tool: describeActiveTool() }),
+    });
+
+    registry.register({
+        name: 'set_active_tool',
+        description: 'Explicitly establish which tool is fitted for routine route clearance. This is separate from the configured longest bit: it becomes the active protrusion used to compute physical obstacle clearances. The operator must state the protrusion and confirm the tool is fitted.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                protrusion_mm: { type: 'number', description: 'Measured or operator-confirmed protrusion below the toolhead, mm.' },
+                source: { type: 'string', enum: ['operator', 'tool_setter', 'spindle_probe'], description: 'Provenance of the assertion. Measurement procedures write their own source; operator is for an explicit fitted-tool confirmation.' },
+                tool_identity: { type: 'string', description: 'Optional bit/probe identity.' },
+                note: { type: 'string', description: 'Why this value is trusted.' },
+                measurement_job_id: { type: 'string', description: 'Job that produced a measured assertion, when source is tool_setter or spindle_probe.' },
+            },
+            required: ['protrusion_mm', 'source'],
+            additionalProperties: false,
+        },
+        handler: async (args: { protrusion_mm?: number; source?: string; tool_identity?: string; note?: string; measurement_job_id?: string }) => {
+            const source = args.source as 'operator' | 'tool_setter' | 'spindle_probe';
+            if (!['operator', 'tool_setter', 'spindle_probe'].includes(source)) {
+                throw new McpToolError('source must be operator, tool_setter, or spindle_probe.');
+            }
+            if (source !== 'operator' && !String(args.measurement_job_id || '').trim()) {
+                throw new McpToolError('A measured active tool needs measurement_job_id provenance.');
+            }
+            const protrusionMm = Number(args.protrusion_mm);
+            if (!Number.isFinite(protrusionMm) || protrusionMm <= 0) {
+                throw new McpToolError('protrusion_mm must be a positive finite number.');
+            }
+            const active = setActiveTool({
+                protrusionMm,
+                source,
+                measurementJobId: args.measurement_job_id || null,
+                toolIdentity: args.tool_identity || null,
+                note: args.note || null,
+            });
+            return describeActiveTool(active);
+        },
+    });
+
+    registry.register({
+        name: 'get_active_tool',
+        description: 'Read the fitted active-tool assertion and its provenance. Routine physical-obstacle clearance uses this value when present; the configured longest bit remains a fallback for setup safety.',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        handler: async () => describeActiveTool(),
     });
 
     registry.register({
@@ -183,7 +229,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 validation,
                 'procedure'
             );
-            job.runner = async () => runToolSetterProcedure(plan);
+            job.runner = async () => runToolSetterProcedure(plan, job.id);
 
             return {
                 job: jobManager.describe(job),

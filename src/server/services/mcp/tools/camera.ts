@@ -32,6 +32,7 @@ import { gateDirectXy, planGotoWorkOrigin } from '../directMovePlan';
 import { clearanceOptions } from '../clearanceContext';
 import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
 import { landmarkStore } from '../landmarks';
+import { routeClearanceForPath } from '../routeClearance';
 import { probeFeedService } from '../probeFeed';
 import { programFrameRoot } from '../programFrames';
 import {
@@ -406,6 +407,19 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         throw new McpToolError('The connected channel does not support direct moves.');
     }
 
+    if (before.machine.x === null || before.machine.y === null) {
+        throw new McpToolError('Machine XY is unknown; cannot compute the route collision envelope.');
+    }
+
+    const routeClearance = routeClearanceForPath(
+        { x: before.machine.x as number, y: before.machine.y as number },
+        machineTarget,
+    );
+
+    if (!Number.isFinite(routeClearance.minimumZ)) {
+        throw new McpToolError(`XY move refused: ${routeClearance.note}`);
+    }
+
     // OPERATOR LAW (2026-09-01, after the probe crash; made a hard gate on
     // 2026-09-21 - "move_and_capture should be z gated first"): X/Y happens at
     // the safe traverse height, and that precondition is established BEFORE
@@ -420,7 +434,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
     // The only escape hatch is operator_confirmed_clearance: the operator's
     // explicit word for the corridor at the CURRENT Z - never the model's own
     // judgment, never derived from assumptions about what is on the bed.
-    const gate = gateDirectXy(before.machine.z, motionFloorZ(), args.operator_confirmed_clearance === true);
+    const gate = gateDirectXy(before.machine.z, routeClearance.minimumZ, args.operator_confirmed_clearance === true);
     if (gate.action === 'refuse' || gate.planZ === null) {
         throw new McpToolError(`XY move refused: ${gate.reason}`);
     }
@@ -538,6 +552,7 @@ export async function executeBoundedMoveAndCapture(args: BoundedMoveArgs): Promi
         raised_first: raisedFirst,
         pacing_warning: pacingWarning,
         note: 'position is firmware-reported after settling, not the commanded target',
+        route_clearance: routeClearance,
     });
 }
 
