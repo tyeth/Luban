@@ -16,6 +16,8 @@
 // Pure: no server imports, unit-tested in tests/toolProtrusion.test.ts.
 
 export interface ToolProtrusionInputs {
+    /** The operator's current-tool assertion, when one has been established. */
+    active?: { protrusionMm: number; source: string; status: string; measuredAt?: number | null } | null;
     /** The last tool-setter measurement of the fitted tool, if there has been one. */
     measured: { protrusionMm: number; at: number } | null;
     /** set_probe_geometry probe_effective_length: the touch probe may be the fitted tool. */
@@ -24,7 +26,7 @@ export interface ToolProtrusionInputs {
     longestBitLengthMm: number | null;
 }
 
-export type ProtrusionSource = 'measured' | 'probe' | 'longest-bit';
+export type ProtrusionSource = 'active-tool' | 'measured' | 'probe' | 'longest-bit';
 
 export interface ToolProtrusion {
     /** Millimetres below the toolhead reference, or null when nothing at all is known. */
@@ -37,6 +39,7 @@ export interface ToolProtrusion {
 }
 
 const LABEL: Record<ProtrusionSource, string> = {
+    'active-tool': 'the active fitted tool',
     measured: 'the last tool-setter measurement',
     probe: 'the touch probe\'s effective length',
     'longest-bit': 'the longest bit in use',
@@ -48,6 +51,14 @@ export const PROTRUSION_UNKNOWN_NOTE = 'Nothing is known about how far the fitte
     + 'computed without it, and nothing is assumed.';
 
 export function resolveToolProtrusion(inputs: ToolProtrusionInputs): ToolProtrusion {
+    if (inputs.active && Number.isFinite(inputs.active.protrusionMm) && inputs.active.protrusionMm > 0) {
+        return {
+            mm: inputs.active.protrusionMm,
+            source: 'active-tool',
+            candidates: [{ source: 'active-tool', mm: inputs.active.protrusionMm, at: inputs.active.measuredAt ?? undefined }],
+            note: `Active tool is ${inputs.active.protrusionMm} mm from ${inputs.active.source} (${inputs.active.status}); routine route clearance uses this fitted-tool value.`,
+        };
+    }
     const candidates: Array<{ source: ProtrusionSource; mm: number; at?: number }> = [];
     if (inputs.measured && Number.isFinite(inputs.measured.protrusionMm) && inputs.measured.protrusionMm > 0) {
         candidates.push({ source: 'measured', mm: inputs.measured.protrusionMm, at: inputs.measured.at });
