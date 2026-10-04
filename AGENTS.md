@@ -39,6 +39,7 @@ the same directory, so Claude Code and Codex load identical files in this checko
 | [`cnc-visual-alignment`](.agents/skills/cnc-visual-alignment/SKILL.md) | Camera frames, visual servo, locating stock or a datum |
 | [`tool-change`](.agents/skills/tool-change/SKILL.md) | Swapping bits without re-touching the stock |
 | [`cnc-thread-milling`](.agents/skills/cnc-thread-milling/SKILL.md) | Thread-milling exports, cutter setup, conversion and staging |
+| [`cnc-vibration`](.agents/skills/cnc-vibration/SKILL.md) | Accelerometers: vibration, axis noise, chatter, deflection, absolute rotary B |
 
 Outside this checkout, add the repo as a plugin marketplace to get the skills and the MCP server
 together: `codex plugin marketplace add tyeth/Luban --ref startup/base`, then
@@ -68,7 +69,8 @@ together: `codex plugin marketplace add tyeth/Luban --ref startup/base`, then
    **Settings → MCP Server**.
 3. Start Luban, connect the machine, and check the health panel on **Settings → MCP Server**.
 4. Optional extras, each documented in the MCP README: a camera (ffmpeg device or snapshot URL),
-   probe and tool-setter feeds (MQTT, or GPIO with `setup.py --blinka --apply`), and HTTPS for
+   probe and tool-setter feeds (MQTT, or GPIO with `setup.py --blinka --apply`), I2C
+   accelerometers on their own bridge or a CircuitPython board ("Accelerometers"), and HTTPS for
    phones on the LAN (`setup.py --https --lan-ip <address>`).
 
 ## Where the documentation is

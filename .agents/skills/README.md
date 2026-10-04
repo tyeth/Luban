@@ -15,6 +15,7 @@ it and point back to it rather than repeating it.
 | [`cnc-visual-alignment`](cnc-visual-alignment/SKILL.md) | Camera frames → millimetres, visual servo, landmarks in frame | Continuous live viewing, synchronized inspection frames, metric calibration and frame-reading heuristics |
 | [`tool-change`](tool-change/SKILL.md) | Swapping bits without re-touching the stock | Tool-setter flows A (MCP offset via `apply_tool_length_offset`) and B (touchscreen wizard) |
 | [`cnc-thread-milling`](cnc-thread-milling/SKILL.md) | Internal/external thread-milling preparation, import and execution | Cutter geometry, bore/boss review, per-feature datums, offline conversion and approved file-job handoff |
+| [`cnc-vibration`](cnc-vibration/SKILL.md) | Vibration, noise, chatter, deflection, spindle RPM from a sensor, the rotary chuck's absolute B | Reading the accelerometer reports honestly; axis-noise surveys by position and spatial period; tilt-based deflection; rotary gravity calibration and power-cycle offset (read-only tools; motion via `cnc-motion-rules`) |
 
 For a plain transit or a Snapmaker-ready file, `cnc-motion-rules` alone is enough (§7–§8 carry the canonical calls).
 A thread-milling controller export also needs `cnc-thread-milling` before submission.
