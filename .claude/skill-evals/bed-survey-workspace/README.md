@@ -18,9 +18,9 @@ removal in the 2027 purge**, like the other workspaces here.
 - `iteration-1/fixtures/tools-list.json` - the live `tools/list` of the deployed build (70 tools). This records the historical deployment, before the skills and tool contracts were updated; it is not the current schema.
 - `iteration-1/eval-0-.../<config>/run-1/{outputs/plan.md, outputs/critique.md, grading.json}`,
   `grading-summary.md` - results and the grader's gap/edit list.
-- `iteration-1/HANDOFF-skills-update.md` - the self-contained brief for the agent doing the skills
-  update: results, code-verified PR #219 facts, gaps G1-G20, edits (a) and product changes (b), and how
-  to run iteration 2.
+- The completed skills-update handoff was removed after implementing the fixes. Its original
+  [brief remains in commit 1fbb0b1ca](https://github.com/tyeth/Luban/blob/1fbb0b1cae1e8abb4bd715bf3d785339812295d6/.claude/skill-evals/bed-survey-workspace/iteration-1/HANDOFF-skills-update.md).
+  The updated iteration-2 specification remains unrun.
 
 Iteration 1 (snapshot bbef661ad): opus 17/20, sonnet 15/20, haiku 4/20, sonnet-noskill 11/20. A5 (the
 active tool opens sub-floor camera routing) failed for every model: it is undocumented.
