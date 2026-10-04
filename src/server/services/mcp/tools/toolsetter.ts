@@ -1,7 +1,7 @@
 /* eslint-disable camelcase */
 // MCP tool arguments are snake_case by convention.
 import { connectionManager } from '../../machine/ConnectionManager';
-import { describeActiveTool, setActiveTool } from '../activeTool';
+import { describeActiveTool, getActiveTool, invalidateActiveTool, setActiveTool } from '../activeTool';
 import { jobManager } from '../jobs';
 import { probeFeedService } from '../probeFeed';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -110,7 +110,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
 
     registry.register({
         name: 'set_active_tool',
-        description: 'Explicitly establish which tool is fitted for routine route clearance. This is separate from the configured longest bit: it becomes the active protrusion used to compute physical obstacle clearances. The operator must state the protrusion and confirm the tool is fitted.',
+        description: 'Record the operator-confirmed fitted tool for clearance, no motion or confirm page. protrusion_mm is the conservative distance below the toolhead, NOT probe contact calibration or necessarily overall length. A shorter active tool lowers physical-obstacle clearance; it never bypasses the motion floor or legacy clearance_z boxes. run_tool_setter replaces it automatically. Restart, detected disconnect/reboot and tool-change parking make it stale; re-confirm the fitted tool, do not blindly replay a historical value.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -135,6 +135,17 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
             if (!Number.isFinite(protrusionMm) || protrusionMm <= 0) {
                 throw new McpToolError('protrusion_mm must be a positive finite number.');
             }
+            if (source !== 'operator') {
+                if (getActiveTool()?.measurementJobId !== args.measurement_job_id) {
+                    throw new McpToolError('This measurement is not the current fitted-tool assertion. After invalidation, confirm the current fitting with source operator or measure again.');
+                }
+                const measurement = jobManager.get(String(args.measurement_job_id));
+                const result = measurement?.result as { active_tool?: { source?: string; protrusionMm?: number } } | undefined;
+                if (measurement?.state !== 'completed' || result?.active_tool?.source !== source
+                    || Math.abs(Number(result.active_tool.protrusionMm) - protrusionMm) > 0.001) {
+                    throw new McpToolError('Measured provenance must match a completed tool-setter job and its actual protrusion. For a current operator assertion use source operator and quote that confirmation.');
+                }
+            }
             const active = setActiveTool({
                 protrusionMm,
                 source,
@@ -148,7 +159,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
 
     registry.register({
         name: 'get_active_tool',
-        description: 'Read the fitted active-tool assertion and its provenance. Routine physical-obstacle clearance uses this value when present; the configured longest bit remains a fallback for setup safety.',
+        description: 'Read the usable active-tool clearance assertion, age and provenance, or active:null plus stored/staleReason when invalidated. Re-read after every setter run or swap. Stale records are not used to shorten physical clearances; fallback is the configured worst case. No motion or confirm page.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         handler: async () => describeActiveTool(),
     });
@@ -303,6 +314,7 @@ export function registerToolSetterTools(registry: ToolRegistry, getConfirmBaseUr
                 `G90\nG53;\nG0 X${cfg.changeX.toFixed(3)}${cfg.changeY !== null ? ` Y${cfg.changeY.toFixed(3)}` : ''};\nG54;`,
             ];
             const reviewText = steps.join('\n; --- next approved step ---\n');
+            invalidateActiveTool('Tool-change park requested; confirm the fitted tool after the manual swap.');
             const validation = validateStagedEnvelope(reviewText, 'goto_tool_change_position');
             const job = jobManager.submit(
                 reviewText,

@@ -1,7 +1,8 @@
 // How far the fitted tool sticks out below the toolhead, resolved from what
 // the server actually knows - and deliberately erring long.
 //
-// Nothing tells this server which tool is in the collet. The tool setter
+// A usable active-tool assertion identifies the fitted tool and takes precedence.
+// Without one, nothing tells this server which tool is in the collet. The tool setter
 // measures one when it is asked to; the operator declares the longest bit in
 // use and the touch probe's effective length once. Any of the three could be
 // what is fitted right now, so a clearance check that must not be wrong takes
@@ -16,6 +17,8 @@
 // Pure: no server imports, unit-tested in tests/toolProtrusion.test.ts.
 
 export interface ToolProtrusionInputs {
+    /** A stale assertion may lengthen the fallback, never shorten it. */
+    staleToolMm?: number | null;
     /** The operator's current-tool assertion, when one has been established. */
     active?: { protrusionMm: number; source: string; status: string; measuredAt?: number | null } | null;
     /** The last tool-setter measurement of the fitted tool, if there has been one. */
@@ -26,7 +29,7 @@ export interface ToolProtrusionInputs {
     longestBitLengthMm: number | null;
 }
 
-export type ProtrusionSource = 'active-tool' | 'measured' | 'probe' | 'longest-bit';
+export type ProtrusionSource = 'active-tool' | 'stale-tool' | 'measured' | 'probe' | 'longest-bit';
 
 export interface ToolProtrusion {
     /** Millimetres below the toolhead reference, or null when nothing at all is known. */
@@ -39,6 +42,7 @@ export interface ToolProtrusion {
 }
 
 const LABEL: Record<ProtrusionSource, string> = {
+    'stale-tool': 'the last confirmed tool (stale, conservative fallback only)',
     'active-tool': 'the active fitted tool',
     measured: 'the last tool-setter measurement',
     probe: 'the touch probe\'s effective length',
@@ -60,6 +64,9 @@ export function resolveToolProtrusion(inputs: ToolProtrusionInputs): ToolProtrus
         };
     }
     const candidates: Array<{ source: ProtrusionSource; mm: number; at?: number }> = [];
+    if (typeof inputs.staleToolMm === 'number' && Number.isFinite(inputs.staleToolMm) && inputs.staleToolMm > 0) {
+        candidates.push({ source: 'stale-tool', mm: inputs.staleToolMm });
+    }
     if (inputs.measured && Number.isFinite(inputs.measured.protrusionMm) && inputs.measured.protrusionMm > 0) {
         candidates.push({ source: 'measured', mm: inputs.measured.protrusionMm, at: inputs.measured.at });
     }

@@ -38,7 +38,7 @@ import {
     resolveMarchParams,
 } from './procedureLimits';
 import { McpToolError } from './registry';
-import { setActiveTool } from './activeTool';
+import { getActiveTool, setActiveTool } from './activeTool';
 import { getPositionSnapshot, motionFloorZ, safeTraverseZ } from './tools/machine';
 
 const log = logger('service:mcp:tool-setter');
@@ -370,6 +370,7 @@ export interface ToolSetterResult {
     finalZ: number | null;
     note: string;
     active_tool?: object;
+    active_tool_replaced?: object;
     warning?: string;
 }
 
@@ -603,6 +604,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan, measurementJo
             spreadMm,
             at: Date.now(),
         });
+        const previousActiveTool = getActiveTool();
         const activeTool = setActiveTool({
             protrusionMm: derivedBitLengthMm,
             source: plan.acceptProbeContact ? 'spindle_probe' : 'tool_setter',
@@ -634,6 +636,7 @@ export async function runToolSetterProcedure(plan: ToolSetterPlan, measurementJo
                 + 'resolution). The derived bit length assumes the stored reference is exact; report it '
                 + `with that uncertainty.${endNote}`,
             active_tool: activeTool,
+            active_tool_replaced: { previous: previousActiveTool, current: activeTool },
             warning: spreadMm > plan.fineStepMm + 1e-9
                 ? `Confirm passes spread ${spreadMm} mm exceeds one fine step - feed timing was unstable; `
                     + 'consider more confirm_passes or a longer sensor_delay_ms.'

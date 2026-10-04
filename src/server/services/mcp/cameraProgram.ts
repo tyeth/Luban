@@ -6,7 +6,8 @@ import * as fs from 'fs-extra';
 
 import { captureFrame, getCachedFrame } from './camera';
 import { clearanceOptions } from './clearanceContext';
-import { getActiveTool } from './activeTool';
+import { cameraOpSchemas, validateCameraOps } from './cameraProgramSchema';
+import { belowCameraFloor } from './cameraSafety';
 import { calibrationStore } from './calibration';
 import { checkMotion, describeViolations, MotionSegment } from './envelopeChecks';
 import { landmarkStore } from './landmarks';
@@ -30,11 +31,14 @@ import { validateStagedEnvelope } from './tools/staging';
 import {
     getMachineSizeByIdentifier,
     getPositionSnapshot,
+    motionFloorZ,
+    requireReliableMachine,
     requirePlanningTravel,
     safeTraverseZ,
 } from './tools/machine';
 import { connectionManager } from '../machine/ConnectionManager';
 import { moveMachineSettled, assertMachineReadyForProcedure, checkProcedureStop } from './probing';
+import { cameraFailure } from './cameraRecovery';
 import { routeClearanceForPath } from './routeClearance';
 import { fovAt } from './cameraGeometry';
 import { cameraModelStore } from './cameraModelStore';
@@ -84,8 +88,8 @@ interface FrameResult {
 }
 
 function finite(value: unknown, field: string): number {
-    const number = Number(value);
-    if (!Number.isFinite(number)) {
+    const number = value as number;
+    if (typeof number !== 'number' || !Number.isFinite(number)) {
         throw new McpToolError(`${field} must be a finite number.`);
     }
     return number;
@@ -106,6 +110,13 @@ function gridPoints(min: number, max: number, pitch: number): number[] {
     return Array.from({ length: intervals + 1 }, (_, i) => Number((min + step * i).toFixed(1)));
 }
 
+function validateColumn(from: { x: number; y: number; z: number }, z: number, where: string): void {
+    if (z < 0 || z > machineTop()) throw new McpToolError(`${where}: machine Z outside travel.`);
+    const violations = checkMotion([{ kind: 'column', what: where, from, to: { ...from, z } }],
+        landmarkStore.obstacleBoxes().map((box) => ({ ...box, mode: 'volume' as const })), clearanceOptions());
+    if (violations.length) throw new McpToolError(`${where}: ${describeViolations(violations)}`);
+}
+
 function surveyArgs(
     args: { [key: string]: unknown },
     virtual: { x: number; y: number; z: number },
@@ -114,7 +125,7 @@ function surveyArgs(
 ): PlannedSurvey {
     const travel = requirePlanningTravel(`${where} survey`, virtual);
     const margin = clampTo(args.margin_mm, SURVEY_MARGIN_MM);
-    const pitch = clampTo(args.pitch_mm, SURVEY_PITCH_MM);
+    let pitch = clampTo(args.pitch_mm, SURVEY_PITCH_MM);
     const limits = travel.limits;
     const xMin = args.x_min === undefined ? limits.xMin + margin : finite(args.x_min, `${where}.x_min`);
     const xMax = args.x_max === undefined ? limits.xMax - margin : finite(args.x_max, `${where}.x_max`);
@@ -123,13 +134,9 @@ function surveyArgs(
     if (!(xMax > xMin) || !(yMax > yMin)) {
         throw new McpToolError(`${where}: survey bounds are empty.`);
     }
-    const xs = gridPoints(Math.max(xMin, limits.xMin), Math.min(xMax, limits.xMax), pitch);
-    const ys = gridPoints(Math.max(yMin, limits.yMin), Math.min(yMax, limits.yMax), pitch);
-    const waypoints: { x: number; y: number }[] = [];
-    ys.forEach((y, row) => {
-        const rowXs = row % 2 === 0 ? xs : [...xs].reverse();
-        rowXs.forEach((x) => waypoints.push({ x, y }));
-    });
+    if (xMin < limits.xMin || xMax > limits.xMax || yMin < limits.yMin || yMax > limits.yMax) {
+        throw new McpToolError(`${where}: bounds exceed machine travel; use bounds from get_stored_state or standalone survey_bed for reported clipping.`);
+    }
     const rawLevels = Array.isArray(args.z_levels) && args.z_levels.length
         ? args.z_levels.map((value) => finite(value, `${where}.z_levels`))
         : [args.machine_z === undefined ? virtual.z : finite(args.machine_z, `${where}.machine_z`)];
@@ -140,26 +147,10 @@ function surveyArgs(
     if (levels.some((level) => level < 0 || level > machineTop())) {
         throw new McpToolError(`${where}: every survey Z must be within machine travel 0..${machineTop()}.`);
     }
-    if (!operatorConfirmedClearance && !getActiveTool() && levels.some((level) => level < 320)) {
-        // A fitted tool plus explicit landmark checks is enough for a dynamic
-        // route; the no-active-tool case retains the old unknown-scene guard.
-        const clearance = clearanceOptions();
-        if (clearance.toolProtrusionMm === null) {
-            throw new McpToolError(`${where}: lower camera heights need an active fitted tool or operator_confirmed_clearance; no tool length is known.`);
-        }
+    if (belowCameraFloor(levels, motionFloorZ(), POSITION_TOLERANCE_MM, operatorConfirmedClearance).length) {
+        throw new McpToolError(`${where}: camera XY below motion floor ${motionFloorZ()} requires explicit operator clearance for this op. An active tool does not bound unmapped obstacles.`);
     }
     const machineZ = args.machine_z === undefined ? null : finite(args.machine_z, `${where}.machine_z`);
-    const plan = planSurvey({
-        levels,
-        waypoints,
-        parkZ: safeTraverseZ(),
-        fromMachine: { x: virtual.x, y: virtual.y, z: machineZ === null ? virtual.z : machineZ },
-        obstacles: landmarkStore.obstacleBoxes(),
-        ...clearanceOptions(),
-    });
-    if (!plan.captureCount) {
-        throw new McpToolError(`${where}: every waypoint is blocked at every requested level.`);
-    }
     const planeZ = args.plane_z === undefined ? 0 : finite(args.plane_z, `${where}.plane_z`);
     if (args.overlap_fraction !== undefined) {
         const overlap = finite(args.overlap_fraction, `${where}.overlap_fraction`);
@@ -170,12 +161,31 @@ function surveyArgs(
         if (!model || !judgeCameraModel(model, modelContext(null)).usable) {
             throw new McpToolError(`${where}: overlap_fraction needs a verified camera model.`);
         }
-        const fov = fovAt(model, { x: virtual.x, y: virtual.y, z: levels[0] }, planeZ);
-        const derived = pitchForOverlap(fov.widthMm, fov.heightMm, overlap);
-        if (Math.min(derived.x, derived.y) <= 0) {
-            throw new McpToolError(`${where}: camera model produced an invalid overlap pitch.`);
+        for (const level of levels) {
+            const fov = fovAt(model, { x: virtual.x, y: virtual.y, z: level }, planeZ);
+            const derived = pitchForOverlap(fov.widthMm, fov.heightMm, overlap);
+            if (!Number.isFinite(derived.x) || !Number.isFinite(derived.y) || Math.min(derived.x, derived.y) <= 0) {
+                throw new McpToolError(`${where}: camera model produced an invalid overlap pitch.`);
+            }
+            pitch = Math.min(pitch, derived.x, derived.y);
         }
     }
+    const count = (Math.ceil((xMax - xMin) / pitch) + 1) * (Math.ceil((yMax - yMin) / pitch) + 1) * levels.length;
+    if (count > 2000) throw new McpToolError(`${where}: ${count} captures exceed 2000; narrow bounds or reduce overlap.`);
+    const xs = gridPoints(xMin, xMax, pitch);
+    const ys = gridPoints(yMin, yMax, pitch);
+    const waypoints: { x: number; y: number }[] = [];
+    ys.forEach((y, row) => (row % 2 === 0 ? xs : [...xs].reverse()).forEach((x) => waypoints.push({ x, y })));
+    if (machineZ !== null) validateColumn(virtual, machineZ, where);
+    const plan = planSurvey({
+        levels,
+        waypoints,
+        parkZ: safeTraverseZ(),
+        fromMachine: { ...virtual, z: machineZ === null ? virtual.z : machineZ },
+        obstacles: landmarkStore.obstacleBoxes(),
+        ...clearanceOptions(),
+    });
+    if (!plan.captureCount) throw new McpToolError(`${where}: every waypoint is blocked at every requested level.`);
     return { kind: 'survey_bed', levels, plan, pitch, xs, ys, planeZ, machineZ };
 }
 
@@ -187,11 +197,14 @@ function validateMoveAndCapture(args: { [key: string]: unknown }, virtual: { x: 
     const x = finite(args.x, `ops[${index}].x`);
     const y = finite(args.y, `ops[${index}].y`);
     const z = finite(args.machine_z, `ops[${index}].machine_z`);
+    validateColumn(virtual, z, `ops[${index}]`);
+    // This is an enumerated, staged program leg. The direct-call 100 mm/pacing
+    // cap is not a reason to split an otherwise safe, fully reviewed sequence.
     const travel = requirePlanningTravel('camera_program move_and_capture', virtual);
     if (x < travel.limits.xMin || x > travel.limits.xMax || y < travel.limits.yMin || y > travel.limits.yMax) {
         throw new McpToolError(`ops[${index}] move_and_capture target is outside the toolhead travel.`);
     }
-    const route = routeClearanceForPath({ x: virtual.x, y: virtual.y }, { x, y });
+    const route = routeClearanceForPath({ x: virtual.x, y: virtual.y }, { x, y }, undefined, args.operator_confirmed_clearance === true);
     if (z < route.minimumZ - POSITION_TOLERANCE_MM) {
         throw new McpToolError(`ops[${index}] move_and_capture Z${z} is below the route collision requirement ${route.minimumZ}: ${route.note}`);
     }
@@ -208,6 +221,10 @@ function validateMoveAndCapture(args: { [key: string]: unknown }, virtual: { x: 
 export function planCameraProgram(args: { name?: unknown; reason?: unknown; ops?: unknown; operator_confirmed_clearance?: unknown }): CameraProgramPlan {
     const name = String(args.name || '').trim();
     const reason = String(args.reason || '').trim();
+    if (args.operator_confirmed_clearance !== undefined) {
+        throw new McpToolError('Program-wide clearance is not accepted. Put operator_confirmed_clearance only on the specific survey_bed or move_and_capture ops the operator explicitly cleared.');
+    }
+    validateCameraOps(args.ops);
     if (!name || !reason) {
         throw new McpToolError('name and reason are required.');
     }
@@ -216,6 +233,7 @@ export function planCameraProgram(args: { name?: unknown; reason?: unknown; ops?
     }
     probeFeedService.assertNoOvertravel();
     const snapshot = getPositionSnapshot();
+    requireReliableMachine(snapshot, 'a camera program');
     if (snapshot.machine.x === null || snapshot.machine.y === null || snapshot.machine.z === null) {
         throw new McpToolError('Current machine position unknown; cannot anchor camera_program.');
     }
@@ -247,12 +265,15 @@ export function planCameraProgram(args: { name?: unknown; reason?: unknown; ops?
             if (z < 0 || z > machineTop()) {
                 throw new McpToolError(`ops[${index}] move_z is outside machine Z 0..${machineTop()}.`);
             }
+            validateColumn(virtual, z, `ops[${index}] move_z`);
             previews.push(`; ${id}: assert machine Z${z.toFixed(3)} before the next operation`);
             virtual.z = z;
         } else if (kind === 'survey_bed') {
-            const survey = surveyArgs(opArgs, virtual, args.operator_confirmed_clearance === true, `ops[${index}]`);
+            const survey = surveyArgs(opArgs, virtual, opArgs.operator_confirmed_clearance === true, `ops[${index}]`);
             surveys[id] = survey;
             previews.push(`; ${id}: survey ${survey.plan.captureCount} waypoint(s) at machine Z ${survey.levels.join(', ')}`);
+            previews.push(`; ${id}: pitch ${survey.pitch} mm; physical plane Z${survey.planeZ}; ${survey.plan.dropped.length} dropped waypoint(s); no mosaic`);
+            previews.push(...survey.plan.dropped.map((d) => `; ${id}: DROPPED (${d.x}, ${d.y}) Z${d.z}: ${d.reason}`));
             if (survey.machineZ !== null) {
                 previews.push(`; ${id}: assert machine Z${survey.machineZ.toFixed(3)} before any survey XY motion`);
             }
@@ -260,9 +281,8 @@ export function planCameraProgram(args: { name?: unknown; reason?: unknown; ops?
                 if (leg.kind === 'capture') return `; ${id}: capture waypoint ${leg.index} at (${leg.x}, ${leg.y}) Z${leg.z}`;
                 return `; ${id}: ${leg.kind} (${leg.x}, ${leg.y}) Z${leg.z}`;
             })));
-            const lastLevel = survey.plan.levels[survey.plan.levels.length - 1];
-            const captures = lastLevel.legs.filter((leg) => leg.kind === 'capture') as Array<{ x: number; y: number; z: number }>;
-            const last = captures[captures.length - 1];
+            const legs = survey.plan.levels.flatMap((level) => level.legs);
+            const last = legs[legs.length - 1];
             if (last) Object.assign(virtual, { x: last.x, y: last.y, z: last.z });
         } else if (kind === 'move_and_capture') {
             validateMoveAndCapture(opArgs, virtual, index);
@@ -298,6 +318,10 @@ export function planCameraProgram(args: { name?: unknown; reason?: unknown; ops?
             if (fit && !ids.has(fit)) throw new McpToolError(`ops[${index}] verify_calibration references an earlier fit_calibration.`);
             previews.push(`; ${id}: verify M.J ~= identity${fit ? ` for fit ${fit}` : ''} before accepting the calibration`);
         }
+        if (opArgs.operator_confirmed_clearance === true) previews.push(`; ${id}: OPERATOR CLEARANCE EXCEPTION for this op only; stored obstacles still checked`);
+        if (['track_feature', 'fit_calibration', 'verify_calibration'].includes(kind)) {
+            previews.push(`; ${id}: parameters ${JSON.stringify(opArgs)}`);
+        }
     }
     return {
         name,
@@ -307,7 +331,7 @@ export function planCameraProgram(args: { name?: unknown; reason?: unknown; ops?
         staged: { x: snapshot.machine.x, y: snapshot.machine.y, z: snapshot.machine.z },
         keepOut: [],
         surveys,
-        operatorConfirmedClearance: args.operator_confirmed_clearance === true,
+        operatorConfirmedClearance: false,
     };
 }
 
@@ -383,6 +407,15 @@ export function describeCameraProgram(plan: CameraProgramPlan): string {
 
 export async function runCameraProgramProcedure(plan: CameraProgramPlan): Promise<object> {
     assertMachineReadyForProcedure();
+    const anchor = getPositionSnapshot().machine;
+    if (anchor.x === null || anchor.y === null || anchor.z === null
+        || Math.hypot(anchor.x - plan.staged.x, anchor.y - plan.staged.y, anchor.z - plan.staged.z) > POSITION_TOLERANCE_MM) {
+        throw new McpToolError('Camera program anchor changed since staging; stage a new plan from the verified position.');
+    }
+    // Recheck the complete envelope with the current tool, landmarks and model
+    // before sending anything, without enlarging the approved waypoint plan.
+    const livePlan = planCameraProgram({ name: plan.name, reason: plan.reason, ops: plan.ops.map((op) => ({ id: op.id, kind: op.kind, ...op.args })) });
+    if (JSON.stringify(livePlan.previews) !== JSON.stringify(plan.previews)) throw new McpToolError('Camera plan changed since approval; restage for review.');
     const startedAt = Date.now();
     const results: Record<string, unknown> = {};
     const phases: object[] = [];
@@ -390,117 +423,124 @@ export async function runCameraProgramProcedure(plan: CameraProgramPlan): Promis
         phases.push({ phase, note });
         mcpBroadcast('mcp:activity', { tool: 'camera_program', phase, note });
     };
-    for (const [index, op] of plan.ops.entries()) {
-        checkProcedureStop();
-        announce(`op-${op.id}-start`, `${index + 1}/${plan.ops.length} ${op.kind}`);
-        if (op.kind === 'move_z') {
-            const z = finite(op.args.machine_z === undefined ? op.args.z : op.args.machine_z, `${op.id}.machine_z`);
-            await moveMachineSettled(`camera_program:${op.id}`, { z }, TRAVEL_FEED);
-            results[op.id] = { machine_z: z };
-        } else if (op.kind === 'survey_bed') {
-            const survey = plan.surveys[op.id];
-            const frames: object[] = [];
-            if (survey.machineZ !== null) {
-                const live = getPositionSnapshot().machine.z;
-                if (live === null || Math.abs(live - survey.machineZ) > POSITION_TOLERANCE_MM) {
-                    await moveMachineSettled(`camera_program:${op.id}:assert-z`, { z: survey.machineZ }, TRAVEL_FEED);
-                }
-                const verified = getPositionSnapshot().machine.z;
-                if (verified === null || Math.abs(verified - survey.machineZ) > POSITION_TOLERANCE_MM) {
-                    throw new McpToolError(`camera_program ${op.id}: explicit machine_z was not verified before XY motion.`);
-                }
-            }
-            for (const level of survey.plan.levels) {
-                for (const leg of level.legs as SurveyLeg[]) {
-                    checkProcedureStop();
-                    if (leg.kind === 'raise' || leg.kind === 'descend') {
-                        await moveMachineSettled(`camera_program:${op.id}:z`, { z: leg.z }, TRAVEL_FEED);
-                    } else if (leg.kind === 'hop') {
-                        await moveMachineSettled(`camera_program:${op.id}:xy`, { x: leg.x, y: leg.y }, TRAVEL_FEED * SURVEY_LINK_FEED_FACTOR);
-                    } else {
-                        const frame = await captureFrame();
-                        const file = programFramePath(startedAt, plan.name, `${op.id}_z${level.z}_wp${leg.index}`);
-                        fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
-                        frames.push({ frame_id: frame.frameId, file, machine: { x: leg.x, y: leg.y, z: leg.z }, captured_at: frame.capturedAt });
+    try {
+        for (const [index, op] of plan.ops.entries()) {
+            checkProcedureStop();
+            announce(`op-${op.id}-start`, `${index + 1}/${plan.ops.length} ${op.kind}`);
+            if (op.kind === 'move_z') {
+                const z = finite(op.args.machine_z === undefined ? op.args.z : op.args.machine_z, `${op.id}.machine_z`);
+                await moveMachineSettled(`camera_program:${op.id}`, { z }, TRAVEL_FEED);
+                results[op.id] = { machine_z: z };
+            } else if (op.kind === 'survey_bed') {
+                const survey = plan.surveys[op.id];
+                const frames: object[] = [];
+                results[op.id] = { levels: survey.levels, frames, incomplete: true };
+                if (survey.machineZ !== null) {
+                    const live = getPositionSnapshot().machine.z;
+                    if (live === null || Math.abs(live - survey.machineZ) > POSITION_TOLERANCE_MM) {
+                        await moveMachineSettled(`camera_program:${op.id}:assert-z`, { z: survey.machineZ }, TRAVEL_FEED);
+                    }
+                    const verified = getPositionSnapshot().machine.z;
+                    if (verified === null || Math.abs(verified - survey.machineZ) > POSITION_TOLERANCE_MM) {
+                        throw new McpToolError(`camera_program ${op.id}: explicit machine_z was not verified before XY motion.`);
                     }
                 }
-            }
-            results[op.id] = { levels: survey.levels, frame_count: frames.length, frames };
-        } else if (op.kind === 'move_and_capture') {
-            const z = finite(op.args.machine_z, `${op.id}.machine_z`);
-            const x = finite(op.args.x, `${op.id}.x`);
-            const y = finite(op.args.y, `${op.id}.y`);
-            const liveZ = getPositionSnapshot().machine.z;
-            if (liveZ === null || Math.abs(liveZ - z) > POSITION_TOLERANCE_MM) await moveMachineSettled(`camera_program:${op.id}:z`, { z }, TRAVEL_FEED);
-            await moveMachineSettled(`camera_program:${op.id}:xy`, { x, y }, TRAVEL_FEED * SURVEY_LINK_FEED_FACTOR);
-            const frame = await captureFrame();
-            results[op.id] = { frame_id: frame.frameId, machine: getPositionSnapshot().machine, captured_at: frame.capturedAt };
-        } else if (op.kind === 'capture') {
-            const frame = await captureFrame();
-            const snapshot = getPositionSnapshot();
-            const file = programFramePath(startedAt, plan.name, op.id);
-            fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
-            results[op.id] = { frameId: frame.frameId, file, machine: snapshot.machine, capturedAt: frame.capturedAt } as FrameResult;
-            announce(`op-${op.id}-frame`, frameLine(op.id, results[op.id] as FrameResult));
-        } else if (op.kind === 'track_feature') {
-            const template = results[String(op.args.template_capture_id)] as { frameId?: string; frame_id?: string } | undefined;
-            const search = results[String(op.args.search_capture_id)] as { frameId?: string; frame_id?: string } | undefined;
-            const templateId = template?.frameId || template?.frame_id;
-            const searchId = search?.frameId || search?.frame_id;
-            const templateJpg = getCachedFrame(String(templateId || ''));
-            const searchJpg = getCachedFrame(String(searchId || ''));
-            if (!templateJpg || !searchJpg) throw new McpToolError(`camera_program ${op.id}: referenced capture is no longer in the frame cache.`);
-            const point = op.args.point as { u?: unknown; v?: unknown };
-            const tracked = trackFeature(decodeToGray(templateJpg), decodeToGray(searchJpg), Math.round(Number(point.u)), Math.round(Number(point.v)), 41, 120);
-            results[op.id] = tracked;
-        } else if (op.kind === 'fit_calibration') {
-            const samples = (op.args.samples as Array<{ track_id: string; dx_mm: number; dy_mm: number }>).map((sample) => {
-                const tracked = results[String(sample.track_id)] as { du?: number; dv?: number } | undefined;
-                if (!tracked) throw new McpToolError(`camera_program ${op.id}: track result ${sample.track_id} is missing.`);
-                return { dx: Number(sample.dx_mm), dy: Number(sample.dy_mm), du: Number(tracked.du), dv: Number(tracked.dv) };
-            });
-            const maxResidual = op.args.max_residual_px === undefined ? 5 : finite(op.args.max_residual_px, `${op.id}.max_residual_px`);
-            const fit = fitJacobian(samples, maxResidual);
-            const position = getPositionSnapshot().machine;
-            const entry = calibrationStore.add({
-                validAtY: op.args.valid_at_y === undefined ? Number(position.y) : finite(op.args.valid_at_y, `${op.id}.valid_at_y`),
-                z: op.args.z === undefined ? Number(position.z) : finite(op.args.z, `${op.id}.z`),
-                matrix: fit.matrix,
-                surface: op.args.surface ? String(op.args.surface) : null,
-                notes: `camera_program ${plan.name}; residual RMSE ${fit.rmsePx.toFixed(3)} px; ${String(op.args.notes || '')}`.trim(),
-            });
-            results[op.id] = { ...fit, entry };
-        } else {
-            let jacobian: [[number, number], [number, number]];
-            let matrix: [[number, number], [number, number]];
-            if (op.args.fit_id) {
-                const fit = results[String(op.args.fit_id)] as FitResult | undefined;
-                if (!fit) throw new McpToolError(`camera_program ${op.id}: fit result is missing.`);
-                jacobian = fit.jacobian;
-                matrix = fit.matrix;
+                for (const level of survey.plan.levels) {
+                    for (const leg of level.legs as SurveyLeg[]) {
+                        checkProcedureStop();
+                        if (leg.kind === 'raise' || leg.kind === 'descend') {
+                            await moveMachineSettled(`camera_program:${op.id}:z`, { z: leg.z }, TRAVEL_FEED);
+                        } else if (leg.kind === 'hop') {
+                            await moveMachineSettled(`camera_program:${op.id}:xy`, { x: leg.x, y: leg.y }, TRAVEL_FEED * SURVEY_LINK_FEED_FACTOR);
+                        } else {
+                            const frame = await captureFrame();
+                            const file = programFramePath(startedAt, plan.name, `${op.id}_z${level.z}_wp${leg.index}`);
+                            fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
+                            frames.push({ frame_id: frame.frameId, file, machine: { x: leg.x, y: leg.y, z: leg.z }, captured_at: frame.capturedAt });
+                        }
+                    }
+                }
+                results[op.id] = { levels: survey.levels, frame_count: frames.length, frames };
+            } else if (op.kind === 'move_and_capture') {
+                const z = finite(op.args.machine_z, `${op.id}.machine_z`);
+                const x = finite(op.args.x, `${op.id}.x`);
+                const y = finite(op.args.y, `${op.id}.y`);
+                const liveZ = getPositionSnapshot().machine.z;
+                if (liveZ === null || Math.abs(liveZ - z) > POSITION_TOLERANCE_MM) await moveMachineSettled(`camera_program:${op.id}:z`, { z }, TRAVEL_FEED);
+                await moveMachineSettled(`camera_program:${op.id}:xy`, { x, y }, TRAVEL_FEED * SURVEY_LINK_FEED_FACTOR);
+                const frame = await captureFrame();
+                const file = programFramePath(startedAt, plan.name, op.id);
+                fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
+                results[op.id] = { frame_id: frame.frameId, file, machine: getPositionSnapshot().machine, captured_at: frame.capturedAt };
+            } else if (op.kind === 'capture') {
+                const frame = await captureFrame();
+                const snapshot = getPositionSnapshot();
+                const file = programFramePath(startedAt, plan.name, op.id);
+                fs.writeFileSync(file, Buffer.from(frame.imageBase64, 'base64'));
+                results[op.id] = { frameId: frame.frameId, file, machine: snapshot.machine, capturedAt: frame.capturedAt } as FrameResult;
+                announce(`op-${op.id}-frame`, frameLine(op.id, results[op.id] as FrameResult));
+            } else if (op.kind === 'track_feature') {
+                const template = results[String(op.args.template_capture_id)] as { frameId?: string; frame_id?: string; file?: string } | undefined;
+                const search = results[String(op.args.search_capture_id)] as { frameId?: string; frame_id?: string; file?: string } | undefined;
+                const templateId = template?.frameId || template?.frame_id;
+                const searchId = search?.frameId || search?.frame_id;
+                const templateJpg = template?.file ? fs.readFileSync(template.file) : getCachedFrame(String(templateId || ''));
+                const searchJpg = search?.file ? fs.readFileSync(search.file) : getCachedFrame(String(searchId || ''));
+                if (!templateJpg || !searchJpg) throw new McpToolError(`camera_program ${op.id}: referenced capture is no longer in the frame cache.`);
+                const point = op.args.point as { u?: unknown; v?: unknown };
+                const tracked = trackFeature(decodeToGray(templateJpg), decodeToGray(searchJpg),
+                    Math.round(Number(point.u)), Math.round(Number(point.v)), 41, 120);
+                results[op.id] = tracked;
+            } else if (op.kind === 'fit_calibration') {
+                const samples = (op.args.samples as Array<{ track_id: string; dx_mm: number; dy_mm: number }>).map((sample) => {
+                    const tracked = results[String(sample.track_id)] as { du?: number; dv?: number } | undefined;
+                    if (!tracked) throw new McpToolError(`camera_program ${op.id}: track result ${sample.track_id} is missing.`);
+                    return { dx: Number(sample.dx_mm), dy: Number(sample.dy_mm), du: Number(tracked.du), dv: Number(tracked.dv) };
+                });
+                const maxResidual = op.args.max_residual_px === undefined ? 5 : finite(op.args.max_residual_px, `${op.id}.max_residual_px`);
+                const fit = fitJacobian(samples, maxResidual);
+                const position = getPositionSnapshot().machine;
+                const entry = calibrationStore.add({
+                    validAtY: op.args.valid_at_y === undefined ? Number(position.y) : finite(op.args.valid_at_y, `${op.id}.valid_at_y`),
+                    z: op.args.z === undefined ? Number(position.z) : finite(op.args.z, `${op.id}.z`),
+                    matrix: fit.matrix,
+                    surface: op.args.surface ? String(op.args.surface) : null,
+                    notes: `camera_program ${plan.name}; residual RMSE ${fit.rmsePx.toFixed(3)} px; ${String(op.args.notes || '')}`.trim(),
+                });
+                results[op.id] = { ...fit, entry };
             } else {
-                jacobian = op.args.jacobian as [[number, number], [number, number]];
-                matrix = op.args.matrix as [[number, number], [number, number]];
+                let jacobian: [[number, number], [number, number]];
+                let matrix: [[number, number], [number, number]];
+                if (op.args.fit_id) {
+                    const fit = results[String(op.args.fit_id)] as FitResult | undefined;
+                    if (!fit) throw new McpToolError(`camera_program ${op.id}: fit result is missing.`);
+                    jacobian = fit.jacobian;
+                    matrix = fit.matrix;
+                } else {
+                    jacobian = op.args.jacobian as [[number, number], [number, number]];
+                    matrix = op.args.matrix as [[number, number], [number, number]];
+                }
+                if (!Array.isArray(jacobian) || !Array.isArray(matrix)) throw new McpToolError(`camera_program ${op.id}: provide fit_id or both jacobian and matrix.`);
+                results[op.id] = verify(jacobian, matrix, op.args.tolerance === undefined ? 0.25 : finite(op.args.tolerance, `${op.id}.tolerance`));
             }
-            if (!Array.isArray(jacobian) || !Array.isArray(matrix)) throw new McpToolError(`camera_program ${op.id}: provide fit_id or both jacobian and matrix.`);
-            results[op.id] = verify(jacobian, matrix, op.args.tolerance === undefined ? 0.25 : finite(op.args.tolerance, `${op.id}.tolerance`));
+            announce(`op-${op.id}-done`);
         }
-        announce(`op-${op.id}-done`);
+        return { name: plan.name, ops: results, phases, finalMachine: getPositionSnapshot().machine, durationMs: Date.now() - startedAt, note: `Camera program ${plan.name} completed with one operator approval.` };
+    } catch (err) {
+        return cameraFailure('camera_program', err, { name: plan.name, ops: results, phases });
     }
-    return { name: plan.name, ops: results, phases, durationMs: Date.now() - startedAt, note: `Camera program ${plan.name} completed with one operator approval.` };
 }
 
 export function registerCameraProgramTool(registry: ToolRegistry, getConfirmBaseUrl: () => string): void {
     registry.register({
         name: 'camera_program',
-        description: 'Stage one composite camera procedure under one operator approval. Operations are move_z, survey_bed, move_and_capture, capture, track_feature, fit_calibration, and verify_calibration. Every exact Z, XY corridor, survey waypoint, feature track, residual threshold, and stored calibration is shown on the confirm page. Use machine_z on survey_bed to assert that Z before any XY motion.',
+        description: 'Stage one camera procedure; each op uses {id, kind, ...fields} from ops.items.oneOf. Homed, idle, toolhead off. Camera XY obeys the motion floor even with an active tool; operator clearance exceptions are per-op only. machine_z is TOOLHEAD machine Z; plane_z is PHYSICAL surface Z. fit_calibration stores a local 2x2 matrix, NOT the camera model. verify_calibration only checks M*J, not a held-out target. Program surveys save frames but no mosaic (use standalone survey_bed for mosaics). Result.ops is keyed by id: captures have file/machine, tracks have du/dv, fits have matrix/jacobian/residuals/entry. Deliver confirm_url and end the turn before start_gcode_job.',
         inputSchema: {
             type: 'object',
             properties: {
                 name: { type: 'string' },
                 reason: { type: 'string' },
-                operator_confirmed_clearance: { type: 'boolean' },
-                ops: { type: 'array', minItems: 1, maxItems: MAX_OPS, items: { type: 'object' } },
+                ops: { type: 'array', minItems: 1, maxItems: MAX_OPS, items: { oneOf: Object.values(cameraOpSchemas) } },
             },
             required: ['name', 'reason', 'ops'],
             additionalProperties: false,

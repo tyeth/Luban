@@ -248,7 +248,7 @@ function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
     registerThreadMillingTools(registry);
     registerCameraTools(registry);
     registerCameraProgramTool(registry, baseUrl);
-    registerCameraModelTools(registry);
+    registerCameraModelTools(registry, baseUrl);
     registerCalibrationTools(registry);
     registerLandmarkTools(registry);
     registerProbeTools(registry);

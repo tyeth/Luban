@@ -10,13 +10,12 @@ milled later. The same eval is id 17 in `.agents/skills/cnc-motion-rules/evals/e
 Committed deliberately (force-added under the otherwise ignored `.claude/skill-evals/`); **scheduled for
 removal in the 2027 purge**, like the other workspaces here.
 
-- `evals.json` - the eval (one prompt, 20 assertions A1-A20).
+- `evals.json` - the current specification (one prompt, 30 assertions A1-A30).
+- `iteration-2/evals.json` - the updated specification and changes from iteration 1; **not run**, at the operator's request. Refresh tool schemas before a future run; iteration-1 fixtures describe the old deployment.
 - `iteration-1/RUN_INSTRUCTIONS.md`, `GRADER_INSTRUCTIONS.md` - what planners and the grader were told.
 - `iteration-1/fixtures/live-state.md` - stand-in read-only results modelled on the box on 2026-10-04
   (connected, NOT homed, B180, no active tool, no camera model, two cameras, probe 70.9 stored).
-- `iteration-1/fixtures/tools-list.json` - the live `tools/list` of the deployed build (70 tools). The new
-  tools are not yet documented in the skills or TOOLS.md, so this is the only place planners can read
-  their schemas, exactly as a live agent would.
+- `iteration-1/fixtures/tools-list.json` - the live `tools/list` of the deployed build (70 tools). This records the historical deployment, before the skills and tool contracts were updated; it is not the current schema.
 - `iteration-1/eval-0-.../<config>/run-1/{outputs/plan.md, outputs/critique.md, grading.json}`,
   `grading-summary.md` - results and the grader's gap/edit list.
 - `iteration-1/HANDOFF-skills-update.md` - the self-contained brief for the agent doing the skills

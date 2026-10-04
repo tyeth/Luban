@@ -44,5 +44,12 @@
         "A30 A text-only agent obtains operator-marked visual targets/device identity or measured tracking evidence, and an agent without a solver requests a real solve rather than inventing geometry."
       ]
     }
+  ],
+  "changes_vs_iteration_1": [
+    "Correct A5 for the restored motion floor and legacy box behavior.",
+    "Separate fine geometry, tolerance and budget assertions (A12/A21/A22).",
+    "Limit coordinate grading to executable Steps; count actual confirm pages only.",
+    "Add schema, physical-plane, holdout, rotary exclusions, active-tool lifecycle, remote solving, archive retention and agent-capability assertions.",
+    "No iteration-2 evals were run; no new scores or model claims."
   ]
 }

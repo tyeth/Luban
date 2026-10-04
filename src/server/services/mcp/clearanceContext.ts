@@ -5,7 +5,7 @@
 // that reads them out of the stored state, so every planner asks the same
 // question and gets the same answer.
 import { CLEARANCE_MARGIN_MM } from './landmarkClearance';
-import { getActiveTool } from './activeTool';
+import { getActiveTool, getStoredActiveTool } from './activeTool';
 import { geometryValue } from './rotaryGeometry';
 import { ToolProtrusion, resolveToolProtrusion } from './toolProtrusion';
 import { getMeasurements, getToolSetterConfig } from './toolSetter';
@@ -16,6 +16,7 @@ export function currentToolProtrusion(): ToolProtrusion {
     const last = getMeasurements().last;
     return resolveToolProtrusion({
         active,
+        staleToolMm: active ? null : getStoredActiveTool()?.protrusionMm,
         measured: last && last.derivedBitLengthMm !== undefined
             ? { protrusionMm: last.derivedBitLengthMm, at: last.at }
             : null,

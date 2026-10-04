@@ -1,12 +1,12 @@
 import { currentToolProtrusion } from './clearanceContext';
 import { landmarkStore } from './landmarks';
 import { motionFloorZ } from './tools/machine';
+import { cameraMinimumZ } from './cameraSafety';
 
 /**
  * A route-specific collision envelope. With an active fitted tool, known
  * physical landmarks determine the required toolhead Z for this XY corridor.
- * Without one, retain the legacy unknown-scene floor rather than pretending a
- * historic measurement identifies the tool that is currently in the collet.
+ * The motion floor ALSO applies: a fitted tool says nothing about unmapped stock.
  */
 export interface RouteClearance {
     minimumZ: number;
@@ -19,19 +19,11 @@ export interface RouteClearance {
 export function routeClearanceForPath(
     from: { x: number; y: number },
     to: { x: number; y: number },
-    marginMm?: number
+    marginMm?: number,
+    operatorConfirmedClearance = false,
 ): RouteClearance {
     const protrusion = currentToolProtrusion();
     const active = protrusion.source === 'active-tool';
-    if (!active) {
-        return {
-            minimumZ: motionFloorZ(),
-            source: 'legacy-unknown-scene',
-            activeToolMm: protrusion.mm,
-            obstacles: [],
-            note: `No active fitted tool is confirmed; retain the legacy unknown-scene floor Z${motionFloorZ()}.`,
-        };
-    }
     const obstacles = landmarkStore.obstaclesOnPath(
         from.x,
         from.y,
@@ -43,18 +35,19 @@ export function routeClearanceForPath(
     );
     const requirements = obstacles.map((obstacle) => obstacle.requiredZ);
     const unknown = requirements.some((required) => required === null);
-    const minimumZ = unknown ? Number.POSITIVE_INFINITY : Math.max(0, ...requirements as number[]);
+    const minimumZ = cameraMinimumZ(motionFloorZ(), requirements, operatorConfirmedClearance);
     let note: string;
     if (unknown) {
         note = 'A physical obstacle lies on this route but its required Z cannot be computed until the active tool length is known.';
     } else if (obstacles.length) {
         note = `Computed from ${obstacles.length} intersected landmark(s) and active tool protrusion ${protrusion.mm} mm.`;
     } else {
-        note = `No stored obstacle intersects this route; active tool protrusion ${protrusion.mm} mm is established.`;
+        note = 'No stored obstacle intersects this route; this does not prove the unmapped scene is clear.';
     }
+    note += operatorConfirmedClearance ? ' Operator explicitly cleared the sub-floor corridor; stored obstacles still apply.' : ` Motion floor Z${motionFloorZ()} still applies.`;
     return {
         minimumZ,
-        source: 'computed-landmarks',
+        source: active ? 'computed-landmarks' : 'legacy-unknown-scene',
         activeToolMm: protrusion.mm,
         obstacles: obstacles.map((obstacle) => ({
             name: obstacle.name,
