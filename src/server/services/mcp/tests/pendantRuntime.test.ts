@@ -166,7 +166,6 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(status.obstacleExclusions[0].requiredZ, 328);
         assert.equal(status.obstacleExclusions[0].machine.x0, 155);
         assert.equal(f.moves(), 0);
-
     }],
     ['broad envelope permits clear low jogs but stops before entering an obstacle', async () => {
         const f = fixture(); await f.initialize();
@@ -198,8 +197,10 @@ export const tests: Array<[string, () => Promise<void>]> = [
                 f.obstacles.push({ name: kind, machine: { x0: 10, x1: 11, y0: 10, y1: 11 }, clearanceZ: 10 });
                 f.input({ z: -1, mode: 'z', deadman: true });
             } else {
-                f.obstacles.push({ name: kind, machine: { x0: 10, x1: 11, y0: 10, y1: 11 },
-                    clearanceZ: kind === 'unknown' ? 1 : 20, clearanceBasis: kind === 'unknown' ? 'physical' : 'toolhead' });
+                f.obstacles.push({ name: kind,
+                    machine: { x0: 10, x1: 11, y0: 10, y1: 11 },
+                    clearanceZ: kind === 'unknown' ? 1 : 20,
+                    clearanceBasis: kind === 'unknown' ? 'physical' : 'toolhead' });
                 f.input({ x: 1, deadman: true });
             }
             await f.tick();
