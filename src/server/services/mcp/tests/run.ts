@@ -12,6 +12,7 @@
  * server (config/settings.base is ESM-only and breaks ts-node).
  */
 import { tests as connectionDiagnosticsTests } from './connectionDiagnostics.test';
+import { tests as pendantSettingsTests } from './pendantSettings.test';
 import { tests as pendantPageTests } from './pendantPage.test';
 import { tests as pendantTests } from './pendant.test';
 import { tests as pendantRuntimeTests } from './pendantRuntime.test';
@@ -69,6 +70,7 @@ type TestCase = [string, () => void | Promise<void>];
 const suites: Array<[string, TestCase[]]> = [
     ['pendant', pendantTests],
     ['pendantPage', pendantPageTests],
+    ['pendantSettings', pendantSettingsTests],
     ['pendantRuntime', pendantRuntimeTests],
     ['sstpConnection', sstpConnectionTests],
     ['connectionDiagnostics', connectionDiagnosticsTests],

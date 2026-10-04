@@ -145,6 +145,28 @@ position as a measurement. USB DRO updates do not make the machine's 2-second
 heartbeat faster. Verify direction, calibration, stop/reconnect and a tiny
 reviewed movement with the operator before treating the system as commissioned.
 
+## Operator settings and twist-mode indication
+
+The pendant page includes an operator editor for the fitted tool's clearance
+protrusion and saved obstructions. Operators can add, edit, rename, disable or
+remove an obstruction, including its machine XY bounds and either physical top
+height or minimum toolhead Z. Switching height basis does not convert the
+number: enter the actual physical top when selecting that basis. A physical
+height adds the confirmed tool protrusion and 5 mm clearance margin; legacy
+toolhead heights already include the tool. The editor previews the result.
+
+Changes persist in Luban's shared records and are logged with before/after values.
+They require the same local page token and origin checks as arming. Saving
+disarms, refuses while a segment or machine job is running, excludes concurrent
+MCP mutations, and requires a fresh arm. The editor shows the effective fallback
+when the fitted tool is unconfirmed or stale; confirming a tool here records an
+operator assertion, not a tool-setter measurement or probe calibration.
+
+Twist **Z** mode changes both the page and Feather backgrounds to red, with a
+text danger indication, whether armed or disarmed. Feed-adjust mode restores
+the normal dark background. This indication does not grant motion authority;
+operator arming, neutral input and held D1 are still required.
+
 ## Wire protocol and checks
 
 USB data uses newline-delimited JSON at nominal 115200 baud. Input has

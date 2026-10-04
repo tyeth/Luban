@@ -30,6 +30,8 @@ async function pageFixture() {
 
         public onsubmit: ((event: { preventDefault: () => void }) => Promise<void>) | null = null;
 
+        public onchange: (() => void) | null = null;
+
         public oninput: (() => void) | null = null;
 
         public appendChild(child: Element) { if (child.id) { elements.set(child.id, child); } }
@@ -50,16 +52,20 @@ async function pageFixture() {
         busy: false,
         error: '',
         ports: [{ path: 'COM42' }],
+        input: { mode: 'feed' },
+        settings: { activeTool: { active: null, stored: null }, toolProtrusion: { mm: 70, source: 'longest-bit' }, clearanceMarginMm: 5, landmarks: [{ id: 'rotary-id', name: 'rotary', description: 'Rotary unit', machine: { x0: 140, x1: 200, y0: 0, y1: 350 }, clearanceZ: 250, clearanceBasis: 'physical', notes: '' }] },
         obstacleExclusions: [{ name: 'rotary-axis', machine: { x0: 135, x1: 205, y0: -5, y1: 355 }, requiredZ: 328 }],
         travelBounds: { xMin: -19, xMax: 330, yMin: 0, yMax: 342, zMin: 0, zMax: 328 },
         defaultBounds: { xMin: 119, xMax: 129, yMin: 198.328994873, yMax: 208.328994873, zMin: 280, zMax: 329 } };
     let refuse = false;
+    const bodyClasses = new Set<string>();
     const posted: Array<{ url: string; body: { bounds?: object } }> = [];
     let poll = () => undefined;
     const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
     assert.ok(script);
     vm.runInNewContext(script as string, {
         document: { hidden: false,
+            body: { classList: { toggle: (name: string, enabled: boolean) => { if (enabled) { bodyClasses.add(name); } else { bodyClasses.delete(name); } } } },
             getElementById: element,
             createElement: () => new Element(),
             addEventListener: () => undefined },
@@ -78,6 +84,7 @@ async function pageFixture() {
     const settle = async () => new Promise<void>((resolve) => setImmediate(resolve));
     await settle();
     return { element,
+        bodyClasses,
         posted,
         state,
         refuse: () => { refuse = true; },
@@ -111,6 +118,45 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.ok(f.posted.some((request) => request.url === '/pendant/arm'));
         assert.equal(f.state.armed, true);
         assert.equal(f.element('review').disabled, true);
+    }],
+    ['Z mode changes page background and warning even while disarmed; feed restores normal', async () => {
+        const f = await pageFixture();
+        assert.equal(f.bodyClasses.has('z-mode'), false);
+        f.state.input.mode = 'z'; await f.refresh();
+        assert.equal(f.bodyClasses.has('z-mode'), true);
+        assert.match(f.element('mode-banner').textContent, /DANGER: TWIST CONTROLS Z/);
+        f.state.input.mode = 'feed'; await f.refresh();
+        assert.equal(f.bodyClasses.has('z-mode'), false);
+        assert.match(f.element('mode-banner').textContent, /FEED ADJUST/);
+    }],
+    ['operator can inspect and submit fitted-tool and obstruction edits without automatic saves', async () => {
+        const f = await pageFixture();
+        assert.match(f.element('tool-summary').textContent, /70 mm/);
+        f.element('obstacle-select').value = 'rotary-id'; f.element('obstacle-select').onchange?.();
+        assert.equal(f.element('obstacle-height').value, 250);
+        assert.match(f.element('obstacle-preview').textContent, /325.000/);
+        f.element('obstacle-height').value = 240;
+        await f.refresh();
+        assert.equal(f.element('obstacle-height').value, 240);
+        assert.equal(f.posted.length, 0);
+        await f.element('obstacle-form').onsubmit?.({ preventDefault: () => undefined });
+        assert.equal(f.posted[0].url, '/pendant/settings');
+        assert.deepEqual(f.posted[0].body, { kind: 'obstacle',
+            id: 'rotary-id',
+            name: 'rotary',
+            description: 'Rotary unit',
+            enabled: true,
+            clearanceBasis: 'physical',
+            clearanceZ: 240,
+            notes: '',
+            x0: 140,
+            x1: 200,
+            y0: 0,
+            y1: 350 });
+        assert.match(f.element('settings-feedback').textContent, /Saved/);
+        f.element('tool-length').value = 12;
+        await f.element('tool-form').onsubmit?.({ preventDefault: () => undefined });
+        assert.equal((f.posted.slice(-1)[0].body as { protrusionMm?: number }).protrusionMm, 12);
     }],
     ['polled jog refusals are revealed beside the controls without opening diagnostics', async () => {
         const f = await pageFixture();

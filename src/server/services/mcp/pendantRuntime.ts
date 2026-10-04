@@ -13,6 +13,7 @@ import { manualControlGate } from './manualControl';
 import { isLoopback } from './McpServer';
 import { JogBounds, JogPosition, PendantSession, parsePendantInput, validateJogBounds } from './pendant';
 import { pendantPage } from './pendantPage';
+import { pendantSettings, updatePendantSettings } from './pendantSettings';
 import { currentGcodeSequence, getPositionOfRecord } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
 import { assertMachineReadyForProcedure, moveMachineSettled } from './probing';
@@ -279,6 +280,7 @@ export class PendantRuntime {
                 defaultBounds: this.defaultBounds(),
                 travelBounds,
                 obstacleExclusions: this.obstacleExclusions(),
+                settings: pendantSettings(),
                 ports: await this.ports() }); return;
         }
         if (req.method !== 'POST' || req.headers['x-pendant-token'] !== this.token) {
@@ -310,6 +312,20 @@ export class PendantRuntime {
                     this.pageAliveAt = Date.now();
                     this.error = null;
                     log.info(`Armed reviewed envelope: ${JSON.stringify(bounds)}`);
+                    break;
+                }
+                case '/pendant/settings': {
+                    this.disarm('Reviewing operator settings. Re-arm after saving.');
+                    if (this.busy || this.opening || ['starting', 'started'].includes(jobManager.getActive()?.state || '')) {
+                        throw new Error('Wait for the current move, connection or machine job to finish before changing settings.');
+                    }
+                    if (connectionManager.getConnectionStatus().connected && getPositionSnapshot().machineStatus !== 'idle') {
+                        throw new Error('Wait for the connected machine to report idle before changing settings.');
+                    }
+                    manualControlGate.acquire();
+                    this.owned = true;
+                    try { updatePendantSettings(args); } finally { this.release(); }
+                    this.error = 'Operator settings saved. Review the updated clearances and re-arm.';
                     break;
                 }
                 case '/pendant/disarm': this.disarm(); break;

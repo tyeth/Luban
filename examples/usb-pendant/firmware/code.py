@@ -38,6 +38,10 @@ frame_button = input_pin(board.D0, digitalio.Pull.UP)
 display = board.DISPLAY
 display.brightness = 0.8
 group = displayio.Group()
+background = displayio.Bitmap(display.width, display.height, 1)
+background_palette = displayio.Palette(1)
+background_palette[0] = 0x000000
+group.append(displayio.TileGrid(background, pixel_shader=background_palette))
 header = label.Label(terminalio.FONT, text="TWIST FEED   MACHINE", color=0x55DDFF, x=4, y=9)
 group.append(header)
 dro_labels = []
@@ -121,7 +125,10 @@ while True:
         frame = "work" if frame == "machine" else "machine"
     frame_was_pressed = pressed
     if now - last_display >= 0.15:
-        header.text = "TWIST:%s %s" % (controller.mode.upper(), "MACHINE" if frame == "machine" else "WORK")
+        z_mode = controller.mode == "z"
+        background_palette[0] = 0x660011 if z_mode else 0x000000
+        header.color = 0xFFFFFF if z_mode else 0x55DDFF
+        header.text = "%s %s" % ("DANGER: TWIST Z" if z_mode else "TWIST:FEED", "MACHINE" if frame == "machine" else "WORK")
         feed_value.text = str(int(controller.feed))
         age = dro.get("age_ms") if dro else None
         valid = fresh and age is not None and age < 3000 and dro.get("reliability") in ("verified", "heartbeat", "cached-offset")

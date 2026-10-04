@@ -19,11 +19,13 @@ function fixture(a350 = false) {
     let moves = 0;
     let readyError = false;
     let estimated = false;
+    let machineStatus = 'idle';
     const gate = new ManualControlGate();
     const obstacles: object[] = [];
     const machine = a350 ? { x: 124, y: 203.3289948730469, z: 327.9990070800781 } : { x: 10, y: 10, z: 10 };
     const logs: string[] = [];
-    const snapshot = () => ({ machine, work: machine, reliability: 'heartbeat', warnings: [], reportAgeMs: 0 });
+    const settingsChanges: object[] = [];
+    const snapshot = () => ({ machine, work: machine, machineStatus, reliability: 'heartbeat', warnings: [], reportAgeMs: 0 });
     class Port extends EventEmitter {
         public static current: Port;
 
@@ -50,7 +52,7 @@ function fixture(a350 = false) {
         http: {},
         '../../lib/logger': () => ({ info: (message: string) => logs.push(message), warn: (message: string) => logs.push(message) }),
         serialport: { SerialPort: Port },
-        '../machine/ConnectionManager': { connectionManager: { getConnectionStatus: () => ({ machineIdentifier: 'mock' }) } },
+        '../machine/ConnectionManager': { connectionManager: { getConnectionStatus: () => ({ machineIdentifier: 'mock', connected: true }) } },
         './clearanceContext': { clearanceOptions: () => ({ toolProtrusionMm: null, clearanceMarginMm: 5 }) },
         './envelopeChecks': envelopeChecks,
         './jobs': { jobManager: { getActive: () => null } },
@@ -60,6 +62,7 @@ function fixture(a350 = false) {
         './McpServer': { isLoopback: (address: string) => address === '127.0.0.1' },
         './pendant': pendant,
         './pendantPage': { pendantPage },
+        './pendantSettings': { pendantSettings: () => ({}), updatePendantSettings: (args: object) => settingsChanges.push(args) },
         './positionOfRecord': { currentGcodeSequence: () => 0, getPositionOfRecord: () => (estimated ? { source: 'estimated' } : null) },
         './probeFeed': { probeFeedService: { assertNoOvertravel: () => undefined } },
         './probing': { assertMachineReadyForProcedure: () => { if (readyError) { throw Error('not idle'); } },
@@ -123,6 +126,8 @@ function fixture(a350 = false) {
         obstacles,
         machine,
         logs,
+        settingsChanges,
+        setMachineStatus: (status: string) => { machineStatus = status; },
         writes: () => Port.current.writes,
         initialize: async () => {
             const page = await request('/pendant');
@@ -217,6 +222,27 @@ export const tests: Array<[string, () => Promise<void>]> = [
             bounds: { xMin: 0, xMax: 200, yMin: 0, yMax: 342, zMin: 280, zMax: 329 } })).status, 200);
         f.input(); f.input({ x: 1, deadman: true });
         await f.tick(); assert.equal(f.moves(), 1); await f.finish();
+    }],
+    ['operator settings disarm, exclude in-flight motion and pending MCP mutations, and require re-arm', async () => {
+        const f = fixture(); await f.initialize(); await f.arm();
+        f.input(); f.input({ x: 1, deadman: true }); await f.tick();
+        const update = { kind: 'tool', protrusionMm: 10 };
+        assert.equal((await f.request('/pendant/settings', update)).status, 400);
+        assert.equal(f.settingsChanges.length, 0);
+        await f.finish();
+        f.setMachineStatus('running');
+        assert.equal((await f.request('/pendant/settings', update)).status, 400);
+        assert.equal(f.settingsChanges.length, 0);
+        f.setMachineStatus('idle');
+        const leave = f.gate.enterTool('set_landmark');
+        assert.equal((await f.request('/pendant/settings', update)).status, 400);
+        assert.equal(f.settingsChanges.length, 0); leave();
+        assert.equal((await f.request('/pendant/settings', update)).status, 200);
+        assert.equal(f.settingsChanges.length, 1);
+        const status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(status.armed, false);
+        f.input({ x: 1, deadman: true }); await f.tick(); assert.equal(f.moves(), 1);
+        assert.equal((await f.arm()).status, 200);
     }],
     ['page stop reaches USB and preserves diagnostics without further movement', async () => {
         const f = fixture(); await f.initialize(); await f.arm(); f.input();
