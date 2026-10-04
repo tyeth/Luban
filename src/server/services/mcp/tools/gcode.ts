@@ -1208,7 +1208,7 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 printingInfo: state ? ((state as { gcodePrintingInfo?: object }).gcodePrintingInfo || null) : null,
                 reportAgeMs: state ? Date.now() - state.timestamp : null,
                 telemetry: spindleTelemetryService.summary(job.id),
-                vibration: vibrationCaptureService.jobSummary(job.id),
+                vibration: await vibrationCaptureService.jobSummary(job.id),
             };
         },
     });

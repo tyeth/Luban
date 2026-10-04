@@ -23,8 +23,12 @@ import { TrackBuilder, buildReport } from '../vibrationReport';
 // staged through the ordinary tools on the operator's word, and recorded
 // alongside.
 
-/** The rotary calibration needs this many still readings over at least this spread of B. */
-const ROTARY_CAL_LIMITS = { minPoints: 3, minSpanDeg: 90 };
+/**
+ * The rotary calibration needs this many still readings over at least this
+ * spread of B: three points over 90 deg extrapolate to p95 0.35 deg with 1 mg
+ * of noise, four over 270 deg to 0.09 deg (review simulation, 2026-10-04).
+ */
+const ROTARY_CAL_LIMITS = { minPoints: 4, minSpanDeg: 180 };
 /** Captures up to this long are waited for by default; longer ones return at once. */
 const WAIT_BY_DEFAULT_S = 60;
 
@@ -90,6 +94,10 @@ function liveLook(seconds: number): { [id: string]: unknown } {
     const now = Date.now();
     for (const rt of vibrationFeedService.runtimes()) {
         if (rt.state !== 'ok') {
+            continue;
+        }
+        if (!rt.ring) {
+            out[rt.spec.id] = { note: 'no samples yet' };
             continue;
         }
         const slice = rt.ring.slice(now - seconds * 1000, now + 1);
@@ -198,7 +206,7 @@ export function registerVibrationTools(registry: ToolRegistry): void {
             await capture.wait(durationS * 1000 + 3000);
             try {
                 // Recorded at resolution_hz already: analyse the in-memory track, not the raw file again.
-                const report = vibrationCaptureService.analyse(capture.id, { ...args, resolution_hz: undefined });
+                const report = await vibrationCaptureService.analyse(capture.id, { ...args, resolution_hz: undefined });
                 return { ...vibrationCaptureService.describe(capture.meta), report };
             } catch (err) {
                 return rethrow(err);
@@ -235,7 +243,7 @@ export function registerVibrationTools(registry: ToolRegistry): void {
             }
             try {
                 const meta = vibrationCaptureService.meta(String(args.capture_id));
-                return { ...vibrationCaptureService.describe(meta), report: vibrationCaptureService.analyse(meta.id, args) };
+                return { ...vibrationCaptureService.describe(meta), report: await vibrationCaptureService.analyse(meta.id, args) };
             } catch (err) {
                 return rethrow(err);
             }
@@ -296,7 +304,7 @@ export function registerVibrationTools(registry: ToolRegistry): void {
             try {
                 const capture = vibrationCaptureService.start({ sensors: [sensor], durationS, label: args.label || 'rotary angle reading' });
                 await capture.wait(durationS * 1000 + 3000);
-                return vibrationCaptureService.rotaryReading(capture.id, sensor);
+                return await vibrationCaptureService.rotaryReading(capture.id, sensor);
             } catch (err) {
                 return rethrow(err);
             }
@@ -306,7 +314,7 @@ export function registerVibrationTools(registry: ToolRegistry): void {
     registry.register({
         name: 'calibrate_rotary_accelerometer',
         description: 'Fit and store the rotary chuck accelerometer\'s calibration from still readings (measure_rotary_angle capture ids) taken at '
-            + 'three or more controller B angles spread over at least 90 deg, ALL IN ONE POWER SESSION (the controller\'s B count must be '
+            + 'four or more controller B angles spread over at least 180 deg, ALL IN ONE POWER SESSION (the controller\'s B count must be '
             + 'consistent between them; 0/90/180/270 is ideal). Nothing about the mounting is assumed: the fit finds the axis in the sensor '
             + 'frame, the accelerometer\'s offset, the rotation sense and the angle at B0, and reports its residual. The B0 of that session '
             + 'becomes the absolute zero from then on. Each reading\'s B is the controller\'s B recorded with it (it must not have moved during '
@@ -349,7 +357,7 @@ export function registerVibrationTools(registry: ToolRegistry): void {
                 let meta;
                 try {
                     meta = vibrationCaptureService.meta(String(reading.capture_id));
-                    gravity = vibrationCaptureService.gravityReading(String(reading.capture_id), sensor);
+                    gravity = await vibrationCaptureService.gravityReading(String(reading.capture_id), sensor);
                 } catch (err) {
                     return rethrow(err);
                 }
@@ -363,7 +371,7 @@ export function registerVibrationTools(registry: ToolRegistry): void {
                     throw new McpToolError(`B moved during capture ${reading.capture_id} (${startB} -> ${endB}): take the reading again with B stopped`);
                 }
                 if (!gravity.still) {
-                    throw new McpToolError(`capture ${reading.capture_id} was not still (vibration ${round(gravity.acRmsG, 4)} g RMS): retake it with B stopped and the spindle off`);
+                    throw new McpToolError(`capture ${reading.capture_id} was not still (${gravity.notStill.join('; ')}): retake it with B stopped and the spindle off`);
                 }
                 points.push({ bDeg, g: gravity.g });
                 used.push({ capture_id: reading.capture_id, b_deg: bDeg, b_source: reading.b_deg !== undefined ? 'operator' : 'controller', gravity_g: gravity.g.map((v) => round(v, 5)) });

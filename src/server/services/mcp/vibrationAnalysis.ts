@@ -388,11 +388,14 @@ export interface CombFit {
     confidence: number;
     /** Excess over the floor at each harmonic used, dB. */
     harmonicsDb: Array<{ k: number; hz: number; excessDb: number }>;
-    /** Half the rate scored within 0.5 dB-equivalent of the fit: an octave error cannot be ruled out. */
+    /** A clear line (>= 6 dB) at half the fitted rate: an octave error cannot be ruled out. */
     halfRateAmbiguous: boolean;
     /** The fit sat on the edge of the searched band: not a lock. */
     edge: boolean;
 }
+
+/** A line at f0 / 2 this far over the floor (6 dB, natural log units) makes the fit's octave ambiguous. */
+const HALF_RATE_LINE = Math.log(4);
 
 /** A harmonic takes part in the frequency refinement only this far over the floor (10 dB, natural log units). */
 const REFINE_MIN_EXCESS = Math.log(10);
@@ -427,14 +430,17 @@ export function combRpm(psd: Float64Array, df: number, opts: CombOptions, floor:
         }
         return Math.max(excess[k - 1], excess[k], excess[k + 1]);
     };
+    // Every harmonic's weight counts, in range or not: dividing by the
+    // in-range weights only let 2 x f0 (whose upper harmonics fall past
+    // Nyquist) beat the true f0 of a 2-flute cut with a weak 1x line - an
+    // octave error at full confidence (review, 2026-10-04).
+    const wsum = harmonics.reduce((sum, [, w]) => sum + w, 0);
     const score = (f0: number): number => {
         let s = 0;
-        let wsum = 0;
         for (const [k, w] of harmonics) {
             const v = at(k * f0);
             if (Number.isFinite(v)) {
                 s += w * v;
-                wsum += w;
             }
         }
         return wsum > 0 ? s / wsum : -Infinity;
@@ -477,8 +483,10 @@ export function combRpm(psd: Float64Array, df: number, opts: CombOptions, floor:
         if (centre < 2 || centre >= psd.length - 2) {
             continue;
         }
+        // The grid's best point can sit anywhere on a ~3-bin plateau of a
+        // strong line, so look +-2 bins for the line itself.
         let peakBin = centre;
-        for (let j = centre - 1; j <= centre + 1; j++) {
+        for (let j = Math.max(1, centre - 2); j <= Math.min(psd.length - 2, centre + 2); j++) {
             if (psd[j] > psd[peakBin]) {
                 peakBin = j;
             }
@@ -498,12 +506,16 @@ export function combRpm(psd: Float64Array, df: number, opts: CombOptions, floor:
     }
     if (den > 0) {
         const refined = num / den;
-        if (Math.abs(refined - f0) <= df) {
+        if (Math.abs(refined - f0) <= 2 * df) {
             f0 = refined;
         }
     }
-    const half = f0 / 2;
-    const halfScore = half >= fLo ? score(half) : -Infinity;
+    // Half the rate is a real possibility when there is a line there: a
+    // clear tone at f0 / 2 means f0 may be its second harmonic.
+    const halfBin = Math.round(f0 / 2 / df);
+    const halfLine = halfBin >= 1 && halfBin < psd.length - 1
+        ? Math.max(excess[halfBin - 1], excess[halfBin], excess[halfBin + 1])
+        : 0;
     const edgeBins = Math.max(2, Math.round(count * 0.01));
     return {
         rpm: round(f0 * 60, 1),
@@ -512,7 +524,7 @@ export function combRpm(psd: Float64Array, df: number, opts: CombOptions, floor:
         harmonicsDb: harmonics
             .filter(([k]) => k * f0 < nyquist)
             .map(([k]) => ({ k, hz: round(k * f0, 2), excessDb: round((10 / Math.LN10) * at(k * f0), 1) })),
-        halfRateAmbiguous: halfScore >= scores[best] - 0.5 / (10 / Math.LN10),
+        halfRateAmbiguous: halfLine >= HALF_RATE_LINE,
         edge: best < edgeBins || best > count - 1 - edgeBins,
     };
 }
@@ -538,7 +550,7 @@ export interface OrderedPeak extends Peak {
     cyclesPerMm: number;
     /** mm of travel per cycle - the length that identifies the component. */
     wavelengthMm: number;
-    /** wavelength / each named reference length: ~1, 2, 1/2 ... ties the tone to it. */
+    /** Each named reference length / wavelength (cycles per reference length): ~1, 2, 1/2 ... ties the tone to it. */
     orders: { [name: string]: number };
 }
 
@@ -591,8 +603,10 @@ export class EnvelopeAccumulator {
         const rc = 1 / (2 * Math.PI * hpHz);
         const dt = 1 / fs;
         this.alpha = rc / (rc + dt);
-        this.windowS = windowS;
         this.windowSamples = Math.max(1, Math.round(fs * windowS));
+        // The window actually used: whole samples (at 13 Hz, 0.05 s is one
+        // sample = 0.077 s, and every segment time would be off by 35 %).
+        this.windowS = this.windowSamples / fs;
         this.prevOut = new Array(channels).fill(0);
     }
 

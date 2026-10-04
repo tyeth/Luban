@@ -100,6 +100,26 @@ export const MAX_SENSORS = 8;
 export const I2C_HZ = { default: 400000, min: 10000, max: 1000000 };
 /** Seconds of every sensor's stream kept in memory for look-back captures. */
 export const BUFFER_S = { default: 120, min: 10, max: 900 };
+/** All look-back rings together (8 sensors x 6664 Hz x 900 s would be ~1 GB). */
+export const MAX_RING_BYTES = 256 * 1024 * 1024;
+/** Ring bytes per sample: time (f64) + accel (3 x f32) [+ gyro (3 x f32)]. */
+const RING_SAMPLE_BYTES = 8 + 12;
+const RING_GYRO_BYTES = 12;
+/**
+ * A FIFO word is 7 bytes; an I2C byte is 9 bit times. This share of the
+ * bus is all the FIFO reads may plan to use (addressing, status reads and
+ * a USB bridge's per-transaction cost take the rest - the heartbeat's busy
+ * fraction and overruns measure what is really left).
+ */
+const BUS_SHARE = 0.6;
+
+/** FIFO bytes per second the configured sensors need, and what the bus clock allows. */
+export function busBudget(sensors: SensorSpec[], i2cHz: number): { neededBytesS: number; availableBytesS: number } {
+    const neededBytesS = sensors
+        .filter((s) => s.mode === 'fifo')
+        .reduce((sum, s) => sum + s.rateHz * (s.gyro ? 2 : 1) * 7, 0);
+    return { neededBytesS, availableBytesS: (i2cHz / 9) * BUS_SHARE };
+}
 
 export type MachineAxis = '+x' | '-x' | '+y' | '-y' | '+z' | '-z';
 
@@ -160,7 +180,7 @@ function pickRaw(env: Env, get: Getter, spec: { env: string; key: string }): { r
     return { raw: undefined, source: 'default' };
 }
 
-function parseFlag(raw: unknown): boolean {
+export function parseFlag(raw: unknown): boolean {
     if (typeof raw === 'boolean') {
         return raw;
     }
@@ -457,6 +477,20 @@ export function resolveVibrationConfig(env: Env, get: Getter, platform: string =
     if (!parsedSensors.problems.length && !parsedSensors.sensors.length) {
         problems.push('no sensors configured');
     }
+    const i2cHz = boundedInt(raw.i2cHz, I2C_HZ);
+    const bufferS = boundedInt(raw.bufferS, BUFFER_S);
+    const budget = busBudget(parsedSensors.sensors, i2cHz);
+    if (budget.neededBytesS > budget.availableBytesS) {
+        problems.push(`the FIFO sensors need ${Math.round(budget.neededBytesS / 1000)} kB/s but a ${i2cHz / 1000} kHz bus carries about `
+            + `${Math.round(budget.availableBytesS / 1000)} kB/s of FIFO data - every batch would overrun. Lower odr_hz, drop the gyro, or spread the sensors `
+            + 'over another bridge');
+    }
+    const ringBytes = parsedSensors.sensors
+        .reduce((sum, s) => sum + Math.ceil(s.rateHz * 1.02 * bufferS) * (RING_SAMPLE_BYTES + (s.gyro ? RING_GYRO_BYTES : 0)), 0);
+    if (ringBytes > MAX_RING_BYTES) {
+        problems.push(`the look-back rings would take ${Math.round(ringBytes / 1048576)} MB (limit ${MAX_RING_BYTES / 1048576} MB): `
+            + 'lower mcpVibrationBufferS or the sensors\' rates');
+    }
     return {
         enabled: parseFlag(raw.enabled),
         transport,
@@ -464,9 +498,9 @@ export function resolveVibrationConfig(env: Env, get: Getter, platform: string =
         blinkaEnvText,
         blinkaEnv,
         serialPort,
-        i2cHz: boundedInt(raw.i2cHz, I2C_HZ),
+        i2cHz,
         jobCapture: parseFlag(raw.jobCapture),
-        bufferS: boundedInt(raw.bufferS, BUFFER_S),
+        bufferS,
         sensors: parsedSensors.sensors,
         problems,
         sources,

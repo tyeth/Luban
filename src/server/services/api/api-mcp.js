@@ -9,7 +9,7 @@ import { listAudioSources } from '../mcp/audioDevices';
 import { describeSourceChoice, matchAudioDevice } from '../mcp/audioSelection';
 import { currentTelemetryConfig, spindleTelemetryService } from '../mcp/spindleTelemetry';
 import { MAX_STATUS_POLL_MS, MIN_STATUS_POLL_MS, TELEMETRY_KEYS } from '../mcp/telemetryConfig';
-import { VIBRATION_KEYS, parseEnvPairs, parseSensors } from '../mcp/vibrationConfig';
+import { VIBRATION_KEYS, parseEnvPairs, parseFlag, parseSensors } from '../mcp/vibrationConfig';
 import { currentVibrationConfig, vibrationFeedService } from '../mcp/vibrationFeed';
 
 const ERR_BAD_REQUEST = 400;
@@ -389,7 +389,9 @@ export const updateSettings = (req, res) => {
             }
         }
     }
-    let vibrationChanged = false;
+    // Only a real change restarts the feed: every Save sends this block, and
+    // a restart drops the rings and interrupts recording captures.
+    const vibrationBefore = JSON.stringify(currentVibrationConfig());
     if (vibration && typeof vibration === 'object') {
         // Accelerometers: validated here so a typo is refused with its reason
         // instead of leaving a feed that will not start. Empty text clears.
@@ -415,10 +417,10 @@ export const updateSettings = (req, res) => {
             return;
         }
         if (vibration.enabled !== undefined) {
-            config.set(VIBRATION_KEYS.enabled.key, !!vibration.enabled);
+            config.set(VIBRATION_KEYS.enabled.key, parseFlag(vibration.enabled));
         }
         if (vibration.jobCapture !== undefined) {
-            config.set(VIBRATION_KEYS.jobCapture.key, !!vibration.jobCapture);
+            config.set(VIBRATION_KEYS.jobCapture.key, parseFlag(vibration.jobCapture));
         }
         const textFields = [
             ['transport', 'transport'], ['python', 'python'], ['blinkaEnv', 'blinkaEnv'], ['serialPort', 'serialPort'], ['sensorsJson', 'sensors'],
@@ -434,7 +436,6 @@ export const updateSettings = (req, res) => {
                 config.set(VIBRATION_KEYS[keyName].key, value);
             }
         }
-        vibrationChanged = true;
     }
     if (cameraStream && typeof cameraStream === 'object') {
         // Live MJPEG camera view (cameraStream.ts). Applies immediately: off
@@ -532,7 +533,7 @@ export const updateSettings = (req, res) => {
         }
     }
 
-    if (vibrationChanged && getMcpStatus().running) {
+    if (JSON.stringify(currentVibrationConfig()) !== vibrationBefore && getMcpStatus().running) {
         // Unlike the listeners, the accelerometer feed restarts at once: it
         // is read-only and owns its own monitor process.
         vibrationFeedService.reconfigure();

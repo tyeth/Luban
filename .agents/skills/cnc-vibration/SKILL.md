@@ -74,10 +74,11 @@ whether they track the spindle.
 toolhead sensor; compare with the microphone telemetry (`get_job_telemetry`) when both exist.
 
 **Rotary absolute B.**
-- Readings are still: B stopped, spindle off. `measure_rotary_angle` reports `still`, the
-  controller's B at start and end, and whether B moved.
-- Calibrate once per mounting: in ONE power session, take readings at >= 3 controller B angles
-  spread over >= 90 deg (0/90/180/270 is ideal). Each B change is a rotation the operator
+- Readings are still: B stopped, spindle off, at least 4 s (3 whole seconds of data). `measure_rotary_angle` reports
+  `still` (and why not: vibration, gravity drift, gyro), the controller's B at start and end, and
+  whether B moved.
+- Calibrate once per mounting: in ONE power session, take readings at >= 4 controller B angles
+  spread over >= 180 deg (0/90/180/270 is ideal). Each B change is a rotation the operator
   approves through the normal tools; each reading is `measure_rotary_angle`. Then
   `calibrate_rotary_accelerometer {readings: [{capture_id}...], reason: "<who, when, session>"}`.
   Quote the residual; above ~0.2 deg a reading was not still or a B was misreported.
@@ -90,7 +91,7 @@ toolhead sensor; compare with the microphone telemetry (`get_job_telemetry`) whe
 ## Limits
 
 Captures: 0.5-600 s (`duration_s`), look-back up to the ring (`mcpVibrationBufferS`), re-analysis
-up to 1800 s of raw samples. Readings over 60 s return at once - poll `get_vibration_capture
+up to 600 s of raw samples. Readings over 60 s return at once - poll `get_vibration_capture
 {wait_ms}`. Poll-mode chips (BNO055, MPU-6050, ...) are for gravity and slow vibration only; a
 spectrum from them is limited by their uneven rate (`poll_jitter_ms`). The engineering reference
 is the "Accelerometers" section of `src/server/services/mcp/README.md`.

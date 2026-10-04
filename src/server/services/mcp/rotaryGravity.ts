@@ -10,7 +10,7 @@
 // turns by dB.
 //
 // Nothing about the sensor's mounting is assumed. A calibration is FITTED
-// from readings taken at three or more controller B angles (in one power
+// from readings taken at several controller B angles (in one power
 // session, so the controller's count is consistent):
 //   - the readings lie on a circle (gravity sweeping a cone about the axis);
 //     the plane of that circle gives the axis direction in the sensor frame

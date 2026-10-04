@@ -126,6 +126,49 @@ export const tests: TestCase[] = [
         }
     }],
 
+    ['a lone clean 1x line is not read a bin and a half low (the score plateau)', () => {
+        const fs = 833.4;
+        let worst = 0;
+        for (let rpm = 9000; rpm <= 16400; rpm += 370) {
+            const x = tones(fs, 5, [[rpm / 60, 0.02]], 0.0005, rpm);
+            const { psd, df } = welchPsd(x, fs, 1024);
+            const fit = combRpm(psd, df, { minRpm: rpm * 0.8, maxRpm: rpm * 1.05 });
+            assert.ok(fit, `rpm ${rpm}`);
+            worst = Math.max(worst, Math.abs((fit as NonNullable<typeof fit>).rpm - rpm));
+        }
+        assert.ok(worst < 6, `worst error ${worst} RPM`);
+    }],
+
+    ['a 2-flute cut with a weak 1x is not locked an octave high in a wide band', () => {
+        const fs = 833;
+        let wrong = 0;
+        for (let f0 = 150; f0 < 200; f0 += 5) {
+            const x = tones(fs, 8, [[f0, 0.002], [2 * f0, 0.02]], 0.0003, f0);
+            const { psd, df } = welchPsd(x, fs, 1024);
+            const fit = combRpm(psd, df, { minRpm: 6000, maxRpm: 24000, harmonics: [[1, 1], [2, 0.8], [3, 0.4]] });
+            if (!fit || Math.abs(fit.hz - f0) > 1) {
+                wrong++;
+            }
+        }
+        assert.strictEqual(wrong, 0, `${wrong} of 10 fits off the true rate`);
+    }],
+
+    ['a line at half the fitted rate flags the octave as ambiguous', () => {
+        const fs = 1666;
+        const x = tones(fs, 6, [[100, 0.01], [200, 0.03], [400, 0.01]], 0.0003);
+        const { psd, df } = welchPsd(x, fs, 2048);
+        const fit = combRpm(psd, df, { minRpm: 10000, maxRpm: 13000 });
+        assert.ok(fit && fit.halfRateAmbiguous, JSON.stringify(fit));
+    }],
+
+    ['the envelope reports the window it really uses (whole samples)', () => {
+        const env = new EnvelopeAccumulator(13.02, 3, 1, 0.05);
+        assert.ok(Math.abs(env.windowS - 1 / 13.02) < 1e-12, `${env.windowS}`);
+        const n = Math.round(13.02 * 60);
+        env.push(new Float64Array(n * 3), 3, n);
+        assert.ok(Math.abs(env.values.length * env.windowS - 60) < 0.1);
+    }],
+
     ['a tone that scales with feed reads as a spatial period; references give its order', () => {
         const peaks = [{ hz: 41.67, psdDb: 0, prominenceDb: 20, rmsG: 0.01, velocityPkMmS: 0, displacementPkUm: 0, axisShare: null }];
         const [p] = spatialOrders(peaks, 10, { 'screw lead': 8 }); // F600 = 10 mm/s

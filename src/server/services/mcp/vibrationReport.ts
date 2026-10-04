@@ -52,8 +52,10 @@ export interface TrackData {
     gravity: [number, number, number];
     /** Mean per completed second, for drift and the standard error. */
     secondMeans: Array<[number, number, number]>;
-    /** RMS of the gyro magnitude, dps (stillness), when streamed. */
+    /** RMS of the gyro about its own mean (bias removed), dps (stillness), when streamed. */
     gyroRmsDps: number | null;
+    /** Time-domain RMS of the acceleration about its mean (all frequencies, the slow ones included), g. */
+    acRmsG: number;
     gaps: number;
 }
 
@@ -79,9 +81,13 @@ export class TrackBuilder {
 
     private count = 0;
 
-    private gyroSq = 0;
+    private gyroSum: [number, number, number] = [0, 0, 0];
+
+    private gyroSq: [number, number, number] = [0, 0, 0];
 
     private gyroCount = 0;
+
+    private sumSq: [number, number, number] = [0, 0, 0];
 
     public gaps = 0;
 
@@ -104,6 +110,7 @@ export class TrackBuilder {
             for (let c = 0; c < 3; c++) {
                 const v = accel[i * 3 + c];
                 this.sum[c] += v;
+                this.sumSq[c] += v * v;
                 this.secondSum[c] += v;
             }
             this.secondCount++;
@@ -118,8 +125,12 @@ export class TrackBuilder {
             for (let c = 0; c < 3; c++) {
                 this.gyro[c].push(gyro, c, 3, frames);
             }
-            for (let i = 0; i < frames * 3; i++) {
-                this.gyroSq += gyro[i] * gyro[i];
+            for (let i = 0; i < frames; i++) {
+                for (let c = 0; c < 3; c++) {
+                    const v = gyro[i * 3 + c];
+                    this.gyroSum[c] += v;
+                    this.gyroSq[c] += v * v;
+                }
             }
             this.gyroCount += frames;
         }
@@ -142,10 +153,30 @@ export class TrackBuilder {
             windowS: this.envelope.windowS,
             gravity: [this.sum[0] / n, this.sum[1] / n, this.sum[2] / n],
             secondMeans: this.secondMeans.slice(),
-            gyroRmsDps: this.gyroCount ? Math.sqrt(this.gyroSq / this.gyroCount) : null,
+            // The zero-rate level (+-1 dps typical) is not rotation: about the mean.
+            gyroRmsDps: this.gyroCount ? Math.sqrt([0, 1, 2].reduce((acc, c) => acc
+                + Math.max(0, this.gyroSq[c] / this.gyroCount - (this.gyroSum[c] / this.gyroCount) ** 2), 0)) : null,
+            acRmsG: Math.sqrt([0, 1, 2].reduce((acc, c) => acc + Math.max(0, this.sumSq[c] / n - (this.sum[c] / n) ** 2), 0)),
             gaps: this.gaps,
         };
     }
+}
+
+/** File sample index of host time `tMs`, through a track's [index, ms] table (linear at `rate` between entries, never past the next). */
+export function sampleAtTime(index: Array<[number, number]>, rate: number, tMs: number): number {
+    if (!index.length) {
+        return 0;
+    }
+    let i = 0;
+    while (i + 1 < index.length && index[i + 1][1] <= tMs) {
+        i++;
+    }
+    const [at, ms] = index[i];
+    if (tMs <= ms) {
+        return at;
+    }
+    const estimate = at + Math.round(((tMs - ms) / 1000) * rate);
+    return i + 1 < index.length ? Math.min(estimate, index[i + 1][0]) : estimate;
 }
 
 export interface ReportOptions {

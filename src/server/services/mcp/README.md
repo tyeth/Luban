@@ -1354,7 +1354,10 @@ and re-initialises whenever a new one arrives (or reads `/vibration_config.json`
 Poll-mode chips need their Adafruit drivers on the host or the board (`requirements.txt` lists
 them as optional).
 
-**Throughput is reported, not assumed.** The heartbeat carries the bus busy fraction and every
+**Throughput is checked, then reported.** A configuration whose FIFO traffic exceeds ~60 % of
+the bus clock (7-byte words, 9 bit times per byte) is refused before it starts, as are look-back
+rings over 256 MB in total (rings are allocated on the first sample).
+ The heartbeat carries the bus busy fraction and every
 sensor's FIFO overruns; `get_vibration_status` shows them. Over a USB HID bridge each I2C
 transaction is a USB round trip, so a FIFO is read in 9-word (63-byte) chunks; whether one or two
 sensors keep up at 1666 Hz on a given bridge is for the overrun counter to say - drop `odr_hz`
@@ -1419,11 +1422,14 @@ are also reported in machine axes. Saving restarts the feed at once.
   means; `lever_mm` carries it to a lateral displacement at the tool tip, labelled as tilt x lever;
   and (2) **dynamic displacement** - per tone and over a band. Temperature drift of the zero-g
   offset limits tilt over long gaps; compare captures taken close together.
-- **Rotary absolute angle**: see `rotaryGravity.ts`. Three or more still readings at controller B
-  angles spread over >= 90 deg (one power session) fit the axis in the sensor frame, the
+- **Rotary absolute angle**: see `rotaryGravity.ts`. Four or more still readings at controller B
+  angles spread over >= 180 deg (one power session; 0/90/180/270 is ideal - three points over
+  90 deg extrapolate to p95 0.35 deg with 1 mg of noise, four over 270 deg to 0.09 deg) fit the axis in the sensor frame, the
   accelerometer's in-plane offset (a circle fit - LSM6DS-class offsets are tens of mg, a degree
   of angle), the rotation sense and the angle at B0; nothing about the mounting is assumed and the
-  residual is reported. From then on any still reading gives the chuck's absolute angle and
+  residual is reported. A reading is STILL only with >= 3 whole seconds, time-domain vibration
+  < 0.02 g RMS, gravity turning < 0.1 deg between its first and last second (catches a slow B
+  rotation no spectral band sees) and, with a gyro, < 0.5 dps RMS about its zero-rate bias. From then on any still reading gives the chuck's absolute angle and
   controller B minus absolute B: what a power cycle lost. Trust checks flag a moved mount
   (in-plane radius) or a tilted module (axial component). **Correcting B is motion and a frame
   decision** - a rotation staged through the normal tools on the operator's word; nothing here
@@ -1433,7 +1439,10 @@ are also reported in machine axes. Saving restarts the feed at once.
 
 `capture_vibration` records a window (optionally reaching `lookback_s` back into the ring),
 `get_vibration_capture` analyses it again over a sub-window, at another resolution, with a motion
-or a baseline. Raw samples are kept under `<userData>/mcp-vibration/<capture id>/<sensor>.f32`
+or a baseline. `from_s`/`to_s` are seconds from the capture's window start, mapped to the raw file
+through a per-sensor time index, so a feed outage inside a capture (counted in `gaps`) does not
+shift later windows; re-analysis reads at most 600 s of raw samples, yielding to the event loop
+between chunks. Raw samples are kept under `<userData>/mcp-vibration/<capture id>/<sensor>.f32`
 (float32 little-endian, interleaved `ax ay az [gx gy gz]`, g and dps; `numpy.fromfile(path,
 '<f4').reshape(-1, 3)`) with `meta.json` beside them (sample rate, controller B and machine status
 at start and end, per-sensor spec). They are not deleted automatically. A file job's automatic
@@ -1444,7 +1453,11 @@ capture (`mcpVibrationJobs`) stops when the job ends (4 h cap) and its summary r
 INTERNAL_FREQ_FINE register); after 20 s of stream the rate is re-measured by regression of
 sample count on batch stamps (lower envelope - stamps lag by the read latency) and used when
 within 5 % of the chip's statement. A FIFO overrun or a sequence gap breaks the run and is
-counted, never papered over. A board's clock is mapped to the host's by the least-delayed batch
+counted, never papered over: the monitor sends what it read before an overrun as its own batch,
+and the first batch of every new monitor run (start, reconnect, a board re-initialising) is
+marked as a gap. A save in Settings restarts the feed only when the resolved configuration
+changed. The monitor never inherits a `BLINKA_*` variable from Luban's own environment, and the
+shared-bridge refusal also checks the bridge the RUNNING probe feed holds. A board's clock is mapped to the host's by the least-delayed batch
 of the last hundred.
 
 ### Modules and tests

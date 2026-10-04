@@ -24,13 +24,13 @@ import * as fs from 'fs-extra';
 import DataStorage from '../../DataStorage';
 import logger from '../../lib/logger';
 import config from '../configstore';
+import { connectionManager } from '../machine/ConnectionManager';
 import { McpJob, jobManager } from './jobs';
 import { parseSpindleProgram } from './spindleProgram';
-import { getPositionSnapshot } from './tools/machine';
 import { RotaryCalibration, Vec3, angleSigmaDeg, rotaryAngle } from './rotaryGravity';
 import { SensorSpec, toMachineFrame } from './vibrationConfig';
 import { SensorRuntime, streamRate, vibrationFeedService } from './vibrationFeed';
-import { ReportOptions, TrackBuilder, TrackData, buildReport, gravityStandardError } from './vibrationReport';
+import { ReportOptions, TrackBuilder, TrackData, angleBetweenDeg, buildReport, gravityStandardError, sampleAtTime } from './vibrationReport';
 import { round } from './vibrationAnalysis';
 
 const log = logger('service:mcp:vibration');
@@ -47,13 +47,13 @@ export const VIBRATION_LIMITS = {
     binMm: { default: 5, min: 0.5, max: 50 },
     spectrumPoints: { default: 0, min: 0, max: 600 },
     /** A rotary angle reading: a few seconds averages the noise to hundredths of a degree. */
-    rotaryS: { default: 3, min: 0.5, max: 30 },
+    rotaryS: { default: 5, min: 4, max: 30 },
     /** A file job's automatic capture stops here whatever the job does. */
     jobCaptureS: 4 * 3600,
     /** Raw samples kept on disk per sensor per capture; the report keeps accumulating past it. */
     rawBytes: 256 * 1024 * 1024,
     /** Re-analysis reads at most this many seconds of raw samples. */
-    reanalyseS: 1800,
+    reanalyseS: 600,
     activeCaptures: 4,
     keptInMemory: 30,
 };
@@ -62,6 +62,11 @@ export const ROTARY_CALIBRATION_KEY = 'mcpRotaryGravityCalibration';
 /** A reading is still when the vibration (AC) RMS is below this, g, and the gyro (if any) below ROTARY_STILL_DPS. */
 export const ROTARY_STILL_G = 0.02;
 export const ROTARY_STILL_DPS = 0.5;
+/** ...and gravity turned less than this between its first and last whole second (B at 600 deg/min would turn 30 deg in 3 s). */
+export const ROTARY_STILL_DRIFT_DEG = 0.1;
+/** Whole seconds a still reading needs (drift and standard error come from per-second means). */
+export const ROTARY_MIN_SECONDS = 3;
+
 
 export class VibrationError extends Error {
 }
@@ -78,19 +83,32 @@ interface ControllerSnapshot {
     at: string;
     b: number | null;
     machine_status: string | null;
-    reliability: string | null;
-    machine: { x: number | null; y: number | null; z: number | null };
+    /** Age of the controller report the B came from, ms. */
+    report_age_ms: number | null;
 }
 
+/**
+ * The controller's last report, read raw: B and the status. Deliberately NOT
+ * getPositionSnapshot(), which feeds the position-of-record judge and clears
+ * it when the machine is disconnected - a recording must not change what
+ * the motion tools believe.
+ */
 function controllerSnapshot(): ControllerSnapshot | null {
     try {
-        const snap = getPositionSnapshot() as unknown as {
-            b: number | null;
-            machineStatus?: string | null;
-            reliability: string;
-            machine: { x: number | null; y: number | null; z: number | null };
+        if (!connectionManager.getConnectionStatus().connected) {
+            return null;
+        }
+        const state = connectionManager.getLatestMachineState() as { pos?: { b?: unknown }; status?: string; timestamp?: number } | null;
+        if (!state) {
+            return null;
+        }
+        const b = Number(state.pos ? state.pos.b : NaN);
+        return {
+            at: new Date().toISOString(),
+            b: Number.isFinite(b) ? b : null,
+            machine_status: state.status || null,
+            report_age_ms: typeof state.timestamp === 'number' ? Date.now() - state.timestamp : null,
         };
-        return { at: new Date().toISOString(), b: snap.b, machine_status: snap.machineStatus ?? null, reliability: snap.reliability, machine: snap.machine };
     } catch (err) {
         return null;
     }
@@ -137,6 +155,9 @@ class CaptureTrack {
 
     public data: TrackData | null = null;
 
+    /** [sample index, host ms] at the first sample, at every gap and about once a second: maps capture time to file position across outages. */
+    public readonly index: Array<[number, number]> = [];
+
     private fd: number | null = null;
 
     public constructor(spec: SensorSpec, rate: number, file: string, resolutionHz: number) {
@@ -159,6 +180,11 @@ class CaptureTrack {
         }
         if (gap) {
             this.builder.gaps++;
+        }
+        const at = this.builder.samples;
+        const last = this.index[this.index.length - 1];
+        if (!last || gap || times[0] - last[1] >= 1000) {
+            this.index.push([at, times[0]]);
         }
         if (this.firstMs === null) {
             this.firstMs = times[0];
@@ -222,6 +248,8 @@ export interface CaptureSensorMeta {
     gaps: number;
     first_ms: number | null;
     last_ms: number | null;
+    /** [sample index, host ms] pairs; windows are mapped through them. */
+    index: Array<[number, number]>;
 }
 
 export interface CaptureMeta {
@@ -289,28 +317,22 @@ export class Capture {
             const rate = rt ? streamRate(rt) : spec.rateHz;
             const track = new CaptureTrack(spec, rate, path.join(this.dir, `${spec.id}.f32`), opts.resolutionHz);
             this.tracks.set(spec.id, track);
-            if (rt && opts.lookbackS > 0) {
+            // The ring is pushed and emitted synchronously together, so this
+            // slice and the live batches after the subscription never overlap.
+            if (rt && rt.ring && opts.lookbackS > 0) {
                 const back = rt.ring.slice(this.windowStartMs, now + 1);
                 track.push(back.times, back.accel, back.gyro, false);
             }
         }
         this.listener = (sensorId, times, accel, gyro, gap) => {
             const track = this.tracks.get(sensorId);
-            if (!track) {
-                return;
+            if (track) {
+                track.push(times, accel, gyro, gap);
             }
-            // Ring samples already taken by the look-back are not taken twice.
-            if (track.lastMs !== null && times.length && times[0] <= track.lastMs) {
-                let from = 0;
-                while (from < times.length && times[from] <= (track.lastMs as number)) {
-                    from++;
-                }
-                track.push(times.subarray(from), accel.subarray(from * 3), gyro ? gyro.subarray(from * 3) : null, gap);
-                return;
-            }
-            track.push(times, accel, gyro, gap);
         };
         vibrationFeedService.on('samples', this.listener);
+        // On disk from the start, so a capture cut short by a crash is still listed.
+        this.writeMeta();
         const length = opts.durationS === null ? VIBRATION_LIMITS.jobCaptureS : opts.durationS;
         this.timer = setTimeout(() => this.finish('done', null), length * 1000);
         if (typeof this.timer.unref === 'function') {
@@ -348,16 +370,21 @@ export class Capture {
                 gaps: track.builder.gaps,
                 first_ms: track.firstMs,
                 last_ms: track.lastMs,
+                index: track.index,
             };
         }
+        this.writeMeta();
+        const waiters = this.waiters;
+        this.waiters = [];
+        waiters.forEach((resolve) => resolve());
+    }
+
+    public writeMeta(): void {
         try {
             fs.writeJsonSync(path.join(this.dir, 'meta.json'), this.meta, { spaces: 1 });
         } catch (err) {
             log.warn(`vibration: cannot write meta for ${this.id}: ${(err as Error).message}`);
         }
-        const waiters = this.waiters;
-        this.waiters = [];
-        waiters.forEach((resolve) => resolve());
     }
 
     /** Resolve when the capture ends or after `ms`. */
@@ -366,11 +393,18 @@ export class Capture {
             return;
         }
         await new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, ms);
-            this.waiters.push(() => {
-                clearTimeout(timer);
+            let timer: NodeJS.Timeout | null = null;
+            const waiter = () => {
+                if (timer) {
+                    clearTimeout(timer);
+                }
                 resolve();
-            });
+            };
+            timer = setTimeout(() => {
+                this.waiters = this.waiters.filter((w) => w !== waiter);
+                resolve();
+            }, ms);
+            this.waiters.push(waiter);
         });
     }
 }
@@ -474,7 +508,10 @@ export interface GravityReading {
     standardErrorG: number | null;
     acRmsG: number;
     gyroRmsDps: number | null;
+    driftDeg: number | null;
     still: boolean;
+    /** Why it is not still (empty when it is). */
+    notStill: string[];
     samples: number;
 }
 
@@ -625,7 +662,7 @@ export class VibrationCaptureService {
     }
 
     /** TrackData for one sensor of a capture, over a window, at a resolution: from memory when it matches, else rebuilt from the raw file. */
-    public trackData(id: string, sensorId: string, window: { fromS?: number; toS?: number; resolutionHz?: number } = {}): TrackResult {
+    public async trackData(id: string, sensorId: string, window: { fromS?: number; toS?: number; resolutionHz?: number } = {}): Promise<TrackResult> {
         const capture = this.captures.get(id);
         if (capture && capture.recording) {
             throw new VibrationError(`capture ${id} is still recording; wait for it (get_vibration_capture wait_ms) or stop it`);
@@ -643,8 +680,12 @@ export class VibrationCaptureService {
         const rate = sensor.sample_rate_hz || sensor.spec.rateHz;
         const frameBytes = sensor.channels * 4;
         const fileSamples = Math.floor(sensor.raw_bytes / frameBytes);
-        const from = Math.max(0, Math.floor((window.fromS ?? 0) * rate));
-        const to = Math.min(fileSamples, window.toS === undefined ? fileSamples : Math.ceil(window.toS * rate));
+        // Seconds from the capture's window start -> file position, through
+        // the index, so an outage inside the capture does not shift a window.
+        const startMs = Date.parse(meta.window.start);
+        const toSample = (seconds: number): number => sampleAtTime(sensor.index || [], rate, startMs + seconds * 1000);
+        const from = Math.max(0, window.fromS === undefined ? 0 : toSample(window.fromS));
+        const to = Math.min(fileSamples, window.toS === undefined ? fileSamples : toSample(window.toS));
         if (to - from < 16) {
             throw new VibrationError(`the window holds ${Math.max(0, to - from)} samples of ${sensorId} `
                 + `(the raw file holds ${fileSamples} at ${round(rate, 2)} Hz)`);
@@ -674,6 +715,8 @@ export class VibrationCaptureService {
                     }
                 }
                 builder.push(accel, count, gyro);
+                // Long re-analyses must not hold the event loop (probe trips, job polls).
+                await new Promise<void>((resolve) => setImmediate(resolve));
             }
         } finally {
             fs.closeSync(fd);
@@ -683,14 +726,14 @@ export class VibrationCaptureService {
     }
 
     /** The report for every (or one) sensor of a finished capture. */
-    public analyse(id: string, args: AnalyseArgs): { [key: string]: unknown } {
+    public async analyse(id: string, args: AnalyseArgs): Promise<{ [key: string]: unknown }> {
         const meta = this.meta(id);
         const sensorIds = args.sensor ? [args.sensor] : Object.keys(meta.sensors);
         const out: { [key: string]: unknown } = {};
         const windowed = args.from_s !== undefined || args.to_s !== undefined || args.resolution_hz !== undefined;
         for (const sensorId of sensorIds) {
             const window = windowed ? { fromS: args.from_s, toS: args.to_s, resolutionHz: args.resolution_hz } : {};
-            const { data, spec, source } = this.trackData(id, sensorId, window);
+            const { data, spec, source } = await this.trackData(id, sensorId, window);
             const opts: ReportOptions = {
                 maxPeaks: bounded(args.max_peaks, VIBRATION_LIMITS.maxPeaks),
                 minProminenceDb: args.min_prominence_db,
@@ -709,7 +752,7 @@ export class VibrationCaptureService {
                 opts.motion = motionOptions(args.motion);
             }
             if (args.baseline_capture_id) {
-                opts.baseline = this.trackData(args.baseline_capture_id, sensorId).data;
+                opts.baseline = (await this.trackData(args.baseline_capture_id, sensorId)).data;
             }
             const report = withMachineFrame(spec, buildReport(data, opts));
             out[sensorId] = { location: spec.location, chip: spec.chip, mode: spec.mode, data_source: source, ...report };
@@ -732,26 +775,42 @@ export class VibrationCaptureService {
     }
 
     /** The still gravity reading of one sensor in a finished capture, with its quality. */
-    public gravityReading(id: string, sensorId: string): GravityReading {
-        const { data } = this.trackData(id, sensorId);
+    public async gravityReading(id: string, sensorId: string): Promise<GravityReading> {
+        const { data } = await this.trackData(id, sensorId);
         const se = gravityStandardError(data.secondMeans);
-        const total = buildReport(data, { maxPeaks: 1 }) as { level: { accel_rms_total_g: number } };
-        const acRms = total.level.accel_rms_total_g;
-        const still = acRms < ROTARY_STILL_G && (data.gyroRmsDps === null || data.gyroRmsDps < ROTARY_STILL_DPS);
+        // Time domain, all frequencies: a slow B rotation is far below any
+        // spectral band but moves the mean - the drift catches it.
+        const means = data.secondMeans;
+        const driftDeg = means.length >= 2 ? angleBetweenDeg(means[0], means[means.length - 1]) : null;
+        const reasons: string[] = [];
+        if (means.length < ROTARY_MIN_SECONDS) {
+            reasons.push(`only ${means.length} whole second(s) of data (need ${ROTARY_MIN_SECONDS})`);
+        }
+        if (data.acRmsG >= ROTARY_STILL_G) {
+            reasons.push(`vibration ${round(data.acRmsG, 4)} g RMS (limit ${ROTARY_STILL_G})`);
+        }
+        if (driftDeg !== null && driftDeg >= ROTARY_STILL_DRIFT_DEG) {
+            reasons.push(`gravity turned ${round(driftDeg, 3)} deg during the reading (limit ${ROTARY_STILL_DRIFT_DEG})`);
+        }
+        if (data.gyroRmsDps !== null && data.gyroRmsDps >= ROTARY_STILL_DPS) {
+            reasons.push(`gyro ${round(data.gyroRmsDps, 2)} dps RMS about its bias (limit ${ROTARY_STILL_DPS})`);
+        }
         return {
             g: data.gravity,
             standardErrorG: se ? Math.sqrt(se[0] ** 2 + se[1] ** 2 + se[2] ** 2) : null,
-            acRmsG: acRms,
+            acRmsG: data.acRmsG,
             gyroRmsDps: data.gyroRmsDps,
-            still,
+            driftDeg,
+            still: reasons.length === 0,
+            notStill: reasons,
             samples: data.samples,
         };
     }
 
     /** Absolute angle of the chuck from a finished rotary capture. */
-    public rotaryReading(id: string, sensorId: string): { [key: string]: unknown } {
+    public async rotaryReading(id: string, sensorId: string): Promise<{ [key: string]: unknown }> {
         const meta = this.meta(id);
-        const reading = this.gravityReading(id, sensorId);
+        const reading = await this.gravityReading(id, sensorId);
         const stored = this.rotaryCalibration();
         const startB = meta.controller_at_start ? meta.controller_at_start.b : null;
         const endB = meta.controller_at_end ? meta.controller_at_end.b : null;
@@ -762,23 +821,23 @@ export class VibrationCaptureService {
             still: reading.still,
             vibration_rms_g: round(reading.acRmsG, 5),
             gyro_rms_dps: reading.gyroRmsDps === null ? null : round(reading.gyroRmsDps, 3),
+            drift_deg: reading.driftDeg === null ? null : round(reading.driftDeg, 4),
             controller: {
                 b_at_start: startB,
                 b_at_end: endB,
                 machine_status: meta.controller_at_end ? meta.controller_at_end.machine_status : null,
-                reliability: meta.controller_at_end ? meta.controller_at_end.reliability : null,
+                report_age_ms: meta.controller_at_end ? meta.controller_at_end.report_age_ms : null,
                 b_moved_during_reading: startB !== null && endB !== null && Math.abs(startB - endB) > 0.01,
             },
         };
         if (!reading.still) {
-            out.warning = `not still (vibration ${round(reading.acRmsG, 4)} g RMS${reading.gyroRmsDps === null ? '' : `, gyro ${round(reading.gyroRmsDps, 2)} dps`}): `
-                + 'the angle is only meaningful with B stopped and the spindle off';
+            out.warning = `not still (${reading.notStill.join('; ')}): the angle is only meaningful with B stopped and the spindle off`;
         }
         if (!stored || stored.sensor_id !== sensorId || !stored.calibration) {
             out.calibration = null;
             out.note = stored && stored.sensor_id !== sensorId
                 ? `the stored rotary calibration belongs to sensor ${String(stored.sensor_id)}, not ${sensorId}`
-                : 'no rotary calibration yet: take still readings at three or more controller B angles (spread over at least 90 deg) in ONE power session '
+                : 'no rotary calibration yet: take still readings at four or more controller B angles (spread over at least 180 deg, 0/90/180/270 ideal) in ONE power session '
                     + 'and pass their capture ids to calibrate_rotary_accelerometer. The B0 of that session becomes the absolute zero.';
             return out;
         }
@@ -813,7 +872,15 @@ export class VibrationCaptureService {
     /** Record a file job that has just started, when mcpVibrationJobs is on and the feed runs. */
     public startForJob(job: McpJob): void {
         const cfg = vibrationFeedService.config();
-        if (!cfg.enabled || !cfg.jobCapture || job.kind !== 'file' || !vibrationFeedService.isRunning() || this.jobCaptures.has(job.id)) {
+        if (!cfg.enabled || !cfg.jobCapture || job.kind !== 'file' || this.jobCaptures.has(job.id)) {
+            return;
+        }
+        if (!vibrationFeedService.isRunning()) {
+            const status = vibrationFeedService.status();
+            jobManager.appendEvent(job, 'vibration_capture_unavailable', {
+                tool: 'vibration',
+                note: `accelerometer feed is ${String(status.state)}${status.last_error ? `: ${String(status.last_error)}` : ''} - this job is not recorded`,
+            });
             return;
         }
         try {
@@ -860,7 +927,7 @@ export class VibrationCaptureService {
     }
 
     /** A compact summary for get_gcode_job_status. */
-    public jobSummary(jobId: string): { [key: string]: unknown } | null {
+    public async jobSummary(jobId: string): Promise<{ [key: string]: unknown } | null> {
         const captureId = this.jobCaptures.get(jobId);
         if (!captureId) {
             return null;
@@ -878,7 +945,7 @@ export class VibrationCaptureService {
         }
         const sensors: { [id: string]: unknown } = {};
         try {
-            const full = this.analyse(captureId, { max_peaks: 3 }) as { [id: string]: { [key: string]: unknown } };
+            const full = await this.analyse(captureId, { max_peaks: 3 }) as { [id: string]: { [key: string]: unknown } };
             for (const [id, report] of Object.entries(full)) {
                 const level = report.level as { velocity_rms_mm_s: number; accel_rms_total_g: number };
                 sensors[id] = {

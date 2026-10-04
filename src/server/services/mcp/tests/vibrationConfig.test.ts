@@ -80,6 +80,25 @@ export const tests: TestCase[] = [
         assert.strictEqual(bridgeOf({}), 'native');
     }],
 
+    ['a configuration the I2C bus cannot carry, or rings too big for memory, is refused', () => {
+        const fast = JSON.stringify([
+            { id: 'a', location: 'toolhead', chip: 'lsm6dsox', odr_hz: 6664, gyro: true },
+            { id: 'b', location: 'tailstock', chip: 'lsm6dsox', address: '0x6b', odr_hz: 6664 },
+        ]);
+        const busy = resolveVibrationConfig({}, store({ mcpVibration: true, mcpVibrationSensors: fast, mcpVibrationTransport: 'serial', mcpVibrationSerialPort: 'COM7' }));
+        assert.ok(busy.problems.some((p) => /every batch would overrun/.test(p)), JSON.stringify(busy.problems));
+        const ok = JSON.stringify([{ id: 'a', location: 'toolhead', chip: 'lsm6dsox', odr_hz: 1666 }]);
+        const fine = resolveVibrationConfig({}, store({ mcpVibration: true, mcpVibrationSensors: ok, mcpVibrationTransport: 'serial', mcpVibrationSerialPort: 'COM7' }));
+        assert.deepStrictEqual(fine.problems, []);
+        const many = JSON.stringify([0, 1, 2, 3, 4, 5, 6, 7].map((i) => ({
+            id: `s${i}`, location: 'frame', chip: 'lsm6dsox', odr_hz: 1666, gyro: true, mux: { address: '0x70', channel: i },
+        })));
+        const big = resolveVibrationConfig({}, store({
+            mcpVibration: true, mcpVibrationSensors: many, mcpVibrationTransport: 'serial', mcpVibrationSerialPort: 'COM7', mcpVibrationBufferS: 900, mcpVibrationI2cHz: 1000000,
+        }));
+        assert.ok(big.problems.some((p) => /look-back rings would take/.test(p)), JSON.stringify(big.problems));
+    }],
+
     ['python falls back to the GPIO transport\'s interpreter; env beats config', () => {
         const cfg = resolveVibrationConfig({ LUBAN_MCP_VIBRATION: '1' }, store({ mcpVibration: false, mcpGpioPython: '/home/pi/dev/Luban/.venv/bin/python' }), 'linux');
         assert.strictEqual(cfg.enabled, true);

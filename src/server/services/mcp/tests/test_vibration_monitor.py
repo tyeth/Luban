@@ -176,6 +176,43 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(batch['ovr'])
         self.assertEqual(sensor.overruns, 1)
 
+    def test_samples_read_before_an_overrun_go_out_in_their_own_batch(self):
+        imu = FakeImu()
+        sensor = monitor.FifoSensor(monitor.Bus(FakeI2C({0x6A: imu})), self.spec(), 9)
+        sensor.start()
+        saved = monitor.BATCH_S
+        monitor.BATCH_S = 10.0  # hold the batch open
+        try:
+            imu.push(0x02, 1, 0, 0)
+            sensor.poll()
+            imu.push(0x02, 2, 0, 0)
+            imu.overrun = True
+            sensor.poll()
+        finally:
+            monitor.BATCH_S = saved
+        batches = [line for line in self.lines if line.get('t') == 'batch']
+        self.assertEqual(len(batches), 1)
+        self.assertFalse(batches[0]['ovr'])
+        self.assertEqual([x for x, _, _ in decode(batches[0])], [1])
+        sensor.emit_batch()
+        last = [line for line in self.lines if line.get('t') == 'batch'][-1]
+        self.assertTrue(last['ovr'])
+        self.assertEqual([x for x, _, _ in decode(last)], [2])
+
+    def test_accel_and_gyro_go_out_in_equal_counts_and_the_remainder_waits(self):
+        imu = FakeImu()
+        sensor = monitor.FifoSensor(monitor.Bus(FakeI2C({0x6A: imu})), self.spec(gyro=True), 9)
+        sensor.start()
+        for i in range(3):
+            imu.push(0x02, i, 0, 0)
+            imu.push(0x01, 10 + i, 0, 0)
+        imu.push(0x02, 3, 0, 0)  # the read ends between an accel and its gyro word
+        sensor.poll()
+        batch = [line for line in self.lines if line.get('t') == 'batch'][0]
+        self.assertEqual(batch['n'], 3)
+        self.assertEqual(batch['ng'], 3)
+        self.assertEqual(len(sensor.accel), 6)  # sample 3 waits for its gyro word
+
     def test_a_part_without_address_rollback_falls_back_to_one_word_per_read(self):
         imu = FakeImu(wraps=False)
         sensor = monitor.FifoSensor(monitor.Bus(FakeI2C({0x6A: imu})), self.spec(), 9)

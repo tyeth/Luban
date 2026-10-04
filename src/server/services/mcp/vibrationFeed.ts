@@ -21,7 +21,8 @@ import { EventEmitter } from 'events';
 
 import logger from '../../lib/logger';
 import config from '../configstore';
-import { VibrationConfig, SensorSpec, monitorConfig, resolveVibrationConfig } from './vibrationConfig';
+import { probeFeedService } from './probeFeed';
+import { VibrationConfig, SensorSpec, bridgeOf, monitorConfig, parseEnvPairs, resolveVibrationConfig } from './vibrationConfig';
 import { VIBRATION_MONITOR_SOURCE } from './vibrationMonitorSource';
 import { ClockStats, FifoClock, MonitorBatch, PollResampler, ProtocolError, decodeBatch } from './vibrationProtocol';
 
@@ -98,24 +99,29 @@ export class SampleRing {
 
     /** Samples with fromMs <= t < toMs, oldest first. */
     public slice(fromMs: number, toMs: number): { times: Float64Array; accel: Float32Array; gyro: Float32Array | null } {
-        const picked: number[] = [];
+        const inWindow = (at: number) => this.times[at] >= fromMs && this.times[at] < toMs;
+        let count = 0;
         for (let i = 0; i < this.size; i++) {
-            const at = (this.head - this.size + i + this.capacity) % this.capacity;
-            const t = this.times[at];
-            if (t >= fromMs && t < toMs) {
-                picked.push(at);
+            if (inWindow((this.head - this.size + i + this.capacity) % this.capacity)) {
+                count++;
             }
         }
-        const times = new Float64Array(picked.length);
-        const accel = new Float32Array(picked.length * 3);
-        const gyro = this.gyro ? new Float32Array(picked.length * 3) : null;
-        picked.forEach((at, i) => {
-            times[i] = this.times[at];
-            accel.set(this.accel.subarray(at * 3, at * 3 + 3), i * 3);
-            if (gyro && this.gyro) {
-                gyro.set(this.gyro.subarray(at * 3, at * 3 + 3), i * 3);
+        const times = new Float64Array(count);
+        const accel = new Float32Array(count * 3);
+        const gyro = this.gyro ? new Float32Array(count * 3) : null;
+        let out = 0;
+        for (let i = 0; i < this.size; i++) {
+            const at = (this.head - this.size + i + this.capacity) % this.capacity;
+            if (!inWindow(at)) {
+                continue;
             }
-        });
+            times[out] = this.times[at];
+            accel.set(this.accel.subarray(at * 3, at * 3 + 3), out * 3);
+            if (gyro && this.gyro) {
+                gyro.set(this.gyro.subarray(at * 3, at * 3 + 3), out * 3);
+            }
+            out++;
+        }
         return { times, accel, gyro };
     }
 }
@@ -131,7 +137,11 @@ export interface SensorRuntime {
     counters: { [key: string]: unknown } | null;
     clock: FifoClock | null;
     resampler: PollResampler | null;
-    ring: SampleRing;
+    /** Allocated on the first batch, so a feed that never starts holds no memory. */
+    ring: SampleRing | null;
+    ringCapacity: number;
+    /** The next batch starts a new monitor run: whatever came before it is not continuous with it. */
+    freshRun: boolean;
     boardOffsets: number[];
     lastBatchAt: number | null;
     batches: number;
@@ -168,10 +178,13 @@ class ChildTransport extends EventEmitter implements LineTransport {
 
     public open(): void {
         const cfgJson = JSON.stringify(monitorConfig(this.cfg, HEARTBEAT_MS));
+        // Only the configured bridge: a BLINKA_* left in Luban's own
+        // environment (the probe feed's U2IF, say) must not reach the child.
+        const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('BLINKA_')));
         let child: ChildProcess;
         try {
             child = spawn(this.cfg.python, ['-u', '-c', VIBRATION_MONITOR_SOURCE, cfgJson], {
-                env: { ...process.env, ...this.cfg.blinkaEnv },
+                env: { ...inherited, ...this.cfg.blinkaEnv },
                 stdio: ['ignore', 'pipe', 'pipe'],
                 windowsHide: true,
             });
@@ -242,6 +255,8 @@ interface SerialPortLike extends EventEmitter {
 class SerialTransport extends EventEmitter implements LineTransport {
     private port: SerialPortLike | null = null;
 
+    private closed = false;
+
     private buffer = '';
 
     public constructor(private readonly cfg: VibrationConfig) {
@@ -285,6 +300,14 @@ class SerialTransport extends EventEmitter implements LineTransport {
             log.warn(`vibration serial ${this.cfg.serialPort}: ${err.message}`);
         });
         port.open((err: Error | null) => {
+            if (this.closed || this.port !== port) {
+                // close() ran while the port was still opening: release it
+                // now, or it stays held and every later open is refused.
+                if (!err && port.isOpen) {
+                    port.close();
+                }
+                return;
+            }
             if (err) {
                 this.port = null;
                 this.emit('close', `cannot open ${this.cfg.serialPort}: ${err.message}`);
@@ -295,6 +318,7 @@ class SerialTransport extends EventEmitter implements LineTransport {
     }
 
     public close(): void {
+        this.closed = true;
         const port = this.port;
         this.port = null;
         if (port && port.isOpen) {
@@ -325,6 +349,20 @@ function runBreaks(rt: SensorRuntime | undefined, clock: ClockStats | null): num
         return clock.breaks;
     }
     return rt ? rt.gaps : null;
+}
+
+/** The USB bridge the probe feed's live GPIO transport has open, if any. */
+function activeProbeBridge(): string | null {
+    try {
+        const status = probeFeedService.status() as { transport?: string; blinkaEnv?: unknown };
+        if (status.transport !== 'gpio' || typeof status.blinkaEnv !== 'string') {
+            return null;
+        }
+        const env = parseEnvPairs(status.blinkaEnv);
+        return typeof env === 'string' ? null : bridgeOf(env);
+    } catch (err) {
+        return null;
+    }
 }
 
 export type FeedState = 'off' | 'unconfigured' | 'starting' | 'running' | 'retrying';
@@ -372,6 +410,11 @@ export class VibrationFeedService extends EventEmitter {
         if (!cfg.enabled) {
             this.state = 'off';
             return;
+        }
+        const live = activeProbeBridge();
+        if (cfg.transport === 'blinka' && live && live === bridgeOf(cfg.blinkaEnv) && live !== 'native') {
+            cfg.problems.push(`the RUNNING probe feed holds the ${live} bridge (its settings change at the next MCP start) - refused: `
+                + 'the accelerometers need their own bridge');
         }
         if (cfg.problems.length) {
             this.state = 'unconfigured';
@@ -432,7 +475,7 @@ export class VibrationFeedService extends EventEmitter {
                 const rt = this.sensors.get(spec.id);
                 const clock = rt && rt.clock ? rt.clock.stats() : null;
                 const jitter = rt && rt.resampler ? rt.resampler.jitter() : null;
-                const span = rt ? rt.ring.span() : null;
+                const span = rt && rt.ring ? rt.ring.span() : null;
                 return {
                     id: spec.id,
                     location: spec.location,
@@ -480,7 +523,9 @@ export class VibrationFeedService extends EventEmitter {
                 counters: null,
                 clock: spec.mode === 'fifo' ? new FifoClock(spec.rateHz) : null,
                 resampler: spec.mode === 'poll' ? new PollResampler(spec.rateHz, POLL_MAX_GAP_S) : null,
-                ring: new SampleRing(capacity),
+                ring: null,
+                ringCapacity: capacity,
+                freshRun: true,
                 boardOffsets: [],
                 lastBatchAt: null,
                 batches: 0,
@@ -644,6 +689,7 @@ export class VibrationFeedService extends EventEmitter {
             rt.clock = rt.spec.mode === 'fifo' ? new FifoClock(rt.spec.rateHz) : null;
             rt.resampler = rt.spec.mode === 'poll' ? new PollResampler(rt.spec.rateHz, POLL_MAX_GAP_S) : null;
             rt.boardOffsets = [];
+            rt.freshRun = true;
         }
         const described = Array.isArray(msg.sensors) ? msg.sensors as Array<{ [key: string]: unknown }> : [];
         for (const info of described) {
@@ -710,14 +756,23 @@ export class VibrationFeedService extends EventEmitter {
             rt.protocolErrors++;
             return;
         }
-        if (gap) {
-            rt.gaps++;
-        }
         if (!times.length) {
             return;
         }
+        // A new monitor run (start, reconnect, a board re-initialising) is
+        // never continuous with what came before it: say so to the captures.
+        if (rt.freshRun) {
+            gap = gap || rt.samples > 0;
+            rt.freshRun = false;
+        }
+        if (gap) {
+            rt.gaps++;
+        }
         const hostMs = this.toHostMs(rt, batch, times);
         rt.samples += hostMs.length;
+        if (!rt.ring) {
+            rt.ring = new SampleRing(rt.ringCapacity);
+        }
         rt.ring.push(hostMs, accel, gyro);
         this.emit('samples', rt.spec.id, hostMs, accel, gyro, gap);
     }

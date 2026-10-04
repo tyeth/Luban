@@ -1,7 +1,7 @@
 /* eslint-disable camelcase */
 import assert from 'assert';
 
-import { TrackBuilder, angleBetweenDeg, buildReport, gravityStandardError } from '../vibrationReport';
+import { TrackBuilder, angleBetweenDeg, buildReport, gravityStandardError, sampleAtTime } from '../vibrationReport';
 
 type TestCase = [string, () => void | Promise<void>];
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -69,6 +69,32 @@ export const tests: TestCase[] = [
         const data = record({ fs: 208, seconds: 10, rpm: 8000 }).data();
         const report = buildReport(data, { rpmHint: 8000 }) as Report;
         assert.match(report.rotation.note, /outside this stream's spectrum/);
+    }],
+
+    ['gyro bias is not rotation; slow tilt shows in the time-domain level', () => {
+        const builder = new TrackBuilder(100, true, 1);
+        const accel = new Float64Array(300 * 3);
+        const gyro = new Float64Array(300 * 3);
+        for (let i = 0; i < 300; i++) {
+            accel[i * 3 + 2] = 1;
+            accel[i * 3] = 0.05 * (i / 300); // a slow lean, far below any spectral band
+            gyro[i * 3] = 1.2; // zero-rate offset
+            gyro[i * 3 + 1] = -0.8;
+        }
+        builder.push(accel, 300, gyro);
+        const data = builder.data();
+        assert.ok((data.gyroRmsDps as number) < 1e-6, `${data.gyroRmsDps}`);
+        assert.ok(data.acRmsG > 0.01, `${data.acRmsG}`);
+    }],
+
+    ['a window maps through the time index, so an outage does not shift it', () => {
+        // 1666 Hz: 10 s from t = 1 s, a 30 s outage, then the stream resumes at 41 s.
+        const index: Array<[number, number]> = [[0, 1000], [8330, 6000], [16660, 41000]];
+        assert.strictEqual(sampleAtTime(index, 1666, 1000), 0);
+        assert.strictEqual(sampleAtTime(index, 1666, 3500), 4165);
+        assert.strictEqual(sampleAtTime(index, 1666, 25000), 16660, 'inside the outage: the gap edge, never past it');
+        assert.strictEqual(sampleAtTime(index, 1666, 41500), 16660 + 833);
+        assert.strictEqual(sampleAtTime([], 1666, 5000), 0);
     }],
 
     ['gravity standard error comes from per-second means; angles between vectors', () => {

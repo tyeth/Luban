@@ -90,14 +90,24 @@ if CIRCUITPY and hasattr(time, 'monotonic_ns'):
         # A board clock: microseconds, integer (a float would lose
         # resolution after hours on 30-bit-float builds).
         return {'tus': time.monotonic_ns() // 1000}
+
+    def clock_s():
+        # Differences of this stay exact; the absolute value may be large.
+        return time.monotonic_ns() / 1e9
+elif CIRCUITPY:
+    def stamp():
+        # Still the board's clock (time.time() is the RTC in whole seconds).
+        return {'tus': int(time.monotonic() * 1000000)}
+
+    def clock_s():
+        return time.monotonic()
 else:
     def stamp():
         # The host clock, the same one Luban reads.
         return {'ts': time.time()}
 
-
-def clock_s():
-    return time.monotonic()
+    def clock_s():
+        return time.monotonic()
 
 
 class Bus:
@@ -310,6 +320,10 @@ class FifoSensor(Sensor):
         count = self.status[0] | ((self.status[1] & 0x03) << 8)
         if self.status[1] & 0x48:  # FIFO_OVR_IA | FIFO_OVR_LATCHED
             self.overruns += 1
+            # Samples read before the loss go out first, so the gap falls
+            # BETWEEN batches (the clock spaces a batch's samples evenly).
+            if len(self.accel) >= 6:
+                self.emit_batch()
             self.overrun_pending = True
         while count > 0:
             words = 1 if self.per_word else min(count, self.chunk_words)
@@ -328,9 +342,14 @@ class FifoSensor(Sensor):
 
     def emit_batch(self):
         n = len(self.accel) // 6
+        ng = len(self.gyro) // 6
+        if self.spec.get('gyro') and ng:
+            # Accel and gyro words interleave in the FIFO; a read can end
+            # between the two. Send the common count, keep the remainder.
+            n = min(n, ng)
+            ng = n
         msg = {'t': 'batch', 'id': self.id, 'mode': 'fifo', 'seq': self.seq, 'n': n,
                'a': b64(self.accel[:n * 6]), 'as': self.accel_scale, 'odr': self.odr_actual, 'ovr': self.overrun_pending}
-        ng = len(self.gyro) // 6
         if ng:
             msg['ng'] = ng
             msg['g'] = b64(self.gyro[:ng * 6])
@@ -339,8 +358,8 @@ class FifoSensor(Sensor):
         emit(msg)
         self.samples += n
         self.seq += 1
-        self.accel = bytearray()
-        self.gyro = bytearray()
+        self.accel = self.accel[n * 6:]
+        self.gyro = self.gyro[ng * 6:]
         self.overrun_pending = False
         self.batch_started = clock_s()
 
