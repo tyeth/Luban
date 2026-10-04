@@ -93,6 +93,26 @@ async function pageFixture() {
 }
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['USB choices recover after hotplug and preserve the selected device', async () => {
+        const f = await pageFixture();
+        assert.equal(f.element('port').value, 'COM42');
+        f.state.ports = []; await f.refresh();
+        assert.equal(f.element('connect').disabled, true);
+        await f.element('connect').onclick?.(); assert.equal(f.posted.length, 0);
+        f.state.ports = [{ path: 'COM43' }, { path: 'COM44' }]; await f.refresh();
+        assert.equal(f.element('port').value, 'COM43');
+        f.element('port').value = 'COM44'; await f.refresh();
+        assert.equal(f.element('port').value, 'COM44');
+        assert.equal(f.element('connect').disabled, false);
+    }],
+    ['Home requires an operator click and explicitly permits stale recovery including rotary homing', async () => {
+        const f = await pageFixture();
+        assert.equal(f.posted.length, 0);
+        await f.element('home').onclick?.();
+        assert.deepEqual(f.posted, [{ url: '/pendant/home', body: { confirmHoming: true } }]);
+        assert.match(f.element('action').textContent, /Homing completed and verified/);
+    }],
+
     ['machine-fill buttons are independent, invalidate consent and preview travel clipping', async () => {
         const f = await pageFixture();
         assert.equal(f.element('yMin').step, 'any');

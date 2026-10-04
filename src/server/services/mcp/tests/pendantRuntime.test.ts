@@ -8,6 +8,7 @@ import ts from 'typescript';
 import * as envelopeChecks from '../envelopeChecks';
 import { ManualControlGate } from '../manualControl';
 import * as pendant from '../pendant';
+import { pendantPosition } from '../pendantPosition';
 import { pendantPage } from '../pendantPage';
 import { requiredToolheadZ } from '../landmarkClearance';
 
@@ -25,7 +26,9 @@ function fixture(a350 = false) {
     const machine = a350 ? { x: 124, y: 203.3289948730469, z: 327.9990070800781 } : { x: 10, y: 10, z: 10 };
     const logs: string[] = [];
     const settingsChanges: object[] = [];
-    const snapshot = () => ({ machine, work: machine, machineStatus, reliability: 'heartbeat', warnings: [], reportAgeMs: 0 });
+    const homes: unknown[][] = [];
+    let restores = 0;
+    const snapshot = () => ({ machine, work: machine, originOffset: { x: 0, y: 0, z: 0 }, originOffsetSource: 'heartbeat', machineStatus, reliability: 'heartbeat', warnings: [], reportAgeMs: 0 });
     class Port extends EventEmitter {
         public static current: Port;
 
@@ -61,13 +64,16 @@ function fixture(a350 = false) {
         './manualControl': { manualControlGate: gate },
         './McpServer': { isLoopback: (address: string) => address === '127.0.0.1' },
         './pendant': pendant,
+        './pendantPosition': { pendantPosition },
         './pendantPage': { pendantPage },
         './pendantSettings': { pendantSettings: () => ({}), updatePendantSettings: (args: object) => settingsChanges.push(args) },
-        './positionOfRecord': { currentGcodeSequence: () => 0, getPositionOfRecord: () => (estimated ? { source: 'estimated' } : null) },
+        './positionOfRecord': { currentGcodeSequence: () => 0, getTrustedOffset: () => null, getPositionOfRecord: () => (estimated ? { source: 'estimated' } : null) },
         './probeFeed': { probeFeedService: { assertNoOvertravel: () => undefined } },
         './probing': { assertMachineReadyForProcedure: () => { if (readyError) { throw Error('not idle'); } },
             moveMachineSettled: async () => { moves += 1; await new Promise<void>((resolve) => { finish = resolve; }); } },
-        './tools/machine': { connectionEpoch: () => epoch,
+        './tools/camera': { sendWorkFrameRestore: async () => { restores += 1; return { result: 0 }; }, homeMachine: async (...args: unknown[]) => { homes.push(args); await new Promise<void>((resolve) => { finish = resolve; }); } },
+        './tools/machine': { HEARTBEAT_STALE_MS: 10000,
+            connectionEpoch: () => epoch,
             getMachineSizeByIdentifier: () => ({ x: 350, y: 350, z: a350 ? 325 : 100 }),
             getPositionSnapshot: snapshot,
             safeTraverseZ: () => (a350 ? 328 : 100),
@@ -127,6 +133,8 @@ function fixture(a350 = false) {
         machine,
         logs,
         settingsChanges,
+        homes,
+        restores: () => restores,
         setMachineStatus: (status: string) => { machineStatus = status; },
         writes: () => Port.current.writes,
         initialize: async () => {
@@ -150,6 +158,31 @@ function fixture(a350 = false) {
 }
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['frame recovery uses the shared no-motion command and leaves jogging disarmed', async () => {
+        const f = fixture(); await f.initialize(); await f.arm();
+        f.setMachineStatus('running');
+        assert.equal((await f.request('/pendant/restore-frame', {})).status, 400);
+        assert.equal(f.restores(), 0);
+        f.setMachineStatus('idle');
+        assert.equal((await f.request('/pendant/restore-frame', {})).status, 200);
+        assert.equal(f.restores(), 1); assert.equal(f.moves(), 0);
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).armed, false);
+    }],
+    ['operator Home disarms and uses the shared stale-only homing override under exclusive ownership', async () => {
+        const f = fixture(); await f.initialize(); await f.arm();
+        assert.equal((await f.request('/pendant/home', {})).status, 400);
+        assert.equal(f.homes.length, 0);
+        const homing = f.request('/pendant/home', { confirmHoming: true });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(f.homes, [['usb_pendant:home', true, true]]);
+        assert.throws(() => f.gate.enterTool('home'), /pendant/);
+        const status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(status.armed, false); assert.equal(status.busy, true);
+        f.input({ x: 1, deadman: true }); await f.tick(); assert.equal(f.moves(), 0);
+        await f.finish(); assert.equal((await homing).status, 200);
+        f.gate.enterTool('home')();
+    }],
+
     ['A350 defaults include park; whole-bed request is clipped to known travel', async () => {
         const f = fixture(true); await f.initialize();
         const before = JSON.parse((await f.request('/pendant/status')).body);

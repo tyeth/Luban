@@ -13,11 +13,13 @@ import { manualControlGate } from './manualControl';
 import { isLoopback } from './McpServer';
 import { JogBounds, JogPosition, PendantSession, parsePendantInput, validateJogBounds } from './pendant';
 import { pendantPage } from './pendantPage';
+import { pendantPosition } from './pendantPosition';
 import { pendantSettings, updatePendantSettings } from './pendantSettings';
-import { currentGcodeSequence, getPositionOfRecord } from './positionOfRecord';
+import { currentGcodeSequence, getPositionOfRecord, getTrustedOffset } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
 import { assertMachineReadyForProcedure, moveMachineSettled } from './probing';
-import { connectionEpoch, getMachineSizeByIdentifier, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
+import { homeMachine, sendWorkFrameRestore } from './tools/camera';
+import { HEARTBEAT_STALE_MS, connectionEpoch, getMachineSizeByIdentifier, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 const log = logger('service:mcp:pendant');
 
@@ -29,6 +31,8 @@ export class PendantRuntime {
     private buffer = '';
 
     private busy = false;
+
+    private recovery: string | null = null;
 
     private owned = false;
 
@@ -59,8 +63,10 @@ export class PendantRuntime {
     private ready(): void {
         assertMachineReadyForProcedure();
         probeFeedService.assertNoOvertravel();
-        if (getPositionSnapshot().warnings.length) { throw new Error('Machine position has unresolved warnings.'); }
         const record = getPositionOfRecord(currentGcodeSequence());
+        const p = getPositionSnapshot();
+        const warnings = this.session.armed ? pendantPosition(p, record, getTrustedOffset(), Date.now(), HEARTBEAT_STALE_MS).warnings : p.warnings;
+        if (warnings.length) { throw new Error(`Machine position unavailable: ${warnings.join(' ')}`); }
         if (record && record.source === 'estimated') { throw new Error('Last move was only estimated; wait for a verified position.'); }
         if (jobManager.getActive()?.state === 'started') { throw new Error('A machine job is active.'); }
     }
@@ -183,11 +189,7 @@ export class PendantRuntime {
         try {
             const p = getPositionSnapshot();
             const record = getPositionOfRecord(currentGcodeSequence());
-            return { machine: p.machine,
-                work: p.work,
-                reliability: record?.source === 'estimated' ? 'estimated' : p.reliability,
-                age_ms: p.reportAgeMs,
-                warnings: p.warnings };
+            return pendantPosition(p, record, getTrustedOffset(), Date.now(), HEARTBEAT_STALE_MS);
         } catch (err) {
             return { machine: null, work: null, reliability: 'disconnected', age_ms: null, warnings: [(err as Error).message] };
         }
@@ -272,6 +274,7 @@ export class PendantRuntime {
             reply(200, { armed: this.session.armed,
                 neutral: this.session.neutral,
                 busy: this.busy,
+                recovery: this.recovery,
                 port: this.port?.path || null,
                 input: this.session.latest,
                 error: this.error,
@@ -329,6 +332,37 @@ export class PendantRuntime {
                     break;
                 }
                 case '/pendant/disarm': this.disarm(); break;
+                case '/pendant/restore-frame':
+                case '/pendant/home': {
+                    const homing = url.pathname === '/pendant/home';
+                    this.disarm(homing ? 'Operator requested homing. Pendant disarmed.' : 'Restoring work frame. Pendant disarmed.');
+                    if (homing && args.confirmHoming !== true) { throw new Error('Confirm homing all axes, including rotary B, even if position data is stale.'); }
+                    if (this.busy || this.opening || ['starting', 'started'].includes(jobManager.getActive()?.state || '')) {
+                        throw new Error('Wait for the current move, connection or machine job to finish before recovery.');
+                    }
+                    if (!homing && getPositionSnapshot().machineStatus !== 'idle') {
+                        throw new Error('Wait for the machine to report idle before changing its coordinate mode.');
+                    }
+                    manualControlGate.acquire();
+                    this.owned = true;
+                    this.busy = true;
+                    this.recovery = homing ? 'Homing and verifying position' : 'Restoring work frame';
+                    try {
+                        if (homing) {
+                            await homeMachine('usb_pendant:home', true, true);
+                            this.error = 'Homing completed and verified. Review bounds and re-arm to jog.';
+                        } else {
+                            const result = await sendWorkFrameRestore('usb_pendant:restore-frame');
+                            if (result.result !== 0) { throw new Error(result.text || 'Controller refused frame recovery.'); }
+                            this.error = 'G90/G54 restored without axis motion. Wait for fresh coordinates, review bounds and re-arm.';
+                        }
+                    } finally {
+                        this.recovery = null;
+                        this.busy = false;
+                        this.release();
+                    }
+                    break;
+                }
                 case '/pendant/keepalive': this.pageAliveAt = Date.now(); break;
                 default: reply(404, { error: 'Unknown pendant action.' }); return;
             }

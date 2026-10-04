@@ -68,8 +68,8 @@ but the original 9.x compiled libraries must be restored with the old code.
 | Twist | D9 | Feed adjustment or Z jog |
 | Joystick button | D10, pull-down | Switch twist mode; always reset feed to 60 mm/min |
 | Feather D1 | Built-in, pull-down | Hold to jog; release to stop requesting moves |
-| Feather D2 | Built-in, pull-down | Stop and disarm |
-| Feather D0 | Built-in, pull-up | Switch DRO machine/work frame |
+| Feather D2 | Built-in, pull-down | Tap to stop and disarm |
+| Feather D0 | Built-in, pull-up | Tap to switch DRO machine/work frame |
 
 Feed mode starts at 60 mm/min; twist increases/decreases it within 60–600.
 Z mode uses the reset slow feed. Startup, a mode change, USB loss, a new arm
@@ -186,3 +186,24 @@ npm run typecheck:mcp
 
 These tests use simulated input and do not move hardware. Hardware firmware
 version, serial enumeration and real display startup must also be verified.
+
+The page shows MACHINE and WORK coordinates together. Both come from the existing
+machine position tracker; raw G53-window heartbeat fields are never labelled as
+work coordinates. The pendant reuses the tracker's recheck logic for its own
+verified arrivals, retains heartbeat warnings in diagnostics, and uses the same
+10-second heartbeat stale threshold. Normal 1–2 second reporting latency does
+not by itself disarm jogging. Estimated positions remain explicitly unverified.
+
+**Restore work frame (no motion)** disarms jogging and sends the shared G90/G54
+recovery command. Use it when the controller was left in a machine or relative
+mode and Luban's ordinary jogs are refused. It does not automatically re-arm or
+claim that a fresh heartbeat has already verified recovery.
+
+**Home all axes (including rotary B)** is an explicit operator action on the
+local page. It disarms jogging, excludes concurrent MCP operations, and uses the
+existing homing routine with its stale-position override. Attached rotary stock
+will rotate. Alarm, toolhead and idle checks remain; completion requires fresh
+feedback. Jog Stop does not cancel an already accepted homing command.
+
+The general automatic post-tool failure recovery hook is tracked separately in
+[issue #221](https://github.com/tyeth/Luban/issues/221); it is not implemented here.

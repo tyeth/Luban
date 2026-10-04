@@ -107,7 +107,7 @@ while True:
     packet = controller.update(values[0], values[1], values[2], mode_button.value,
                                deadman.value, stop_button.value, now, dt, fresh, armed=linked)
     if serial.connected and now - last_send >= 0.05:
-        packet.update({"v": 1, "seq": seq, "raw": raw,
+        packet.update({"v": 1, "seq": seq, "raw": raw, "dro_frame": frame,
                        "display": [display.width, display.height]})
         # Nonblocking: partial frames force a newline and neutral re-arm, never a backlog.
         payload = (json.dumps(packet) + "\n").encode("utf-8")
@@ -131,7 +131,8 @@ while True:
         header.text = "%s %s" % ("DANGER: TWIST Z" if z_mode else "TWIST:FEED", "MACHINE" if frame == "machine" else "WORK")
         feed_value.text = str(int(controller.feed))
         age = dro.get("age_ms") if dro else None
-        valid = fresh and age is not None and age < 3000 and dro.get("reliability") in ("verified", "heartbeat", "cached-offset")
+        stale_after = dro.get("stale_after_ms", 10000) if dro else 10000
+        valid = fresh and age is not None and age < stale_after and dro.get("reliability") in ("verified", "heartbeat", "cached-offset")
         valid = valid and not dro.get("warnings")
         position = dro.get(frame) if valid else None
         for axis, area in zip("xyz", dro_labels):
