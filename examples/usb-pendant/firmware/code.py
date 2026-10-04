@@ -11,6 +11,10 @@ import usb_cdc
 from adafruit_display_text import label
 from controller import Controller, normalize, deadzone
 
+if usb_cdc.data is None:
+    print("Pendant maintenance console. Release D0 and reset to run USB data.")
+    print("If PENDANT_CONSOLE=1 is set in settings.toml, remove it first.")
+    raise SystemExit
 
 def input_pin(pin, pull):
     button = digitalio.DigitalInOut(pin)
@@ -34,13 +38,19 @@ frame_button = input_pin(board.D0, digitalio.Pull.UP)
 display = board.DISPLAY
 display.brightness = 0.8
 group = displayio.Group()
-header = label.Label(terminalio.FONT, text="TWIST FEED   F60", color=0x55DDFF, x=4, y=9)
+header = label.Label(terminalio.FONT, text="TWIST FEED   MACHINE", color=0x55DDFF, x=4, y=9)
 group.append(header)
 dro_labels = []
 for axis, y in zip("XYZ", (33, 60, 87)):
     area = label.Label(terminalio.FONT, text=axis + "  ---.---", scale=2, color=0xFFFFFF, x=4, y=y)
     dro_labels.append(area)
     group.append(area)
+feed_title = label.Label(terminalio.FONT, text="FEED", color=0x55DDFF, x=171, y=33)
+feed_value = label.Label(terminalio.FONT, text="60", scale=3, color=0xFFFFFF, x=171, y=63)
+feed_units = label.Label(terminalio.FONT, text="mm/min", color=0xAAAAAA, x=171, y=87)
+group.append(feed_title)
+group.append(feed_value)
+group.append(feed_units)
 status = label.Label(terminalio.FONT, text="USB: waiting for Luban", color=0xFFBB44, x=4, y=113)
 help_text = label.Label(terminalio.FONT, text="D1 hold jog | D2 stop", color=0xAAAAAA, x=4, y=128)
 group.append(status)
@@ -87,12 +97,14 @@ while True:
         controller.feed = 60
         controller.neutral_required = True
     was_linked = linked
-    values = [deadzone(normalize(axis.value, centers[i], minimums[i], maximums[i], inverted[i]), zone)
-              for i, axis in enumerate(axes)]
+    raw = [axis.value for axis in axes]
+    values = [deadzone(normalize(value, centers[i], minimums[i], maximums[i], inverted[i]), zone)
+              for i, value in enumerate(raw)]
     packet = controller.update(values[0], values[1], values[2], mode_button.value,
                                deadman.value, stop_button.value, now, dt, linked)
     if serial.connected and now - last_send >= 0.05:
-        packet.update({"v": 1, "seq": seq})
+        packet.update({"v": 1, "seq": seq, "raw": raw,
+                       "display": [display.width, display.height]})
         # Nonblocking: partial frames force a newline and neutral re-arm, never a backlog.
         payload = (json.dumps(packet) + "\n").encode("utf-8")
         try:
@@ -109,7 +121,8 @@ while True:
         frame = "work" if frame == "machine" else "machine"
     frame_was_pressed = pressed
     if now - last_display >= 0.15:
-        header.text = "TWIST:%s F%d %s" % (controller.mode.upper(), int(controller.feed), "M" if frame == "machine" else "W")
+        header.text = "TWIST:%s %s" % (controller.mode.upper(), "MACHINE" if frame == "machine" else "WORK")
+        feed_value.text = str(int(controller.feed))
         age = dro.get("age_ms") if dro else None
         valid = fresh and age is not None and age < 3000 and dro.get("reliability") in ("verified", "heartbeat", "cached-offset")
         valid = valid and not dro.get("warnings")

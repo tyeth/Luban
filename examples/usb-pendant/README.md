@@ -47,9 +47,14 @@ python examples/usb-pendant/deploy.py --uf2 C:/dev/python/circuitpython/3dof-lub
 python examples/usb-pendant/deploy.py --project C:/dev/python/circuitpython/3dof-luban-controller --bundle C:/dev/python/circuitpython/3dof-luban-controller/firmware/adafruit-circuitpython-bundle-11.x-mpy-20261003.zip --settings C:/dev/python/circuitpython/3dof-luban-controller/backups/2026-10-04-before-update/CIRCUITPY/settings.toml --drive D:/
 ```
 
-Press RESET once after copying `boot.py`. USB exposes console and data serial
-ports; select **data**, generally the second port. HID and MIDI are disabled to
-free USB endpoints. The console is for diagnostics, never the jogging stream.
+Press RESET once after copying `boot.py`. USB exposes **one data serial port**
+and CIRCUITPY. This ESP32-S3 cannot fit the disk and two CDC interfaces within
+its five IN endpoints (including EP0); HID and MIDI are also disabled.
+For a maintenance console, hold built-in **D0 while pressing RESET**, then
+release D0. The controller does not run in maintenance mode. Release D0 and
+reset again to return to the data port. Alternatively temporarily set
+`PENDANT_CONSOLE = "1"` in `settings.toml`; remove it before resetting to run.
+The console is for diagnostics, never the jogging stream.
 To restore the old application, copy its saved UF2 to FTHRS3BOOT and restore
 the old CIRCUITPY tree. The new TinyUF2 layout supports CircuitPython 9.1+
 but the original 9.x compiled libraries must be restored with the old code.
@@ -78,7 +83,7 @@ Defaults are centre 32768, min 0, max 65535, 12% deadzone, X inverted.
 Set these from actual released-centre and full-travel ADC readings; do not
 automatically treat an off-centre boot position as neutral. `settings.example.toml`
 contains public examples. Invalid calibration stops the firmware with a console
-error. Calibration and direction need a physical check before operator use.
+error in maintenance mode. Calibration and direction need a physical check before operator use.
 
 ## Luban operation
 
@@ -113,7 +118,8 @@ loopback-only even when MCP LAN access is enabled. Operator POSTs require a
 page token, matching origin, and a loopback Host. The page cannot be framed.
 The operator should not jog simultaneously using the touchscreen or other UI.
 
-The TFT shows reported machine or work XYZ, mode and feed. It blanks stale,
+The TFT shows reported machine or work XYZ on the left, with **FEED** and its
+larger numeric value beneath on the right, plus twist mode at the top. It blanks stale,
 disconnected or unreliable DRO data instead of displaying a locally integrated
 position as a measurement. USB DRO updates do not make the machine's 2-second
 heartbeat faster. Verify direction, calibration, stop/reconnect and a tiny
@@ -123,7 +129,9 @@ reviewed movement with the operator before treating the system as commissioned.
 
 USB data uses newline-delimited JSON at nominal 115200 baud. Input has
 `v:1`, increasing `seq`, normalized `x,y,z`, `mode:feed|z`, `feed:60..600`,
-and booleans `ready`, `deadman`, `stop`. Feed mode must send Z=0. Luban replies
+and booleans `ready`, `deadman`, `stop`. Additional diagnostics `raw` contain
+the X/Y/twist ADC samples, and `display` contains the initialized TFT dimensions.
+Feed mode must send Z=0. Luban replies
 with `type:dro`, `armed`, `neutral`, `machine`, `work`, `reliability`, `age_ms`,
 `warnings` and an operator message. The board has no authority without the
 operator's armed session and fresh DRO reply.
