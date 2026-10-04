@@ -1,0 +1,117 @@
+// USB wire protocol and bounded operator jogging. No server or serial imports.
+export interface PendantInput {
+    v: 1;
+    seq: number;
+    x: number;
+    y: number;
+    z: number;
+    feed: number;
+    mode: 'feed' | 'z';
+    deadman: boolean;
+    stop: boolean;
+    ready: boolean;
+}
+
+export interface JogBounds {
+    xMin: number; xMax: number;
+    yMin: number; yMax: number;
+    zMin: number; zMax: number;
+}
+
+export interface JogPosition { x: number; y: number; z: number }
+
+export function parsePendantInput(line: string): PendantInput {
+    if (line.length > 512) { throw new Error('USB frame too long.'); }
+    const p = JSON.parse(line) as PendantInput;
+    if (!p || p.v !== 1 || !Number.isSafeInteger(p.seq) || p.seq < 0
+        || ![p.x, p.y, p.z].every((n) => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) <= 1)
+        || typeof p.feed !== 'number' || !Number.isFinite(p.feed) || p.feed < 60 || p.feed > 600
+        || !['feed', 'z'].includes(p.mode) || typeof p.deadman !== 'boolean' || typeof p.stop !== 'boolean'
+        || typeof p.ready !== 'boolean'
+        || (p.mode === 'feed' && p.z !== 0)) {
+        throw new Error('Invalid USB pendant frame.');
+    }
+    return p;
+}
+
+export function validateJogBounds(bounds: JogBounds, current: JogPosition): void {
+    for (const axis of ['x', 'y', 'z'] as const) {
+        const lo = bounds[`${axis}Min`];
+        const hi = bounds[`${axis}Max`];
+        if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo || hi - lo > 100
+            || current[axis] < lo || current[axis] > hi) {
+            throw new Error(`Invalid machine ${axis.toUpperCase()} envelope (max span 100 mm; must contain current position).`);
+        }
+    }
+}
+
+export class PendantSession {
+    public armed = false;
+
+    public neutral = false;
+
+    public latest: PendantInput | null = null;
+
+    public receivedAt = 0;
+
+    public expiresAt = 0;
+
+    public bounds: JogBounds | null = null;
+
+    private sequence = -1;
+
+    public arm(bounds: JogBounds, current: JogPosition, now: number): void {
+        validateJogBounds(bounds, current);
+        this.bounds = { ...bounds };
+        this.armed = true;
+        this.neutral = false;
+        this.latest = null;
+        this.expiresAt = now + 10 * 60 * 1000;
+    }
+
+    public disarm(): void {
+        this.armed = false;
+        this.neutral = false;
+        this.latest = null;
+    }
+
+    public reset(): void {
+        this.disarm();
+        this.sequence = -1;
+        this.receivedAt = 0;
+    }
+
+    public receive(input: PendantInput, now: number): void {
+        if (input.seq <= this.sequence) { throw new Error('Repeated or out-of-order USB frame.'); }
+        this.sequence = input.seq;
+        this.latest = input;
+        this.receivedAt = now;
+        if (input.stop) { this.disarm(); }
+        if (input.ready && !input.deadman && input.x === 0 && input.y === 0 && input.z === 0) { this.neutral = true; }
+    }
+
+    public target(current: JogPosition, now: number): { position: JogPosition; feed: number } | null {
+        if (!this.armed) { return null; }
+        if (now >= this.expiresAt || now - this.receivedAt > 300) {
+            this.disarm();
+            return null;
+        }
+        const p = this.latest;
+        if (!this.neutral || !p || !p.ready || !p.deadman || !this.bounds) { return null; }
+        const magnitude = Math.hypot(p.x, p.y, p.z);
+        if (magnitude < 0.01) { return null; }
+        // At most 0.1 second's travel, 0.5 mm vector length, one move in flight.
+        const distance = Math.min(0.5, p.feed / 600) * Math.min(1, magnitude);
+        const position = {
+            x: current.x + p.x / magnitude * distance,
+            y: current.y + p.y / magnitude * distance,
+            z: current.z + p.z / magnitude * distance,
+        };
+        for (const axis of ['x', 'y', 'z'] as const) {
+            if (position[axis] < this.bounds[`${axis}Min`] || position[axis] > this.bounds[`${axis}Max`]) {
+                throw new Error(`Jog would leave approved machine ${axis.toUpperCase()} envelope.`);
+            }
+        }
+        return { position, feed: p.feed };
+    }
+}
