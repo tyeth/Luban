@@ -24,7 +24,10 @@ import { registerProbeTools } from './tools/probe';
 import { registerProbingTools } from './tools/probing';
 import { registerStatusTools } from './tools/status';
 import { registerTelemetryTools } from './tools/telemetry';
+import { registerVibrationTools } from './tools/vibration';
 import { spindleTelemetryService } from './spindleTelemetry';
+import { vibrationCaptureService } from './vibrationCaptures';
+import { vibrationFeedService } from './vibrationFeed';
 import { registerToolSetterTools } from './tools/toolsetter';
 import { registerWorkspaceTools } from './tools/workspace';
 import { registerThreadMillingTools } from './tools/threadMilling';
@@ -251,6 +254,7 @@ function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
     registerLandmarkTools(registry);
     registerProbeTools(registry);
     registerTelemetryTools(registry);
+    registerVibrationTools(registry);
     registerToolSetterTools(registry, baseUrl);
     registerWorkspaceTools(registry, baseUrl);
     registerProbingTools(registry, baseUrl);
@@ -330,6 +334,14 @@ function startConfiguredMcpService(socketServer?: McpBroadcaster): void {
             log.error(`Probe feed auto-connect failed: ${err.message}`);
         });
     }
+
+    // Accelerometers (opt-in, read-only): their own monitor and bridge,
+    // retried by their own backoff; never part of the probe feed.
+    try {
+        vibrationFeedService.reconfigure();
+    } catch (err) {
+        log.error(`Accelerometer feed start failed: ${(err as Error).message}`);
+    }
 }
 
 export function startMcpService(socketServer?: McpBroadcaster): void {
@@ -347,6 +359,8 @@ export function startMcpService(socketServer?: McpBroadcaster): void {
 
 export function stopMcpService(): void {
     cameraStreamService.shutdown();
+    vibrationCaptureService.shutdown();
+    vibrationFeedService.shutdown();
     listeners.stop();
     runningSettings = null;
     startupError = null;
