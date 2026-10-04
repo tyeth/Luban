@@ -4,10 +4,51 @@ import pathlib
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent / "firmware"))
-from controller import Controller, normalize, deadzone
+from controller import Controller, DroDisplay, LinkWatchdog, normalize, deadzone
 
 
 class ControllerTests(unittest.TestCase):
+    def test_feedback_round_trip_watchdog_rejects_old_duplicate_and_delayed_acknowledgements(self):
+        link = LinkWatchdog()
+        self.assertFalse(link.healthy(1, True, 1))
+        link.sent(1, 1.0)
+        link.acknowledge(1, 10, 1.05)
+        self.assertTrue(link.healthy(1.05, True, 1.05))
+        self.assertLessEqual(link.round_trip_ms, 51)
+        link.acknowledge(1, 0, 1.8)
+        self.assertFalse(link.healthy(1.95, True, 1.95))
+        link.sent(2, 2.0)
+        link.acknowledge(2, 950, 2.05)
+        self.assertFalse(link.healthy(2.05, True, 2.05))
+        link.acknowledge(2, 0, 3.1)
+        self.assertFalse(link.healthy(3.1, True, 3.1))
+        link.sent(3, 4.0)
+        link.acknowledge(3, 0, 4.05)
+        self.assertTrue(link.healthy(4.05, True, 4.05))
+        self.assertFalse(link.healthy(4.05, False, 4.05))
+        self.assertFalse(link.healthy(4.05, True, 3.0))
+
+
+    def test_dro_retains_trusted_values_during_moves_and_marks_actual_staleness(self):
+        display = DroDisplay()
+        packet = {"machine": {"x": -19, "y": 342, "z": 328},
+                  "work": {"x": -188.5, "y": 212.2, "z": 116},
+                  "reliability": "verified", "age_ms": 0, "warnings": []}
+        display.receive(packet, 1)
+        self.assertEqual(display.state("machine", 1, True), "live")
+        display.receive(dict(packet, moving=True, machine={"x": 999, "y": 999, "z": 999}), 1.1)
+        self.assertEqual(display.positions["machine"]["x"], -19)
+        self.assertEqual(display.state("machine", 1.1, True), "updating")
+        display.receive(dict(packet, warnings=["G53 transition"], reliability="awaiting-resync"), 1.2)
+        self.assertEqual(display.positions["work"]["x"], -188.5)
+        self.assertEqual(display.state("work", 1.2, True), "updating")
+        display.receive(dict(packet, machine={"x": -14, "y": 342, "z": 328}), 1.5)
+        self.assertEqual(display.positions["machine"]["x"], -14)
+        self.assertEqual(display.state("machine", 1.5, True), "live")
+        self.assertEqual(display.state("machine", 1.6, False), "stale")
+        self.assertEqual(display.positions["machine"]["x"], -14)
+        self.assertEqual(display.state("machine", 12, True), "stale")
+
     def test_disarmed_feed_adjustment_never_emits_motion(self):
         c = Controller()
         c.update(0, 0, 0, False, False, False, 0, 0.05, True, armed=False)

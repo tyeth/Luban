@@ -111,11 +111,15 @@ and attempted Z, without sending that segment. The usual agent motion-floor
 rules and staged-job workflow remain in force for AI operations. Pendant control requires homed, idle, coherent fresh position,
 toolhead off and no safety alarm or active job. A reconnect invalidates the arm.
 
-Only one move is in flight. Each move is at most 0.5 mm in vector length and
+Only one move is in flight. The operator approves a 0.5–1 second maximum segment
+duration (default 0.5 seconds), with distance calculated from feed and stick
+deflection. Changed intent uses roughly 100 ms segments; steady input ramps to
+the approved maximum. Measured controller/transport overhead reduces travel
+time to target a complete command cycle under one second. Each segment
 uses the existing machine-frame settled-motion engine and contact/crash
-tripwire. USB samples replace intent rather than queueing moves. USB silence
-over 300 ms, browser silence over 2 seconds, STOP, expiry, invalid input or a
-motion error disarms. The browser must remain visible. An already accepted
+tripwire. USB samples replace intent rather than queueing moves. USB silence over 300 ms pauses new segments; input, browser or round-trip
+feedback silence approaching one second disarms. STOP, expiry, invalid input
+and motion errors also disarm. The browser must remain visible. An already accepted
 segment can finish after release/STOP; use the machine's physical emergency
 stop for immediate stopping. A stopped/error session holds its position and
 does not invent a retreat or any extra motion.
@@ -207,3 +211,18 @@ feedback. Jog Stop does not cancel an already accepted homing command.
 
 The general automatic post-tool failure recovery hook is tracked separately in
 [issue #221](https://github.com/tyeth/Luban/issues/221); it is not implemented here.
+
+USB input runs at 20 Hz and host feedback at least 10 Hz while connected. The
+host echoes received input sequence numbers; the Feather measures round-trip
+age on its own clock, rejects replayed acknowledgements, and drops jog intent
+before feedback reaches one second old. Packets carry compact display data;
+full coordinate warning details remain on the web diagnostics page. The page
+shows round-trip time and commanded versus total segment duration. A long
+controller/network stall cannot be cancelled merely by changing the stick; no
+additional segment is queued, and the physical emergency stop remains available.
+
+The TFT and page retain their last trusted DRO values during an in-flight jog or
+coordinate-frame transition. These held values are labelled as updating (or
+stale on feedback loss) and never authorize motion. New verified arrivals
+replace them. A heartbeat received after an echo but still showing the tracker's
+previous position is treated as delayed using the existing tracker recheck.

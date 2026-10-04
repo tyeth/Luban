@@ -9,7 +9,7 @@ import displayio
 import terminalio
 import usb_cdc
 from adafruit_display_text import label
-from controller import Controller, normalize, deadzone
+from controller import Controller, DroDisplay, LinkWatchdog, normalize, deadzone
 
 if usb_cdc.data is None:
     print("Pendant maintenance console. Release D0 and reset to run USB data.")
@@ -66,6 +66,8 @@ if serial is None:
 serial.timeout = 0
 serial.write_timeout = 0
 controller = Controller()
+link_watchdog = LinkWatchdog()
+dro_display = DroDisplay()
 rx = b""
 dro = None
 last_dro = -100
@@ -93,9 +95,11 @@ while True:
                 if message.get("v") == 1 and message.get("type") == "dro":
                     dro = message
                     last_dro = now
+                    link_watchdog.acknowledge(message.get("input_seq"), message.get("input_age_ms"), now)
+                    dro_display.receive(message, now)
             except (ValueError, UnicodeError):
                 pass
-    fresh = serial.connected and now - last_dro < 1.0
+    fresh = link_watchdog.healthy(now, serial.connected, last_dro)
     linked = fresh and dro is not None and dro.get("armed") is True
     if linked != was_linked:
         controller.feed = 60
@@ -108,11 +112,14 @@ while True:
                                deadman.value, stop_button.value, now, dt, fresh, armed=linked)
     if serial.connected and now - last_send >= 0.05:
         packet.update({"v": 1, "seq": seq, "raw": raw, "dro_frame": frame,
+                       "feedback_ok": bool(fresh), "round_trip_ms": link_watchdog.round_trip_ms,
                        "display": [display.width, display.height]})
         # Nonblocking: partial frames force a newline and neutral re-arm, never a backlog.
         payload = (json.dumps(packet) + "\n").encode("utf-8")
         try:
             written = serial.write(payload)
+            if written == len(payload):
+                link_watchdog.sent(seq, now)
             if written != len(payload):
                 serial.write(b"\n")
                 controller.neutral_required = True
@@ -130,19 +137,19 @@ while True:
         header.color = 0xFFFFFF if z_mode else 0x55DDFF
         header.text = "%s %s" % ("DANGER: TWIST Z" if z_mode else "TWIST:FEED", "MACHINE" if frame == "machine" else "WORK")
         feed_value.text = str(int(controller.feed))
-        age = dro.get("age_ms") if dro else None
-        stale_after = dro.get("stale_after_ms", 10000) if dro else 10000
-        valid = fresh and age is not None and age < stale_after and dro.get("reliability") in ("verified", "heartbeat", "cached-offset")
-        valid = valid and not dro.get("warnings")
-        position = dro.get(frame) if valid else None
+        dro_state = dro_display.state(frame, now, fresh)
+        valid = dro_state == "live"
+        position = dro_display.positions.get(frame)
         for axis, area in zip("xyz", dro_labels):
             value = position.get(axis) if position else None
             area.text = axis.upper() + (" %8.3f" % value if value is not None else "  ---.---")
             area.color = 0xFFFFFF if valid else 0xFFBB44
         if not fresh:
-            status.text = "USB: waiting for Luban"
-        elif not valid:
-            status.text = "DRO stale / unavailable"
+            status.text = "USB stale: held DRO" if position else "USB: waiting for Luban"
+        elif dro_state == "updating":
+            status.text = "JOGGING: updating DRO" if linked else "DRO updating: held values"
+        elif dro_state != "live":
+            status.text = "DRO stale: held values" if position else "DRO unavailable"
         elif not linked:
             if controller.neutral_required:
                 status.text = "DISARMED: centre axes"

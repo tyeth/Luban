@@ -57,6 +57,13 @@ export const tests: Array<[string, () => void]> = [
             assert.equal(dro.stale_after_ms, 10000);
         }
     }],
+    ['a late-received report of the previous recorded position cannot disarm a verified jog', () => {
+        const p = { ...snapshot(), reportedAt: 5100, reportAgeMs: 100 };
+        const dro = pendantPosition(p, record, offset, 5200, 10000);
+        assert.equal(dro.warnings.length, 0);
+        assert.deepEqual(dro.machine, record.machine);
+        assert.ok(dro.heartbeatWarnings.length);
+    }],
     ['estimates, missing records, changed offsets, unrelated echoes and true staleness remain blocked', () => {
         for (const r of [null, { ...record, source: 'estimated' as const }, { ...record, tool: 'other' }]) {
             assert.ok(pendantPosition(snapshot(), r, offset, 5200, 10000).warnings.length);

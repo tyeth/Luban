@@ -31,7 +31,7 @@ export const tests: Array<[string, () => void]> = [
         session.receive(frame({ seq: 4, x: 1, deadman: true }), 1040);
         assert.ok(session.target(current, 1040));
     }],
-    ['diagonal motion caps vector length, feed scales slow input, and latest intent replaces old intent', () => {
+    ['diagonal motion caps duration, feed scales slow input, and latest intent replaces old intent', () => {
         const session = new PendantSession();
         session.arm(bounds, current, 1000);
         session.receive(frame(), 1000);
@@ -39,7 +39,7 @@ export const tests: Array<[string, () => void]> = [
         const target = session.target(current, 1010);
         assert.ok(target);
         if (!target) { throw new Error('Expected jog target'); }
-        assert.ok(Math.hypot(target.position.x - 10, target.position.y - 10) <= 0.500001);
+        assert.ok(Math.hypot(target.position.x - 10, target.position.y - 10) <= 1.000001);
         session.receive(frame({ seq: 2, x: -1, feed: 60, deadman: true }), 1020);
         const latest = session.target(current, 1020);
         assert.ok(latest);
@@ -48,13 +48,43 @@ export const tests: Array<[string, () => void]> = [
         session.receive(frame({ seq: 3 }), 1030);
         assert.equal(session.target(current, 1030), null);
     }],
+    ['time-based travel scales with feed, shrinks on changing intent, and reserves measured link overhead', () => {
+        const session = new PendantSession();
+        session.arm(bounds, current, 1000, 1000);
+        session.receive(frame(), 1000);
+        session.receive(frame({ seq: 1, x: 1, feed: 600, deadman: true }), 1010);
+        assert.equal(session.target(current, 1010)?.durationMs, 100);
+        session.receive(frame({ seq: 2, x: 1, feed: 600, deadman: true }), 3000);
+        const fast = session.target(current, 3000);
+        assert.equal(fast?.durationMs, 900);
+        assert.equal(fast?.distanceMm, 9);
+        assert.equal(session.target(current, 3000, 400)?.durationMs, 500);
+        session.receive(frame({ seq: 3, x: -0.5, feed: 600, deadman: true }), 3010);
+        const changed = session.target(current, 3010);
+        assert.equal(changed?.durationMs, 100);
+        assert.equal(changed?.feed, 300);
+        assert.equal(changed?.distanceMm, 0.5);
+        session.receive(frame({ seq: 4, x: 1, feed: 60, deadman: true }), 3020);
+        session.receive(frame({ seq: 5, x: 1, feed: 60, deadman: true }), 5000);
+        const slow = session.target(current, 5000);
+        assert.ok(Math.abs((slow?.distanceMm || 0) - 0.9) < 0.000001);
+        for (const duration of [499, 1001, NaN]) { assert.throws(() => session.arm(bounds, current, 0, duration)); }
+    }],
+    ['brief USB jitter pauses new segments without dropping the arm', () => {
+        const session = new PendantSession(); session.arm(bounds, current, 1000);
+        session.receive(frame(), 1000);
+        session.receive(frame({ seq: 1, x: 1, deadman: true }), 1010);
+        assert.equal(session.target(current, 1400), null); assert.equal(session.armed, true);
+        session.receive(frame({ seq: 2, x: 1, deadman: true }), 1410);
+        assert.ok(session.target(current, 1410));
+    }],
     ['stale USB, expiry, physical stop and replay require a new arm', () => {
         for (const cause of ['stale', 'expired', 'stop']) {
             const session = new PendantSession();
             session.arm(bounds, current, 1000);
             session.receive(frame(), 1000);
             session.receive(frame({ seq: 1, x: 1, deadman: true, stop: cause === 'stop' }), 1010);
-            const times: { [key: string]: number } = { stale: 1400, expired: 601001, stop: 1010 };
+            const times: { [key: string]: number } = { stale: 2000, expired: 601001, stop: 1010 };
             assert.equal(session.target(current, times[cause]), null);
             assert.equal(session.armed, false);
         }
@@ -73,7 +103,9 @@ export const tests: Array<[string, () => void]> = [
         session.arm(bounds, current, 1000);
         session.receive(frame(), 1000);
         session.receive(frame({ seq: 1, x: 1, deadman: true }), 1010);
-        assert.throws(() => session.target({ ...current, x: 20 }, 1010), /envelope/);
+        assert.equal(session.target({ ...current, x: 20 }, 1010), null);
+        assert.deepEqual(session.limitedAxes, ['X']);
+        assert.equal(session.armed, true);
     }],
     ['MCP and manual ownership excludes pending mutations but preserves status and stop', () => {
         const gate = new ManualControlGate();

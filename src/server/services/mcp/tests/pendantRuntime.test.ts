@@ -18,9 +18,11 @@ function fixture(a350 = false) {
     let tick: (() => void) | null = null;
     let finish: (() => void) | null = null;
     let moves = 0;
+    let immediate: (() => void) | null = null;
     let readyError = false;
     let estimated = false;
     let machineStatus = 'idle';
+    let warnings: string[] = [];
     const gate = new ManualControlGate();
     const obstacles: object[] = [];
     const machine = a350 ? { x: 124, y: 203.3289948730469, z: 327.9990070800781 } : { x: 10, y: 10, z: 10 };
@@ -28,7 +30,7 @@ function fixture(a350 = false) {
     const settingsChanges: object[] = [];
     const homes: unknown[][] = [];
     let restores = 0;
-    const snapshot = () => ({ machine, work: machine, originOffset: { x: 0, y: 0, z: 0 }, originOffsetSource: 'heartbeat', machineStatus, reliability: 'heartbeat', warnings: [], reportAgeMs: 0 });
+    const snapshot = () => ({ machine, work: machine, originOffset: { x: 0, y: 0, z: 0 }, originOffsetSource: 'heartbeat', machineStatus, reliability: 'heartbeat', warnings, reportAgeMs: 0 });
     class Port extends EventEmitter {
         public static current: Port;
 
@@ -94,6 +96,8 @@ function fixture(a350 = false) {
         Buffer,
         URL,
         setInterval: (fn: () => void) => { tick = fn; return 1; },
+        setImmediate: (fn: () => void) => { immediate = fn; return 1; },
+        clearImmediate: () => { immediate = null; },
         clearInterval: () => undefined });
     const runtime = exports.pendantRuntime;
     let token = '';
@@ -135,6 +139,7 @@ function fixture(a350 = false) {
         settingsChanges,
         homes,
         restores: () => restores,
+        setWarnings: (value: string[]) => { warnings = value; },
         setMachineStatus: (status: string) => { machineStatus = status; },
         writes: () => Port.current.writes,
         initialize: async () => {
@@ -148,6 +153,7 @@ function fixture(a350 = false) {
         },
         tick: async () => { if (tick) { tick(); } await settle(); },
         moves: () => moves,
+        immediate: async () => { const fn = immediate; immediate = null; if (fn) { fn(); } await settle(); },
         rawInput: (data: string) => Port.current.emit('data', Buffer.from(data)),
         finish: async () => { if (finish) { finish(); } await settle(); },
         advance: (ms: number) => { now += ms; },
@@ -158,6 +164,28 @@ function fixture(a350 = false) {
 }
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['USB feedback stays compact while full position warnings remain on the page', async () => {
+        const f = fixture(); await f.initialize();
+        f.setWarnings(['frame detail '.repeat(300)]); await f.tick();
+        const packet = f.writes().slice(-1)[0] as { input_seq: number; warnings: string[] }; // eslint-disable-line camelcase -- USB protocol key
+        assert.ok(packet.input_seq >= 0);
+        assert.ok(JSON.stringify(packet).length < 1024);
+        assert.equal(packet.warnings[0].length, 160);
+        const status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.ok(status.dro.heartbeatWarnings[0].length > 1000);
+    }],
+    ['feedback loss disarms, and completion samples latest USB intent without a timer delay', async () => {
+        const f = fixture(); await f.initialize(); await f.arm(); f.input();
+        f.input({ x: 1, deadman: true }); await f.tick(); assert.equal(f.moves(), 1);
+        await f.finish();
+        f.input({ x: -1, deadman: true }); await f.immediate(); assert.equal(f.moves(), 2);
+        await f.finish();
+        f.input({ feedback_ok: false }); await f.immediate(); assert.equal(f.moves(), 2);
+        const status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(status.armed, false); assert.match(status.error, /feedback exceeded one second/);
+        assert.equal((await f.arm()).status, 400);
+        f.input({ feedback_ok: true, round_trip_ms: 50 }); assert.equal((await f.arm()).status, 200);
+    }],
     ['frame recovery uses the shared no-motion command and leaves jogging disarmed', async () => {
         const f = fixture(); await f.initialize(); await f.arm();
         f.setMachineStatus('running');
@@ -334,7 +362,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
     ['USB timeout and machine reconnect disarm without extra moves', async () => {
         for (const reason of ['USB', 'epoch']) {
             const f = fixture(); await f.initialize(); await f.arm(); f.input();
-            if (reason === 'USB') { f.advance(301); } else { f.reconnect(); }
+            if (reason === 'USB') { f.advance(901); } else { f.reconnect(); }
             await f.tick();
             const status = JSON.parse((await f.request('/pendant/status')).body);
             assert.equal(status.armed, false);

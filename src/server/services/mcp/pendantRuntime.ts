@@ -34,6 +34,14 @@ export class PendantRuntime {
 
     private recovery: string | null = null;
 
+    private nextJog: ReturnType<typeof setImmediate> | null = null;
+
+    private lastJog: { durationMs: number; distanceMm: number; feed: number; elapsedMs: number } | null = null;
+
+    private commandOverheadMs = 500;
+
+    private feedbackHealthy: boolean | null = null;
+
     private owned = false;
 
     private opening = false;
@@ -139,6 +147,7 @@ export class PendantRuntime {
     }
 
     public disarm(reason = 'Disarmed by operator.'): void {
+        if (this.nextJog !== null) { clearImmediate(this.nextJog); this.nextJog = null; }
         if (this.session.armed || this.error !== reason) { log.info(`Disarmed: ${reason}`); }
         this.session.disarm();
         this.error = reason;
@@ -158,6 +167,7 @@ export class PendantRuntime {
             if (!ports.some((p) => p.path === path)) { throw new Error('Select the Feather USB data port.'); }
             this.shutdown();
             this.session.reset();
+            this.feedbackHealthy = null;
             const port = new SerialPort({ path, baudRate: 115200, autoOpen: false });
             this.port = port;
             port.on('error', (err: Error) => { if (port === this.port) { this.disarm(err.message); } });
@@ -172,8 +182,12 @@ export class PendantRuntime {
                     for (const line of lines) {
                         if (line.trim()) {
                             const input = parsePendantInput(line);
+                            this.feedbackHealthy = input.feedback_ok ?? null;
                             this.session.receive(input, Date.now());
                             if (input.stop) { this.disarm('Stopped with Feather D2.'); }
+                            if (this.session.armed && input.feedback_ok === false) {
+                                this.disarm('Feather feedback exceeded one second. Centre axes and re-arm after the USB link recovers.');
+                            }
                         }
                     }
                 } catch (err) { this.disarm((err as Error).message); }
@@ -197,17 +211,28 @@ export class PendantRuntime {
 
     private async tick(): Promise<void> {
         const now = Date.now();
-        if (this.session.armed && (now - this.pageAliveAt > 2000 || now - this.session.receivedAt > 300
-            || now >= this.session.expiresAt || this.machineEpoch() !== this.epoch)) {
-            this.disarm('Session, browser, USB input or machine connection expired. Re-arm at centre.');
+        if (this.session.armed) {
+            if (this.machineEpoch() !== this.epoch) { this.disarm('Machine connection changed. Re-arm at centre.'); } else if (now >= this.session.expiresAt) { this.disarm('The 10-minute jog approval expired. Review bounds and re-arm.'); } else if (now - this.pageAliveAt > 900) { this.disarm('Pendant page heartbeat exceeded the one-second limit. Keep the page visible and re-arm.'); } else if (now - this.session.receivedAt > 900) { this.disarm('Feather input exceeded the one-second limit. Check USB, centre axes and re-arm.'); }
         }
         if (this.port?.isOpen && this.port.writableLength < 1024) {
+            const dro = this.dro() as { machine: object | null; work: object | null; reliability: string;
+                // eslint-disable-next-line camelcase -- USB protocol keys
+                age_ms: number | null; position_age_ms?: number; stale_after_ms?: number; warnings: string[] };
             this.port.write(`${JSON.stringify({ v: 1,
                 type: 'dro',
                 armed: this.session.armed,
                 neutral: this.session.neutral,
-                ...this.dro(),
-                message: this.error })}\n`, (err) => {
+                machine: dro.machine,
+                work: dro.work,
+                reliability: dro.reliability,
+                age_ms: dro.age_ms,
+                position_age_ms: dro.position_age_ms,
+                stale_after_ms: dro.stale_after_ms,
+                moving: this.busy && this.recovery === null,
+                warnings: dro.warnings.length ? [dro.warnings[0].slice(0, 160)] : [],
+                input_seq: this.session.inputSequence >= 0 ? this.session.inputSequence : null,
+                input_age_ms: now - this.session.receivedAt,
+                message: this.error?.slice(0, 240) || null })}\n`, (err) => {
                 if (err) { this.disarm(err.message); }
             });
         }
@@ -215,16 +240,29 @@ export class PendantRuntime {
         if (this.busy || !this.session.armed) { return; }
         this.ready();
         const from = this.position();
-        const target = this.session.target(from, now);
+        const target = this.session.target(from, now, this.commandOverheadMs);
         if (!target) { this.release(); return; }
         this.validateEnvelope(this.session.bounds as JogBounds);
         this.validateJogSegment(from, target.position);
         this.busy = true;
         try {
             await moveMachineSettled('usb_pendant', target.position, target.feed);
+            this.lastJog = { durationMs: target.durationMs,
+                distanceMm: target.distanceMm,
+                feed: target.feed,
+                elapsedMs: Date.now() - now };
+            this.commandOverheadMs = Math.max(this.commandOverheadMs * 0.8, this.lastJog.elapsedMs - target.durationMs, 0);
         } finally {
             this.busy = false;
             this.release();
+        }
+        // Service pending USB events before sampling the next intent. Do not add
+        // the periodic timer's 0–100 ms idle gap after each synchronous move.
+        if (this.session.armed && this.nextJog === null) {
+            this.nextJog = setImmediate(() => {
+                this.nextJog = null;
+                this.tick().catch((err: Error) => this.disarm(err.message));
+            });
         }
     }
 
@@ -275,6 +313,10 @@ export class PendantRuntime {
                 neutral: this.session.neutral,
                 busy: this.busy,
                 recovery: this.recovery,
+                maxSegmentMs: this.session.maxSegmentMs,
+                limitedAxes: this.session.limitedAxes,
+                lastJog: this.lastJog,
+                inputAgeMs: Date.now() - this.session.receivedAt,
                 port: this.port?.path || null,
                 input: this.session.latest,
                 error: this.error,
@@ -303,6 +345,9 @@ export class PendantRuntime {
                     if (!this.port?.isOpen || this.busy || Date.now() - this.session.receivedAt > 300) {
                         throw new Error('No recent USB input, or a jog is still settling.');
                     }
+                    if (this.feedbackHealthy === false) {
+                        throw new Error('Wait for the Feather to acknowledge host feedback within one second before arming.');
+                    }
                     if (args.clearanceConfirmed !== true) { throw new Error('Review and confirm the entire envelope.'); }
                     this.ready();
                     const bounds = this.reviewedBounds(args.bounds);
@@ -310,7 +355,7 @@ export class PendantRuntime {
                     this.validateJogSegment(current, current);
                     manualControlGate.acquire(() => this.disarm('Stopped through MCP.'));
                     this.owned = true;
-                    this.session.arm(bounds, this.position(), Date.now());
+                    this.session.arm(bounds, this.position(), Date.now(), args.maxSegmentMs ?? 500);
                     this.epoch = this.machineEpoch();
                     this.pageAliveAt = Date.now();
                     this.error = null;

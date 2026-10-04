@@ -53,6 +53,7 @@ async function pageFixture() {
         error: '',
         ports: [{ path: 'COM42' }],
         input: { mode: 'feed' },
+        dro: { machine: { x: 10, y: 20, z: 30 }, work: { x: 1, y: 2, z: 3 }, reliability: 'verified', warnings: [] as string[] },
         settings: { activeTool: { active: null, stored: null }, toolProtrusion: { mm: 70, source: 'longest-bit' }, clearanceMarginMm: 5, landmarks: [{ id: 'rotary-id', name: 'rotary', description: 'Rotary unit', machine: { x0: 140, x1: 200, y0: 0, y1: 350 }, clearanceZ: 250, clearanceBasis: 'physical', notes: '' }] },
         obstacleExclusions: [{ name: 'rotary-axis', machine: { x0: 135, x1: 205, y0: -5, y1: 355 }, requiredZ: 328 }],
         travelBounds: { xMin: -19, xMax: 330, yMin: 0, yMax: 342, zMin: 0, zMax: 328 },
@@ -93,6 +94,16 @@ async function pageFixture() {
 }
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['DRO retains labelled values through in-flight motion and refreshes on verified arrival', async () => {
+        const f = await pageFixture();
+        assert.match(f.element('dro').textContent, /MACHINE: X 10.000/);
+        f.state.busy = true; f.state.dro.machine.x = 999; await f.refresh();
+        assert.match(f.element('dro').textContent, /Held values/);
+        assert.match(f.element('dro').textContent, /MACHINE: X 10.000/);
+        f.state.busy = false; f.state.dro.machine.x = 15; await f.refresh();
+        assert.match(f.element('dro').textContent, /MACHINE: X 15.000/);
+        assert.ok(!f.element('dro').textContent.includes('Held values'));
+    }],
     ['USB choices recover after hotplug and preserve the selected device', async () => {
         const f = await pageFixture();
         assert.equal(f.element('port').value, 'COM42');
