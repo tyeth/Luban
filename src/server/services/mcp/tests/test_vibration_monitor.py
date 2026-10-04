@@ -78,13 +78,20 @@ class FakeI2C:
         self.locked = False
 
     def device(self, addr):
+        # Every device that would see this address right now: the root one,
+        # plus any behind an OPEN mux channel. Two = a bus collision.
+        found = []
         if addr in self.devices:
-            return self.devices[addr]
+            found.append(self.devices[addr])
         for mux_addr, mask in self.muxes.items():
             for channel in range(8):
                 if mask & (1 << channel) and (mux_addr, channel, addr) in self.behind:
-                    return self.behind[(mux_addr, channel, addr)]
-        raise OSError('no ACK from 0x%02x' % addr)
+                    found.append(self.behind[(mux_addr, channel, addr)])
+        if len(found) > 1:
+            raise OSError('bus collision: %d devices answered 0x%02x' % (len(found), addr))
+        if not found:
+            raise OSError('no ACK from 0x%02x' % addr)
+        return found[0]
 
     def writeto(self, addr, data):
         assert self.locked
@@ -212,6 +219,116 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(batch['n'], 3)
         self.assertEqual(batch['ng'], 3)
         self.assertEqual(len(sensor.accel), 6)  # sample 3 waits for its gyro word
+
+    def test_a_bad_tag_splits_the_batch_and_marks_the_next_as_a_gap(self):
+        imu = FakeImu()
+        sensor = monitor.FifoSensor(monitor.Bus(FakeI2C({0x6A: imu})), self.spec(), 9)
+        sensor.start()
+        imu.push(0x02, 1, 0, 0)
+        imu.push(0x02, 2, 0, 0)
+        imu.fifo.append(bytes([0x1F << 3]) + bytes(6))  # a corrupt word
+        imu.push(0x02, 3, 0, 0)
+        saved = monitor.BATCH_S
+        monitor.BATCH_S = 10.0
+        try:
+            sensor.poll()
+        finally:
+            monitor.BATCH_S = saved
+        batches = [line for line in self.lines if line.get('t') == 'batch']
+        self.assertEqual([x for x, _, _ in decode(batches[0])], [1, 2])
+        self.assertFalse(batches[0]['ovr'])
+        sensor.emit_batch()
+        last = [line for line in self.lines if line.get('t') == 'batch'][-1]
+        self.assertEqual([x for x, _, _ in decode(last)], [3])
+        self.assertTrue(last['ovr'], 'the sample after the hole starts a new run')
+        self.assertEqual(sensor.bad_tags, 1)
+
+    def test_a_root_poll_sensor_never_reaches_a_device_behind_an_open_mux_channel(self):
+        # The configured muxed sensor is at 0x6A; another device on the same
+        # channel answers at 0x6B, the root sensor's address. A root read with
+        # that channel still open would collide.
+        root = FakeImu()
+        behind = FakeImu()
+        neighbour = FakeImu()
+        i2c = FakeI2C({0x6B: root}, muxes=(0x70,))
+        i2c.attach_behind(0x70, 1, 0x6A, behind)
+        i2c.attach_behind(0x70, 1, 0x6B, neighbour)
+        bus = monitor.Bus(i2c)
+        fifo = monitor.FifoSensor(bus, self.spec(id='tail', mux={'address': 0x70, 'channel': 1}), 9)
+
+        class Driver:
+            # Reads WHO_AM_I through whatever i2c object it was given, as an Adafruit driver would.
+            def __init__(self, i2c_obj, addr):
+                self.i2c = i2c_obj
+                self.addr = addr
+                self.reads = 0
+
+            @property
+            def acceleration(self):
+                while not self.i2c.try_lock():
+                    pass
+                try:
+                    buf = bytearray(1)
+                    self.i2c.writeto_then_readfrom(self.addr, bytes([0x0F]), buf)
+                finally:
+                    self.i2c.unlock()
+                self.reads += 1
+                return (0.0, 0.0, 9.80665)
+
+        saved = monitor.driver_for
+        monitor.driver_for = lambda chip, i2c_obj, addr: Driver(i2c_obj, addr)
+        try:
+            poll = monitor.PollSensor(bus, self.spec(id='head', chip='bno055', mode='poll', rate_hz=1000, address=0x6B))
+            fifo.start()  # leaves mux channel 1 open
+            poll.start()
+            for i in range(20):
+                behind.push(0x02, i, 0, 0)
+                fifo.poll()
+                poll.next_due = 0
+                poll.poll()  # would collide if the channel were still open
+        finally:
+            monitor.driver_for = saved
+        self.assertEqual(poll.driver.reads, 20)
+        self.assertIn((0x70, 0), i2c.mux_writes)
+        self.assertFalse([line for line in self.lines if line.get('t') == 'warn'])
+
+    def test_eight_sensors_on_four_mux_channels_stream_without_cross_talk(self):
+        i2c = FakeI2C({}, muxes=(0x70,))
+        imus = {}
+        specs = []
+        for channel in range(4):
+            for addr in (0x6A, 0x6B):
+                imu = FakeImu()
+                i2c.attach_behind(0x70, channel, addr, imu)
+                sid = 's%d_%x' % (channel, addr)
+                imus[sid] = imu
+                specs.append(self.spec(id=sid, address=addr, mux={'address': 0x70, 'channel': channel}, gyro=(channel % 2 == 1)))
+        bus = monitor.Bus(i2c)
+        sensors = monitor.make_sensors(bus, {'sensors': specs})
+        for sensor in sensors:
+            monitor.start_sensor(sensor)
+        self.assertTrue(all(sensor.state == 'ok' for sensor in sensors))
+        expected = {sid: [] for sid in imus}
+        for round_no in range(25):
+            for k, (sid, imu) in enumerate(sorted(imus.items())):
+                for j in range(1 + (round_no + k) % 5):
+                    value = k * 1000 + len(expected[sid])
+                    expected[sid].append(value)
+                    imu.push(0x02, value, -value, k)
+                    if sid.startswith(('s1', 's3')):
+                        imu.push(0x01, value, 0, 0)
+            for sensor in sensors:
+                sensor.poll()
+        for sensor in sensors:
+            if sensor.accel:
+                sensor.emit_batch()
+        got = {sid: [] for sid in imus}
+        for line in self.lines:
+            if line.get('t') == 'batch':
+                got[line['id']].extend(x for x, _, _ in decode(line))
+        self.assertEqual(got, expected)
+        self.assertFalse([line for line in self.lines if line.get('t') == 'warn'])
+        self.assertTrue(all(not line['ovr'] for line in self.lines if line.get('t') == 'batch'))
 
     def test_a_part_without_address_rollback_falls_back_to_one_word_per_read(self):
         imu = FakeImu(wraps=False)

@@ -654,7 +654,7 @@ const McpServer: React.FC = () => {
                             onChange={(e) => setVibrationSerialPort(e.target.value)}
                             disabled={!enabled || vibrationEnv('serialPort')}
                             style={{ width: 360 }}
-                            placeholder="/dev/ttyACM1 or COM7"
+                            placeholder="/dev/ttyACM1 or COM7 - several boards: comma-separated"
                         />
                     </div>
                 )}

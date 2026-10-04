@@ -1,6 +1,6 @@
 import assert from 'assert';
 
-import { bridgeOf, parseOrientation, parseSensors, resolveVibrationConfig, toMachineFrame } from '../vibrationConfig';
+import { bridgeOf, leaseConflict, parseOrientation, parseSensors, probeLeases, resolveVibrationConfig, toMachineFrame } from '../vibrationConfig';
 
 type TestCase = [string, () => void | Promise<void>];
 
@@ -69,15 +69,63 @@ export const tests: TestCase[] = [
     ['refuses to share the probe feed\'s USB bridge, allows a different one', () => {
         const probeOnU2if = { mcpProbeTransport: 'gpio', mcpGpioPinProbe: 'A0:down', mcpVibration: true, mcpVibrationSensors: SENSORS };
         const shared = resolveVibrationConfig({}, store({ ...probeOnU2if, mcpVibrationBlinkaEnv: 'BLINKA_U2IF=1' }));
-        assert.ok(shared.problems.some((p) => /share the probe feed's BLINKA_U2IF bridge/.test(p)), JSON.stringify(shared.problems));
+        assert.ok(shared.problems.some((p) => /share usb:BLINKA_U2IF with the probe feed/.test(p)), JSON.stringify(shared.problems));
         // Probe pins only, transport unset: auto-gpio, default U2IF env - still the same bridge.
         const implicit = resolveVibrationConfig({}, store({ mcpGpioPinProbe: 'A0:down', mcpVibration: true, mcpVibrationSensors: SENSORS, mcpVibrationBlinkaEnv: 'BLINKA_U2IF=1' }));
-        assert.ok(implicit.problems.some((p) => /share the probe feed/.test(p)));
+        assert.ok(implicit.problems.some((p) => /share usb:BLINKA_U2IF with the probe feed/.test(p)));
         const own = resolveVibrationConfig({}, store({ ...probeOnU2if, mcpVibrationBlinkaEnv: 'BLINKA_MCP2221=1' }));
         assert.deepStrictEqual(own.problems, []);
         assert.deepStrictEqual(own.blinkaEnv, { BLINKA_MCP2221: '1' });
         assert.strictEqual(bridgeOf({ BLINKA_FT232H: '1' }), 'BLINKA_FT232H');
         assert.strictEqual(bridgeOf({}), 'native');
+    }],
+
+    ['several CircuitPython boards: one link per port, sensors assigned by port, each board its own bus', () => {
+        const sensors = JSON.stringify([
+            { id: 'head', location: 'toolhead', chip: 'lsm6dsox', port: '/dev/ttyACM1' },
+            { id: 'tail', location: 'tailstock', chip: 'lsm6dsox', port: '/dev/ttyACM2' },
+            { id: 'chuck', location: 'rotary-chuck', chip: 'lsm6dsox', address: '0x6b', port: '/dev/ttyACM2' },
+        ]);
+        const cfg = resolveVibrationConfig({}, store({
+            mcpVibration: true, mcpVibrationTransport: 'serial', mcpVibrationSerialPort: '/dev/ttyACM1, /dev/ttyACM2', mcpVibrationSensors: sensors,
+        }));
+        assert.deepStrictEqual(cfg.problems, []);
+        assert.deepStrictEqual(cfg.links.map((l) => [l.id, l.sensors.map((s) => s.id)]), [['/dev/ttyACM1', ['head']], ['/dev/ttyACM2', ['tail', 'chuck']]]);
+        assert.deepStrictEqual(cfg.leases, ['serial:/dev/ttyACM1', 'serial:/dev/ttyACM2']);
+        const unassigned = resolveVibrationConfig({}, store({
+            mcpVibration: true, mcpVibrationTransport: 'serial', mcpVibrationSerialPort: 'COM7,COM8', mcpVibrationSensors: JSON.stringify([{ id: 'a', location: 'bed', chip: 'lsm6dsox' }]),
+        }));
+        assert.ok(unassigned.problems.some((p) => /name its board's port/.test(p)));
+        assert.ok(unassigned.problems.some((p) => /COM7 has no sensors|COM8 has no sensors/.test(p)));
+    }],
+
+    ['a root sensor cannot share an address with a muxed one, nor sit at the mux address', () => {
+        const { problems } = parseSensors([
+            { id: 'root', location: 'toolhead', chip: 'lsm6dsox', address: '0x6a' },
+            { id: 'muxed', location: 'tailstock', chip: 'lsm6dsox', address: '0x6a', mux: { address: '0x70', channel: 2 } },
+            { id: 'clash', location: 'bed', chip: 'bno055', address: '0x70' },
+            { id: 'behind', location: 'frame', chip: 'lsm6dsox', address: '0x6b', mux: { address: '0x70', channel: 3 } },
+        ]);
+        assert.ok(problems.some((p) => /would collide with the sensor behind a mux/.test(p)), JSON.stringify(problems));
+        assert.ok(problems.some((p) => /the address of a TCA9548A mux/.test(p)));
+    }],
+
+    ['gyro only on chips that have one; one bridge selector; native pins are leases too', () => {
+        assert.match(String(parseSensors([{ id: 'a', location: 'bed', chip: 'lis3dh', gyro: true }]).problems), /has no gyroscope/);
+        assert.deepStrictEqual(parseSensors([{ id: 'a', location: 'rotary-chuck', chip: 'bno055', gyro: true }]).problems, []);
+        const two = resolveVibrationConfig({}, store({ mcpVibration: true, mcpVibrationSensors: SENSORS, mcpVibrationBlinkaEnv: 'BLINKA_MCP2221=1 BLINKA_FT232H=1' }));
+        assert.ok(two.problems.some((p) => /choose exactly one bridge/.test(p)));
+        // A probe on Raspberry Pi header pin D2 (= SDA) and accelerometers on native I2C.
+        const native = resolveVibrationConfig({}, store({
+            mcpProbeTransport: 'gpio', mcpGpioBlinkaEnv: 'native', mcpGpioPinProbe: 'D2:up', mcpVibration: true, mcpVibrationSensors: SENSORS, mcpVibrationBlinkaEnv: 'native',
+        }));
+        assert.ok(native.problems.some((p) => /share pin:SDA/.test(p)), JSON.stringify(native.problems));
+        const nativeOk = resolveVibrationConfig({}, store({
+            mcpProbeTransport: 'gpio', mcpGpioBlinkaEnv: 'native', mcpGpioPinProbe: 'D17:up', mcpVibration: true, mcpVibrationSensors: SENSORS, mcpVibrationBlinkaEnv: 'native',
+        }));
+        assert.deepStrictEqual(nativeOk.problems, []);
+        assert.deepStrictEqual(probeLeases('gpio', null, ['A0:down']), ['usb:BLINKA_U2IF']);
+        assert.strictEqual(leaseConflict(['usb:BLINKA_MCP2221'], ['usb:BLINKA_U2IF'], 'x'), null);
     }],
 
     ['a configuration the I2C bus cannot carry, or rings too big for memory, is refused', () => {

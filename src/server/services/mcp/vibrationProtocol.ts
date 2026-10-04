@@ -263,7 +263,11 @@ export class PollResampler {
 
     private prevT: number | null = null;
 
-    private prev: Float32Array = new Float32Array(3);
+    /** The previous arrival's channels: accel x,y,z then (once seen) gyro x,y,z. */
+    private prev: number[] = [0, 0, 0, 0, 0, 0];
+
+    /** Set once a batch carried gyro: from then on the output has six channels (a batch without them holds the last value). */
+    private hasGyro = false;
 
     /** The grid is gridStart + k / rate (k counted, never accumulated: no drift). */
     private gridStart = 0;
@@ -279,17 +283,29 @@ export class PollResampler {
         this.maxGapS = maxGapS;
     }
 
-    public push(batch: MonitorBatch): { times: Float64Array; accel: Float32Array; gap: boolean } {
+    public push(batch: MonitorBatch): { times: Float64Array; accel: Float32Array; gyro: Float32Array | null; gap: boolean } {
         const outT: number[] = [];
         const outA: number[] = [];
+        const outG: number[] = [];
         let gap = false;
         const offsets = batch.offsetsS as Float64Array;
         const eps = 1e-9;
+        if (batch.gyro) {
+            this.hasGyro = true;
+        }
+        const emitAt = (t: number, v: number[]) => {
+            outT.push(t);
+            outA.push(v[0], v[1], v[2]);
+            outG.push(v[3], v[4], v[5]);
+        };
         for (let i = 0; i < batch.n; i++) {
             const t = batch.stampS + offsets[i];
-            const ax = batch.accel[i * 3];
-            const ay = batch.accel[i * 3 + 1];
-            const az = batch.accel[i * 3 + 2];
+            const v = [batch.accel[i * 3], batch.accel[i * 3 + 1], batch.accel[i * 3 + 2]];
+            if (batch.gyro) {
+                v.push(batch.gyro[i * 3], batch.gyro[i * 3 + 1], batch.gyro[i * 3 + 2]);
+            } else {
+                v.push(this.prev[3], this.prev[4], this.prev[5]);
+            }
             if (this.prevT !== null && t - this.prevT > this.maxGapS) {
                 gap = true;
                 this.gaps++;
@@ -297,11 +313,10 @@ export class PollResampler {
             }
             if (this.prevT === null) {
                 this.prevT = t;
-                this.prev = Float32Array.of(ax, ay, az);
+                this.prev = v;
                 this.gridStart = t;
                 this.gridIndex = 1;
-                outT.push(t);
-                outA.push(ax, ay, az);
+                emitAt(t, v);
                 continue;
             }
             if (t <= this.prevT) {
@@ -317,14 +332,18 @@ export class PollResampler {
                     break;
                 }
                 const f = Math.min(1, (next - this.prevT) / (t - this.prevT));
-                outT.push(next);
-                outA.push(this.prev[0] + f * (ax - this.prev[0]), this.prev[1] + f * (ay - this.prev[1]), this.prev[2] + f * (az - this.prev[2]));
+                emitAt(next, v.map((value, c) => this.prev[c] + f * (value - this.prev[c])));
                 this.gridIndex++;
             }
             this.prevT = t;
-            this.prev = Float32Array.of(ax, ay, az);
+            this.prev = v;
         }
-        return { times: Float64Array.from(outT), accel: Float32Array.from(outA), gap };
+        return {
+            times: Float64Array.from(outT),
+            accel: Float32Array.from(outA),
+            gyro: this.hasGyro ? Float32Array.from(outG) : null,
+            gap,
+        };
     }
 
     /** Arrival interval statistics (s): how uneven the polling really is. */

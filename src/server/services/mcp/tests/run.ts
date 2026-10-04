@@ -61,6 +61,7 @@ import { tests as vibrationAnalysisTests } from './vibrationAnalysis.test';
 import { tests as vibrationConfigTests } from './vibrationConfig.test';
 import { tests as vibrationProtocolTests } from './vibrationProtocol.test';
 import { tests as vibrationReportTests } from './vibrationReport.test';
+import { tests as vibrationStreamTests } from './vibrationStream.test';
 
 type TestCase = [string, () => void | Promise<void>];
 
@@ -109,6 +110,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['vibrationReport', vibrationReportTests],
     ['vibrationConfig', vibrationConfigTests],
     ['vibrationProtocol', vibrationProtocolTests],
+    ['vibrationStream', vibrationStreamTests],
     ['rotaryGravity', rotaryGravityTests],
     ['telemetryConfig', telemetryConfigTests],
     ['spindleProgram', spindleProgramTests],

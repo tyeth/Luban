@@ -69,6 +69,8 @@ export type SensorMode = 'fifo' | 'poll';
 export const FIFO_CHIPS = ['lsm6dsox', 'lsm6dso32', 'ism330dhcx'] as const;
 export const POLL_CHIPS = ['lsm6dsox', 'lsm6dso32', 'ism330dhcx', 'lsm6ds3trc', 'lsm6ds33', 'lsm9ds1', 'bno055', 'mpu6050', 'icm20948', 'lis3dh', 'adxl34x'] as const;
 export type SensorChip = typeof POLL_CHIPS[number];
+/** Chips with a gyroscope the monitor can stream (FIFO words or the driver's `gyro`). */
+export const GYRO_CHIPS: SensorChip[] = ['lsm6dsox', 'lsm6dso32', 'ism330dhcx', 'lsm6ds3trc', 'lsm6ds33', 'lsm9ds1', 'bno055', 'mpu6050', 'icm20948'];
 
 /** 7-bit default I2C address of each chip on its Adafruit breakout (address jumper open). */
 export const DEFAULT_ADDRESS: { [chip in SensorChip]: number } = {
@@ -135,14 +137,24 @@ export interface SensorSpec {
     /** fifo: the ODR (one of FIFO_ODR_HZ). poll: the target poll rate. */
     rateHz: number;
     rangeG: number;
-    /** Also stream the gyroscope (fifo chips; dps). */
+    /** Also stream the gyroscope (dps), FIFO or poll; only on GYRO_CHIPS. */
     gyro: boolean;
+    /** serial transport: the board (serial port) this sensor hangs off; null = the only one. */
+    port: string | null;
     /** Machine axis each sensor axis points along, when known: [x, y, z]. */
     orientation: [MachineAxis, MachineAxis, MachineAxis] | null;
     note: string | null;
 }
 
 export type SettingSource = 'env' | 'config' | 'default';
+
+export interface VibrationLink {
+    /** 'blinka', or the serial port. */
+    id: string;
+    transport: VibrationTransport;
+    port: string | null;
+    sensors: SensorSpec[];
+}
 
 export interface VibrationConfig {
     enabled: boolean;
@@ -151,7 +163,12 @@ export interface VibrationConfig {
     /** Blinka environment as text (blinka transport), null when none was configured. */
     blinkaEnvText: string | null;
     blinkaEnv: { [name: string]: string };
-    serialPort: string | null;
+    /** serial transport: one CircuitPython board per port, each with its own I2C bus and sensors. */
+    serialPorts: string[];
+    /** One monitor per link: the Blinka bridge, or each serial board. */
+    links: VibrationLink[];
+    /** Physical resources the accelerometers hold exclusively (USB bridge, I2C pins, serial ports). */
+    leases: string[];
     i2cHz: number;
     /** Record every file job's vibration automatically. */
     jobCapture: boolean;
@@ -205,14 +222,59 @@ export function parseEnvPairs(text: string): { [name: string]: string } | string
     return out;
 }
 
-/** Which USB bridge a Blinka environment selects, for the shared-bridge check. */
+const BRIDGE_SELECTORS = ['BLINKA_U2IF', 'BLINKA_MCP2221', 'BLINKA_FT232H', 'BLINKA_FT2232H', 'BLINKA_GREATFET'];
+
+/** Every USB-bridge selector a Blinka environment switches on. */
+export function bridgeSelectors(env: { [name: string]: string }): string[] {
+    return BRIDGE_SELECTORS.filter((name) => env[name] !== undefined && env[name] !== '' && env[name] !== '0');
+}
+
+/** Which USB bridge a Blinka environment selects ('native' = none: a board's own pins). */
 export function bridgeOf(env: { [name: string]: string }): string {
-    for (const name of ['BLINKA_U2IF', 'BLINKA_MCP2221', 'BLINKA_FT232H', 'BLINKA_FT2232H', 'BLINKA_GREATFET']) {
-        if (env[name] !== undefined && env[name] !== '' && env[name] !== '0') {
-            return name;
-        }
+    return bridgeSelectors(env)[0] || 'native';
+}
+
+/**
+ * Raspberry Pi header pins that ARE the I2C bus (board.D2/D3 = SDA/SCL on
+ * I2C1): a native probe pin named either way collides with native I2C.
+ */
+const NATIVE_I2C_PIN_ALIASES: { [pin: string]: string } = { D2: 'SDA', D3: 'SCL', SDA: 'SDA', SCL: 'SCL', SDA1: 'SDA', SCL1: 'SCL' };
+
+/**
+ * The exclusive physical resources a Blinka process holds: the USB bridge
+ * it opens, or - on native pins - the pins themselves. The accelerometers
+ * and the safety (probe / crash sensor) feed must never hold one in common;
+ * a future SPI feed declares its pins the same way (pin:SCK, pin:MOSI ...).
+ */
+export function blinkaLeases(env: { [name: string]: string }, pins: string[]): string[] {
+    const bridge = bridgeOf(env);
+    if (bridge !== 'native') {
+        return [`usb:${bridge}`];
     }
-    return 'native';
+    return pins.map((pin) => `pin:${NATIVE_I2C_PIN_ALIASES[pin.toUpperCase()] || pin.toUpperCase()}`);
+}
+
+/** The probe feed's leases from its transport kind, Blinka environment text and pin specs ("A0:down"). */
+export function probeLeases(kind: string, envText: string | null, pinSpecs: string[]): string[] {
+    if (kind !== 'gpio') {
+        return [];
+    }
+    const env = parseEnvPairs(envText === null ? GPIO_DEFAULT_BLINKA_ENV : envText);
+    if (typeof env === 'string') {
+        return [];
+    }
+    return blinkaLeases(env, pinSpecs.map((spec) => spec.split(':')[0].trim()).filter(Boolean));
+}
+
+/** Resources both sides would hold, with a sentence naming them; null when none. */
+export function leaseConflict(own: string[], safety: string[], what: string): string | null {
+    const shared = own.filter((lease) => safety.includes(lease));
+    if (!shared.length) {
+        return null;
+    }
+    return `the accelerometers would share ${shared.join(', ')} with ${what} - refused: the probe and crash sensors are safety equipment, `
+        + 'and two processes on one USB bridge or pin contend for it (a claim leaked mid-open wedged the KB2040 on 2026-09-19). '
+        + 'Give the accelerometers their own bridge (an MCP2221A or FT232H breakout) or a CircuitPython board on serial';
 }
 
 const MACHINE_AXES: MachineAxis[] = ['+x', '-x', '+y', '-y', '+z', '-z'];
@@ -344,6 +406,10 @@ export function parseSensor(entry: unknown, index: number): SensorSpec | string 
         }
         orientation = parsed;
     }
+    const gyro = parseFlag(e.gyro);
+    if (gyro && !GYRO_CHIPS.includes(chip)) {
+        return `${at}: ${chip} has no gyroscope (gyro needs one of ${GYRO_CHIPS.join(', ')})`;
+    }
     return {
         id,
         location,
@@ -353,7 +419,8 @@ export function parseSensor(entry: unknown, index: number): SensorSpec | string 
         mux,
         rateHz,
         rangeG,
-        gyro: parseFlag(e.gyro),
+        gyro,
+        port: present(e.port) ? String(e.port).trim() : null,
         orientation,
         note: present(e.note) ? String(e.note).trim() : null,
     };
@@ -392,7 +459,19 @@ export function parseSensors(raw: unknown): { sensors: SensorSpec[]; problems: s
             problems.push(`sensor id "${sensor.id}" is used twice`);
         }
         ids.add(sensor.id);
-        const bus = `${sensor.mux ? `${sensor.mux.address}/${sensor.mux.channel}` : 'root'}:${sensor.address}`;
+        // Each serial board has its own bus: the same address on two boards is fine.
+        const bus = `${sensor.port || ''}|${sensor.mux ? `${sensor.mux.address}/${sensor.mux.channel}` : 'root'}:${sensor.address}`;
+        // A root device and a muxed one at the same address cannot coexist: an
+        // open channel joins its devices to the root bus, so both would answer.
+        // Nor may a sensor sit at a mux's own address.
+        const sameBoard = sensors.filter((other) => other !== sensor && (other.port || '') === (sensor.port || ''));
+        if (!sensor.mux && sameBoard.some((other) => other.mux && other.address === sensor.address)) {
+            problems.push(`sensor "${sensor.id}" at 0x${sensor.address.toString(16)} on the root bus would collide with the sensor behind a mux at the same `
+                + 'address whenever its channel is open: put both behind mux channels, or change one address');
+        }
+        if (sameBoard.some((other) => other.mux && other.mux.address === sensor.address)) {
+            problems.push(`sensor "${sensor.id}" sits at 0x${sensor.address.toString(16)}, the address of a TCA9548A mux`);
+        }
         if (buses.has(bus)) {
             problems.push(`two sensors share I2C address 0x${sensor.address.toString(16)}${sensor.mux ? ` on mux channel ${sensor.mux.channel}` : ''} `
                 + '(set the other board\'s address jumper or put it behind a TCA9548A channel)');
@@ -434,7 +513,10 @@ export function resolveVibrationConfig(env: Env, get: Getter, platform: string =
 
     let blinkaEnvText: string | null = present(raw.blinkaEnv) ? String(raw.blinkaEnv).trim() : null;
     let blinkaEnv: { [name: string]: string } = {};
-    const serialPort = present(raw.serialPort) ? String(raw.serialPort).trim() : null;
+    const serialPorts = present(raw.serialPort)
+        ? [...new Set(String(raw.serialPort).split(',').map((port) => port.trim()).filter(Boolean))]
+        : [];
+    let leases: string[] = [];
     if (transport === 'blinka') {
         if (blinkaEnvText === null) {
             problems.push('no Blinka bridge chosen for the accelerometers: set the Blinka environment (e.g. BLINKA_MCP2221=1, BLINKA_FT232H=1, '
@@ -445,6 +527,11 @@ export function resolveVibrationConfig(env: Env, get: Getter, platform: string =
                 problems.push(parsed);
             } else {
                 blinkaEnv = parsed;
+                const selectors = bridgeSelectors(parsed);
+                if (selectors.length > 1) {
+                    problems.push(`the Blinka environment switches on ${selectors.join(' and ')}: choose exactly one bridge`);
+                }
+                leases = blinkaLeases(parsed, ['SCL', 'SDA']);
             }
         }
         // The probe feed's bridge is safety equipment: a second process
@@ -453,21 +540,26 @@ export function resolveVibrationConfig(env: Env, get: Getter, platform: string =
         // 2026-09-19 (the probe feed went dark until a USB reset). Refuse,
         // rather than share it.
         const probeTransport = pickRaw(env, get, GPIO_PROBE_KEYS.transport);
-        const anyPin = ['toolsetter', 'overtravel', 'probe'].some((name) => present(pickRaw(env, get, GPIO_PROBE_KEYS[name as 'probe']).raw));
-        const probeIsGpio = String(probeTransport.raw ?? '').trim().toLowerCase() === 'gpio' || (!present(probeTransport.raw) && anyPin);
-        if (probeIsGpio && blinkaEnvText !== null && typeof parseEnvPairs(blinkaEnvText) !== 'string') {
-            const probeEnvRaw = pickRaw(env, get, GPIO_PROBE_KEYS.blinkaEnv).raw;
-            const probeEnv = parseEnvPairs(present(probeEnvRaw) ? String(probeEnvRaw) : GPIO_DEFAULT_BLINKA_ENV);
-            const probeBridge = typeof probeEnv === 'string' ? null : bridgeOf(probeEnv);
-            const ownBridge = bridgeOf(blinkaEnv);
-            if (probeBridge && probeBridge === ownBridge && ownBridge !== 'native') {
-                problems.push(`the accelerometers would share the probe feed's ${ownBridge} bridge - refused: two processes on one USB bridge contend for it `
-                    + 'and can wedge the probe/crash-sensor feed. Give the accelerometers their own bridge (an MCP2221A or FT232H breakout), '
-                    + 'or a microcontroller running vibration_monitor.py (transport "serial")');
-            }
+        const pinSpecs = ['toolsetter', 'overtravel', 'probe']
+            .map((name) => pickRaw(env, get, GPIO_PROBE_KEYS[name as 'probe']).raw)
+            .filter(present)
+            .map((value) => String(value));
+        // Unset transport = auto: gpio when only GPIO pins are configured.
+        let probeKind = pinSpecs.length ? 'gpio' : 'mqtt';
+        if (present(probeTransport.raw)) {
+            probeKind = String(probeTransport.raw).trim().toLowerCase();
         }
-    } else if (!serialPort) {
-        problems.push('transport "serial" needs the serial port of the microcontroller running vibration_monitor.py (e.g. /dev/ttyACM1, COM7)');
+        const probeEnvRaw = pickRaw(env, get, GPIO_PROBE_KEYS.blinkaEnv).raw;
+        const conflict = leaseConflict(leases, probeLeases(probeKind, present(probeEnvRaw) ? String(probeEnvRaw) : null, pinSpecs), 'the probe feed (stored settings)');
+        if (conflict) {
+            problems.push(conflict);
+        }
+    } else {
+        if (!serialPorts.length) {
+            problems.push('transport "serial" needs the serial port of the CircuitPython board running vibration_monitor.py (e.g. /dev/ttyACM1, COM7; '
+                + 'several boards: comma-separated)');
+        }
+        leases = serialPorts.map((port) => `serial:${port}`);
     }
     if (transport !== 'blinka') {
         blinkaEnvText = null;
@@ -479,11 +571,37 @@ export function resolveVibrationConfig(env: Env, get: Getter, platform: string =
     }
     const i2cHz = boundedInt(raw.i2cHz, I2C_HZ);
     const bufferS = boundedInt(raw.bufferS, BUFFER_S);
-    const budget = busBudget(parsedSensors.sensors, i2cHz);
-    if (budget.neededBytesS > budget.availableBytesS) {
-        problems.push(`the FIFO sensors need ${Math.round(budget.neededBytesS / 1000)} kB/s but a ${i2cHz / 1000} kHz bus carries about `
-            + `${Math.round(budget.availableBytesS / 1000)} kB/s of FIFO data - every batch would overrun. Lower odr_hz, drop the gyro, or spread the sensors `
-            + 'over another bridge');
+    // One monitor per link; each serial board has its own bus.
+    const links: VibrationLink[] = [];
+    if (transport === 'blinka') {
+        const stray = parsedSensors.sensors.filter((s) => s.port);
+        if (stray.length) {
+            problems.push(`sensor(s) ${stray.map((s) => s.id).join(', ')} name a port, which applies to the serial transport only`);
+        }
+        links.push({ id: 'blinka', transport, port: null, sensors: parsedSensors.sensors });
+    } else if (serialPorts.length) {
+        for (const sensor of parsedSensors.sensors) {
+            if (!sensor.port && serialPorts.length > 1) {
+                problems.push(`sensor "${sensor.id}": name its board's port (one of ${serialPorts.join(', ')})`);
+            } else if (sensor.port && !serialPorts.includes(sensor.port)) {
+                problems.push(`sensor "${sensor.id}": port ${sensor.port} is not one of the configured serial ports (${serialPorts.join(', ')})`);
+            }
+        }
+        for (const port of serialPorts) {
+            const sensors = parsedSensors.sensors.filter((s) => s.port === port || (!s.port && serialPorts.length === 1));
+            if (!sensors.length) {
+                problems.push(`serial port ${port} has no sensors assigned`);
+            }
+            links.push({ id: port, transport, port, sensors });
+        }
+    }
+    for (const link of links) {
+        const budget = busBudget(link.sensors, i2cHz);
+        if (budget.neededBytesS > budget.availableBytesS) {
+            problems.push(`${link.port ? `the board on ${link.port}: ` : ''}the FIFO sensors need ${Math.round(budget.neededBytesS / 1000)} kB/s but a `
+                + `${i2cHz / 1000} kHz bus carries about ${Math.round(budget.availableBytesS / 1000)} kB/s of FIFO data - every batch would overrun. `
+                + 'Lower odr_hz, drop the gyro, or spread the sensors over another board');
+        }
     }
     const ringBytes = parsedSensors.sensors
         .reduce((sum, s) => sum + Math.ceil(s.rateHz * 1.02 * bufferS) * (RING_SAMPLE_BYTES + (s.gyro ? RING_GYRO_BYTES : 0)), 0);
@@ -497,7 +615,9 @@ export function resolveVibrationConfig(env: Env, get: Getter, platform: string =
         python,
         blinkaEnvText,
         blinkaEnv,
-        serialPort,
+        serialPorts,
+        links,
+        leases,
         i2cHz,
         jobCapture: parseFlag(raw.jobCapture),
         bufferS,
@@ -521,12 +641,12 @@ export function toMachineFrame(orientation: SensorSpec['orientation'], v: [numbe
 }
 
 /** The monitor's configuration message (the JSON the Python monitor reads). */
-export function monitorConfig(cfg: VibrationConfig, heartbeatMs: number): object {
+export function monitorConfig(cfg: VibrationConfig, heartbeatMs: number, sensors: SensorSpec[] = cfg.sensors): object {
     return {
         t: 'config',
         i2c_hz: cfg.i2cHz,
         heartbeat_ms: heartbeatMs,
-        sensors: cfg.sensors.map((sensor) => ({
+        sensors: sensors.map((sensor) => ({
             id: sensor.id,
             chip: sensor.chip,
             mode: sensor.mode,

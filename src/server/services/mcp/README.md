@@ -1340,9 +1340,11 @@ TCA9548A mux (`mux: {address, channel}`). The sensors need **their own bridge**:
   safety equipment, two processes on one U2IF/MCP2221 HID device contend for it, and a claim
   leaked mid-open is exactly what wedged the KB2040 on 2026-09-19. Nothing is picked
   automatically: the Blinka environment is required.
-- **`serial` transport** - a CircuitPython board (QT Py RP2040, Feather, KB2040 running
-  CircuitPython, not U2IF) runs the same file as `code.py` and streams over USB serial; Luban
-  sends it the sensor list. The board does the I2C at 400 kHz locally, so this is the right
+- **`serial` transport** - CircuitPython boards (QT Py RP2040, Feather, KB2040 running
+  CircuitPython, not U2IF) run the same file as `code.py` and stream over USB serial; Luban
+  sends each its sensor list. Several boards: list their ports comma-separated and give each
+  sensor `"port"`; every board is its own link (monitor, I2C bus, bus budget, reconnects), so
+  one per area of the machine (toolhead, tailstock, rotary, an axis) keeps cables short. The board does the I2C at 400 kHz locally, so this is the right
   choice for several sensors, high rates, or long cables to the toolhead / tailstock / rotary
   (I2C over a metre of STEMMA QT is marginal - put the board near the machine).
 
@@ -1353,6 +1355,14 @@ board: copy `vibration_monitor.py` to CIRCUITPY as `code.py`; it waits for Luban
 and re-initialises whenever a new one arrives (or reads `/vibration_config.json` standalone).
 Poll-mode chips need their Adafruit drivers on the host or the board (`requirements.txt` lists
 them as optional).
+
+**Resources are leased, not shared.** The configuration states the physical resources the
+accelerometers hold - the USB bridge (`usb:BLINKA_MCP2221`), native I2C pins (`pin:SDA`,
+`pin:SCL`; a Raspberry Pi's D2/D3 are those pins), serial ports - and refuses any that the probe
+feed holds, from its stored settings and from the running feed, and an environment that switches
+on more than one bridge. A future SPI feed declares its pins the same way (`pin:SCK`, ...). Each
+FIFO batch is a contiguous run: an overrun or a corrupt FIFO word ends the batch, and the next one
+is marked as a gap.
 
 **Throughput is checked, then reported.** A configuration whose FIFO traffic exceeds ~60 % of
 the bus clock (7-byte words, 9 bit times per byte) is refused before it starts, as are look-back
@@ -1376,7 +1386,7 @@ wins):
 | `mcpVibrationTransport` | `LUBAN_MCP_VIBRATION_TRANSPORT` | `blinka` (default) or `serial` |
 | `mcpVibrationBlinkaEnv` | `LUBAN_MCP_VIBRATION_BLINKA_ENV` | e.g. `BLINKA_MCP2221=1`; required for blinka |
 | `mcpVibrationPython` | `LUBAN_MCP_VIBRATION_PYTHON` | default: the GPIO transport's interpreter, else `python3` |
-| `mcpVibrationSerialPort` | `LUBAN_MCP_VIBRATION_SERIAL_PORT` | e.g. `/dev/ttyACM1`, `COM7` |
+| `mcpVibrationSerialPort` | `LUBAN_MCP_VIBRATION_SERIAL_PORT` | e.g. `/dev/ttyACM1`, `COM7`; several boards comma-separated |
 | `mcpVibrationSensors` | `LUBAN_MCP_VIBRATION_SENSORS` | JSON array, below |
 | `mcpVibrationJobs` | `LUBAN_MCP_VIBRATION_JOBS` | record every file job automatically |
 | `mcpVibrationI2cHz` | `LUBAN_MCP_VIBRATION_I2C_HZ` | bus clock (default 400000) |
@@ -1390,6 +1400,11 @@ wins):
   {"id": "ycar", "location": "y-axis", "chip": "lsm6dso32", "range_g": 8}
 ]
 ```
+
+`port` (serial, several boards) names the board a sensor hangs off. `gyro` streams the
+gyroscope in FIFO and poll mode alike, on chips that have one. A root-bus sensor may not share an
+address with a sensor behind a mux on the same board (an open channel joins the two buses, so
+both would answer), nor sit at a mux's address.
 
 `location` is one of `toolhead`, `tailstock`, `rotary-chuck` (turns WITH the chuck - the only
 location the absolute-B tools accept), `rotary-body`, `x-axis`, `y-axis`, `z-axis`, `bed`, `frame`,
@@ -1445,7 +1460,11 @@ shift later windows; re-analysis reads at most 600 s of raw samples, yielding to
 between chunks. Raw samples are kept under `<userData>/mcp-vibration/<capture id>/<sensor>.f32`
 (float32 little-endian, interleaved `ax ay az [gx gy gz]`, g and dps; `numpy.fromfile(path,
 '<f4').reshape(-1, 3)`) with `meta.json` beside them (sample rate, controller B and machine status
-at start and end, per-sensor spec). They are not deleted automatically. A file job's automatic
+at start and end, per-sensor spec). They are not deleted automatically: a new capture is refused while the directory holds more
+than 4 GB, the recording captures together write at most 1 GB of raw samples (each sensor 256 MB
+per capture), and raw samples are written asynchronously - if the disk falls 16 MB behind, that
+raw file stops (the report keeps accumulating) and `raw_stop_reason` says why. Changing the
+accelerometer settings ends every recording capture with that reason. A file job's automatic
 capture (`mcpVibrationJobs`) stops when the job ends (4 h cap) and its summary rides on
 `get_gcode_job_status` as `vibration`.
 
@@ -1458,7 +1477,10 @@ and the first batch of every new monitor run (start, reconnect, a board re-initi
 marked as a gap. A save in Settings restarts the feed only when the resolved configuration
 changed. The monitor never inherits a `BLINKA_*` variable from Luban's own environment, and the
 shared-bridge refusal also checks the bridge the RUNNING probe feed holds. A board's clock is mapped to the host's by the least-delayed batch
-of the last hundred.
+of the last hundred. A sensor's stream survives its monitor: after a reconnect or a board restart
+the first batch is a gap, so a capture spanning the outage counts it and its windows map through
+the time index (`vibrationStream.ts`; `tests/vibrationStream.test.ts` interleaves eight streams
+through a restart, and the monitor's Python tests stream eight sensors over four mux channels).
 
 ### Modules and tests
 

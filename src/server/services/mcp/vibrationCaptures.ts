@@ -29,7 +29,8 @@ import { McpJob, jobManager } from './jobs';
 import { parseSpindleProgram } from './spindleProgram';
 import { RotaryCalibration, Vec3, angleSigmaDeg, rotaryAngle } from './rotaryGravity';
 import { SensorSpec, toMachineFrame } from './vibrationConfig';
-import { SensorRuntime, streamRate, vibrationFeedService } from './vibrationFeed';
+import { streamRate, vibrationFeedService } from './vibrationFeed';
+import { SensorStream } from './vibrationStream';
 import { ReportOptions, TrackBuilder, TrackData, angleBetweenDeg, buildReport, gravityStandardError, sampleAtTime } from './vibrationReport';
 import { round } from './vibrationAnalysis';
 
@@ -52,6 +53,12 @@ export const VIBRATION_LIMITS = {
     jobCaptureS: 4 * 3600,
     /** Raw samples kept on disk per sensor per capture; the report keeps accumulating past it. */
     rawBytes: 256 * 1024 * 1024,
+    /** Raw bytes all recording captures together may write (4 captures x 8 sensors could otherwise reach 8 GB). */
+    activeRawBytes: 1024 * 1024 * 1024,
+    /** A new capture is refused while the captures directory holds more than this. */
+    diskBytes: 4 * 1024 * 1024 * 1024,
+    /** Raw bytes queued behind a slow disk before the raw file stops (the report keeps accumulating). */
+    writeBacklogBytes: 16 * 1024 * 1024,
     /** Re-analysis reads at most this many seconds of raw samples. */
     reanalyseS: 600,
     activeCaptures: 4,
@@ -118,6 +125,25 @@ function captureRoot(): string {
     return path.join(DataStorage.userDataDir, 'mcp-vibration');
 }
 
+/** Raw bytes the recording captures have written so far (the global budget). */
+let activeRawBytes = 0;
+
+/** Bytes under the captures directory (one level of capture folders). */
+function captureDiskBytes(): number {
+    let total = 0;
+    try {
+        for (const id of fs.readdirSync(captureRoot())) {
+            const dir = path.join(captureRoot(), id);
+            for (const file of fs.readdirSync(dir)) {
+                total += fs.statSync(path.join(dir, file)).size;
+            }
+        }
+    } catch (err) {
+        // no directory yet, or a capture removed while counting
+    }
+    return total;
+}
+
 function rescale(data: TrackData, factor: number): TrackData {
     if (factor === 1) {
         return data;
@@ -158,18 +184,40 @@ class CaptureTrack {
     /** [sample index, host ms] at the first sample, at every gap and about once a second: maps capture time to file position across outages. */
     public readonly index: Array<[number, number]> = [];
 
-    private fd: number | null = null;
+    /** Why the raw file stopped short, when it did. */
+    public rawStopReason: string | null = null;
+
+    /** Resolves when the raw file is flushed and closed. */
+    public closed: Promise<void> = Promise.resolve();
+
+    private out: fs.WriteStream | null = null;
 
     public constructor(spec: SensorSpec, rate: number, file: string, resolutionHz: number) {
         this.spec = spec;
         this.startRate = rate;
-        this.channels = spec.gyro && spec.mode === 'fifo' ? 6 : 3;
+        // Gyro rides along whenever the sensor streams it, FIFO or poll.
+        this.channels = spec.gyro ? 6 : 3;
         this.builder = new TrackBuilder(rate, this.channels === 6, resolutionHz);
         try {
-            this.fd = fs.openSync(file, 'w');
+            // Asynchronous writes: the event loop also serves the probe
+            // tripwires and job polls, and must never wait on the disk.
+            this.out = fs.createWriteStream(file);
+            this.out.on('error', (err: Error) => {
+                log.warn(`vibration: raw write to ${file} failed: ${err.message}`);
+                this.stopRaw(`write failed: ${err.message}`);
+            });
         } catch (err) {
             log.warn(`vibration: cannot write ${file}: ${(err as Error).message}`);
-            this.fd = null;
+            this.out = null;
+            this.rawStopReason = `cannot open: ${(err as Error).message}`;
+        }
+    }
+
+    /** Stop the raw file for good (the report keeps accumulating); a gap in the file would misplace every later sample. */
+    private stopRaw(reason: string): void {
+        if (!this.rawTruncated) {
+            this.rawTruncated = true;
+            this.rawStopReason = reason;
         }
     }
 
@@ -191,7 +239,7 @@ class CaptureTrack {
         }
         this.lastMs = times[n - 1];
         this.builder.push(accel, n, this.channels === 6 ? gyro : null);
-        if (this.fd === null || this.rawTruncated) {
+        if (this.out === null || this.rawTruncated) {
             return;
         }
         const frame = new Float32Array(n * this.channels);
@@ -207,26 +255,32 @@ class CaptureTrack {
         }
         const bytes = Buffer.from(frame.buffer, frame.byteOffset, frame.byteLength);
         if (this.rawBytes + bytes.length > VIBRATION_LIMITS.rawBytes) {
-            this.rawTruncated = true;
+            this.stopRaw(`per-sensor raw limit ${VIBRATION_LIMITS.rawBytes / 1048576} MB reached`);
             return;
         }
-        try {
-            fs.writeSync(this.fd, bytes);
-            this.rawBytes += bytes.length;
-        } catch (err) {
-            log.warn(`vibration: raw write failed: ${(err as Error).message}`);
-            this.rawTruncated = true;
+        if (activeRawBytes + bytes.length > VIBRATION_LIMITS.activeRawBytes) {
+            this.stopRaw(`all recording captures together reached ${VIBRATION_LIMITS.activeRawBytes / 1048576} MB of raw samples`);
+            return;
         }
+        if (this.out.writableLength > VIBRATION_LIMITS.writeBacklogBytes) {
+            this.stopRaw(`the disk fell ${Math.round(this.out.writableLength / 1048576)} MB behind`);
+            return;
+        }
+        this.out.write(bytes);
+        this.rawBytes += bytes.length;
+        activeRawBytes += bytes.length;
     }
 
-    public finish(rt: SensorRuntime | null): void {
-        if (this.fd !== null) {
-            try {
-                fs.closeSync(this.fd);
-            } catch (err) {
-                // closed already
-            }
-            this.fd = null;
+    public finish(rt: SensorStream | null): void {
+        activeRawBytes = Math.max(0, activeRawBytes - this.rawBytes);
+        if (this.out !== null) {
+            const out = this.out;
+            this.out = null;
+            this.closed = new Promise<void>((resolve) => {
+                out.once('close', () => resolve());
+                out.once('error', () => resolve());
+                out.end();
+            });
         }
         // The clock keeps refining the rate while it streams; scale the
         // frequency axis to the best estimate at the end (density rescaled
@@ -245,6 +299,7 @@ export interface CaptureSensorMeta {
     raw_file: string;
     raw_bytes: number;
     raw_truncated: boolean;
+    raw_stop_reason: string | null;
     gaps: number;
     first_ms: number | null;
     last_ms: number | null;
@@ -367,6 +422,7 @@ export class Capture {
                 raw_file: path.join(this.dir, `${id}.f32`),
                 raw_bytes: track.rawBytes,
                 raw_truncated: track.rawTruncated,
+                raw_stop_reason: track.rawStopReason,
                 gaps: track.builder.gaps,
                 first_ms: track.firstMs,
                 last_ms: track.lastMs,
@@ -540,6 +596,16 @@ export class VibrationCaptureService {
 
     private jobWatch: NodeJS.Timeout | null = null;
 
+    public constructor() {
+        // New settings replace the streams (rates, sensors, links): a capture
+        // cannot continue across that, so it ends with the reason.
+        vibrationFeedService.on('reconfigured', () => {
+            for (const capture of this.active()) {
+                capture.finish('stopped', 'accelerometer settings changed (the feed restarted with a new configuration)');
+            }
+        });
+    }
+
     public active(): Capture[] {
         return [...this.captures.values()].filter((c) => c.recording);
     }
@@ -569,6 +635,12 @@ export class VibrationCaptureService {
         });
         if (!streaming.length) {
             throw new VibrationError(`none of ${specs.map((s) => s.id).join(', ')} is streaming (see get_vibration_status for each sensor's error)`);
+        }
+        const onDisk = captureDiskBytes();
+        if (onDisk > VIBRATION_LIMITS.diskBytes) {
+            throw new VibrationError(`the captures directory ${captureRoot()} holds ${Math.round(onDisk / 1048576)} MB (budget `
+                + `${VIBRATION_LIMITS.diskBytes / 1048576} MB): the operator archives or deletes old captures there before recording more `
+                + '(nothing is deleted automatically)');
         }
         const lookbackS = Math.min(bounded(opts.lookbackS, VIBRATION_LIMITS.lookbackS), cfg.bufferS);
         const capture = new Capture(newId(), streaming, {
@@ -676,6 +748,9 @@ export class VibrationCaptureService {
         const track = capture ? capture.tracks.get(sensorId) : null;
         if (whole && track && track.data) {
             return { data: track.data, spec: sensor.spec, source: 'memory' };
+        }
+        if (track) {
+            await track.closed;
         }
         const rate = sensor.sample_rate_hz || sensor.spec.rateHz;
         const frameBytes = sensor.channels * 4;

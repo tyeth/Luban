@@ -171,7 +171,10 @@ class Bus:
 
 
 class MuxChannelI2C:
-    """busio.I2C look-alike that selects a mux channel whenever it is locked (for Adafruit drivers)."""
+    """busio.I2C look-alike that selects its mux channel - or, for a root
+    device (mux None), closes every channel - whenever it is locked. Every
+    Adafruit driver goes through one, so a root transaction can never reach
+    a muxed device left selected at the same address."""
 
     def __init__(self, bus, mux):
         self.bus = bus
@@ -312,7 +315,13 @@ class FifoSensor(Sensor):
             elif tag == TAG_GYRO:
                 self.gyro.extend(buf[base + 1:base + 7])
             else:
+                # A discarded word is a lost sample: what came before goes
+                # out as its own batch and the next one is marked, so the
+                # clock never spaces samples across the hole.
                 bad += 1
+                if len(self.accel) >= 6:
+                    self.emit_batch()
+                self.overrun_pending = True
         return bad
 
     def poll(self):
@@ -412,8 +421,7 @@ class PollSensor(Sensor):
         self.t0_clock = None
 
     def start(self):
-        i2c = MuxChannelI2C(self.bus, self.mux) if self.mux else self.bus.i2c
-        self.driver = driver_for(self.spec['chip'], i2c, self.addr)
+        self.driver = driver_for(self.spec['chip'], MuxChannelI2C(self.bus, self.mux), self.addr)
         self.next_due = clock_s()
         self.state = 'ok'
         self.error = None
