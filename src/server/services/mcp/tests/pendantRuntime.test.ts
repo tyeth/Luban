@@ -10,7 +10,7 @@ import * as pendant from '../pendant';
 import { pendantPage } from '../pendantPage';
 import { requiredToolheadZ } from '../landmarkClearance';
 
-function fixture() {
+function fixture(a350 = false) {
     let now = 1000;
     let epoch = 1;
     let tick: (() => void) | null = null;
@@ -20,7 +20,8 @@ function fixture() {
     let estimated = false;
     const gate = new ManualControlGate();
     const obstacles: object[] = [];
-    const machine = { x: 10, y: 10, z: 10 };
+    const machine = a350 ? { x: 124, y: 203.3289948730469, z: 327.9990070800781 } : { x: 10, y: 10, z: 10 };
+    const logs: string[] = [];
     const snapshot = () => ({ machine, work: machine, reliability: 'heartbeat', warnings: [], reportAgeMs: 0 });
     class Port extends EventEmitter {
         public static current: Port;
@@ -46,6 +47,7 @@ function fixture() {
     const dependencies: Record<string, unknown> = {
         crypto,
         http: {},
+        '../../lib/logger': () => ({ info: (message: string) => logs.push(message), warn: (message: string) => logs.push(message) }),
         serialport: { SerialPort: Port },
         '../machine/ConnectionManager': { connectionManager: { getConnectionStatus: () => ({ machineIdentifier: 'mock' }) } },
         './clearanceContext': { clearanceOptions: () => ({ toolProtrusionMm: null, clearanceMarginMm: 5 }) },
@@ -61,10 +63,10 @@ function fixture() {
         './probing': { assertMachineReadyForProcedure: () => { if (readyError) { throw Error('not idle'); } },
             moveMachineSettled: async () => { moves += 1; await new Promise<void>((resolve) => { finish = resolve; }); } },
         './tools/machine': { connectionEpoch: () => epoch,
-            getMachineSizeByIdentifier: () => ({ x: 100, y: 100, z: 100 }),
+            getMachineSizeByIdentifier: () => ({ x: 350, y: 350, z: a350 ? 325 : 100 }),
             getPositionSnapshot: snapshot,
-            safeTraverseZ: () => 100,
-            requirePlanningTravel: () => ({ limits: { xMin: 0, xMax: 100, yMin: 0, yMax: 100 }, conflicts: [] }) }
+            safeTraverseZ: () => (a350 ? 328 : 100),
+            requirePlanningTravel: () => ({ limits: { xMin: a350 ? -19 : 0, xMax: a350 ? 330 : 100, yMin: 0, yMax: a350 ? 342 : 100 }, conflicts: [] }) }
     };
     const exports: Record<string, any> = {}; // eslint-disable-line @typescript-eslint/no-explicit-any
     const source = fs.readFileSync(path.resolve(__dirname, '../pendantRuntime.ts'), 'utf8');
@@ -117,6 +119,8 @@ function fixture() {
         arm,
         gate,
         obstacles,
+        logs,
+        writes: () => Port.current.writes,
         initialize: async () => {
             const page = await request('/pendant');
             const match = page.body.match(/const token="([a-f0-9]+)"/);
@@ -138,6 +142,61 @@ function fixture() {
 }
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['A350 defaults include park; whole-bed request is clipped to known travel', async () => {
+        const f = fixture(true); await f.initialize();
+        const before = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(before.defaultBounds.zMin, 280);
+        assert.equal(before.defaultBounds.zMax, 329);
+        assert.equal(before.travelBounds.zMax, 328);
+        const requested = { xMin: -20, xMax: 331, yMin: -1, yMax: 343, zMin: 280, zMax: 329 };
+        assert.equal((await f.request('/pendant/arm', { bounds: requested, clearanceConfirmed: true })).status, 200);
+        const after = JSON.parse((await f.request('/pendant/status')).body);
+        assert.deepEqual(after.bounds, { xMin: -19, xMax: 330, yMin: 0, yMax: 342, zMin: 280, zMax: 328 });
+        assert.equal(f.moves(), 0);
+        await f.request('/pendant/disarm', {});
+        f.obstacles.push({ name: 'rotary', machine: { x0: 160, x1: 180, y0: 280, y1: 330 }, clearanceZ: 328 });
+        const refused = await f.request('/pendant/arm', { bounds: requested, clearanceConfirmed: true });
+        assert.equal(refused.status, 400);
+        assert.match(refused.body, /rotary/);
+        const status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(status.armed, false);
+        assert.match(status.error, /rotary/);
+        await f.tick();
+        assert.match(JSON.stringify(f.writes().slice(-1)), /rotary/);
+        assert.ok(f.logs.some((line) => line.includes('arm refused')));
+    }],
+    ['page stop reaches USB and preserves diagnostics without further movement', async () => {
+        const f = fixture(); await f.initialize(); await f.arm(); f.input();
+        await f.tick();
+        assert.equal((f.writes().slice(-1)[0] as { armed: boolean }).armed, true);
+        await f.request('/pendant/disarm', {});
+        f.input({ x: 1, deadman: true });
+        await f.tick();
+        const reply = f.writes().slice(-1)[0] as { armed: boolean; message: string };
+        assert.equal(reply.armed, false);
+        assert.match(reply.message, /Disarmed by operator/);
+        assert.equal(f.moves(), 0);
+        assert.ok(JSON.parse((await f.request('/pendant/status')).body).input);
+    }],
+    ['firmware sequence restart recovers telemetry but requires explicit fresh arm', async () => {
+        const f = fixture(); await f.initialize(); await f.arm();
+        f.input({ seq: 800 });
+        f.input({ seq: 0, x: 1, deadman: true });
+        await f.tick();
+        const stopped = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(stopped.armed, false);
+        assert.match(stopped.error, /sequence/);
+        f.input({ seq: 1 });
+        f.input({ seq: 2, x: 1, deadman: true });
+        await f.tick();
+        assert.equal(f.moves(), 0);
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).input.seq, 2);
+        assert.equal((await f.arm()).status, 200);
+        f.input({ seq: 3, x: 1, deadman: true });
+        await f.tick(); assert.equal(f.moves(), 0);
+        f.input({ seq: 4 }); f.input({ seq: 5, x: 1, deadman: true });
+        await f.tick(); assert.equal(f.moves(), 1); await f.finish();
+    }],
     ['operator routes refuse cross-origin, hostile Host and missing page token', async () => {
         const f = fixture();
         assert.equal((await f.request('/pendant/arm', {})).status, 403);

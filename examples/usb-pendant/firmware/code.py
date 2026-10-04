@@ -93,7 +93,7 @@ while True:
                 pass
     fresh = serial.connected and now - last_dro < 1.0
     linked = fresh and dro is not None and dro.get("armed") is True
-    if linked and not was_linked:
+    if linked != was_linked:
         controller.feed = 60
         controller.neutral_required = True
     was_linked = linked
@@ -101,7 +101,7 @@ while True:
     values = [deadzone(normalize(value, centers[i], minimums[i], maximums[i], inverted[i]), zone)
               for i, value in enumerate(raw)]
     packet = controller.update(values[0], values[1], values[2], mode_button.value,
-                               deadman.value, stop_button.value, now, dt, linked)
+                               deadman.value, stop_button.value, now, dt, fresh, armed=linked)
     if serial.connected and now - last_send >= 0.05:
         packet.update({"v": 1, "seq": seq, "raw": raw,
                        "display": [display.width, display.height]})
@@ -136,10 +136,21 @@ while True:
         elif not valid:
             status.text = "DRO stale / unavailable"
         elif not linked:
-            status.text = "DISARMED: open /pendant"
+            if controller.neutral_required:
+                status.text = "DISARMED: centre axes"
+            else:
+                status.text = "DISARMED: Z needs arm" if controller.mode == "z" else "DISARMED: twist sets feed"
         elif controller.neutral_required:
             status.text = "Centre axes; release D1"
         else:
             status.text = "JOGGING" if packet["deadman"] else "READY: hold D1 to jog"
+        reason = dro.get("message") if fresh and dro else None
+        if not linked and reason:
+            # Scroll the host's refusal/stop reason across the 38-character bottom row.
+            text = str(reason)
+            offset = int(now * 4) % (len(text) + 4) if len(text) > 38 else 0
+            help_text.text = (text + "    " + text)[offset:offset + 38]
+        else:
+            help_text.text = "D1 hold jog | D2 stop"
         last_display = now
     time.sleep(0.01)

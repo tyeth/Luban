@@ -26,7 +26,7 @@ class Controller:
         self.button_stable = False
         self.button_changed = 0
 
-    def update(self, x, y, twist, button, held, stop, now, dt, link):
+    def update(self, x, y, twist, button, held, stop, now, dt, link, armed=True):
         if button != self.button_raw:
             self.button_raw = button
             self.button_changed = now
@@ -44,7 +44,7 @@ class Controller:
         ready = not self.neutral_required
         if ready and self.mode == "feed" and link:
             self.feed = max(SLOW_FEED, min(MAX_FEED, self.feed + twist * 300 * min(dt, 0.1)))
-        moving = ready and held and link and not stop
+        moving = ready and held and link and armed and not stop
         return {"x": x if moving else 0.0, "y": y if moving else 0.0,
                 "z": twist if moving and self.mode == "z" else 0.0,
                 "feed": int(self.feed), "mode": self.mode, "ready": ready,

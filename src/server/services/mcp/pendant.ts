@@ -35,12 +35,13 @@ export function parsePendantInput(line: string): PendantInput {
 }
 
 export function validateJogBounds(bounds: JogBounds, current: JogPosition): void {
+    if (!bounds || typeof bounds !== 'object') { throw new Error('Machine XYZ bounds are required.'); }
     for (const axis of ['x', 'y', 'z'] as const) {
         const lo = bounds[`${axis}Min`];
         const hi = bounds[`${axis}Max`];
-        if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo || hi - lo > 100
+        if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo
             || current[axis] < lo || current[axis] > hi) {
-            throw new Error(`Invalid machine ${axis.toUpperCase()} envelope (max span 100 mm; must contain current position).`);
+            throw new Error(`Invalid machine ${axis.toUpperCase()} envelope ${lo}..${hi}; must be finite, ordered and contain current position ${current[axis]}.`);
         }
     }
 }
@@ -79,14 +80,22 @@ export class PendantSession {
         this.disarm();
         this.sequence = -1;
         this.receivedAt = 0;
+        this.bounds = null;
+        this.expiresAt = 0;
     }
 
     public receive(input: PendantInput, now: number): void {
-        if (input.seq <= this.sequence) { throw new Error('Repeated or out-of-order USB frame.'); }
+        if (input.seq <= this.sequence) {
+            // A firmware reset restarts seq. Drop authority before accepting the new baseline.
+            this.disarm();
+            this.sequence = input.seq;
+            this.receivedAt = 0;
+            throw new Error('USB sequence restarted or repeated. Centre axes and re-arm.');
+        }
         this.sequence = input.seq;
         this.latest = input;
         this.receivedAt = now;
-        if (input.stop) { this.disarm(); }
+        if (input.stop) { this.disarm(); return; }
         if (input.ready && !input.deadman && input.x === 0 && input.y === 0 && input.z === 0) { this.neutral = true; }
     }
 

@@ -60,12 +60,13 @@ export const tests: Array<[string, () => void]> = [
         }
         const session = new PendantSession();
         session.receive(frame(), 1000);
-        assert.throws(() => session.receive(frame(), 1010), /out-of-order/);
+        assert.throws(() => session.receive(frame(), 1010), /sequence/);
         session.reset();
         session.receive(frame(), 1020);
     }],
-    ['envelope forbids crossing its edge and invalid or oversized bounds', () => {
-        assert.throws(() => validateJogBounds({ ...bounds, xMax: 101 }, current));
+    ['envelope forbids crossing its edge and invalid bounds', () => {
+        validateJogBounds({ ...bounds, xMax: 350 }, current);
+        assert.throws(() => validateJogBounds({ ...bounds, xMax: Infinity }, current));
         assert.throws(() => validateJogBounds({ ...bounds, zMin: 11 }, current));
         assert.throws(() => validateJogBounds({ ...bounds, yMin: NaN }, current));
         const session = new PendantSession();

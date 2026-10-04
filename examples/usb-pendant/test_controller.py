@@ -8,6 +8,18 @@ from controller import Controller, normalize, deadzone
 
 
 class ControllerTests(unittest.TestCase):
+    def test_disarmed_feed_adjustment_never_emits_motion(self):
+        c = Controller()
+        c.update(0, 0, 0, False, False, False, 0, 0.05, True, armed=False)
+        p = c.update(1, 1, 1, False, True, False, 1, 0.1, True, armed=False)
+        self.assertGreater(p["feed"], 60)
+        self.assertFalse(p["deadman"])
+        self.assertEqual((p["x"], p["y"], p["z"]), (0, 0, 0))
+        p = c.update(0, 0, 1, False, False, False, 2, 0.1, False, armed=False)
+        self.assertEqual(p["feed"], 60)
+        p = c.update(0, 0, 1, False, False, True, 3, 0.1, True, armed=False)
+        self.assertEqual(p["feed"], 60)
+
     def test_calibration_deadzone_and_inversion(self):
         self.assertEqual(deadzone(0.05), 0)
         self.assertEqual(normalize(0), -1)

@@ -93,9 +93,13 @@ the Feather data port. Review the machine-coordinate XYZ envelope and confirm
 the complete volume is clear for the fitted tool. Then click **Arm**. This
 operator page is the session's decision point; no MCP tool can arm a pendant.
 
-The session lasts at most 10 minutes, spans at most 100 mm per axis, and defaults
-to ±5 mm within known travel. This is direct, supervised manual control:
-the operator approves the entire local corridor, including its Z range, and
+The session lasts at most 10 minutes. X/Y default to ±5 mm around the current
+position; Z defaults to 280–329 mm. **Fill machine X**, **Fill machine Y** and
+**Fill both X/Y** fill known X/Y travel with 1 mm extra at each end. The page
+previews the usable intersection with known travel; arming clips the requested
+bounds to that intersection (A350 Z ends at 328, not the profile's 325).
+There is no arbitrary 100 mm envelope span limit. This is direct, supervised manual control:
+the operator approves the entire requested corridor, including its Z range, and
 holds D1 for each movement. It does not reuse or broaden an AI job approval.
 Known obstacles and tool-length clearances still refuse the envelope. The
 usual agent motion-floor rules and staged-job workflow remain in force for AI
@@ -117,6 +121,16 @@ operation prevents arming. Read-only `get_*`, `list_*`, `validate_*` and
 loopback-only even when MCP LAN access is enabled. Operator POSTs require a
 page token, matching origin, and a loopback Host. The page cannot be framed.
 The operator should not jog simultaneously using the touchscreen or other UI.
+
+Arm refusals remain visible on the page and are logged under
+`service:mcp:pendant`. Stop explicitly reports disarmed; raw joystick samples and
+DRO updates continue as diagnostics. A firmware sequence reset disarms and
+recovers incoming telemetry without waiting for the old counter; centre and
+explicitly arm again. The TFT scrolls Luban's refusal or stop reason.
+
+Twist in feed mode adjusts the displayed feed while connected and disarmed,
+without producing motion intent. Arming, disarming, a mode change, USB loss and
+STOP reset feed to 60 mm/min; centre all axes and release D1 before jogging.
 
 The TFT shows reported machine or work XYZ on the left, with **FEED** and its
 larger numeric value beneath on the right, plus twist mode at the top. It blanks stale,

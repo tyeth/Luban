@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import http from 'http';
 import { SerialPort } from 'serialport';
 
+import logger from '../../lib/logger';
 import { connectionManager } from '../machine/ConnectionManager';
 import { clearanceOptions } from './clearanceContext';
 import { jobManager } from './jobs';
@@ -15,6 +16,8 @@ import { currentGcodeSequence, getPositionOfRecord } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
 import { assertMachineReadyForProcedure, moveMachineSettled } from './probing';
 import { connectionEpoch, getMachineSizeByIdentifier, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
+
+const log = logger('service:mcp:pendant');
 
 export class PendantRuntime {
     private session = new PendantSession();
@@ -60,15 +63,35 @@ export class PendantRuntime {
         if (jobManager.getActive()?.state === 'started') { throw new Error('A machine job is active.'); }
     }
 
+    private travelBounds(): JogBounds {
+        const travel = requirePlanningTravel('manual jogging', this.position());
+        if (travel.conflicts.length) { throw new Error('Machine travel has unresolved conflicts.'); }
+        const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+        if (!size) { throw new Error('Machine travel is unknown.'); }
+        // Match stagingFrameContext: A350 profile Z325 excludes its reachable Z328 park.
+        return { ...travel.limits, zMin: 0, zMax: Math.max(size.z, safeTraverseZ()) };
+    }
+
+    private reviewedBounds(requested: JogBounds): JogBounds {
+        validateJogBounds(requested, this.position());
+        const travel = this.travelBounds();
+        const bounds = { ...requested };
+        for (const axis of ['x', 'y', 'z'] as const) {
+            bounds[`${axis}Min`] = Math.max(requested[`${axis}Min`], travel[`${axis}Min`]);
+            bounds[`${axis}Max`] = Math.min(requested[`${axis}Max`], travel[`${axis}Max`]);
+        }
+        this.validateEnvelope(bounds);
+        return bounds;
+    }
+
     private validateEnvelope(bounds: JogBounds): void {
         const current = this.position();
         validateJogBounds(bounds, current);
-        const travel = requirePlanningTravel('manual jogging', current);
-        const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
-        if (travel.conflicts.length || bounds.xMin < travel.limits.xMin || bounds.xMax > travel.limits.xMax
-            || bounds.yMin < travel.limits.yMin || bounds.yMax > travel.limits.yMax
-            || !size || bounds.zMin < 0 || bounds.zMax > Math.min(size.z, safeTraverseZ())) {
-            throw new Error('Reviewed envelope is outside known machine travel.');
+        const travel = this.travelBounds();
+        for (const axis of ['x', 'y', 'z'] as const) {
+            if (bounds[`${axis}Min`] < travel[`${axis}Min`] || bounds[`${axis}Max`] > travel[`${axis}Max`]) {
+                throw new Error(`Machine ${axis.toUpperCase()} bounds must stay within ${travel[`${axis}Min`]}..${travel[`${axis}Max`]} mm.`);
+            }
         }
         // Conservative: forbid the entire envelope if any XY corridor crosses a known obstacle at its lowest Z.
         const opts = clearanceOptions();
@@ -79,7 +102,7 @@ export class PendantRuntime {
                 opts.toolProtrusionMm, opts.clearanceMarginMm);
             return overlap && (required === null || bounds.zMin < required - 0.05);
         });
-        if (hits.length) { throw new Error('Reviewed envelope intersects a known obstacle below its clearance.'); }
+        if (hits.length) { throw new Error(`Reviewed envelope intersects known obstacles below their clearances: ${hits.map((box) => box.name).join(', ')}. Narrow the envelope or raise its minimum Z.`); }
     }
 
     private release(): void {
@@ -90,6 +113,7 @@ export class PendantRuntime {
     }
 
     public disarm(reason = 'Disarmed by operator.'): void {
+        if (this.session.armed || this.error !== reason) { log.info(`Disarmed: ${reason}`); }
         this.session.disarm();
         this.error = reason;
         this.release();
@@ -119,11 +143,18 @@ export class PendantRuntime {
                 const lines = this.buffer.split('\n');
                 this.buffer = lines.pop() || '';
                 try {
-                    for (const line of lines) { if (line.trim()) { this.session.receive(parsePendantInput(line), Date.now()); } }
+                    for (const line of lines) {
+                        if (line.trim()) {
+                            const input = parsePendantInput(line);
+                            this.session.receive(input, Date.now());
+                            if (input.stop) { this.disarm('Stopped with Feather D2.'); }
+                        }
+                    }
                 } catch (err) { this.disarm((err as Error).message); }
             });
             await new Promise<void>((resolve, reject) => port.open((err) => (err ? reject(err) : resolve())));
             this.error = 'Connected. Centre all axes before arming.';
+            log.info(`USB connected: ${path}`);
             this.timer = setInterval(() => { this.tick().catch((err: Error) => this.disarm(err.message)); }, 100);
         } finally { this.opening = false; }
     }
@@ -186,14 +217,13 @@ export class PendantRuntime {
     private defaultBounds(): JogBounds | null {
         try {
             const p = this.position();
-            const travel = requirePlanningTravel('manual jogging', p).limits;
-            const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
+            const travel = this.travelBounds();
             return { xMin: Math.max(travel.xMin, p.x - 5),
                 xMax: Math.min(travel.xMax, p.x + 5),
                 yMin: Math.max(travel.yMin, p.y - 5),
                 yMax: Math.min(travel.yMax, p.y + 5),
-                zMin: Math.max(0, p.z - 5),
-                zMax: Math.min(size?.z || 0, safeTraverseZ(), p.z + 5) };
+                zMin: 280,
+                zMax: 329 };
         } catch (err) { return null; }
     }
 
@@ -216,6 +246,8 @@ export class PendantRuntime {
             res.end(pendantPage(this.token)); return;
         }
         if (req.method === 'GET' && url.pathname === '/pendant/status') {
+            let travelBounds: JogBounds | null = null;
+            try { travelBounds = this.travelBounds(); } catch (err) { /* Unknown travel is shown explicitly. */ }
             reply(200, { armed: this.session.armed,
                 neutral: this.session.neutral,
                 busy: this.busy,
@@ -225,6 +257,7 @@ export class PendantRuntime {
                 dro: this.dro(),
                 bounds: this.session.bounds,
                 defaultBounds: this.defaultBounds(),
+                travelBounds,
                 ports: await this.ports() }); return;
         }
         if (req.method !== 'POST' || req.headers['x-pendant-token'] !== this.token) {
@@ -240,26 +273,33 @@ export class PendantRuntime {
             switch (url.pathname) {
                 case '/pendant/connect':
                     await this.connect(String(args.path || '')); break;
-                case '/pendant/arm':
+                case '/pendant/arm': {
                     if (!this.port?.isOpen || this.busy || Date.now() - this.session.receivedAt > 300) {
                         throw new Error('No recent USB input, or a jog is still settling.');
                     }
                     if (args.clearanceConfirmed !== true) { throw new Error('Review and confirm the entire envelope.'); }
                     this.ready();
-                    this.validateEnvelope(args.bounds);
+                    const bounds = this.reviewedBounds(args.bounds);
                     manualControlGate.acquire(() => this.disarm('Stopped through MCP.'));
                     this.owned = true;
-                    this.session.arm(args.bounds, this.position(), Date.now());
+                    this.session.arm(bounds, this.position(), Date.now());
                     this.epoch = this.machineEpoch();
                     this.pageAliveAt = Date.now();
                     this.error = null;
+                    log.info(`Armed reviewed envelope: ${JSON.stringify(bounds)}`);
                     break;
+                }
                 case '/pendant/disarm': this.disarm(); break;
                 case '/pendant/keepalive': this.pageAliveAt = Date.now(); break;
                 default: reply(404, { error: 'Unknown pendant action.' }); return;
             }
             reply(200, { ok: true });
-        } catch (err) { reply(400, { error: (err as Error).message }); }
+        } catch (err) {
+            const message = `${url.pathname.split('/').pop()} refused: ${(err as Error).message}`;
+            this.disarm(message);
+            log.warn(message);
+            reply(400, { error: message });
+        }
     }
 }
 
