@@ -5,6 +5,7 @@ import { SerialPort } from 'serialport';
 import logger from '../../lib/logger';
 import { connectionManager } from '../machine/ConnectionManager';
 import { clearanceOptions } from './clearanceContext';
+import { OBSTACLE_MARGIN_MM, POSITION_EPSILON_MM, segmentHitsBox2D } from './envelopeChecks';
 import { jobManager } from './jobs';
 import { landmarkStore } from './landmarks';
 import { requiredToolheadZ } from './landmarkClearance';
@@ -93,16 +94,34 @@ export class PendantRuntime {
                 throw new Error(`Machine ${axis.toUpperCase()} bounds must stay within ${travel[`${axis}Min`]}..${travel[`${axis}Max`]} mm.`);
             }
         }
-        // Conservative: forbid the entire envelope if any XY corridor crosses a known obstacle at its lowest Z.
+    }
+
+    private obstacleExclusions() {
         const opts = clearanceOptions();
-        const hits = landmarkStore.obstacleBoxes().filter((box) => {
-            const overlap = bounds.xMax >= box.machine.x0 - 5 && bounds.xMin <= box.machine.x1 + 5
-                && bounds.yMax >= box.machine.y0 - 5 && bounds.yMin <= box.machine.y1 + 5;
-            const required = requiredToolheadZ(box.clearanceZ, box.clearanceBasis || 'toolhead',
-                opts.toolProtrusionMm, opts.clearanceMarginMm);
-            return overlap && (required === null || bounds.zMin < required - 0.05);
-        });
-        if (hits.length) { throw new Error(`Reviewed envelope intersects known obstacles below their clearances: ${hits.map((box) => box.name).join(', ')}. Narrow the envelope or raise its minimum Z.`); }
+        return landmarkStore.obstacleBoxes().map((box) => ({
+            name: box.name,
+            machine: {
+                x0: Math.min(box.machine.x0, box.machine.x1) - OBSTACLE_MARGIN_MM,
+                x1: Math.max(box.machine.x0, box.machine.x1) + OBSTACLE_MARGIN_MM,
+                y0: Math.min(box.machine.y0, box.machine.y1) - OBSTACLE_MARGIN_MM,
+                y1: Math.max(box.machine.y0, box.machine.y1) + OBSTACLE_MARGIN_MM,
+            },
+            requiredZ: requiredToolheadZ(box.clearanceZ, box.clearanceBasis || 'toolhead',
+                opts.toolProtrusionMm, opts.clearanceMarginMm),
+        }));
+    }
+
+    private validateJogSegment(from: JogPosition, to: JogPosition): void {
+        for (const box of this.obstacleExclusions()) {
+            // Manual jogs get no probing exemption: check the complete segment,
+            // including Z-only descents and moves wholly inside a landmark footprint.
+            if (segmentHitsBox2D(from.x, from.y, to.x, to.y, box.machine, 0)
+                && (box.requiredZ === null || Math.min(from.z, to.z) < box.requiredZ - POSITION_EPSILON_MM)) {
+                const needed = box.requiredZ === null ? 'tool clearance is unknown; this region is excluded'
+                    : `requires machine Z at or above ${box.requiredZ.toFixed(3)} mm`;
+                throw new Error(`Jog blocked by ${box.name}: ${needed}. Requested segment reaches machine Z ${Math.min(from.z, to.z).toFixed(3)} mm. Review the obstacle exclusions before re-arming.`);
+            }
+        }
     }
 
     private release(): void {
@@ -196,6 +215,7 @@ export class PendantRuntime {
         const target = this.session.target(from, now);
         if (!target) { this.release(); return; }
         this.validateEnvelope(this.session.bounds as JogBounds);
+        this.validateJogSegment(from, target.position);
         this.busy = true;
         try {
             await moveMachineSettled('usb_pendant', target.position, target.feed);
@@ -258,6 +278,7 @@ export class PendantRuntime {
                 bounds: this.session.bounds,
                 defaultBounds: this.defaultBounds(),
                 travelBounds,
+                obstacleExclusions: this.obstacleExclusions(),
                 ports: await this.ports() }); return;
         }
         if (req.method !== 'POST' || req.headers['x-pendant-token'] !== this.token) {
@@ -280,6 +301,8 @@ export class PendantRuntime {
                     if (args.clearanceConfirmed !== true) { throw new Error('Review and confirm the entire envelope.'); }
                     this.ready();
                     const bounds = this.reviewedBounds(args.bounds);
+                    const current = this.position();
+                    this.validateJogSegment(current, current);
                     manualControlGate.acquire(() => this.disarm('Stopped through MCP.'));
                     this.owned = true;
                     this.session.arm(bounds, this.position(), Date.now());

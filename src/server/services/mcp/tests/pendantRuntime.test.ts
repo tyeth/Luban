@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import vm from 'vm';
 import ts from 'typescript';
+import * as envelopeChecks from '../envelopeChecks';
 import { ManualControlGate } from '../manualControl';
 import * as pendant from '../pendant';
 import { pendantPage } from '../pendantPage';
@@ -51,6 +52,7 @@ function fixture(a350 = false) {
         serialport: { SerialPort: Port },
         '../machine/ConnectionManager': { connectionManager: { getConnectionStatus: () => ({ machineIdentifier: 'mock' }) } },
         './clearanceContext': { clearanceOptions: () => ({ toolProtrusionMm: null, clearanceMarginMm: 5 }) },
+        './envelopeChecks': envelopeChecks,
         './jobs': { jobManager: { getActive: () => null } },
         './landmarks': { landmarkStore: { obstacleBoxes: () => obstacles } },
         './landmarkClearance': { requiredToolheadZ },
@@ -119,6 +121,7 @@ function fixture(a350 = false) {
         arm,
         gate,
         obstacles,
+        machine,
         logs,
         writes: () => Port.current.writes,
         initialize: async () => {
@@ -155,15 +158,64 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(f.moves(), 0);
         await f.request('/pendant/disarm', {});
         f.obstacles.push({ name: 'rotary', machine: { x0: 160, x1: 180, y0: 280, y1: 330 }, clearanceZ: 328 });
-        const refused = await f.request('/pendant/arm', { bounds: requested, clearanceConfirmed: true });
-        assert.equal(refused.status, 400);
-        assert.match(refused.body, /rotary/);
+        const accepted = await f.request('/pendant/arm', { bounds: requested, clearanceConfirmed: true });
+        assert.equal(accepted.status, 200);
         const status = JSON.parse((await f.request('/pendant/status')).body);
-        assert.equal(status.armed, false);
-        assert.match(status.error, /rotary/);
+        assert.equal(status.armed, true);
+        assert.equal(status.obstacleExclusions[0].name, 'rotary');
+        assert.equal(status.obstacleExclusions[0].requiredZ, 328);
+        assert.equal(status.obstacleExclusions[0].machine.x0, 155);
+        assert.equal(f.moves(), 0);
+
+    }],
+    ['broad envelope permits clear low jogs but stops before entering an obstacle', async () => {
+        const f = fixture(); await f.initialize();
+        f.obstacles.push({ name: 'fixture', machine: { x0: 20, x1: 21, y0: 5, y1: 15 }, clearanceZ: 20 });
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
+            bounds: { xMin: 0, xMax: 50, yMin: 0, yMax: 50, zMin: 0, zMax: 50 } })).status, 200);
+        f.input(); f.input({ x: 1, deadman: true });
+        await f.tick(); assert.equal(f.moves(), 1); await f.finish();
+        f.machine.x = 14.95;
+        f.input({ x: 1, deadman: true }); await f.tick();
+        const stopped = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(stopped.armed, false);
+        assert.match(stopped.error, /fixture.*machine Z at or above 20.000/);
+        assert.equal(f.moves(), 1);
         await f.tick();
-        assert.match(JSON.stringify(f.writes().slice(-1)), /rotary/);
-        assert.ok(f.logs.some((line) => line.includes('arm refused')));
+        assert.match(JSON.stringify(f.writes().slice(-1)), /fixture/);
+    }],
+    ['clearance check covers complete diagonals, Z-only descent, unknown tools and changed landmarks', async () => {
+        for (const kind of ['diagonal', 'descent', 'unknown', 'changed']) {
+            const f = fixture(); await f.initialize();
+            assert.equal((await f.arm()).status, 200);
+            f.input();
+            if (kind === 'diagonal') {
+                // Both endpoints miss this tiny padded corner, but the segment crosses it.
+                f.obstacles.push({ name: kind, machine: { x0: 15.04, x1: 15.04, y0: 4.94, y1: 4.94 }, clearanceZ: 20 });
+                f.input({ x: 1, y: -1, deadman: true, feed: 600 });
+            } else if (kind === 'descent') {
+                f.machine.z = 10;
+                f.obstacles.push({ name: kind, machine: { x0: 10, x1: 11, y0: 10, y1: 11 }, clearanceZ: 10 });
+                f.input({ z: -1, mode: 'z', deadman: true });
+            } else {
+                f.obstacles.push({ name: kind, machine: { x0: 10, x1: 11, y0: 10, y1: 11 },
+                    clearanceZ: kind === 'unknown' ? 1 : 20, clearanceBasis: kind === 'unknown' ? 'physical' : 'toolhead' });
+                f.input({ x: 1, deadman: true });
+            }
+            await f.tick();
+            const status = JSON.parse((await f.request('/pendant/status')).body);
+            assert.equal(status.armed, false, kind);
+            assert.match(status.error, new RegExp(kind));
+            assert.equal(f.moves(), 0, kind);
+        }
+    }],
+    ['jogs over a landmark at its required Z accept normal heartbeat noise', async () => {
+        const f = fixture(true); await f.initialize();
+        f.obstacles.push({ name: 'rotary', machine: { x0: 120, x1: 180, y0: 190, y1: 330 }, clearanceZ: 328 });
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
+            bounds: { xMin: 0, xMax: 200, yMin: 0, yMax: 342, zMin: 280, zMax: 329 } })).status, 200);
+        f.input(); f.input({ x: 1, deadman: true });
+        await f.tick(); assert.equal(f.moves(), 1); await f.finish();
     }],
     ['page stop reaches USB and preserves diagnostics without further movement', async () => {
         const f = fixture(); await f.initialize(); await f.arm(); f.input();
@@ -250,7 +302,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: false })).status, 400);
         assert.equal((await f.arm()).status, 200);
     }],
-    ['the entire envelope rejects a small off-diagonal obstacle and non-idle machine', async () => {
+    ['arming refuses a current position inside an excluded volume and a non-idle machine', async () => {
         const f = fixture(); await f.initialize();
         f.obstacles.push({ name: 'corner obstacle',
             machine: { x0: 5, x1: 5.2, y0: 14, y1: 14.2 },

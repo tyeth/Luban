@@ -18,6 +18,14 @@ async function pageFixture() {
 
         public disabled = false;
 
+        public focused = false;
+
+        public scrolled = false;
+
+        public focus() { this.focused = true; }
+
+        public scrollIntoView() { this.scrolled = true; }
+
         public onclick: (() => void | Promise<void>) | null = null;
 
         public onsubmit: ((event: { preventDefault: () => void }) => Promise<void>) | null = null;
@@ -42,6 +50,7 @@ async function pageFixture() {
         busy: false,
         error: '',
         ports: [{ path: 'COM42' }],
+        obstacleExclusions: [{ name: 'rotary-axis', machine: { x0: 135, x1: 205, y0: -5, y1: 355 }, requiredZ: 328 }],
         travelBounds: { xMin: -19, xMax: 330, yMin: 0, yMax: 342, zMin: 0, zMax: 328 },
         defaultBounds: { xMin: 119, xMax: 129, yMin: 198.328994873, yMax: 208.328994873, zMin: 280, zMax: 329 } };
     let refuse = false;
@@ -95,17 +104,32 @@ export const tests: Array<[string, () => Promise<void>]> = [
         await f.element('fill-xy').onclick?.();
         assert.match(f.element('effective').textContent, /X -19.000 to 330.000/);
         assert.match(f.element('effective').textContent, /Z 280.000 to 328.000/);
+        assert.match(f.element('exclusions').textContent, /rotary-axis: X 135 to 205.*requires Z ≥ 328.000/);
+        assert.ok(f.element('exclusions').textContent.includes('\n'));
         f.element('clear').checked = true;
         await f.arm();
         assert.ok(f.posted.some((request) => request.url === '/pendant/arm'));
         assert.equal(f.state.armed, true);
         assert.equal(f.element('review').disabled, true);
     }],
+    ['polled jog refusals are revealed beside the controls without opening diagnostics', async () => {
+        const f = await pageFixture();
+        f.state.error = 'Jog blocked by rotary-axis: requires machine Z at or above 328.000 mm.';
+        await f.refresh();
+        assert.match(f.element('action').textContent, /requires machine Z at or above 328.000/);
+        assert.equal(f.element('action').focused, true);
+        assert.equal(f.element('action').scrolled, true);
+        f.element('action').scrolled = false;
+        await f.refresh();
+        assert.equal(f.element('action').scrolled, false);
+    }],
     ['refused arm stays visible through polls and Stop has explicit persistent acknowledgement', async () => {
         const f = await pageFixture();
         f.refuse(); await f.arm();
         await f.refresh(); await f.refresh();
         assert.match(f.element('action').textContent, /rotary clearance/);
+        assert.equal(f.element('action').focused, true);
+        assert.equal(f.element('action').scrolled, true);
         await f.element('stop').onclick?.();
         await f.refresh();
         assert.match(f.element('action').textContent, /Stop accepted. Disarmed/);

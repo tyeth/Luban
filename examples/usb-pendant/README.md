@@ -90,8 +90,8 @@ error in maintenance mode. Calibration and direction need a physical check befor
 Install/build the PR version of this Luban fork, enable its MCP server, and
 connect the machine in Luban. Open <http://127.0.0.1:40889/pendant>. Connect
 the Feather data port. Review the machine-coordinate XYZ envelope and confirm
-the complete volume is clear for the fitted tool. Then click **Arm**. This
-operator page is the session's decision point; no MCP tool can arm a pendant.
+the usable space is clear for the fitted tool after reviewing the displayed
+obstacle exclusions. Then click **Arm**. This operator page is the session's decision point; no MCP tool can arm a pendant.
 
 The session lasts at most 10 minutes. X/Y default to ±5 mm around the current
 position; Z defaults to 280–329 mm. **Fill machine X**, **Fill machine Y** and
@@ -101,9 +101,14 @@ bounds to that intersection (A350 Z ends at 328, not the profile's 325).
 There is no arbitrary 100 mm envelope span limit. This is direct, supervised manual control:
 the operator approves the entire requested corridor, including its Z range, and
 holds D1 for each movement. It does not reuse or broaden an AI job approval.
-Known obstacles and tool-length clearances still refuse the envelope. The
-usual agent motion-floor rules and staged-job workflow remain in force for AI
-operations. Pendant control requires homed, idle, coherent fresh position,
+Stored obstacle footprints, including a 5 mm XY margin, remain excluded below
+their displayed required machine Z (all heights if tool clearance is unknown).
+A broad envelope may include these exclusions: arming checks the current point,
+and every complete jog segment is checked before transmission. This includes
+diagonals, vertical descents and movement wholly inside a footprint; there is
+no probing exemption. A blocked jog disarms and names the obstacle, required Z
+and attempted Z, without sending that segment. The usual agent motion-floor
+rules and staged-job workflow remain in force for AI operations. Pendant control requires homed, idle, coherent fresh position,
 toolhead off and no safety alarm or active job. A reconnect invalidates the arm.
 
 Only one move is in flight. Each move is at most 0.5 mm in vector length and
@@ -122,7 +127,8 @@ loopback-only even when MCP LAN access is enabled. Operator POSTs require a
 page token, matching origin, and a loopback Host. The page cannot be framed.
 The operator should not jog simultaneously using the touchscreen or other UI.
 
-Arm refusals remain visible on the page and are logged under
+Arm and jog refusals appear next to the Arm/Stop controls, receive focus and
+scroll into view, persist through polling, and are logged under
 `service:mcp:pendant`. Stop explicitly reports disarmed; raw joystick samples and
 DRO updates continue as diagnostics. A firmware sequence reset disarms and
 recovers incoming telemetry without waiting for the old counter; centre and
