@@ -15,8 +15,8 @@ import { isLoopback } from './McpServer';
 import { JogBounds, JogPosition, PENDANT_FEED_MAX, PendantSession, firmwareMotionProblem, parsePendantInput, validateJogBounds } from './pendant';
 import {
     A350_STEPS_PER_MM, CountCheckMode, CountSample, HOLD_COUNT_POLL_MS, HOLD_FEATHER_GAP_MS, HOLD_HEARTBEAT_MAX_AGE_MS, HOLD_MIN_ACCEL, HOLD_MOVE_MS,
-    HOLD_LATE_EVENTS_TO_DISABLE, HOLD_QUEUE_AHEAD_MS, HOLD_REPLY_LATE_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault, countToMm, extendAlong,
-    holdMoveMm, holdRunoutMm, judgeCountSample, parseCountReport, parseStepsPerMm,
+    CountOffset, HOLD_LATE_EVENTS_TO_DISABLE, HOLD_QUEUE_AHEAD_MS, HOLD_REPLY_LATE_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault,
+    countToMachine, countToMm, extendAlong, holdMoveMm, holdRunoutMm, judgeCountSample, learnCountOffset, parseCountReport, parseStepsPerMm,
 } from './pendantHold';
 import { pendantPage } from './pendantPage';
 import { pendantPosition } from './pendantPosition';
@@ -184,10 +184,14 @@ export class PendantRuntime {
         notice: null as string | null,
         lastHold: null as HoldSummary | null };
 
-    // The M114 Count check: mode read on arm, steps/mm from M503 S (else the A350 default).
+    // The M114 Count check: mode read on arm, steps/mm from M503 S (else the A350
+    // default), and the Count-frame offset learned from an idle M114 at arm (the
+    // trial A350 counts from its homing position: X +19, Y +4, Z +0 mm).
     private countCheck = { mode: 'observe' as CountCheckMode,
         stepsPerMm: A350_STEPS_PER_MM,
         stepsPerMmSource: 'default' as 'M92' | 'default',
+        countOffset: null as CountOffset | null,
+        countOffsetProblem: null as string | null,
         last: null as CountSample | null };
 
     private holdPromise: Promise<void> | null = null;
@@ -645,7 +649,12 @@ export class PendantRuntime {
     /** Read the firmware's motion limits and steps/mm once per arm; the hold stays off unless they fit the model. */
     private async preparePipeline(): Promise<void> {
         this.pipeline = { ...this.pipeline, requested: false, disabled: null, notice: null };
-        this.countCheck = { ...this.countCheck, mode: requestedCountCheck(), stepsPerMm: A350_STEPS_PER_MM, stepsPerMmSource: 'default' };
+        this.countCheck = { ...this.countCheck,
+            mode: requestedCountCheck(),
+            stepsPerMm: A350_STEPS_PER_MM,
+            stepsPerMmSource: 'default',
+            countOffset: null,
+            countOffsetProblem: null };
         this.lateStreak = 0;
         this.holdOffUntilNeutral = false;
         if (!pipelineRequested()) { return; }
@@ -658,9 +667,14 @@ export class PendantRuntime {
         } catch (err) {
             problem = `Could not read the controller's motion limits: ${(err as Error).message}`;
         }
+        if (!problem) { await this.learnCountOffset(); }
+        const offsetNote = this.countCheck.countOffset
+            ? `Count offset learned at arm: X ${this.countCheck.countOffset.x.toFixed(3)} Y ${this.countCheck.countOffset.y.toFixed(3)} `
+                + `Z ${this.countCheck.countOffset.z.toFixed(3)} mm.`
+            : `Count offset unknown (${this.countCheck.countOffsetProblem || 'not read'}): Count is traced raw and cannot be read as a position.`;
         const countNote = this.countCheck.mode === 'enforced'
-            ? 'The M114 Count check is ENFORCED: a Count position more than one increment from the model, or a late M114 reply, stops the hold.'
-            : 'The M114 Count check is in observe mode: it is traced, it never stops a hold (LUBAN_PENDANT_COUNT_CHECK=enforced turns it into a gate).';
+            ? `The M114 Count check is ENFORCED: a Count position more than one increment from the model, or a late M114 reply, stops the hold. ${offsetNote}`
+            : `The M114 Count check is in observe mode: it is traced, it never stops a hold (LUBAN_PENDANT_COUNT_CHECK=enforced turns it into a gate). ${offsetNote}`;
         const notice = problem ? null : ['Continuous jogging is on: one G53 when D1 is pressed, clock-paced increments while it is held, one G54 when it is',
             `released or anything stops the hold; at most ${HOLD_QUEUE_AHEAD_MS} ms of motion is queued ahead. Each hold sends M220 S100, which STAYS`,
             'in force afterwards: a reduced touchscreen speed % is overridden for later file jobs too. Set it again before a job that relies on it.',
@@ -669,6 +683,42 @@ export class PendantRuntime {
         if (problem) { log.warn(`Continuous jog refused: ${problem}`); } else {
             log.info(`Continuous jog enabled (Count check ${this.countCheck.mode}, steps/mm from ${this.countCheck.stepsPerMmSource}): ${notice}`);
         }
+    }
+
+    /**
+     * Learn the Count-frame offset once per arm: one M114 while idle with the
+     * reliable position of record ready() just admitted, offset = Count /
+     * steps-per-mm - record machine position. Never compare Count to machine
+     * coordinates without it (the trial A350 counts from its homing position,
+     * X +19 Y +4 Z +0 mm, so a raw comparison would read a constant 19 mm
+     * "lag" and enforced mode would stop every hold). No Count in the reply, or
+     * a failed M114, leaves the offset unknown: observe mode then traces raw
+     * Count only; enforced mode refuses to arm rather than gate on garbage.
+     */
+    private async learnCountOffset(): Promise<void> {
+        let problem: string | null = null;
+        try {
+            const machine = this.position();
+            const executed = await queryPositionReport('usb_pendant:count-offset');
+            const report = executed.result === 0 ? parseCountReport(executed.text) : { position: null, count: null };
+            if (report.count) {
+                const offset = learnCountOffset(report.count, this.countCheck.stepsPerMm, machine, Date.now());
+                this.countCheck = { ...this.countCheck, countOffset: offset, countOffsetProblem: null };
+                log.info(`Count offset learned at arm: Count ${JSON.stringify(report.count)} / ${JSON.stringify(this.countCheck.stepsPerMm)} steps/mm at machine `
+                    + `${JSON.stringify(machine)} -> offset X ${offset.x.toFixed(3)} Y ${offset.y.toFixed(3)} Z ${offset.z.toFixed(3)} mm.`);
+            } else {
+                problem = `the arm-time M114 carried no Count fields (result ${executed.result}: ${(executed.text || 'no text').slice(0, 120)})`;
+            }
+        } catch (err) {
+            problem = `the arm-time M114 failed: ${(err as Error).message}`;
+        }
+        if (!problem) { return; }
+        this.countCheck = { ...this.countCheck, countOffset: null, countOffsetProblem: problem };
+        if (this.countCheck.mode === 'enforced') {
+            throw new Error(`The M114 Count check is enforced but its offset could not be learned: ${problem}. Nothing gates on an unreadable Count; `
+                + 'fix the controller reply or start Luban with LUBAN_PENDANT_COUNT_CHECK=observe.');
+        }
+        log.warn(`Count offset unknown: ${problem}. Count is traced raw only.`);
     }
 
     // X/Y only: a target whose Z differs from the head's by more than G-code rounding is a Z jog (settled path).
@@ -798,7 +848,7 @@ export class PendantRuntime {
             body = `sent X${tick.sent?.x} Y${tick.sent?.y} F${tick.feed} reply ${tick.replyMs} ms`;
         } else if (tick.kind === 'count' && tick.count) {
             const c = tick.count;
-            body = `count ${JSON.stringify(c.count)} derived ${JSON.stringify(c.derived)} expected ${JSON.stringify(c.expected)} `
+            body = `count ${JSON.stringify(c.count)} raw ${JSON.stringify(c.rawMm)} derived ${JSON.stringify(c.derived)} expected ${JSON.stringify(c.expected)} `
                 + `lag ${c.lagMm === null ? 'n/a' : c.lagMm.toFixed(3)} mm reply ${c.execMs} ms${c.late ? ' LATE' : ''}${c.error ? ` error ${c.error}` : ''}`;
         }
         trace(`[hold] ${tick.kind} outstanding ${tick.outstandingMs} ms input age ${tick.inputAgeMs} ms ${body}`);
@@ -820,12 +870,15 @@ export class PendantRuntime {
             const executed = await leased(async () => queryPositionReport('usb_pendant:count'));
             const execMs = Date.now() - sentAt;
             const report = executed.result === 0 ? parseCountReport(executed.text) : { position: null, count: null };
-            const derived = report.count ? countToMm(report.count, this.countCheck.stepsPerMm) : null;
+            const { stepsPerMm, countOffset } = this.countCheck;
+            const rawMm = report.count ? countToMm(report.count, stepsPerMm) : null;
+            const derived = report.count && countOffset ? countToMachine(report.count, stepsPerMm, countOffset) : null;
             const judged = judgeCountSample(derived, expected, moveMm, POSITION_EPSILON_MM);
             sample = { at: sentAt,
                 execMs,
                 late: execMs > HOLD_TICK_MS,
                 count: report.count,
+                rawMm,
                 derived,
                 position: report.position,
                 expected,
@@ -837,6 +890,7 @@ export class PendantRuntime {
                 execMs: Date.now() - sentAt,
                 late: false,
                 count: null,
+                rawMm: null,
                 derived: null,
                 position: null,
                 expected,
@@ -1148,6 +1202,9 @@ export class PendantRuntime {
                     lateEvents: this.lateStreak,
                     holdOffUntilNeutral: this.holdOffUntilNeutral,
                     countCheck: { ...this.countCheck,
+                        countOffsetMm: this.countCheck.countOffset
+                            ? { x: this.countCheck.countOffset.x, y: this.countCheck.countOffset.y, z: this.countCheck.countOffset.z } : null,
+                        countOffsetLearnedAt: this.countCheck.countOffset?.learnedAt ?? null,
                         tickMs: HOLD_TICK_MS,
                         moveMs: HOLD_MOVE_MS,
                         queueAheadMs: HOLD_QUEUE_AHEAD_MS,

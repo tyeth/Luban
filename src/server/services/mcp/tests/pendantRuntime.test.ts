@@ -26,8 +26,13 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
     // serialize it behind the G1 in flight; here it runs beside it on the fake clock).
     let countRttMs = 0;
     let countText: string | null = null;
+    // The arm-time M114 (offset learning) can be given its own text.
+    let armCountText: string | null = null;
     // The M114 double answers result -1 (as SstpHttpChannel does for a transport error).
     let countFail = false;
+    // The Count frame's offset from machine coordinates, as the trial A350 showed it (X +19, Y +4, Z +0 mm): the
+    // double prints Count = (position + offset) x 400, so every test exercises the learning, never a constant.
+    let countOffset = { x: 19, y: 4, z: 0 };
     let queueHold = false;
     let queueFail = false;
     let tripped = false;
@@ -200,7 +205,7 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
             sleep: async (ms: number) => { await new Promise<void>((resolve) => setImmediate(resolve)); now += ms; hooks.stream(); },
             readFirmwareMotionConfig: async () => m503,
             enterMachineFrame: async () => {
-                frames.push('enter'); leaseChecks.push(lease.refusal('G53')); runNo += 1; holdOpen = true;
+                frames.push('enter'); leaseChecks.push(lease.refusal('G53', now)); runNo += 1; holdOpen = true;
                 now += rttMs; hooks.stream();
                 if (onEnter) { onEnter(); }
                 if (enterFail) { throw Error('transport_error after the request was sent'); }
@@ -209,7 +214,7 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
             },
             queueMachineMove: async (_tool: string, target: { x: number; y: number; z: number }, feed: number, opts?: { omitZ?: boolean }) => {
                 const sentAt = now;
-                leaseChecks.push(lease.refusal('G1'));
+                leaseChecks.push(lease.refusal('G1', now));
                 if (queueFail) { throw Error('Controller rejected the queued move: transport_error'); }
                 if (queueHold) { await new Promise<void>((resolve) => { held.push(resolve); }); }
                 return channel('move', queueHold ? 0 : rttMs, async () => {
@@ -230,16 +235,20 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
             // Marlin prints it (Count in steps at 400 steps/mm).
             queryPositionReport: async () => {
                 const sentAt = now;
-                countLeaseChecks.push(lease.refusal('M114'));
+                countLeaseChecks.push(lease.refusal('M114', now));
                 const p = hooks.physicalAt(sentAt);
-                return channel('query', countRttMs, async () => {
-                    if (countFail) {
+                const override = holdOpen ? countText : armCountText;
+                // At arm nothing drives the clock, so the arm-time M114 takes its reply time like an awaited request.
+                return channel(holdOpen ? 'query' : 'move', countRttMs, async () => {
+                    if (countFail && holdOpen) {
                         counts.push({ sentAt, execMs: now - sentAt, text: 'transport_error' });
                         return { result: -1, text: 'transport_error', sequence: 0, execMs: now - sentAt };
                     }
-                    const text = countText !== null ? countText
-                        : `X:${p.x.toFixed(3)} Y:${p.y.toFixed(3)} Z:${p.z.toFixed(3)} E:0.00 `
-                        + `Count X:${Math.round(p.x * 400)} Y:${Math.round(p.y * 400)} Z:${Math.round(p.z * 400)}`;
+                    const c = { x: Math.round((p.x + countOffset.x) * 400),
+                        y: Math.round((p.y + countOffset.y) * 400),
+                        z: Math.round((p.z + countOffset.z) * 400) };
+                    const text = override !== null ? override
+                        : `X:${p.x.toFixed(3)} Y:${p.y.toFixed(3)} Z:${p.z.toFixed(3)} E:0.00 Count X:${c.x} Y:${c.y} Z:${c.z}`;
                     counts.push({ sentAt, execMs: now - sentAt, text });
                     return { result: 0, text, sequence: 0, execMs: now - sentAt };
                 });
@@ -404,6 +413,8 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
         setRtt: (ms: number) => { rttMs = ms; },
         setCountRtt: (ms: number) => { countRttMs = ms; },
         setCountText: (text: string | null) => { countText = text; },
+        setArmCountText: (text: string | null) => { armCountText = text; },
+        setCountOffset: (offset: { x: number; y: number; z: number }) => { countOffset = offset; },
         failCount: () => { countFail = true; },
         holdQueue: (hold: boolean) => { queueHold = hold; },
         failQueue: () => { queueFail = true; },
@@ -1075,13 +1086,18 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.deepEqual(after.pipeline.countCheck.stepsPerMm, { x: 400, y: 400, z: 400 });
         assert.equal(after.pipeline.countCheck.stepsPerMmSource, 'M92');
         assert.equal(after.pipeline.countCheck.queueAheadMs, 200);
-        const sampleGaps = f.counts.slice(1).map((c, i) => c.sentAt - f.counts[i].sentAt);
+        assert.deepEqual(after.pipeline.countCheck.countOffsetMm, { x: 19, y: 4, z: 0 }, 'learned from the arm-time M114, not assumed');
+        assert.ok(after.pipeline.countCheck.countOffsetLearnedAt >= 1000);
+        assert.equal(after.pipeline.countCheck.countOffsetProblem, null);
+        assert.ok(after.pipeline.countCheck.last.rawMm.x - after.pipeline.countCheck.last.derived.x - 19 < 1e-9, 'raw Count frame kept beside the derived position');
+        const sampleGaps = f.counts.slice(2).map((c, i) => c.sentAt - f.counts[i + 1].sentAt); // counts[0] is the arm-time offset sample
         assert.ok(sampleGaps.every((gap) => gap >= 250 - 1e-6), `polled every 250 ms: ${sampleGaps}`);
         const traceBody = JSON.parse((await f.request('/pendant/hold-trace')).body);
         const kinds = new Set(traceBody.ticks.map((t: { kind: string }) => t.kind));
         for (const kind of ['send', 'wait', 'count', 'stop']) { assert.ok(kinds.has(kind), `trace has ${kind} records`); }
         const countTick = traceBody.ticks.find((t: { kind: string }) => t.kind === 'count');
-        assert.ok(countTick.count.count && countTick.count.derived && countTick.count.expected && typeof countTick.count.lagMm === 'number');
+        assert.ok(countTick.count.count && countTick.count.rawMm && countTick.count.derived && countTick.count.expected && typeof countTick.count.lagMm === 'number');
+        assert.ok(Math.abs(countTick.count.rawMm.x - countTick.count.count.x / 400) < 1e-9, 'the raw Count stays in every trace record');
         assert.ok(traceBody.ticks.every((t: { outstandingMs: number; inputAgeMs: number }) => t.outstandingMs <= 200 && t.inputAgeMs >= 0));
         assert.equal(traceBody.hold.stopReason, 'stick centred');
     }],
@@ -1130,6 +1146,54 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(after.pipeline.lastHold.stopReason, 'stick centred', `a controller that keeps up is never stopped by the enforced check: ${JSON.stringify([after.pipeline.lastHold, steady.counts])}`);
         assert.ok(after.pipeline.lastHold.countSamples >= 3);
         assert.equal(after.pipeline.lastHold.maxLagMm <= 5.05, true);
+    }],
+    ['the Count offset is learned on every arm; an arm-time reply without Count leaves it unknown (observe traces raw, enforced refuses to arm)', async () => {
+        const f = fixture(false, { pipeline: true });
+        f.setCountOffset({ x: 7.25, y: -3, z: 1 });
+        await f.initialize();
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        let status = await readStatus(f);
+        assert.deepEqual(status.pipeline.countCheck.countOffsetMm, { x: 7.25, y: -3, z: 1 }, 'whatever the controller reports, not 19/4/0');
+        assert.match(String(status.pipeline.notice), /Count offset learned at arm: X 7\.250 Y -3\.000 Z 1\.000 mm/);
+        assert.ok(f.logs.some((line) => /Count offset learned at arm/.test(line)));
+        await f.request('/pendant/disarm', {});
+        f.setCountOffset({ x: 19, y: 4, z: 0 }); // e.g. after a home: the counts moved, the next arm learns again
+        f.input();
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        status = await readStatus(f);
+        assert.deepEqual(status.pipeline.countCheck.countOffsetMm, { x: 19, y: 4, z: 0 });
+        assert.equal(f.counts.length, 2, 'one offset sample per arm');
+        f.input(); f.onQueue((count) => { if (count === 8) { f.stopStream(); f.input({ deadman: true }); } });
+        f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); await f.tick(); await f.flush();
+        status = await readStatus(f);
+        assert.ok(status.pipeline.lastHold.countSamples >= 1);
+        assert.ok(status.pipeline.countCheck.lastLagMm < 5.05, `the offset is applied: lag ${status.pipeline.countCheck.lastLagMm} mm`);
+        // No Count at arm: observe arms and traces raw Count only; nothing is derived or judged.
+        const blind = fixture(false, { pipeline: true });
+        blind.setArmCountText('X:10.000 Y:10.000 Z:10.000 E:0.00');
+        await blind.initialize();
+        assert.equal((await blind.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        status = await readStatus(blind);
+        assert.equal(status.pipeline.countCheck.countOffsetMm, null);
+        assert.match(String(status.pipeline.countCheck.countOffsetProblem), /no Count fields/);
+        assert.match(String(status.pipeline.notice), /Count offset unknown/);
+        blind.input(); blind.onQueue((count) => { if (count === 8) { blind.stopStream(); blind.input({ deadman: true }); } });
+        blind.stream({ x: 1, deadman: true, feed: 3000 }, 3000); await blind.tick(); await blind.flush();
+        status = await readStatus(blind);
+        assert.equal(status.pipeline.lastHold.stopReason, 'stick centred');
+        assert.ok(status.pipeline.lastHold.countSamples >= 1);
+        assert.ok(status.pipeline.countCheck.last.count && status.pipeline.countCheck.last.rawMm, 'raw Count traced');
+        assert.equal(status.pipeline.countCheck.last.derived, null); assert.equal(status.pipeline.countCheck.lastLagMm, null);
+        assert.equal(status.pipeline.lastHold.maxLagMm, null);
+        // Enforced cannot gate on an unreadable Count: the arm is refused with the reason.
+        const strict = fixture(false, { pipeline: true, countCheck: 'enforced' });
+        strict.setArmCountText('ok');
+        await strict.initialize();
+        const refused = await strict.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide });
+        assert.equal(refused.status, 400);
+        assert.match(refused.body, /Count check is enforced but its offset could not be learned: the arm-time M114 carried no Count fields/);
+        assert.equal((await readStatus(strict)).armed, false);
+        assert.deepEqual(strict.frames, []);
     }],
     ['steps per mm fall back to the A350 default when M503 S has no M92', async () => {
         const f = fixture(false, { pipeline: true });

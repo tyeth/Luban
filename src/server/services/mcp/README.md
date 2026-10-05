@@ -1813,9 +1813,11 @@ retired after hardware feedback (2026-10-05: a second of motion, a 0.5-2 s stop,
 increment is checked from the pendant's own dead-reckoned commanded position against the
 reviewed envelope and the obstacle map including the queued run-out; the position of record is
 blind inside the `G53` window by design. `M114` is polled every 250 ms during a hold and its
-`Count` fields (stepper steps, converted with `M92` steps/mm from `M503 S` or the A350 default)
-are traced against the model; the check is `observe` by default and gates only with
-`LUBAN_PENDANT_COUNT_CHECK=enforced`. The pendant README states the stop triggers, the latency
+`Count` fields (stepper steps, converted with `M92` steps/mm from `M503 S` or the A350 default,
+minus a per-axis offset learned from an idle `M114` on every arm: the trial A350 counts from its
+homing position, X +19 Y +4 Z +0 mm, so raw counts are never compared to machine coordinates) are
+traced against the model; the check is `observe` by default and gates only with
+`LUBAN_PENDANT_COUNT_CHECK=enforced` (which refuses to arm when the offset cannot be learned). The pendant README states the stop triggers, the latency
 bounds and what the first hardware trial must answer. While a hold holds the window, an
 exclusive gcode lease (`machine/gcodeLease.ts`) refuses every other command. It covers every
 channel's `executeGcode`, the SSTP job and override endpoints (including the MCP file-job start)

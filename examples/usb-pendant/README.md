@@ -248,10 +248,26 @@ any connection other than the A350's HTTP channel.
   `Count X: Y: Z:` fields are stepper counts; they are turned into millimetres
   with the `M92` steps/mm from the `M503 S` read at arm time, or the A350
   default of 400 steps/mm when `M503 S` does not report `M92` (the status says
-  which). Each sample records the reply time, the Count, the derived position,
-  the reply's own X/Y/Z fields, the clock model's expected executed position at
-  the send time and the XY distance between the two (`lagMm`; it is symmetric,
-  a controller running ahead of the model counts like one behind it).
+  which). **Counts are not machine coordinates.** On the trial A350
+  (2026-10-05, four at-rest samples) Count/400 read machine X + 19, Y + 4,
+  Z + 0: machine X263.42 Y0 Z299.67 printed `Count X:112966 Y:1600 Z:119867`.
+  Count X zero is the X home switch at machine X −19, so the counts are
+  measured from the homing position. Luban therefore **learns the per-axis
+  offset on every arm** (`pipeline.countCheck.countOffsetMm`, with
+  `countOffsetLearnedAt`): one `M114` while idle, right after the `M503 S`
+  read, with the reliable position of record the arm just admitted; offset =
+  Count / steps-per-mm − record machine position. Nothing is assumed, and a
+  home between arms (which could reset the counts) is covered by the re-learn.
+  If the arm-time reply has no `Count`, or the `M114` fails, the offset is
+  unknown (`countOffsetProblem` says why): observe mode arms and traces the
+  raw Count only, deriving and judging nothing; enforced mode refuses to arm
+  with that reason rather than gate on an unreadable Count. Each sample records
+  the reply time, the raw Count (steps) and `rawMm` (Count / steps, the Count
+  frame, kept so the trial can see the offset stay constant during motion),
+  the derived machine position (raw minus the learned offset), the reply's own
+  X/Y/Z fields, the clock model's expected executed position at the send time
+  and the XY distance between the two (`lagMm`; it is symmetric, a controller
+  running ahead of the model counts like one behind it).
   - `countCheck: observe` (the **default**): every sample is traced and shown,
     and the check never stops a hold. The open-loop clock pacing with the 200 ms
     cap is the whole behaviour. Observe mode is inert for *gating* only: the
@@ -390,11 +406,20 @@ the controller needs 50 ms to decelerate). If the first trial shows a ripple at
 high feed but none at 300 mm/min, that is this, and `HOLD_QUEUE_AHEAD_MS` (with
 its run-out) is the constant to revisit, not the tick.
 
+**Already answered by the earlier trial (the #230 build, 2026-10-05):** G53
+does not wait for motion (`M220 S100` / `G90` / `G53` took 160–345 ms for the
+three requests and the G1s started straight after); G1 replies arrive once
+queued (38–69 ms for ~175 ms moves); `M503 S` over HTTP parses (M203 X/Y
+100 mm/s, M201 X/Y 1000); `M220 S100` is accepted; idle is reported during
+queued motion (probably: several queued runs, no non-idle disarm); Count has
+the constant at-rest offset above.
+
 **Still needs hardware verification (the first trial answers these):**
 
-- Does `Count` keep up: `lagMm` in the Count samples stays within one increment
-  while the controller runs at the commanded feed, and the derived position is
-  the machine position (not shifted by a constant).
+- Is **Count live during motion** (every earlier sample was at rest): `lagMm`
+  stays within one increment while the controller runs at the commanded feed,
+  and `rawMm − derived` stays at the offset learned at arm (X +19, Y +4, Z +0
+  on the trial machine) throughout a hold.
 - Does `M114` answer promptly during motion (reply time under one tick), or does
   it synchronize the planner (then every poll would stall the queue).
 - Actual run-out after release at F300, F1000 and F3000 against the ~310 ms

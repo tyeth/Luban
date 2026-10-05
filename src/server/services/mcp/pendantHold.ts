@@ -209,8 +209,42 @@ export function parseStepsPerMm(m503: string | undefined | null): JogPosition | 
     return (['x', 'y', 'z'] as const).every((axis) => Number.isFinite(steps[axis]) && steps[axis] > 0) ? steps : null;
 }
 
+/** Count / steps-per-mm: millimetres in the COUNT frame, not machine coordinates (see learnCountOffset). */
 export function countToMm(count: JogPosition, stepsPerMm: JogPosition): JogPosition {
     return { x: count.x / stepsPerMm.x, y: count.y / stepsPerMm.y, z: count.z / stepsPerMm.z };
+}
+
+/**
+ * The per-axis offset between the Count frame and machine coordinates,
+ * learned once per arm from an M114 taken at rest with a reliable position of
+ * record: offset = Count / steps-per-mm - machine. HARDWARE FACT (A350 trial,
+ * 2026-10-05, four at-rest samples): Count/400 read machine X + 19, Y + 4,
+ * Z + 0 - machine X263.42 Y0 Z299.67 printed `Count X:112966 Y:1600
+ * Z:119867`. Count X zero is the X home switch at machine X -19: the counts
+ * are measured from the homing position, not machine zero. The values are
+ * never assumed; they are learned on every arm (homing could reset them).
+ */
+export interface CountOffset {
+    /** Count frame minus machine frame, mm, per axis. */
+    x: number;
+    y: number;
+    z: number;
+    /** Clock time of the arm-time M114 it was learned from. */
+    learnedAt: number;
+    /** The raw Count and the record machine position it was learned from. */
+    count: JogPosition;
+    machine: JogPosition;
+}
+
+export function learnCountOffset(count: JogPosition, stepsPerMm: JogPosition, machine: JogPosition, now: number): CountOffset {
+    const mm = countToMm(count, stepsPerMm);
+    return { x: mm.x - machine.x, y: mm.y - machine.y, z: mm.z - machine.z, learnedAt: now, count: { ...count }, machine: { ...machine } };
+}
+
+/** Machine coordinates from a Count sample: Count / steps-per-mm minus the learned offset. */
+export function countToMachine(count: JogPosition, stepsPerMm: JogPosition, offset: CountOffset): JogPosition {
+    const mm = countToMm(count, stepsPerMm);
+    return { x: mm.x - offset.x, y: mm.y - offset.y, z: mm.z - offset.z };
 }
 
 export interface CountJudgement {
@@ -241,7 +275,9 @@ export interface CountSample {
     /** The reply took longer than one tick. */
     late: boolean;
     count: JogPosition | null;
-    /** Count / steps-per-mm. */
+    /** Count / steps-per-mm before the offset (the Count frame), kept so a trial can see the offset stay constant during motion. */
+    rawMm: JogPosition | null;
+    /** Count / steps-per-mm minus the learned offset: machine coordinates. Null without Count or without a learned offset. */
     derived: JogPosition | null;
     /** The reply's X/Y/Z fields (the selected workspace: machine coordinates inside the hold). */
     position: JogPosition | null;
@@ -260,7 +296,8 @@ export interface CountSample {
 export function countFault(sample: CountSample, moveMm: number): string | null {
     if (sample.error) { return `M114 failed during the hold: ${sample.error}`; }
     if (sample.late) { return `the M114 reply took ${sample.execMs} ms (limit one tick, ${HOLD_TICK_MS} ms)`; }
-    if (!sample.derived) { return 'the M114 reply carried no Count fields, so the executed position cannot be checked'; }
+    if (!sample.count) { return 'the M114 reply carried no Count fields, so the executed position cannot be checked'; }
+    if (!sample.derived) { return 'the Count offset was not learned at arm, so the Count cannot be read as a machine position'; }
     if (sample.off) {
         return `the Count position is ${(sample.lagMm as number).toFixed(2)} mm from the expected executed position `
             + `(limit one increment, ${moveMm.toFixed(2)} mm)`;

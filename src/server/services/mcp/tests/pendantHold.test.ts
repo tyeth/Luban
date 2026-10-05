@@ -1,8 +1,8 @@
 import assert from 'assert';
 import {
     A350_STEPS_PER_MM, HOLD_COUNT_POLL_MS, HOLD_FEATHER_GAP_MS, HOLD_HEARTBEAT_MAX_AGE_MS, HOLD_LATE_EVENTS_TO_DISABLE, HOLD_MOVE_MS, HOLD_QUEUE_AHEAD_MS,
-    HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault, countToMm, extendAlong, holdMoveMm, holdRunoutMm, judgeCountSample, parseCountReport,
-    parseStepsPerMm, queuedMoveGcode,
+    HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault, countToMachine, countToMm, extendAlong, holdMoveMm, holdRunoutMm, judgeCountSample,
+    learnCountOffset, parseCountReport, parseStepsPerMm, queuedMoveGcode,
 } from '../pendantHold';
 
 const origin = { x: 10, y: 20, z: 300 };
@@ -83,16 +83,38 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.equal(judgeCountSample({ x: 20, y: 20, z: 0 }, expected, 5, 0.05).off, false, 'Z is not judged: the hold never commands it');
         assert.equal(judgeCountSample({ x: 26, y: 20, z: 300 }, expected, 5, 0.05).off, true, 'leading the model by more than an increment also counts (symmetric)');
     }],
+    ['the Count offset is learned from the operator\'s at-rest sample and a later sample reads as 10 mm travelled with zero lag', () => {
+        // A350 trial 2026-10-05: machine X263.42 Y0 Z299.67 printed Count X:112966 Y:1600 Z:119867 (400 steps/mm).
+        const steps = { x: 400, y: 400, z: 400 };
+        const atRest = parseCountReport('X:263.420 Y:0.000 Z:299.670 E:0.00 Count X:112966 Y:1600 Z:119867');
+        assert.ok(atRest.count);
+        const offset = learnCountOffset(atRest.count as { x: number; y: number; z: number }, steps, { x: 263.42, y: 0, z: 299.67 }, 1234);
+        assert.ok(Math.abs(offset.x - 19) < 0.005 && Math.abs(offset.y - 4) < 0.005 && Math.abs(offset.z) < 0.005, JSON.stringify(offset));
+        assert.equal(offset.learnedAt, 1234);
+        assert.deepEqual(offset.count, { x: 112966, y: 1600, z: 119867 });
+        assert.deepEqual(offset.machine, { x: 263.42, y: 0, z: 299.67 });
+        // Later, 10 mm further along X: the Count-derived machine position is X273.42 and the lag against the model is nil.
+        const later = parseCountReport('Count X:116966 Y:1600 Z:119867').count as { x: number; y: number; z: number };
+        const derived = countToMachine(later, steps, offset);
+        assert.ok(Math.abs(derived.x - 273.42) < 0.005 && Math.abs(derived.y) < 0.005 && Math.abs(derived.z - 299.67) < 0.005, JSON.stringify(derived));
+        assert.ok(Math.abs(derived.x - offset.machine.x - 10) < 0.005, 'ten millimetres travelled');
+        const judged = judgeCountSample(derived, { x: 273.42, y: 0, z: 299.67 }, 0.5, 0.05);
+        assert.ok(judged.lagMm !== null && judged.lagMm < 0.01 && !judged.off, JSON.stringify(judged));
+        // The raw comparison the offset replaces would have read a constant 19.4 mm "lag".
+        const raw = judgeCountSample(countToMm(later, steps), { x: 273.42, y: 0, z: 299.67 }, 0.5, 0.05);
+        assert.ok(raw.lagMm !== null && raw.lagMm > 19 && raw.off);
+    }],
     ['a hold increment is G1 X Y F with no Z word; the settled form still carries Z', () => {
         assert.equal(queuedMoveGcode({ x: 12.3456, y: -0.5, z: 327.999 }, 300, true), 'G1 X12.346 Y-0.500 F300;');
         assert.equal(queuedMoveGcode({ x: 12.3456, y: -0.5, z: 327.999 }, 300, false), 'G1 X12.346 Y-0.500 Z327.999 F300;');
     }],
     ['countFault names the late reply, the missing Count or the lag; a clean sample is no fault', () => {
         const xyz = { x: 1, y: 2, z: 3 };
-        const base = { at: 0, execMs: 40, late: false, count: xyz, derived: xyz, position: null, expected: xyz, lagMm: 0, off: false, error: null };
+        const base = { at: 0, execMs: 40, late: false, count: xyz, rawMm: xyz, derived: xyz, position: null, expected: xyz, lagMm: 0, off: false, error: null };
         assert.equal(countFault(base, 5), null);
         assert.match(String(countFault({ ...base, late: true, execMs: 140 }, 5)), /took 140 ms \(limit one tick, 100 ms\)/);
-        assert.match(String(countFault({ ...base, count: null, derived: null }, 5)), /no Count fields/);
+        assert.match(String(countFault({ ...base, count: null, rawMm: null, derived: null }, 5)), /no Count fields/);
+        assert.match(String(countFault({ ...base, derived: null }, 5)), /offset was not learned at arm/);
         assert.match(String(countFault({ ...base, lagMm: 7.25, off: true }, 5)),
             /7\.25 mm from the expected executed position \(limit one increment, 5\.00 mm\)/);
         assert.match(String(countFault({ ...base, error: 'transport_error' }, 5)), /M114 failed during the hold: transport_error/);
