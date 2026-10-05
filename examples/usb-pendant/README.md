@@ -97,19 +97,46 @@ obstacle exclusions. Then click **Arm**. This operator page is the session's dec
 
 The session lasts at most 10 minutes. X/Y default to ±5 mm around the current
 position; Z defaults to 280–329 mm. **Fill machine X**, **Fill machine Y** and
-**Fill both X/Y** fill known X/Y travel with 1 mm extra at each end. The page
-previews the usable intersection with known travel; arming clips the requested
-bounds to that intersection (A350 Z ends at 328, not the profile's 325).
+**Fill both X/Y** fill known X/Y travel with 1 mm extra at each end. Jogging may
+reach up to 1 mm past known travel on every axis (A350 Z travel ends at 328, not
+the profile's 325): the machine accepts attempted overtravel and the DRO corrects
+on the next position sync. Arming clips requested bounds to travel ±1 mm. A head
+already outside the envelope is never pulled back by the clamp; it moves only
+when the stick asks for a move.
 There is no arbitrary 100 mm envelope span limit. This is direct, supervised manual control:
 the operator approves the entire requested corridor, including its Z range, and
 holds D1 for each movement. It does not reuse or broaden an AI job approval.
 Stored obstacle footprints, including a 5 mm XY margin, remain excluded below
 their displayed required machine Z (all heights if tool clearance is unknown).
-A broad envelope may include these exclusions: arming checks the current point,
-and every complete jog segment is checked before transmission. This includes
-diagonals, vertical descents and movement wholly inside a footprint; there is
-no probing exemption. A blocked jog disarms and names the obstacle, required Z
-and attempted Z, without sending that segment. The usual agent motion-floor
+A broad envelope may include these exclusions: every complete jog segment is
+checked before transmission, on the exact 3-decimal target that is sent. This
+includes diagonals, vertical descents and movement wholly inside a footprint;
+there is no probing exemption. The single exception is a **straight Z-up exit**:
+X and Y unchanged (within 0.05 mm) and Z strictly rising, still limited by the
+envelope and travel Z maximum. A segment that would enter an exclusion below its
+required Z is **held, not sent, and the pendant stays armed** (an envelope edge
+clips the same way). In its place Luban sends only motion that stays clear: first
+the approach up to 0.5 mm outside the exclusion (0.1 mm above its required Z),
+then the same stick intent with the offending axis component removed, for example
+X still moves while a Z-down twist over the rotary axis is refused. The dominant
+stick axis is never the one removed, so a Z-down twist with slight X/Y drift holds
+rather than sending only the drift. Every segment
+actually sent passes the complete obstacle check. Nothing is re-sent while the
+stick is unchanged; moving away, staying above the required Z, or centring the
+stick continues normally. The page and TFT name the obstacle, its required Z and
+the requested Z while held; the first hold per obstacle per arm is logged.
+Displayed heights never understate the rule: required Z rounds up and requested
+Z rounds down to 0.01 mm.
+
+Arming is allowed with the toolhead already inside an exclusion below its
+required Z, so the pendant can climb out. Until it leaves, the page and TFT show
+`INSIDE rotary-axis below Z328: Z-up only` and only a straight Z-up exit is sent:
+switch twist to Z mode and twist up. Every other stick motion holds, including Z-up
+with any X/Y component; in feed mode twist only changes feed, so nothing moves.
+Normal motion resumes once Z reaches the required height. Exclusions are
+recomputed for every segment, so a landmark or fitted-tool change while armed
+applies to the next one.
+There is no landmark override on the pendant. The usual agent motion-floor
 rules and staged-job workflow remain in force for AI operations. Pendant control requires homed, idle, coherent fresh position,
 toolhead off and no safety alarm or active job. A reconnect invalidates the arm.
 
@@ -126,6 +153,161 @@ segment can finish after release/STOP; use the machine's physical emergency
 stop for immediate stopping. A stopped/error session holds its position and
 does not invent a retreat or any extra motion.
 
+### Continuous jogging (opt-in, not yet run on hardware)
+
+**Why the default moves, stops, moves, stops.** Each settled segment is sent as
+`G90`, `G53;`, `G1 …`, `G54;`, and the HTTP channel sends each line as its own
+request and waits for its reply. On the Snapmaker controller `G54` runs
+`select_coordinate_system()`, which calls `planner.synchronize()` when the
+workspace changes, so the last reply arrives only once the G1 has finished
+(live 2026-10-05: 0.50 s of motion, 777 ms until the reply). The next segment
+then needs three more round trips before it moves, about 280 ms at rest each time.
+A bare `G53` does not synchronize, and a plain G1 is acknowledged once queued.
+
+Start Luban with `LUBAN_PENDANT_PIPELINE=1` to try continuous X/Y jogging. It is
+read when you arm and is off by default. An X/Y jog then sends `M220 S100`,
+`G90` and `G53` once, queues short G1 segments, and ends with one verified
+settle: the ordinary settled move to the last queued point, whose G54 restores
+the work frame and whose echo verifies the arrival. Z intent always uses the
+settled path, and so does any connection other than the A350's HTTP channel.
+
+**Smoothness trade-off, by default.** Nothing the A350 reports confirms
+execution during a run. Its heartbeat x/y/z is the planner's queued target, 16
+blocks ahead, and arrives every 2 s. So by default each run commands at most the
+approved segment duration (0.5–1 s), then settles and verifies. The backlog can
+then never exceed one approved duration of travel, however slowly the controller
+actually runs. With that default, a run moves no further between stops than one
+settled segment does, so it is not yet smoother than the settled path.
+
+After you have verified stop behaviour on hardware, you can raise
+`LUBAN_PENDANT_PIPELINE_RUN_MS`, up to 2000 ms, to get continuous runs. Raising
+it raises the worst-case backlog to the same figure. M114's `Count` fields may
+give a real executed-position signal that would lift this limit safely; that
+signal is unverified, and nothing relies on it yet.
+
+**Arming checks the controller.** Luban reads `M503 S` and keeps pipelining off
+(`pipeline.disabled` in `/pendant/status`) unless all of these are reported and
+fit the model:
+
+- `M203` X/Y max feed is at least 50 mm/s.
+- `M201` X/Y max acceleration is at least 500 mm/s².
+- `M204` P/T acceleration is at least 500 mm/s².
+
+The Snapmaker build's `M220` reports nothing, so the feed override cannot be
+read. Each run therefore sends `M220 S100`. **That setting persists after
+jogging.** Any reduced touchscreen speed percentage is overridden for later file
+jobs too, so set it again before a job that relies on it. The page shows this
+warning whenever pipelining is active, `/pendant/status` reports the last
+accepted override as `pipeline.feedOverride` (armed or not), and an MCP tool's
+`failure_recovery` evidence carries it as `feed_override`.
+
+**The run's guards:**
+
+- **Exclusive lease** (`machine/gcodeLease.ts`). It is held from before the G53
+  until the closing G54, and it does not lapse while the run may have G53
+  selected. While it is held every HTTP request times out after 10 s instead of
+  the channel's 300 s, so a hung request fails the run (which raises the latch
+  and admits Restore work frame) instead of blocking recovery; `finally`
+  releases the lease.
+  - **What it refuses:**
+    - every channel's `executeGcode`;
+    - the SSTP job and override endpoints: start, resume, work-speed, laser-power
+      and Z-offset overrides, filament load and unload, and the laser
+      material-thickness probe;
+    - ConnectionManager `startGcode`, `startGcodeAction`, `resumeGcode`, `goHome`,
+      `coordinateMove` and `setWorkOrigin`;
+    - the MCP file-job start, which goes through `startGcodeJob`.
+  - **What it does not cover:** file upload and `prepare_print` (no motion), job
+    pause and stop (allowed on purpose), status polls, and enclosure and
+    air-purifier controls.
+  - **If the restore fails:** the lease hands over to the recovery hold. The hold
+    IS the frame-uncertainty latch (below), read directly, so it cannot outlive
+    it: `holdForRecovery` re-raises the latch if a verified beat had cleared it
+    between the G54 acknowledgement and the failed fallback restore. It accepts
+    only `G90`/`G54`, `M5`, `M114`, `M400`, `M503`, job stop/pause, and Luban's
+    own UI Home button as the whole `G53`/`G28`/`G54` sequence (it sends its
+    three requests inside `runAsHomeSequence`, and its accepted `G54` marks the
+    frame restored; a bare `G53` or `G28` is refused). The ways out are
+    **Restore work frame** (this page or MCP `restore_work_frame`) and that UI
+    Home button. This page's **Home** and the MCP `home` tool are refused while
+    the frame is uncertain: both check the position first, and a re-home is not
+    the remedy for a frame problem.
+- **Frame-uncertainty latch.** It is set before the G53 is sent and persisted
+  across Luban restarts (`mcp-frame-latch.json`, written whole; a file that
+  exists but cannot be read raises the latch). On startup it returns, and with
+  it the recovery hold. It is the same latch the MCP failed-call cleanup raises
+  for a tool, runner or file job that may have left `G53`, so the two recoveries
+  are one design: one record, one refusal, one clearing path.
+  - **Every exit path restores G54:** the normal settle; a no-motion `G90`/`G54`
+    after a lost reply or a failed settle; an awaited `shutdown()`.
+  - **A run that queued nothing** (stick released, obstacle hold or a Z switch
+    straight after the G53) restores and then proves the position with `M114`.
+    The reply must read as a WORK-frame position; one that matches only as raw
+    machine coordinates is what a controller still in G53 would say, and is not
+    accepted (with a ~0 work offset the two readings coincide and nothing can
+    tell them apart). It stays armed.
+  - **Clearing:** the latch clears only after an acknowledged restore AND a
+    verified position. Until then pendant arming and all MCP motion are refused.
+    It appears in `get_position` warnings and in diagnostics. The crash guard
+    held after a failed restore is released when the latch clears, whoever
+    restored (this page, MCP `restore_work_frame`, the failed-call cleanup or a
+    home) and whether or not the USB pendant is still open.
+- **Segments and queue model.** Each segment is at most (approved duration −
+  150 ms) / 2. Marlin never replans a block it is already executing, so the next
+  segment has to arrive before the one ahead starts. Luban sends a segment only
+  while the modelled unfinished motion stays within the approved duration, with
+  at most three segments unfinished.
+- **Obstacles.** Every target goes through the obstacle hold and approach logic
+  from the previous queued endpoint, rounded to the three decimals that are sent,
+  and then the full envelope and segment checks. A held or released stick ends
+  the run with a settle.
+- **Heartbeats in a run.** While the run is declared (from its G53 reply to its
+  G54 reply), the tracker judges heartbeats as machine coordinates and sets
+  ambiguous ones aside. A lag check compares them with the queue model. It is
+  **unproven and expected to be inert on the A350**, because its beats show the
+  queued target, and nothing relies on it.
+- **Falling back.** An acknowledgement slower than 400 ms, or a drain that ends
+  more than 300 ms after the modelled end, returns the session to settled jogs
+  until it is re-armed.
+- **Stale heartbeat.** A heartbeat older than 2.5 s ends the run.
+- **If the controller reports anything but idle during queued motion, the run
+  ends and the pendant disarms.** The page and TFT say so, and you must re-arm. If
+  it happens on every jog, this controller reports busy during queued moves:
+  restart Luban without `LUBAN_PENDANT_PIPELINE`.
+
+**Stop latency (pipelined X/Y, 3000 mm/min = 50 mm/s).** STOP, a released
+deadman and a centred stick are seen on the next 20 Hz USB frame. No segment is
+sent after that. What is already queued is at most one run's commanded travel,
+and with the default budget that is the approved duration: 0.5 s / 25 mm by
+default, 1.0 s / 50 mm at most. This holds whatever the controller's real speed,
+including a stall or a touchscreen speed override. A slower controller takes
+longer to cover that distance, but cannot be asked to go further. Worst case at
+full speed, from the event to standstill:
+
+| Event | Default 0.5 s | Approved 1.0 s |
+|---|---|---|
+| STOP, deadman release or neutral | about 0.61 s, 28 mm or less | about 1.11 s, 53 mm or less |
+| USB silent (no new segment after 300 ms) | about 0.86 s | about 1.36 s |
+| Browser keepalive lost (disarms at 900 ms) | about 1.46 s | about 1.96 s |
+
+If you raise `LUBAN_PENDANT_PIPELINE_RUN_MS`, a stalled controller could hold
+that much commanded travel, at most 2 s (100 mm). The settled path's bound is one
+in-flight segment of up to the approved duration. Z jogs stay settled: at the
+Z-mode limit of 1000 mm/min that is at most 8.3 mm (0.5 s) or 16.7 mm (1 s).
+
+**Still needs hardware verification:**
+
+- `G53` does not synchronize, and plain G1 replies arrive once the move is queued.
+- The controller reports idle during queued direct moves.
+- `M503 S` and `M114` text come back through the HTTP API.
+- `M220 S100` is accepted.
+
+Marlin has `M410` (quickstop), but Luban does not use it: the Snapmaker build
+lacks the emergency parser, and its behaviour over this channel is unverified.
+Commission continuous jogging with small envelopes and the physical emergency
+stop in reach. Compare `pipeline.lastRun` and `lastJog` in `/pendant/status`
+with what the machine did.
+
 MCP mutations are excluded while the pendant owns control, and a pending MCP
 operation prevents arming. Read-only `get_*`, `list_*`, `validate_*` and
 `stop_gcode_job` remain available; stop also disarms. Manual control is
@@ -139,6 +321,36 @@ scroll into view, persist through polling, and are logged under
 DRO updates continue as diagnostics. A firmware sequence reset disarms and
 recovers incoming telemetry without waiting for the old counter; centre and
 explicitly arm again. The TFT scrolls Luban's refusal or stop reason.
+
+### Bed plan and obstacle warning
+
+The page draws a plan view of the bed in machine X/Y, Y up as on the A350
+(-19..339 by 0..342, widened to any stored obstacle): the known travel (dashed
+blue), the envelope being reviewed or the armed one (green), each obstacle
+exclusion with its 5 mm margin labelled with its name and `needs Z ≥ N`, and the
+toolhead. The toolhead is a white dot only while the DRO is verified; otherwise a
+hollow amber ring marks the held, stale position. The map follows every status
+poll and every edit to the bounds fields. A table below it lists each exclusion,
+its required toolhead Z, the stored landmark height and basis (physical top,
+minimum toolhead Z, or the legacy toolhead default) and its notes.
+
+An obstacle turns red when the envelope's XY reaches its footprint and the
+envelope's Z minimum is below its required Z. A red warning then appears beside
+the Arm button, for example *Your envelope Z 280–328 overlaps rotary-axis: inside
+X135–205, Y-5–355 (incl. 5 mm margin) the toolhead cannot go below Z328; Z-down
+or entry there below Z328 will be held, not sent.* The warning does not block
+arming: the operator may arm a broad envelope knowingly, and jogs into the
+exclusion are then held as described above. While armed, a hold is shown beside
+the map and in the state line, e.g. `BLOCKED rotary-axis: Z>=328 (asked 327.91)`,
+or `LIMITED …` when only the clear part of the stick motion was sent.
+
+The TFT's bottom row shows the same reason while linked and the stick is
+deflected, red for BLOCKED and amber for LIMITED, scrolling when longer than its
+38 characters. It returns to the grey help text as soon as the stick is centred
+or Luban accepts a full segment. `INSIDE … Z-up only` stays on the row (red)
+while linked, even with the stick centred, until the toolhead leaves the
+exclusion. While disarmed the row still scrolls Luban's
+refusal or stop reason.
 
 Twist in feed mode adjusts the displayed feed while connected and disarmed,
 without producing motion intent. Arming, disarming, a mode change, USB loss and
@@ -187,7 +399,13 @@ optional `log` carries one rare firmware event such as a link change or short
 write. A rejected frame is disarmed with the failing field named, for example
 `Invalid USB pendant frame: feed 1200 above the Z-mode limit 1000 mm/min`. Luban replies
 with `type:dro`, `armed`, `neutral`, `machine`, `work`, `reliability`, `age_ms`,
-`warnings` and an operator message. The board has no authority without the
+`warnings`, an operator `message`, and `blocked`: `null`, or
+`{name, requiredZ, requestedZ, held, inside, text}` while an obstacle is holding
+(`held:true`) or limiting (`held:false`) the stick, or `inside:true` while the
+toolhead is inside an exclusion below its required Z (Z-up only). `requiredZ` is `null` when
+tool clearance is unknown and the footprint is excluded at every height. Luban
+logs the firmware id once per connection, `unidentified (pre-fw build)` for a
+board that sends none. The board has no authority without the
 operator's armed session and fresh DRO reply.
 
 ```powershell

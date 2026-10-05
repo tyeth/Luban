@@ -992,6 +992,73 @@ These are agent release requirements, not new runtime checks in `validate_gcode`
   before a work-frame `move_z` / `move_and_capture`). See "Coordinate frames and the position
   of record" below. Agent guidance: `.agents/skills/cnc-motion-rules/SKILL.md` (canonical) and
   `.agents/skills/README.md`.
+- **A failed tool call does not leave G53/G91 behind silently** (#221). `ToolRegistry.call()`
+  records the direct sends made in the call's OWN async context (`failureRecovery.ts`, per call
+  via AsyncLocalStorage); anything the call launches in the background is detached from that
+  ledger. When the call throws or returns an error, it checks whether the call may have left
+  `G53`, `G91` or a mode an unfinished payload carried. If so, and only if the connection
+  generation is unchanged, none of THIS call's own payloads is still unanswered (the channel's
+  queue is not inspected), no other operation, job or pendant owns the controller, no
+  crash/overtravel latch or procedure stop request is set, and the machine is idle (all
+  re-checked before EACH cleanup send), and the failure was not a stop/trip/overtravel (only the
+  real markers: the procedure-stop marker, `CRASH ALARM` / `OVERTRAVEL ALARM` / `UNEXPECTED
+  CONTACT`, "Stopped on request"; a latch without one is caught by the guard), it sends `G90`
+  and, when `G53` is or may be active, `G54`, as separate, axis-free commands. A `G55`-`G59`
+  selection whose outcome is unknown is warned about, never reset to `G54`. A failure of
+  `restore_work_frame` itself is reported and never retried, and the failed command is never
+  retried: nothing is. The failure is never turned into success: the original error text comes
+  first, followed by `failure_recovery: {...}` evidence (or a `failure_recovery` field on a
+  structured error result). A failed call that cleans up holds the ownership gate about 4.5 s
+  longer (the 4.5 s settle before verification, plus the two replies). A call that SUCCEEDS but leaves
+  `G53`/`G91`/unknown behind gets the same field with status `skipped` and nothing sent (not for
+  a payload still pending, nor under a running job). The distance mode is never claimed verified.
+  The workspace is verified with `restore_work_frame`'s rule (`frameRecovery.verifyWorkFrame`):
+  a status report at least one poll period (2 s) after the cleanup reply, judged work-frame, a
+  work offset above 0.5 mm, AND the raw report impossible as a machine position; otherwise
+  "consistent with work frame, unverified", "unverifiable", or "no fresh beat". A position is
+  reported trustworthy only when its reliability allows motion and either it is a `verified`
+  echo (still physically valid, but the cleanup sends voided the echo record: re-read
+  `get_position`) or its frame is proven. Anything skipped or unverified names
+  `restore_work_frame` as the no-motion recovery, to call once no job is starting or running.
+- **One recovery design with the USB pendant** (2026-10-05). The hook, the pendant's queued
+  runs and the restart carry-over share ONE record that the controller may still have `G53`
+  selected: the frame-uncertainty latch in `positionOfRecord.ts`. The gcode lease's recovery
+  hold (`machine/gcodeLease.ts`) is that latch, read directly, not a second state. So:
+  - the hook never sends into the pendant's lease or into a recovery hold: a held lease, or a
+    latch already set, is `another-operation-active` (nothing sent, the explanation names the
+    holder or the latch, and a second restore is never sent on top of the one the operator or
+    agent owes);
+  - whenever G53 is or may be active and the hook did not verify G54 (skipped, failed, or
+    accepted but unverified), it raises that latch (before its own sends, as the pendant does
+    before its G53), with the same effect everywhere: pendant arming refused, every MCP motion
+    tool refused by `requireReliableMachine`, the `FRAME UNCERTAIN` line in `get_position`
+    warnings (one wording, `frameRecovery.describeFrameLatch`), `frameUncertain` and
+    `gcodeLease.recovery` in `get_mcp_diagnostics`, and `position.frame_uncertain` in the
+    evidence; `position.trustworthy` is false while the latch stands;
+  - an accepted G54 is recorded as the restore (`noteFrameRestored`), and the latch clears only
+    where `restore_work_frame`'s does: in `getPositionSnapshot`, on a verified position after
+    the restore (a work-frame beat with a reported offset at least 1 s later, or a verified
+    echo). Clearing releases the pendant's held crash guard and ends the lease's hold.
+  - `G90` is never claimed verified (`frameRecovery.DISTANCE_MODE_WARNING`, the same text in
+    both places). `feed_override` reports the last accepted `M220 S<n>` on the direct path,
+    which persists on the controller after the pendant run that sent it.
+- **Jobs that end outside the call that started them** (#221). A procedure runner is detached
+  from `start_gcode_job`'s ledger onto its own, so a step still pending when the call returns
+  `running` is not the start's exposure; when the runner ends (inside the 25 s start wait or
+  later) its ledger is judged exactly like a failed call (the waiting start call counts as the
+  same operation), the evidence goes on the job record and, inside the wait, on the start
+  error. A FILE job runs on the controller's interpreter, so its exposure is inferred from the
+  program text: modal words act when the controller PARSES a line and the parser runs far ahead
+  of the cutter, so after a stop every line from the last `currentLine` seen (less a 16-line
+  queue margin, widened by any `totalLines` mismatch) to the END of the file may have been
+  parsed; several possible modes make that mode unknown, and no reading puts the whole file in
+  play. A completed file leaves the modes of its last line. A file job is NEVER cleaned up
+  automatically: a stop (`stop_gcode_job`, dashboard), a crash/overtravel latch, a lost
+  connection and a completion all record skipped evidence (`job-completed-with-modal-exposure`
+  for a completion that left `G53`/`G91`). Only a job classified as failed on its own may get
+  the guarded `G90`/`G54`, and the file-job watcher has no such classification today (the
+  controller reports no failure state for it). The evidence is `job.failure_recovery` in
+  `get_gcode_job_status`, `stop_gcode_job` and the dashboard.
 - **Compound motion and all cutting goes out as gcode FILES** through the same
   `prepare_print`/`start_print` path as Luban's Start button, so the controller job state
   machine and the enclosure **door interlock** apply (fork issue #23). The direct
@@ -1731,3 +1798,34 @@ The local `/pendant` page connects an operator's CircuitPython USB joystick,
 reviews a bounded machine-coordinate jog envelope, and arms a supervised session
 with live DRO feedback. See [firmware, installation, controls and safety model](../../../../examples/usb-pendant/README.md).
 It uses a separate USB data interface and does not expose an MCP arming tool.
+Settled pendant segments stop between moves because the engine's trailing `G54;` synchronizes
+the controller's planner (Marlin `select_coordinate_system()`). `LUBAN_PENDANT_PIPELINE=1` is an
+opt-in, hardware-unverified continuous X/Y mode. It queues bounded G1 segments in one `G53`
+window (`probing.ts` `enterMachineFrame` / `queueMachineMove` / `settleQueuedMachineMoves`) and
+settles once; the pendant README states its stop-latency bounds. While a run holds the window, an
+exclusive gcode lease (`machine/gcodeLease.ts`) refuses every other command. It covers every
+channel's `executeGcode`, the SSTP job and override endpoints (including the MCP file-job start)
+and ConnectionManager's job, jog, home and origin entry points, and it shortens every HTTP
+request to 10 s while held (`PIPELINE_REQUEST_TIMEOUT_MS`), so a hung request fails the run
+instead of blocking recovery for the channel's 300 s. After a failed restore the frame latch
+becomes a recovery hold that admits only frame recovery (`restore_work_frame` or the pendant
+page's Restore work frame), Luban's own UI Home button as the whole `G53`/`G28`/`G54` sequence
+(a bare `G53` or `G28` is refused; the button sends its three requests inside
+`runAsHomeSequence`), position queries, spindle off and job stop. The MCP `home` tool and the
+pendant page's Home are NOT routes out: both go through `requireReliableMachine`, which refuses
+on any latch, and a re-home is not the remedy for a frame problem anyway.
+
+By default a run commands at most the approved segment duration before it settles. The A350
+heartbeat reports the planner's queued target, so it cannot confirm execution mid-run.
+`M220 S100` persists after jogging: `/pendant/status` shows it as `pipeline.feedOverride` and the
+failed-call evidence as `feed_override`. The tracker judges in-run beats as machine coordinates
+(`declareMachineFrameRun`, `machinePosition.ts` `judgeDeclaredRun`).
+
+A persistent `frameUncertain` latch (`positionOfRecord.ts`) survives Luban restarts and shows in
+`get_position` warnings and in `get_mcp_diagnostics`. It refuses all motion until the work frame
+is restored and a fresh position verified. It is the same latch the failed-call cleanup hook
+raises and clears (see "Failed calls" above), and the lease's recovery hold IS the latch: the
+hold cannot outlive it, because `holdForRecovery` re-raises the latch if a beat cleared it
+mid-run. The latch file (`mcp-frame-latch.json`) is written whole (temp file and rename); a file
+that exists but cannot be read raises the latch on startup. The pendant's held crash guard is
+released whenever the latch clears, with or without a USB pendant open.
