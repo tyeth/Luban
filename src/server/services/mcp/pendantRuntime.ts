@@ -627,6 +627,9 @@ export class PendantRuntime {
                 position_age_ms: dro.position_age_ms,
                 stale_after_ms: dro.stale_after_ms,
                 moving: this.busy && this.recovery === null,
+                // PR #233: the TFT names the limited axis while the stick pushes into the envelope edge.
+                // eslint-disable-next-line camelcase -- USB protocol key
+                limit_axes: this.session.limitedAxes,
                 warnings: dro.warnings.length ? [dro.warnings[0].slice(0, 160)] : [],
                 input_seq: this.session.inputSequence >= 0 ? this.session.inputSequence : null,
                 input_age_ms: now - this.session.receivedAt,
