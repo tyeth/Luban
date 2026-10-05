@@ -67,13 +67,18 @@ export function parsePendantInput(line: string): PendantInput {
     return p;
 }
 
+// Same value as envelopeChecks POSITION_EPSILON_MM; kept local so this module stays import-free.
+const EDGE_TOLERANCE_MM = 0.05;
+
 export function validateJogBounds(bounds: JogBounds, current: JogPosition): void {
     if (!bounds || typeof bounds !== 'object') { throw new Error('Machine XYZ bounds are required.'); }
     for (const axis of ['x', 'y', 'z'] as const) {
         const lo = bounds[`${axis}Min`];
         const hi = bounds[`${axis}Max`];
+        // Heartbeat noise at a travel edge (e.g. Y -0.000005 with travel clipped to Y0)
+        // must not refuse the arm.
         if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo
-            || current[axis] < lo || current[axis] > hi) {
+            || current[axis] < lo - EDGE_TOLERANCE_MM || current[axis] > hi + EDGE_TOLERANCE_MM) {
             throw new Error(`Invalid machine ${axis.toUpperCase()} envelope ${lo}..${hi}; must be finite, ordered and contain current position ${current[axis]}.`);
         }
     }
