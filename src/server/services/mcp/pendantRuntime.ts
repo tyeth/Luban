@@ -26,7 +26,7 @@ import { getFeedOverride } from './failureRecovery';
 import { currentGcodeSequence, getFrameLatch, getPositionOfRecord, getTrustedOffset, latchFrameUncertain, onFrameLatchChange } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
 import {
-    assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queryPositionReport, queueMachineMove, readFirmwareMotionConfig, sleep,
+    assertFullFeedrate, assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queryPositionReport, queueMachineMove, readFirmwareMotionConfig, sleep,
     verifyRestoredPosition,
 } from './probing';
 import { homeMachine, sendWorkFrameRestore } from './tools/camera';
@@ -680,6 +680,12 @@ export class PendantRuntime {
         } catch (err) {
             problem = `Could not read the controller's motion limits: ${(err as Error).message}`;
         }
+        if (!problem) {
+            // Once per arm, not per hold: one fewer request between D1 and the first increment.
+            try { await assertFullFeedrate('usb_pendant:pipeline-check'); } catch (err) {
+                problem = `Could not assert a 100 % feed override: ${(err as Error).message}`;
+            }
+        }
         if (!problem) { await this.learnCountOffset(); }
         const offsetNote = this.countCheck.countOffset
             ? `Count offset learned at arm: X ${this.countCheck.countOffset.x.toFixed(3)} Y ${this.countCheck.countOffset.y.toFixed(3)} `
@@ -689,8 +695,9 @@ export class PendantRuntime {
             ? `The M114 Count check is ENFORCED: a Count position more than one increment from the model, or a late M114 reply, stops the hold. ${offsetNote}`
             : `The M114 Count check is in observe mode: it is traced, it never stops a hold (LUBAN_PENDANT_COUNT_CHECK=enforced turns it into a gate). ${offsetNote}`;
         const notice = problem ? null : ['Continuous jogging is on: one G53 when D1 is pressed, clock-paced increments while it is held, one G54 when it is',
-            `released or anything stops the hold; at most ${HOLD_QUEUE_AHEAD_MS} ms of motion is queued ahead. Each hold sends M220 S100, which STAYS`,
+            `released or anything stops the hold; at most ${HOLD_QUEUE_AHEAD_MS} ms of motion is queued ahead. Arming sent M220 S100, which STAYS`,
             'in force afterwards: a reduced touchscreen speed % is overridden for later file jobs too. Set it again before a job that relies on it.',
+            'A touchscreen speed change made after arming is not corrected until the next arm (the Count trace shows the lag).',
             countNote].join(' ');
         this.pipeline = { ...this.pipeline, requested: true, disabled: problem ? `${problem} Settled jogs only.` : null, notice };
         if (problem) { log.warn(`Continuous jog refused: ${problem}`); } else {

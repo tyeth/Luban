@@ -181,7 +181,7 @@ any connection other than the A350's HTTP channel.
 **The hold (`pendantRuntime.ts` `continuousHold`, constants in `pendantHold.ts`):**
 
 - **One G53 at the press, one G54 at the stop.** The whole hold runs inside one
-  gcode-lease acquisition. The press sends `M220 S100`, `G90`, `G53;` once (the
+  gcode-lease acquisition. The press sends `G90`, `G53;` once (the
   frame latch is raised *before* the send, so a lost reply still counts). The
   stop sends nothing further, then closes through the shared restore path:
   `sendWorkFrameRestore` (`G90`/`G54;`, which synchronizes the planner, so its
@@ -311,8 +311,10 @@ per-increment error bounded (at 1000 mm/s² a 100 ms increment at 3000 mm/min
 spends up to 50 ms accelerating) and the Count check measures whatever remains.
 
 The Snapmaker build's `M220` reports nothing, so the feed override cannot be
-read. Each hold therefore sends `M220 S100`. **That setting persists after
-jogging.** Any reduced touchscreen speed percentage is overridden for later file
+read. Arming continuous jogging therefore sends `M220 S100` once (not per
+hold, to keep the press-to-motion delay to two requests); a touchscreen speed
+change made after arming is not corrected until the next arm, and the Count
+trace shows the resulting lag. **That setting persists after jogging.** Any reduced touchscreen speed percentage is overridden for later file
 jobs too, so set it again before a job that relies on it. The page shows this
 warning whenever continuous jogging is active, `/pendant/status` reports the
 last accepted override as `pipeline.feedOverride` (armed or not), and an MCP

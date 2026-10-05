@@ -70,6 +70,7 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
     const counts: Array<{ sentAt: number; execMs: number; text: string }> = [];
     const verified: Array<{ x: number; y: number; z: number }> = [];
     let feedOverride: object | null = null;
+    let m220Sends = 0;
     let streaming: object | null = null;
     let streamKeepalive = true;
     let streamUntil = 0;
@@ -204,12 +205,16 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
             // Let a fire-and-forget M114 settle its reply time before the clock moves on.
             sleep: async (ms: number) => { await new Promise<void>((resolve) => setImmediate(resolve)); now += ms; hooks.stream(); },
             readFirmwareMotionConfig: async () => m503,
+            assertFullFeedrate: async () => {
+                m220Sends += 1;
+                feedOverride = { gcode: 'M220 S100', at: now, connection: 'c', certain: true, note: null }; // What recordModalSend notes for the accepted payload.
+                return { result: 0 };
+            },
             enterMachineFrame: async () => {
                 frames.push('enter'); leaseChecks.push(lease.refusal('G53', now)); runNo += 1; holdOpen = true;
                 now += rttMs; hooks.stream();
                 if (onEnter) { onEnter(); }
                 if (enterFail) { throw Error('transport_error after the request was sent'); }
-                feedOverride = { gcode: 'M220 S100', at: now, connection: 'c', certain: true, note: null }; // What recordModalSend notes for the accepted payload.
                 return { result: 0 };
             },
             queueMachineMove: async (_tool: string, target: { x: number; y: number; z: number }, feed: number, opts?: { omitZ?: boolean }) => {
@@ -375,6 +380,7 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
         homes,
         targets,
         restores: () => restores,
+        m220Sends: () => m220Sends,
         setWarnings: (value: string[]) => { warnings = value; },
         setMachineStatus: (status: string) => { machineStatus = status; },
         writes: () => Port.current.writes,
@@ -457,6 +463,21 @@ const startRun = async (f: Fixture, extra: object = {}, forMs = 1500, maxSegment
 };
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['M220 S100 is asserted once per arm, not on every hold press', async () => {
+        const f = fixture(false, { pipeline: true });
+        f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input({ deadman: true }); } });
+        await startRun(f, {}, 1500);
+        assert.equal(f.m220Sends(), 1);
+        const first = (await readStatus(f)).pipeline.lastHold.startedAt;
+        f.advance(5000);
+        await f.request('/pendant/keepalive', {}); f.input();
+        f.onQueue((count) => { if (count === 8) { f.stopStream(); f.input({ deadman: true }); } });
+        f.stream({ x: 1, deadman: true, feed: 3000 }, 1500); await f.tick(); await f.flush();
+        const second = (await readStatus(f)).pipeline.lastHold;
+        assert.notEqual(second.startedAt, first, 'a second hold ran');
+        assert.ok(second.moves > 0);
+        assert.equal(f.m220Sends(), 1, 'the second hold sent no M220');
+    }],
     ['a G53-window beat arriving after a proved hold close waits instead of disarming, within the grace', async () => {
         const f = fixture(false, { pipeline: true });
         f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input({ deadman: true }); } });
@@ -1386,10 +1407,10 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.deepEqual(late.frames, ['latch', 'enter', 'restore', 'verify']);
         assert.equal(late.motion(), 0);
         const stalled = fixture(false, { pipeline: true, serialized: true });
-        stalled.setCountRtt(450);
+        stalled.setCountRtt(750);
         await startRun(stalled, {}, 5000);
         after = await readStatus(stalled);
-        assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement', 'a G1 behind a 450 ms M114 is over the 400 ms stop limit');
+        assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement', 'a G1 behind a 750 ms M114 is over the 700 ms stop limit');
         assert.equal(after.armed, true);
         assert.equal(stalled.motion(), 0);
     }],

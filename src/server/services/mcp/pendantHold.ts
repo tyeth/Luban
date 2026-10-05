@@ -35,8 +35,12 @@ export const HOLD_FEATHER_GAP_MS = 150;
 export const HOLD_COUNT_POLL_MS = 250;
 /** A G1 reply slower than this means the controller is holding the request (planner full): stop. */
 export const HOLD_REPLY_LATE_MS = HOLD_QUEUE_AHEAD_MS;
-/** A single increment reply this late stops the hold outright. */
-export const HOLD_REPLY_STOP_MS = 2 * HOLD_REPLY_LATE_MS;
+/**
+ * A single increment reply this late stops the hold outright. Trial 2026-10-05:
+ * p99 420 ms, max 643 ms over Wi-Fi; isolated spikes are tolerated because the
+ * queue is paced by send time, so a late reply never admits extra motion.
+ */
+export const HOLD_REPLY_STOP_MS = 700;
 /** Consecutive late increment replies that stop the hold (one Wi-Fi hiccup is tolerated). */
 export const HOLD_LATE_REPLIES_TO_STOP = 2;
 /**
