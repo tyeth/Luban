@@ -144,6 +144,19 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.match(map(), /id="toolhead-held"/);
         assert.ok(!map().includes('toolhead-live'));
     }],
+    ['the map and warning never understate a required Z, and INSIDE explains the Z-up exit', async () => {
+        const f = await pageFixture();
+        f.state.obstacleExclusions[0].requiredZ = 327.951;
+        await f.element('fill-xy').onclick?.();
+        assert.match(f.element('map').innerHTML, /needs Z ≥ 327.96/);
+        assert.match(f.element('obstacle-warning').textContent, /cannot go below Z327.96;/);
+        f.state.armed = true;
+        f.state.bounds = { xMin: 100, xMax: 180, yMin: 0, yMax: 342, zMin: 280, zMax: 328 };
+        f.state.blocked = { name: 'rotary-axis', requiredZ: 327.951, requestedZ: 300, held: true, inside: true, text: 'INSIDE rotary-axis below Z327.96: Z-up only' } as never;
+        await f.refresh();
+        assert.match(f.element('blocked').textContent, /^INSIDE rotary-axis below Z327.96: Z-up only — the toolhead is inside this exclusion. Only a straight Z-up exit is sent/);
+        assert.equal(f.element('blocked').className, 'held');
+    }],
     ['armed map uses the armed envelope and mirrors a held obstacle refusal beside it', async () => {
         const f = await pageFixture();
         f.state.armed = true;

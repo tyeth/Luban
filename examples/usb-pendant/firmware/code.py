@@ -12,7 +12,7 @@ from adafruit_display_text import label
 from controller import DEFAULT_FEED, Controller, DroDisplay, LinkWatchdog, bottom_row, normalize, deadzone
 
 # Sent in every frame; Luban logs it on connect so a stale code.py/controller.py pair is visible.
-FIRMWARE = "pendant-2026-10-05c"
+FIRMWARE = "pendant-2026-10-05d"
 
 if usb_cdc.data is None:
     print("Pendant maintenance console. Release D0 and reset to run USB data.")

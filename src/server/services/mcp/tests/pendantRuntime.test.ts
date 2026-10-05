@@ -252,14 +252,14 @@ export const tests: Array<[string, () => Promise<void>]> = [
         const held = JSON.parse((await f.request('/pendant/status')).body);
         assert.equal(held.armed, true);
         assert.equal(held.error, null);
-        assert.deepEqual(held.blocked, { name: 'fixture', requiredZ: 20, requestedZ: 10, held: true, text: 'BLOCKED fixture: Z>=20 (asked 10.0)' });
+        assert.deepEqual(held.blocked, { name: 'fixture', requiredZ: 20, requestedZ: 10, held: true, inside: false, text: 'BLOCKED fixture: Z>=20 (asked 10)' });
         assert.equal(f.moves(), 1, 'a refused segment is never transmitted, however many ticks pass');
         assert.equal(f.logs.filter((line) => line.startsWith('Jog held at fixture')).length, 1);
         assert.ok(!f.logs.slice(f.logs.findIndex((line) => line.startsWith('Armed reviewed'))).some((line) => line.startsWith('Disarmed')));
         const frame = f.writes().slice(-1)[0] as { armed: boolean; blocked: { name: string; requiredZ: number; requestedZ: number }; message: string };
         assert.equal(frame.armed, true);
         assert.deepEqual([frame.blocked.name, frame.blocked.requiredZ, frame.blocked.requestedZ], ['fixture', 20, 10]);
-        assert.match(frame.message, /BLOCKED fixture: Z>=20 \(asked 10.0\)/);
+        assert.match(frame.message, /BLOCKED fixture: Z>=20 \(asked 10\)/);
         f.input(); await f.tick();
         assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked, null, 'neutral stick clears the hold');
         await f.tick();
@@ -315,6 +315,73 @@ export const tests: Array<[string, () => Promise<void>]> = [
         await f.tick(); await f.tick();
         assert.equal(f.moves(), 1);
         assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked.held, true);
+    }],
+    ['short approach segments stop at the 0.5 mm XY / 0.1 mm Z pad, not the exclusion edge', async () => {
+        const f = fixture(); await f.initialize();
+        // Exclusion X starts at 15 (obstacle 20 minus the 5 mm margin); the pad edge is 14.5.
+        f.obstacles.push({ name: 'wall', machine: { x0: 20, x1: 21, y0: 5, y1: 15 }, clearanceZ: 20, clearanceBasis: 'toolhead' });
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
+            bounds: { xMin: 0, xMax: 50, yMin: 0, yMax: 50, zMin: 0, zMax: 50 } })).status, 200);
+        f.machine.x = 14.3;
+        f.input(); f.input({ x: 1, deadman: true }); await f.tick();
+        // A 100 ms segment at 300 mm/min would end at 14.8: clear of the exclusion but inside the pad.
+        assert.equal(f.moves(), 1);
+        assert.ok(f.targets[0].x > 14.3 && f.targets[0].x <= 14.5, `stopped at ${f.targets[0].x}`);
+        assert.match(JSON.parse((await f.request('/pendant/status')).body).blocked.text, /^LIMITED wall/);
+        await f.finish();
+        // Z: above the footprint, a descent stops at requiredZ + 0.1 - epsilon, not requiredZ - epsilon.
+        f.machine.x = 16; f.machine.z = 20.3;
+        f.input(); f.input({ z: -1, mode: 'z', deadman: true }); await f.tick();
+        assert.equal(f.moves(), 2);
+        assert.ok(f.targets[1].z >= 20.05 && f.targets[1].z < 20.3, `stopped at Z ${f.targets[1].z}`);
+        await f.finish();
+    }],
+    ['every sent target is rounded to G-code precision inside the envelope before it is checked', async () => {
+        const f = fixture(); await f.initialize();
+        f.machine.x = 10.00049; f.machine.y = 9.99951;
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
+            bounds: { xMin: 5, xMax: 10.2996, yMin: 5, yMax: 15, zMin: 5, zMax: 15 } })).status, 200);
+        f.input(); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+        assert.equal(f.moves(), 1);
+        const sent = f.targets[0];
+        for (const axis of ['x', 'y', 'z'] as const) { assert.equal(Number(sent[axis].toFixed(3)), sent[axis], axis); }
+        assert.equal(sent.x, 10.299, 'clipped at 10.2996 and rounded inward, never 10.300');
+        assert.equal(sent.y, 10);
+        await f.finish();
+    }],
+    ['displayed heights round the requirement up and the request down', async () => {
+        const f = fixture(); await f.initialize();
+        f.obstacles.push({ name: 'fixture', machine: { x0: 20, x1: 21, y0: 5, y1: 15 }, clearanceZ: 20.004, clearanceBasis: 'toolhead' });
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
+            bounds: { xMin: 0, xMax: 50, yMin: 0, yMax: 50, zMin: 0, zMax: 50 } })).status, 200);
+        f.machine.x = 15.2; f.machine.z = 19.996;
+        f.input(); f.input({ z: -1, mode: 'z', deadman: true }); await f.tick();
+        assert.equal(f.moves(), 0);
+        // Requested 19.496 and required 20.004: shown as 19.49 and 20.01, never 19.5 / 20.
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked.text, 'BLOCKED fixture: Z>=20.01 (asked 19.49)');
+    }],
+    ['a Z-down stick with slight XY drift holds instead of sending only the drift', async () => {
+        const f = fixture(true); await f.initialize();
+        f.obstacles.push({ name: 'rotary', machine: { x0: 140, x1: 200, y0: 0, y1: 350 }, clearanceZ: 328, clearanceBasis: 'toolhead' });
+        f.machine.x = 170; f.machine.z = 328;
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
+            bounds: { xMin: -19, xMax: 330, yMin: 0, yMax: 342, zMin: 280, zMax: 328 } })).status, 200);
+        f.input(); f.input({ z: -1, x: 0.15, mode: 'z', deadman: true }); await f.tick(); await f.tick();
+        assert.equal(f.moves(), 0);
+        const status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(status.armed, true);
+        assert.equal(status.blocked.held, true);
+        assert.match(status.blocked.text, /^BLOCKED rotary: Z>=328/);
+    }],
+    ['landmark changes while armed apply to the next segment and the inside state', async () => {
+        const f = fixture(); await f.initialize(); await f.arm(); f.input();
+        await f.tick();
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked, null);
+        f.obstacles.push({ name: 'new clamp', machine: { x0: 9, x1: 11, y0: 9, y1: 11 }, clearanceZ: 30, clearanceBasis: 'toolhead' });
+        await f.tick();
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked.text, 'INSIDE new clamp below Z30: Z-up only');
+        f.input({ x: 1, deadman: true }); await f.tick();
+        assert.equal(f.moves(), 0);
     }],
     ['a pre-fw Feather is logged once per connection as unidentified', async () => {
         const f = fixture(); await f.initialize();
@@ -476,17 +543,64 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: false })).status, 400);
         assert.equal((await f.arm()).status, 200);
     }],
-    ['arming refuses a current position inside an excluded volume and a non-idle machine', async () => {
+    ['arming is allowed inside an excluded volume (to climb out) but refused on a non-idle machine', async () => {
         const f = fixture(); await f.initialize();
         f.obstacles.push({ name: 'corner obstacle',
             machine: { x0: 5, x1: 5.2, y0: 14, y1: 14.2 },
             clearanceZ: 20,
             clearanceBasis: 'toolhead',
             mode: 'crossing' });
-        assert.equal((await f.arm()).status, 400);
+        assert.equal((await f.arm()).status, 200);
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked.text, 'INSIDE corner obstacle below Z20: Z-up only');
+        await f.request('/pendant/disarm', {});
         f.obstacles.length = 0;
         f.failReady();
         assert.equal((await f.arm()).status, 400);
+    }],
+    ['the final segment check permits only a straight Z-up exit through an exclusion', async () => {
+        const f = fixture(); await f.initialize();
+        f.obstacles.push({ name: 'block', machine: { x0: 8, x1: 12, y0: 8, y1: 12 }, clearanceZ: 20, clearanceBasis: 'toolhead' });
+        const from = { x: 10, y: 10, z: 10 };
+        f.runtime.validateJogSegment(from, { x: 10, y: 10, z: 11 });
+        f.runtime.validateJogSegment(from, { x: 10.04, y: 9.96, z: 11 });
+        assert.throws(() => f.runtime.validateJogSegment(from, { x: 10.2, y: 10, z: 11 }), /Jog blocked by block/);
+        assert.throws(() => f.runtime.validateJogSegment(from, { x: 10, y: 10, z: 9 }), /Jog blocked by block/);
+        assert.throws(() => f.runtime.validateJogSegment(from, { x: 11, y: 10, z: 10 }), /Jog blocked by block/);
+        assert.throws(() => f.runtime.validateJogSegment({ x: 0, y: 10, z: 10 }, { x: 10, y: 10, z: 10 }), /Jog blocked by block/);
+    }],
+    ['armed inside an exclusion only Z-up moves; leaving it at the required Z restores normal motion', async () => {
+        const f = fixture(); await f.initialize();
+        f.obstacles.push({ name: 'rotary-axis', machine: { x0: 8, x1: 12, y0: 8, y1: 12 }, clearanceZ: 12, clearanceBasis: 'toolhead' });
+        assert.equal((await f.arm()).status, 200);
+        const status = async () => JSON.parse((await f.request('/pendant/status')).body);
+        assert.deepEqual((await status()).blocked, { name: 'rotary-axis', requiredZ: 12, requestedZ: 10, held: true, inside: true, text: 'INSIDE rotary-axis below Z12: Z-up only' });
+        f.input();
+        await f.tick();
+        const frame = f.writes().slice(-1)[0] as { armed: boolean; blocked: { inside: boolean; text: string } };
+        assert.equal(frame.armed, true);
+        assert.equal(frame.blocked.inside, true);
+        assert.equal(frame.blocked.text, 'INSIDE rotary-axis below Z12: Z-up only');
+        f.input({ x: 1, deadman: true }); await f.tick(); await f.tick();
+        f.input({ y: -1, deadman: true }); await f.tick();
+        f.input({ feed: 1000, deadman: true }); await f.tick();
+        f.input({ z: -1, mode: 'z', deadman: true }); await f.tick();
+        f.input({ z: 1, x: 0.3, mode: 'z', deadman: true }); await f.tick();
+        assert.equal(f.moves(), 0, 'XY, feed-mode twist, Z-down and Z-up with an XY component all hold');
+        assert.equal((await status()).armed, true);
+        assert.equal(f.logs.filter((line) => line.startsWith('Jog held inside rotary-axis')).length, 1);
+        f.input({ z: 1, mode: 'z', deadman: true }); await f.tick();
+        assert.equal(f.moves(), 1);
+        assert.equal(f.targets[0].x, 10); assert.equal(f.targets[0].y, 10);
+        assert.ok(f.targets[0].z > 10);
+        assert.equal((await status()).blocked.inside, true, 'still inside until the required Z is reached');
+        await f.finish();
+        f.machine.z = 12;
+        f.input({ x: 1, deadman: true }); await f.tick();
+        assert.equal(f.moves(), 2);
+        assert.ok(f.targets[1].x > 10);
+        assert.equal(f.targets[1].z, 12);
+        assert.equal((await status()).blocked, null);
+        await f.finish();
     }],
     ['estimated motion is explicitly marked on the DRO and cannot authorize a new jog', async () => {
         const f = fixture(); await f.initialize(); f.estimate();

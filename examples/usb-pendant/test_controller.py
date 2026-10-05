@@ -54,9 +54,13 @@ class ControllerTests(unittest.TestCase):
         blocked = {"name": "rotary-axis", "requiredZ": 328, "requestedZ": 327.911, "held": True,
                    "text": "BLOCKED rotary-axis: Z>=328 (asked 327.9)"}
         dro = {"armed": True, "blocked": blocked, "message": blocked["text"]}
-        self.assertEqual(blocked_text(blocked), "BLOCKED rotary-axis: Z>=328 (asked 327.9)")
+        self.assertEqual(blocked_text(blocked), "BLOCKED rotary-axis: Z>=328 (asked 327.91)")
+        # Never understated: required rounds up, asked rounds down.
+        self.assertEqual(blocked_text(dict(blocked, requestedZ=327.96)), "BLOCKED rotary-axis: Z>=328 (asked 327.96)")
+        self.assertEqual(blocked_text(dict(blocked, requestedZ=327.999)), "BLOCKED rotary-axis: Z>=328 (asked 327.99)")
+        self.assertEqual(blocked_text(dict(blocked, requiredZ=327.951)), "BLOCKED rotary-axis: Z>=327.96 (asked 327.91)")
         text, color = bottom_row(dro, True, True, True, 0)
-        self.assertEqual(text, "BLOCKED rotary-axis: Z>=328 (asked 327.9)"[:38])
+        self.assertEqual(text, "BLOCKED rotary-axis: Z>=328 (asked 327.91)"[:38])
         self.assertEqual(color, BLOCKED_COLOR)
         self.assertNotEqual(color, HELP_COLOR)
         scrolled, _ = bottom_row(dro, True, True, True, 1)
@@ -67,10 +71,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(bottom_row(dro, False, True, True, 0), (HELP_TEXT, HELP_COLOR))
         self.assertEqual(bottom_row(dict(dro, blocked=None), True, True, True, 0), (HELP_TEXT, HELP_COLOR))
         limited = dict(blocked, held=False, requiredZ=327.25, requestedZ=300)
-        self.assertEqual(blocked_text(limited), "LIMITED rotary-axis: Z>=327.25 (asked 300.0)")
+        self.assertEqual(blocked_text(limited), "LIMITED rotary-axis: Z>=327.25 (asked 300)")
         self.assertEqual(bottom_row({"blocked": limited}, True, True, True, 0)[1], LIMITED_COLOR)
         self.assertEqual(blocked_text({"name": "clamp", "requiredZ": None, "requestedZ": 10, "held": True}),
                          "BLOCKED clamp: no entry, tool unknown")
+        inside = {"name": "rotary-axis", "requiredZ": 328, "requestedZ": 300, "held": True, "inside": True}
+        self.assertEqual(blocked_text(inside), "INSIDE rotary-axis below Z328: Z-up only")
+        self.assertEqual(blocked_text(dict(inside, requiredZ=327.951)), "INSIDE rotary-axis below Z327.96: Z-up only")
+        # INSIDE shows even with the stick neutral, and scrolls past 38 characters.
+        text, color = bottom_row({"blocked": inside}, True, True, False, 0)
+        self.assertEqual((text, color), ("INSIDE rotary-axis below Z328: Z-up only"[:38], BLOCKED_COLOR))
+        self.assertEqual(blocked_text(dict(inside, requiredZ=None)), "INSIDE rotary-axis (tool unknown): Z-up only")
         # Disarmed: Luban's reason still scrolls, and a short one is not repeated.
         self.assertEqual(bottom_row({"message": "Disarmed by operator."}, True, False, False, 3),
                          ("Disarmed by operator.", HELP_COLOR))

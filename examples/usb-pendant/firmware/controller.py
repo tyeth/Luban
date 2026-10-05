@@ -14,9 +14,18 @@ LIMITED_COLOR = 0xFFBB44  # Only the part of the stick motion clear of the obsta
 ROW_CHARS = 38
 
 
-def _mm(value):
-    text = "%.3f" % value
+def _trim(text):
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _z_up(value):
+    """Required Z, rounded up to 0.01 so the display never understates it."""
+    return _trim("%.2f" % (math.ceil(value * 100 - 1e-6) / 100))
+
+
+def _z_down(value):
+    """Requested Z, rounded down to 0.01."""
+    return _trim("%.2f" % (math.floor(value * 100 + 1e-6) / 100))
 
 
 def scroll_row(text, now, width=ROW_CHARS):
@@ -27,8 +36,13 @@ def scroll_row(text, now, width=ROW_CHARS):
 
 
 def blocked_text(blocked):
-    """'BLOCKED rotary-axis: Z>=328 (asked 327.9)' from Luban's DRO `blocked` field."""
+    """'BLOCKED rotary-axis: Z>=328 (asked 327.91)' from Luban's DRO `blocked` field."""
     name = str(blocked.get("name") or "obstacle")
+    if blocked.get("inside"):
+        required = blocked.get("requiredZ")
+        if isinstance(required, (int, float)):
+            return "INSIDE %s below Z%s: Z-up only" % (name, _z_up(required))
+        return "INSIDE %s (tool unknown): Z-up only" % name
     word = "BLOCKED" if blocked.get("held", True) else "LIMITED"
     required = blocked.get("requiredZ")
     asked = blocked.get("requestedZ")
@@ -36,17 +50,18 @@ def blocked_text(blocked):
         return "%s %s: no entry, tool unknown" % (word, name)
     if not isinstance(required, (int, float)):
         return str(blocked.get("text") or word)
-    text = "%s %s: Z>=%s" % (word, name, _mm(required))
+    text = "%s %s: Z>=%s" % (word, name, _z_up(required))
     if isinstance(asked, (int, float)):
-        text += " (asked %.1f)" % asked
+        text += " (asked %s)" % _z_down(asked)
     return text
 
 
 def bottom_row(dro, fresh, linked, stick_active, now):
     """Bottom TFT row (text, colour). An obstacle hold shows while linked and the stick is
-    deflected; it clears as soon as the stick is neutral or Luban accepts a full segment."""
+    deflected; it clears as soon as the stick is neutral or Luban accepts a full segment.
+    INSIDE (the toolhead is already inside an exclusion; Z-up only) shows whenever linked."""
     blocked = dro.get("blocked") if fresh and dro else None
-    if linked and stick_active and isinstance(blocked, dict):
+    if linked and isinstance(blocked, dict) and (stick_active or blocked.get("inside")):
         color = BLOCKED_COLOR if blocked.get("held", True) else LIMITED_COLOR
         return scroll_row(blocked_text(blocked), now), color
     reason = dro.get("message") if fresh and dro else None
