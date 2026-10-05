@@ -229,6 +229,7 @@ export class PendantRuntime {
                 position_age_ms: dro.position_age_ms,
                 stale_after_ms: dro.stale_after_ms,
                 moving: this.busy && this.recovery === null,
+                limit_axes: this.session.limitedAxes,
                 warnings: dro.warnings.length ? [dro.warnings[0].slice(0, 160)] : [],
                 input_seq: this.session.inputSequence >= 0 ? this.session.inputSequence : null,
                 input_age_ms: now - this.session.receivedAt,

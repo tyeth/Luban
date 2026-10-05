@@ -2,6 +2,7 @@
 import time
 import os
 import json
+import re
 import board
 import analogio
 import digitalio
@@ -42,23 +43,20 @@ background = displayio.Bitmap(display.width, display.height, 1)
 background_palette = displayio.Palette(1)
 background_palette[0] = 0x000000
 group.append(displayio.TileGrid(background, pixel_shader=background_palette))
-header = label.Label(terminalio.FONT, text="TWIST FEED   MACHINE", color=0x55DDFF, x=4, y=9)
+header = label.Label(terminalio.FONT, text="WORK F60 USB", color=0x55DDFF, x=2, y=8)
 group.append(header)
 dro_labels = []
-for axis, y in zip("XYZ", (33, 60, 87)):
-    area = label.Label(terminalio.FONT, text=axis + "  ---.---", scale=2, color=0xFFFFFF, x=4, y=y)
+for axis, y in zip("XYZ", (29, 56, 83)):
+    # Full-width values use the screen instead of reserving a feed column.
+    area = label.Label(terminalio.FONT, text=axis + " ---.---", scale=3, color=0xFFFFFF, x=2, y=y)
     dro_labels.append(area)
     group.append(area)
-feed_title = label.Label(terminalio.FONT, text="FEED", color=0x55DDFF, x=171, y=33)
-feed_value = label.Label(terminalio.FONT, text="60", scale=3, color=0xFFFFFF, x=171, y=63)
-feed_units = label.Label(terminalio.FONT, text="mm/min", color=0xAAAAAA, x=171, y=87)
-group.append(feed_title)
-group.append(feed_value)
-group.append(feed_units)
-status = label.Label(terminalio.FONT, text="USB: waiting for Luban", color=0xFFBB44, x=4, y=113)
-help_text = label.Label(terminalio.FONT, text="D1 hold jog | D2 stop", color=0xAAAAAA, x=4, y=128)
+status = label.Label(terminalio.FONT, text="READY D1 / STOP D2", scale=2, color=0xFFFFFF, x=2, y=116)
 group.append(status)
-group.append(help_text)
+alert_title = label.Label(terminalio.FONT, text="", scale=3, color=0xFFFFFF, x=2, y=52)
+alert_detail = label.Label(terminalio.FONT, text="", scale=2, color=0xFFBB44, x=2, y=91)
+group.append(alert_title)
+group.append(alert_detail)
 display.root_group = group
 serial = usb_cdc.data
 if serial is None:
@@ -79,6 +77,39 @@ frame = "machine"
 frame_was_pressed = False
 was_linked = False
 print("Luban USB joystick v1. Hold D1 to jog, D2 to stop; D0 switches DRO frame.")
+
+def obstacle_lines(reason):
+    """Compress a host refusal into two readable TFT lines."""
+    text = str(reason or "")
+    marker = "Jog blocked by "
+    if marker not in text:
+        return "BLOCKED", "REVIEW + RE-ARM"
+    detail = text.split(marker, 1)[1]
+    name = detail.split(":", 1)[0].strip().upper()[:12]
+    z_match = re.search(r"machine Z at or above ([0-9.]+) mm", detail)
+    if z_match:
+        return "BLOCKED", (name + " Z>=" + z_match.group(1))[:19]
+    return "BLOCKED", name or "REVIEW + RE-ARM"
+
+def alert_lines(dro_message, fresh, linked, dro_state, limit_axes, d1_held):
+    """Return short, actionable text; long diagnostics stay on the web page."""
+    reason = str(dro_message or "")
+    if not fresh:
+        return "! LINK LOST", "WAIT OR RECONNECT"
+    # After every hard stop the first question is whether the safety key is held.
+    if not linked and d1_held:
+        return "RELEASE D1", "THEN RE-ARM + PRESS"
+    if limit_axes:
+        return "LIMIT " + ",".join(limit_axes), "PULL BACK TO MOVE"
+    if "Jog blocked by " in reason:
+        return obstacle_lines(reason)
+    if "position" in reason.lower() or dro_state != "live":
+        return "WAIT FOR DRO", "MOTION BLOCKED"
+    if "travel" in reason.lower() or "bounds" in reason.lower():
+        return "! TRAVEL", "REVIEW BOUNDS + RE-ARM"
+    if not linked:
+        return "DISARMED", "ARM THEN PRESS D1"
+    return "", ""
 
 while True:
     now = time.monotonic()
@@ -135,37 +166,32 @@ while True:
         z_mode = controller.mode == "z"
         background_palette[0] = 0x660011 if z_mode else 0x000000
         header.color = 0xFFFFFF if z_mode else 0x55DDFF
-        header.text = "%s %s" % ("DANGER: TWIST Z" if z_mode else "TWIST:FEED", "MACHINE" if frame == "machine" else "WORK")
-        feed_value.text = str(int(controller.feed))
+        header.text = "%s F%d %s" % ("! Z MODE" if z_mode else ("MACHINE" if frame == "machine" else "WORK"),
+                                      int(controller.feed), "LIVE" if fresh else "LOST")
         dro_state = dro_display.state(frame, now, fresh)
         valid = dro_state == "live"
         position = dro_display.positions.get(frame)
-        for axis, area in zip("xyz", dro_labels):
-            value = position.get(axis) if position else None
-            area.text = axis.upper() + (" %8.3f" % value if value is not None else "  ---.---")
-            area.color = 0xFFFFFF if valid else 0xFFBB44
-        if not fresh:
-            status.text = "USB stale: held DRO" if position else "USB: waiting for Luban"
-        elif dro_state == "updating":
-            status.text = "JOGGING: updating DRO" if linked else "DRO updating: held values"
-        elif dro_state != "live":
-            status.text = "DRO stale: held values" if position else "DRO unavailable"
-        elif not linked:
-            if controller.neutral_required:
-                status.text = "DISARMED: centre axes"
-            else:
-                status.text = "DISARMED: Z needs arm" if controller.mode == "z" else "DISARMED: twist sets feed"
-        elif controller.neutral_required:
-            status.text = "Centre axes; release D1"
+        limit_axes = dro.get("limit_axes") if fresh and isinstance(dro, dict) else []
+        if not isinstance(limit_axes, list):
+            limit_axes = []
+        title, detail = alert_lines(dro.get("message") if fresh and dro else None,
+                                     fresh, linked, dro_state, limit_axes, deadman.value)
+        if title:
+            # Error states replace the DRO instead of competing with it for a tiny footer.
+            for area in dro_labels:
+                area.text = ""
+            alert_title.text = title
+            alert_detail.text = detail
+            alert_title.color = 0xFFFFFF if title.startswith("!") or title == "BLOCKED" else 0xFFBB44
+            alert_detail.color = 0xFFFFFF if title == "RELEASE D1" else 0xFFBB44
+            status.text = ""
         else:
-            status.text = "JOGGING" if packet["deadman"] else "READY: hold D1 to jog"
-        reason = dro.get("message") if fresh and dro else None
-        if not linked and reason:
-            # Scroll the host's refusal/stop reason across the 38-character bottom row.
-            text = str(reason)
-            offset = int(now * 4) % (len(text) + 4) if len(text) > 38 else 0
-            help_text.text = (text + "    " + text)[offset:offset + 38]
-        else:
-            help_text.text = "D1 hold jog | D2 stop"
+            alert_title.text = ""
+            alert_detail.text = ""
+            for axis, area in zip("xyz", dro_labels):
+                value = position.get(axis) if position else None
+                area.text = axis.upper() + (" %.3f" % value if value is not None else " ---.---")
+                area.color = 0xFFFFFF if valid else 0xFFBB44
+            status.text = "JOGGING" if packet["deadman"] else "READY D1 / STOP D2"
         last_display = now
     time.sleep(0.01)
