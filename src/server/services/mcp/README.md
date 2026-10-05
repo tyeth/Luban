@@ -1731,3 +1731,8 @@ The local `/pendant` page connects an operator's CircuitPython USB joystick,
 reviews a bounded machine-coordinate jog envelope, and arms a supervised session
 with live DRO feedback. See [firmware, installation, controls and safety model](../../../../examples/usb-pendant/README.md).
 It uses a separate USB data interface and does not expose an MCP arming tool.
+Settled pendant segments stop between moves because the engine's trailing `G54;` synchronizes
+the controller's planner (Marlin `select_coordinate_system()`). `LUBAN_PENDANT_PIPELINE=1` is an
+opt-in, hardware-unverified continuous X/Y mode. It queues bounded G1 segments in one `G53`
+window (`probing.ts` `enterMachineFrame` / `queueMachineMove` / `settleQueuedMachineMoves`) and
+settles once; the pendant README states its stop-latency bounds.

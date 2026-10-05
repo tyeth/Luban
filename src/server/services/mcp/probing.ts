@@ -19,7 +19,7 @@ import {
 import { ProbeChannel, probeFeedService, resolveSensorEnabled, sensorLabel } from './probeFeed';
 import { MARCH_SEGMENT_MM, TRAVEL_FEED, marchSegments } from './procedureLimits';
 import { McpToolError } from './registry';
-import { GcodeChannel, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
+import { GcodeChannel, SentGcode, currentGcodeSequence, sendGcodeVisible } from './tools/camera';
 import { PositionSnapshot, assertFreshHeartbeat, getPositionSnapshot, safeTraverseZ } from './tools/machine';
 import { ProcedureAbort, ProcedureStopped } from './procedureAbort';
 import { TRAVERSE_Z_TOLERANCE_MM, planRaiseToTop } from './traversePlan';
@@ -210,6 +210,10 @@ async function moveMachineSettledUnguarded(
         target.y !== undefined ? `Y${target.y.toFixed(3)}` : '',
         target.z !== undefined ? `Z${target.z.toFixed(3)}` : '',
     ].filter(Boolean).join(' ');
+    // The trailing G54 is also what makes this call "settled": on the Snapmaker
+    // controller select_coordinate_system() runs planner.synchronize() when the
+    // workspace changes, so its reply (the last of four HTTP requests) only
+    // arrives once the G1 has finished. A bare G53 does not synchronize.
     const gcode = `G90
 G53;
 G1 ${words} F${feed};
@@ -482,6 +486,66 @@ export async function moveMachineSettled(
         probeFeedService.motionEnd();
     }
 }
+// ---------------------------------------------------------------------------
+// Queued machine-frame moves (USB pendant pipelined jogging, opt-in).
+//
+// Why a settled move always ends at rest: the engine's trailing `G54;` runs
+// select_coordinate_system() in the Snapmaker controller (Marlin
+// G53-G59.cpp), which calls planner.synchronize() whenever the workspace
+// changes. The HTTP channel sends each line as its own request and waits for
+// each reply (SstpHttpChannel.consumeGCodeQueue), so the reply - and the next
+// segment - waits for the G1 to finish, and the planner drains between
+// segments. The controller's G53() handler, by contrast, selects the machine
+// workspace WITHOUT a synchronize, and a plain G1 is acknowledged once it is in
+// the planner (a `G0 B180` + `M114` batch answered in 219 ms during an 18 s
+// rotation, 2026-09-21). These helpers let a caller hold the machine frame
+// across several queued segments and settle ONCE, with the same verified-settle
+// engine, at the end. The caller owns every bound on what it queues.
+
+/** Select absolute machine coordinates for a run of queued moves. No motion. */
+export async function enterMachineFrame(tool: string): Promise<SentGcode> {
+    probeFeedService.assertNoOvertravel();
+    checkProcedureStop();
+    const executed = await sendGcodeVisible(getDirectChannel(), tool, 'G90\nG53;');
+    if (executed.result !== 0) {
+        throw new ProcedureAbort(`Controller rejected the machine-frame select: ${executed.text || executed.result}`);
+    }
+    return executed;
+}
+
+/**
+ * Queue one absolute G1 in the machine frame that enterMachineFrame selected.
+ * Returns when the controller accepted it, normally long before it finishes.
+ * Never call it outside such a run: on its own it would move in the work frame.
+ */
+export async function queueMachineMove(tool: string, target: Xyz, feed: number): Promise<SentGcode> {
+    probeFeedService.assertNoOvertravel();
+    checkProcedureStop();
+    const words = `X${target.x.toFixed(3)} Y${target.y.toFixed(3)} Z${target.z.toFixed(3)}`;
+    const executed = await sendGcodeVisible(getDirectChannel(), tool, `G1 ${words} F${feed};`);
+    if (executed.result !== 0) {
+        throw new ProcedureAbort(`Controller rejected the queued move: ${executed.text || executed.result}`);
+    }
+    return executed;
+}
+
+/**
+ * End a run of queued moves: the ordinary settled move to the run's last
+ * queued endpoint (a zero-length G1, so no new motion), whose trailing G54
+ * waits for the planner to drain, restores the work frame and lets the echo
+ * verify the arrival. No procedure-stop check here: a stop must still restore
+ * the frame, and this adds no travel to what is already queued.
+ */
+export async function settleQueuedMachineMoves(tool: string, last: Xyz, feed: number): Promise<void> {
+    probeFeedService.motionBegin();
+    try {
+        await moveMachineSettledUnguarded(tool, last, feed);
+        traceMark('settled-exit');
+    } finally {
+        probeFeedService.motionEnd();
+    }
+}
+
 /** What raiseToTop did, so a runner can report the head's final Z honestly. */
 export interface RaiseToTopOutcome {
     action: 'raised' | 'skipped' | 'held' | 'no-retreat';

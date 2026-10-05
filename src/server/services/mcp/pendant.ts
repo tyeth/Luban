@@ -159,7 +159,14 @@ export class PendantSession {
         }
     }
 
-    public target(current: JogPosition, now: number, overheadMs = 0): { position: JogPosition; feed: number; durationMs: number; distanceMm: number } | null {
+    /**
+     * The next segment from `current`. `segmentCapMs`, when given, replaces the
+     * overhead-compensated ceiling: pipelined jogging (pendantRuntime) has no
+     * per-segment stop to compensate and bounds its whole queue instead. The
+     * operator's maxSegmentMs still caps every segment either way.
+     */
+    public target(current: JogPosition, now: number, overheadMs = 0, segmentCapMs?: number)
+        : { position: JogPosition; feed: number; durationMs: number; distanceMm: number } | null {
         if (!this.armed) { return null; }
         if (now >= this.expiresAt || now - this.receivedAt > 900) {
             this.disarm();
@@ -176,7 +183,8 @@ export class PendantSession {
         // operator's time limit, never over one second. No queued trajectory.
         // Reserve measured controller/transport overhead plus 100 ms, so the
         // whole request aims to finish inside a second, not just its G1 travel.
-        const ceilingMs = Math.min(this.maxSegmentMs, Math.max(50, 900 - Math.max(0, overheadMs)));
+        const ceilingMs = segmentCapMs !== undefined ? Math.min(this.maxSegmentMs, Math.max(50, segmentCapMs))
+            : Math.min(this.maxSegmentMs, Math.max(50, 900 - Math.max(0, overheadMs)));
         const durationMs = Math.min(ceilingMs, 100 + Math.max(0, now - this.changedAt - 100) * 0.8);
         const feed = Math.max(1, Math.round(p.feed * Math.min(1, magnitude)));
         const distance = feed * durationMs / 60000;

@@ -150,6 +150,70 @@ segment can finish after release/STOP; use the machine's physical emergency
 stop for immediate stopping. A stopped/error session holds its position and
 does not invent a retreat or any extra motion.
 
+### Continuous jogging (opt-in, not yet run on hardware)
+
+**Why the default moves, stops, moves, stops.** Each settled segment is sent as
+`G90`, `G53;`, `G1 …`, `G54;`, and the HTTP channel sends each line as its own
+request and waits for its reply. On the Snapmaker controller `G54` runs
+`select_coordinate_system()`, which calls `planner.synchronize()` when the
+workspace changes, so the last reply arrives only once the G1 has finished
+(live 2026-10-05: 0.50 s of motion, 777 ms until the reply). The next segment
+then needs three more round trips before it moves, about 280 ms at rest each time.
+A bare `G53` does not synchronize, and a plain G1 is acknowledged once queued.
+
+Start Luban with `LUBAN_PENDANT_PIPELINE=1` to try continuous X/Y jogging. It is
+read when you arm and is off by default. An X/Y jog then sends `G90`/`G53` once,
+queues short G1 segments, and ends with one verified settle: the ordinary
+settled move to the last queued point, whose G54 restores the work frame and
+whose echo verifies the arrival. Nothing changes for Z intent, which always uses
+the settled path. The run's limits:
+
+- Each segment is at most (approved duration − 150 ms) / 2: 175 ms at the
+  default 0.5 s, 425 ms at 1 s. That leaves time for the next one to arrive
+  before the one ahead starts. Marlin never replans a block it is already
+  executing, so a block that starts with nothing behind it plans to stop.
+- Luban models the queue. Each segment counts its commanded time, plus a full
+  stop and restart at an assumed 500 mm/s² whenever it starts from rest or
+  changes direction or feed. A segment is sent only while the modelled unfinished
+  motion, including the new segment, stays within the approved duration, with at
+  most three segments unfinished. Each one is checked against the envelope and
+  every obstacle exclusion from the previous queued endpoint before it is sent.
+- If an acknowledgement takes more than 400 ms, or the closing settle finishes
+  more than 300 ms after the modelled end of the queue, the run stops queueing
+  and the session returns to settled jogs until it is re-armed (shown as
+  `pipeline.disabled` in `/pendant/status`). Either one means the model was wrong.
+  A run also settles, verifies its position and restores G54 every 10 s while the
+  stick is held.
+- Inside a run, the heartbeat reports machine coordinates and is set aside by
+  design. Freshness, idle, homed, toolhead-off, overtravel and job checks still
+  run before every segment.
+
+**Stop latency (pipelined X/Y, 3000 mm/min = 50 mm/s).** STOP, a released
+deadman and a centred stick are seen on the next 20 Hz USB frame. No segment is
+sent after that. What is already queued is at most the approved duration of
+commanded travel (0.5 s / 25 mm by default, at most 1.0 s / 50 mm). Worst case,
+from the event to standstill:
+
+| Event | Default 0.5 s | Approved 1.0 s |
+|---|---|---|
+| STOP, deadman release or neutral | about 0.61 s, 28 mm or less | about 1.11 s, 53 mm or less |
+| USB silent (no new segment after 300 ms) | about 0.86 s | about 1.36 s |
+| Browser keepalive lost (disarms at 900 ms) | about 1.46 s | about 1.96 s |
+
+The bound on the settled path is the same: one in-flight segment of up to the
+approved duration. Z jogs stay settled, so at the Z-mode limit of 1000 mm/min
+the in-flight travel is at most 8.3 mm (0.5 s) or 16.7 mm (1 s).
+
+These bounds hold only if three things are true of the controller. Its
+acceleration must be no lower than the model assumes. It must not pause queued
+direct moves. And `G53` must not synchronize. They come from the controller's
+Marlin source and earlier hardware notes, not from a measurement on this machine.
+Marlin has `M410` (quickstop), but Luban does not use it: the Snapmaker build
+lacks the emergency parser, and its behaviour over this channel is unverified.
+Commission continuous jogging with small envelopes and the physical
+emergency stop in reach. Compare `pipeline.lastRun` and `lastJog` in
+`/pendant/status` with what the machine did.
+
 MCP mutations are excluded while the pendant owns control, and a pending MCP
 operation prevents arming. Read-only `get_*`, `list_*`, `validate_*` and
 `stop_gcode_job` remain available; stop also disarms. Manual control is

@@ -12,8 +12,27 @@ import { pendantPosition } from '../pendantPosition';
 import { pendantPage } from '../pendantPage';
 import { requiredToolheadZ } from '../landmarkClearance';
 
-function fixture(a350 = false) {
+interface Queued { sentAt: number; replyAt: number; target: { x: number; y: number; z: number }; feed: number }
+
+function fixture(a350 = false, options: { pipeline?: boolean } = {}) {
     let now = 1000;
+    // Pipelined-run doubles: the controller acknowledges each request after rttMs,
+    // and an ideal executor (no acceleration) runs accepted segments back to back
+    // from rttMs / 2 after the send. queueHold parks acknowledgements for the test.
+    let rttMs = 80;
+    let settleExtraMs = 0;
+    let queueHold = false;
+    let queueFail = false;
+    const held: Array<() => void> = [];
+    const queued: Queued[] = [];
+    const frames: string[] = [];
+    let settledAt: { x: number; y: number; z: number } | null = null;
+    let streaming: object | null = null;
+    let streamUntil = 0;
+    let streamedAt = -Infinity;
+    let motion = 0;
+    // Assigned below, once the USB stream and the executor exist.
+    const hooks = { stream: (): void => undefined, drainEnd: (): number => now };
     let epoch = 1;
     let tick: (() => void) | null = null;
     let finish: (() => void) | null = null;
@@ -31,7 +50,7 @@ function fixture(a350 = false) {
     const homes: unknown[][] = [];
     const targets: Array<{ x: number; y: number; z: number }> = [];
     let restores = 0;
-    const snapshot = () => ({ machine, work: machine, originOffset: { x: 0, y: 0, z: 0 }, originOffsetSource: 'heartbeat', machineStatus, reliability: 'heartbeat', warnings, reportAgeMs: 0 });
+    const snapshot = () => ({ machine, work: machine, originOffset: { x: 0, y: 0, z: 0 }, originOffsetSource: 'heartbeat', machineStatus, reliability: 'heartbeat', warnings, reportAgeMs: 0, isHomed: true });
     class Port extends EventEmitter {
         public static current: Port;
 
@@ -58,7 +77,7 @@ function fixture(a350 = false) {
         http: {},
         '../../lib/logger': () => ({ info: (message: string) => logs.push(message), warn: (message: string) => logs.push(message) }),
         serialport: { SerialPort: Port },
-        '../machine/ConnectionManager': { connectionManager: { getConnectionStatus: () => ({ machineIdentifier: 'mock', connected: true }) } },
+        '../machine/ConnectionManager': { connectionManager: { getConnectionStatus: () => ({ machineIdentifier: 'mock', connected: true }), getLatestMachineState: () => ({}) } },
         './clearanceContext': { clearanceOptions: () => ({ toolProtrusionMm: null, clearanceMarginMm: 5 }) },
         './envelopeChecks': envelopeChecks,
         './jobs': { jobManager: { getActive: () => null } },
@@ -71,12 +90,27 @@ function fixture(a350 = false) {
         './pendantPage': { pendantPage },
         './pendantSettings': { pendantSettings: () => ({}), updatePendantSettings: (args: object) => settingsChanges.push(args) },
         './positionOfRecord': { currentGcodeSequence: () => 0, getTrustedOffset: () => null, getPositionOfRecord: () => (estimated ? { source: 'estimated' } : null) },
-        './probeFeed': { probeFeedService: { assertNoOvertravel: () => undefined } },
+        './probeFeed': { probeFeedService: { assertNoOvertravel: () => undefined, motionBegin: () => { motion += 1; }, motionEnd: () => { motion -= 1; } } },
         './probing': { assertMachineReadyForProcedure: () => { if (readyError) { throw Error('not idle'); } },
             moveMachineSettled: async (_label: string, position: { x: number; y: number; z: number }) => {
                 moves += 1; targets.push({ ...position }); await new Promise<void>((resolve) => { finish = resolve; });
+            },
+            sleep: async (ms: number) => { now += ms; hooks.stream(); },
+            enterMachineFrame: async () => { frames.push('enter'); now += rttMs; hooks.stream(); return { result: 0 }; },
+            queueMachineMove: async (_tool: string, target: { x: number; y: number; z: number }, feed: number) => {
+                const sentAt = now;
+                if (queueFail) { throw Error('Controller rejected the queued move: transport_error'); }
+                if (queueHold) { await new Promise<void>((resolve) => { held.push(resolve); }); } else { now += rttMs; }
+                queued.push({ sentAt, replyAt: now, target: { ...target }, feed });
+                hooks.stream();
+                return { result: 0 };
+            },
+            settleQueuedMachineMoves: async (_tool: string, last: { x: number; y: number; z: number }) => {
+                frames.push('settle');
+                settledAt = { ...last };
+                now = Math.max(now + 4 * rttMs, hooks.drainEnd() + rttMs / 2) + settleExtraMs;
             } },
-        './tools/camera': { sendWorkFrameRestore: async () => { restores += 1; return { result: 0 }; }, homeMachine: async (...args: unknown[]) => { homes.push(args); await new Promise<void>((resolve) => { finish = resolve; }); } },
+        './tools/camera': { sendWorkFrameRestore: async () => { restores += 1; frames.push('restore'); return { result: 0 }; }, homeMachine: async (...args: unknown[]) => { homes.push(args); await new Promise<void>((resolve) => { finish = resolve; }); } },
         './tools/machine': { HEARTBEAT_STALE_MS: 10000,
             connectionEpoch: () => epoch,
             getMachineSizeByIdentifier: () => ({ x: 350, y: 350, z: a350 ? 325 : 100 }),
@@ -101,6 +135,7 @@ function fixture(a350 = false) {
         setInterval: (fn: () => void) => { tick = fn; return 1; },
         setImmediate: (fn: () => void) => { immediate = fn; return 1; },
         clearImmediate: () => { immediate = null; },
+        process: { env: options.pipeline ? { LUBAN_PENDANT_PIPELINE: '1' } : {} },
         setTimeout: () => 0,
         clearTimeout: () => undefined,
         clearInterval: () => undefined });
@@ -130,6 +165,31 @@ function fixture(a350 = false) {
         deadman: false,
         stop: false,
         ...extra })}\n`));
+    // Keep the Feather's 20 Hz stream alive on the fake clock while a run sleeps.
+    hooks.stream = () => {
+        while (streaming && now < streamUntil && now - streamedAt >= 50) {
+            streamedAt = now;
+            input(streaming);
+            request('/pendant/keepalive', {}).catch(() => undefined);
+        }
+    };
+    // Ideal executor: start, end and outstanding commanded time per accepted segment.
+    const executed = () => {
+        let end = 0;
+        let previous: { x: number; y: number; z: number } | null = null;
+        return queued.map((q) => {
+            const from = previous || machine;
+            const durationMs = Math.hypot(q.target.x - from.x, q.target.y - from.y, q.target.z - from.z) / q.feed * 60000;
+            const arrival = q.sentAt + rttMs / 2;
+            const outstandingBefore = Math.max(0, end - arrival);
+            const start = Math.max(end, arrival);
+            const gap = queued.indexOf(q) > 0 ? Math.max(0, arrival - end) : 0;
+            end = start + durationMs;
+            previous = q.target;
+            return { ...q, durationMs, start, end, gap, outstandingAtArrival: outstandingBefore + durationMs };
+        });
+    };
+    hooks.drainEnd = () => { const runs = executed(); return runs.length ? runs[runs.length - 1].end : now; };
     const arm = async () => request('/pendant/arm', { clearanceConfirmed: true,
         bounds: { xMin: 5, xMax: 15, yMin: 5, yMax: 15, zMin: 5, zMax: 15 } });
     return {
@@ -165,9 +225,36 @@ function fixture(a350 = false) {
         advance: (ms: number) => { now += ms; },
         reconnect: () => { epoch += 1; },
         failReady: () => { readyError = true; },
-        estimate: () => { estimated = true; }
+        estimate: () => { estimated = true; },
+        now: () => now,
+        flush: async () => { for (let i = 0; i < 20; i++) { await new Promise<void>((resolve) => setImmediate(resolve)); } },
+        stream: (extra: object, forMs: number) => { streaming = extra; streamUntil = now + forMs; streamedAt = -Infinity; hooks.stream(); },
+        stopStream: () => { streaming = null; },
+        queued,
+        frames,
+        executed,
+        settledAt: () => settledAt,
+        motion: () => motion,
+        setRtt: (ms: number) => { rttMs = ms; },
+        setSettleExtra: (ms: number) => { settleExtraMs = ms; },
+        holdQueue: (hold: boolean) => { queueHold = hold; },
+        failQueue: () => { queueFail = true; },
+        release: async () => { const next = held.shift(); if (next) { next(); } await new Promise<void>((resolve) => setImmediate(resolve)); },
+        pendingAcks: () => held.length
     };
 }
+
+type Fixture = ReturnType<typeof fixture>;
+const wide = { xMin: 0, xMax: 100, yMin: 0, yMax: 100, zMin: 0, zMax: 50 };
+const readStatus = async (f: Fixture) => JSON.parse((await f.request('/pendant/status')).body);
+const startRun = async (f: Fixture, extra: object = {}, forMs = 1500, maxSegmentMs = 500) => {
+    await f.initialize();
+    assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide, maxSegmentMs })).status, 200);
+    f.input();
+    f.stream({ x: 1, deadman: true, feed: 3000, ...extra }, forMs);
+    await f.tick();
+    await f.flush();
+};
 
 export const tests: Array<[string, () => Promise<void>]> = [
     ['USB feedback stays compact while full position warnings remain on the page', async () => {
@@ -601,6 +688,121 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(f.targets[1].z, 12);
         assert.equal((await status()).blocked, null);
         await f.finish();
+    }],
+    ['pipelining is off by default: X/Y jogs stay on the settled one-segment engine', async () => {
+        const f = fixture(); await f.initialize();
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        f.input(); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+        assert.equal(f.moves(), 1); assert.equal(f.queued.length, 0); assert.deepEqual(f.frames, []);
+        assert.equal((await readStatus(f)).pipeline.requested, false);
+        await f.finish();
+    }],
+    ['pipelined X/Y keeps the planner fed inside the approved duration and settles once', async () => {
+        for (const maxSegmentMs of [500, 1000]) {
+            const f = fixture(false, { pipeline: true });
+            await startRun(f, {}, 1500, maxSegmentMs);
+            const runs = f.executed();
+            assert.ok(runs.length >= 6, `segments ${runs.length}`);
+            assert.deepEqual(f.frames, ['enter', 'settle']);
+            assert.deepEqual(f.settledAt(), runs[runs.length - 1].target);
+            assert.equal(f.moves(), 0);
+            const capMs = Math.floor((maxSegmentMs - 150) / 2);
+            for (const run of runs) {
+                // Each segment is short, and an ideal controller never holds more
+                // than the operator's approved duration of commanded travel.
+                assert.ok(run.durationMs <= capMs + 1e-6, `segment ${run.durationMs} ms`);
+                assert.ok(run.outstandingAtArrival <= maxSegmentMs + 1e-6, `outstanding ${run.outstandingAtArrival} ms`);
+                assert.equal(run.gap, 0, 'the next segment arrives before the controller runs dry');
+                assert.equal(run.target.z, 10);
+                assert.ok(run.feed <= 3000);
+            }
+            // Nothing is queued once the USB input is older than 300 ms.
+            const lastInputAt = runs[0].sentAt + 1500;
+            assert.ok(runs[runs.length - 1].sentAt <= lastInputAt + 300, 'no segment on stale input');
+            const after = await readStatus(f);
+            assert.equal(after.busy, false); assert.equal(after.armed, true);
+            assert.equal(after.pipeline.active, false); assert.equal(after.pipeline.disabled, null);
+            assert.equal(after.pipeline.lastRun.segments, runs.length);
+            assert.ok(after.pipeline.lastRun.maxOutstandingMs <= maxSegmentMs);
+            assert.equal(f.motion(), 0);
+        }
+    }],
+    ['STOP, deadman release and browser loss queue nothing further and still settle before releasing control', async () => {
+        for (const how of ['stop', 'release', 'browser']) {
+            const f = fixture(false, { pipeline: true });
+            f.holdQueue(true);
+            await startRun(f);
+            assert.equal(f.pendingAcks(), 1, how);
+            await f.release(); await f.flush();
+            assert.equal(f.queued.length, 1, how); assert.equal(f.pendingAcks(), 1, how);
+            f.stopStream();
+            if (how === 'stop') {
+                f.input({ stop: true });
+            } else if (how === 'release') {
+                f.input();
+            } else {
+                f.advance(901); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+            }
+            assert.throws(() => f.gate.enterTool('home'), /pendant/, how);
+            f.holdQueue(false);
+            await f.release(); await f.flush();
+            assert.equal(f.queued.length, 2, `${how}: only the already-sent segment completes`);
+            assert.deepEqual(f.frames, ['enter', 'settle'], how);
+            assert.deepEqual(f.settledAt(), f.queued[1].target, how);
+            const after = await readStatus(f);
+            assert.equal(after.busy, false, how);
+            assert.equal(after.armed, how === 'release', how);
+            if (how === 'browser') { assert.match(after.error, /page heartbeat/); }
+            if (how !== 'release') {
+                f.gate.enterTool('home')();
+                f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick(); await f.flush();
+                assert.equal(f.queued.length, 2, how);
+            }
+        }
+    }],
+    ['each pipelined segment is checked against obstacles from the previous queued endpoint', async () => {
+        const f = fixture(false, { pipeline: true });
+        f.obstacles.push({ name: 'fixture', machine: { x0: 30, x1: 31, y0: 0, y1: 20 }, clearanceZ: 20 });
+        await startRun(f, {}, 3000);
+        const after = await readStatus(f);
+        assert.equal(after.armed, false); assert.match(after.error, /fixture/);
+        assert.ok(f.queued.length >= 2);
+        for (const q of f.queued) { assert.ok(q.target.x < 25, `queued X ${q.target.x} reaches the padded footprint`); }
+        assert.deepEqual(f.frames, ['enter', 'settle']);
+        assert.equal(after.busy, false);
+    }],
+    ['Z intent uses the settled engine; a slow acknowledgement or late drain returns to it until re-arm', async () => {
+        const z = fixture(false, { pipeline: true });
+        await z.initialize();
+        assert.equal((await z.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        z.input(); z.input({ z: 1, mode: 'z', deadman: true, feed: 600 }); await z.tick();
+        assert.equal(z.moves(), 1); assert.equal(z.queued.length, 0); await z.finish();
+        for (const fault of ['slow', 'late']) {
+            const f = fixture(false, { pipeline: true });
+            if (fault === 'slow') { f.setRtt(450); } else { f.setSettleExtra(1000); }
+            await startRun(f, {}, 1500);
+            const after = await readStatus(f);
+            assert.match(String(after.pipeline.disabled), fault === 'slow' ? /acknowledged/ : /modelled end/);
+            assert.equal(after.armed, true, fault);
+            if (fault === 'slow') { assert.equal(f.queued.length, 1); }
+            const queued = f.queued.length;
+            await f.request('/pendant/keepalive', {}); f.input(); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+            assert.equal(f.moves(), 1, fault); assert.equal(f.queued.length, queued, fault);
+            await f.finish();
+            await f.request('/pendant/disarm', {});
+            f.input();
+            assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+            assert.equal((await readStatus(f)).pipeline.disabled, null);
+        }
+    }],
+    ['an unacknowledged queued move disarms and restores G54 without commanding a position', async () => {
+        const f = fixture(false, { pipeline: true });
+        f.failQueue();
+        await startRun(f);
+        const after = await readStatus(f);
+        assert.equal(after.armed, false); assert.match(after.error, /rejected/);
+        assert.deepEqual(f.frames, ['enter', 'restore']);
+        assert.equal(f.settledAt(), null); assert.equal(after.busy, false);
     }],
     ['estimated motion is explicitly marked on the DRO and cannot authorize a new jog', async () => {
         const f = fixture(); await f.initialize(); f.estimate();

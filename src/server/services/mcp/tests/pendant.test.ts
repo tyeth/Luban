@@ -71,6 +71,10 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(fast?.durationMs, 900);
         assert.equal(fast?.distanceMm, 45);
         assert.equal(session.target(current, 3000, 400)?.durationMs, 500);
+        // Pipelined runs pass their own cap: it replaces the overhead ceiling but
+        // never exceeds the operator's maxSegmentMs.
+        assert.equal(session.target(current, 3000, 800, 425)?.durationMs, 425);
+        assert.equal(session.target(current, 3000, 0, 5000)?.durationMs, 1000);
         session.receive(frame({ seq: 3, x: -0.5, feed: 300, deadman: true }), 3010);
         const changed = session.target(current, 3010);
         assert.equal(changed?.durationMs, 100);

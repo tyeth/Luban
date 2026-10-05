@@ -17,7 +17,7 @@ import { pendantPosition } from './pendantPosition';
 import { pendantSettings, updatePendantSettings } from './pendantSettings';
 import { currentGcodeSequence, getPositionOfRecord, getTrustedOffset } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
-import { assertMachineReadyForProcedure, moveMachineSettled } from './probing';
+import { assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queueMachineMove, settleQueuedMachineMoves, sleep } from './probing';
 import { homeMachine, sendWorkFrameRestore } from './tools/camera';
 import { HEARTBEAT_STALE_MS, connectionEpoch, getMachineSizeByIdentifier, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
@@ -57,6 +57,34 @@ export interface PendantBlocked {
     inside: boolean;
     text: string;
 }
+
+// Pipelined X/Y jogging: LUBAN_PENDANT_PIPELINE=1, read on every arm. OFF by
+// default and NOT yet run on hardware; the default is the settled one-segment
+// loop. Why segments stop and how the run is bounded: examples/usb-pendant/README.md
+// ("Continuous jogging") and probing.ts (queueMachineMove).
+const pipelineRequested = (): boolean => typeof process !== 'undefined' && /^(1|true|on|yes)$/i.test(process.env?.LUBAN_PENDANT_PIPELINE || '');
+// Every admission keeps this much room for the request's round trip (about
+// 80-90 ms per request on WiFi), so a segment reaches the controller before the
+// one ahead of it starts. Marlin never replans an executing block, so a block
+// that starts with nothing queued behind it plans to stop.
+export const PIPELINE_MARGIN_MS = 150;
+// Modelled unfinished segments, including the one being sent: executing + 2.
+export const PIPELINE_MAX_SEGMENTS = 3;
+// Model acceleration, mm/s^2: half the controller's default X/Y 1000. A segment
+// that starts from rest or changes direction or feed is charged a full
+// stop-and-restart (v/a), so the model runs late, which only under-fills the queue.
+export const PIPELINE_MODEL_ACCEL = 500;
+const PIPELINE_MIN_SEGMENT_MS = 50;
+// A queued G1 should be acknowledged in one round trip. A slower reply means the
+// controller is holding the request (planner full or synchronizing): the model
+// is wrong, so stop queueing and fall back to settled jogs until re-armed.
+export const PIPELINE_REPLY_LIMIT_MS = 400;
+// The closing settle must finish this soon after the modelled end of the queue,
+// or the controller ran longer than modelled: fall back until re-armed.
+export const PIPELINE_DRAIN_LATE_MS = 300;
+// Settle, verify and restore G54 at least this often during a long hold.
+export const PIPELINE_RUN_MAX_MS = 10000;
+const PIPELINE_POLL_MS = 10;
 
 export class PendantRuntime {
     private session = new PendantSession();
@@ -106,6 +134,8 @@ export class PendantRuntime {
 
     private epoch: number | null = null;
 
+    private pipeline = { requested: false, active: false, disabled: null as string | null, lastRun: null as object | null };
+
     private position(): JogPosition {
         const p = getPositionSnapshot();
         if (!p.machine || !['x', 'y', 'z'].every((a) => Number.isFinite(p.machine[a as keyof JogPosition]))) {
@@ -129,8 +159,8 @@ export class PendantRuntime {
         if (jobManager.getActive()?.state === 'started') { throw new Error('A machine job is active.'); }
     }
 
-    private travelBounds(): JogBounds {
-        const travel = requirePlanningTravel('manual jogging', this.position());
+    private travelBounds(current: JogPosition = this.position()): JogBounds {
+        const travel = requirePlanningTravel('manual jogging', current);
         if (travel.conflicts.length) { throw new Error('Machine travel has unresolved conflicts.'); }
         const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
         if (!size) { throw new Error('Machine travel is unknown.'); }
@@ -150,10 +180,11 @@ export class PendantRuntime {
         return bounds;
     }
 
-    private validateEnvelope(bounds: JogBounds): void {
-        const current = this.position();
+    // A pipelined run passes its queued endpoint: inside the run's G53 window the
+    // heartbeat is set aside, and the controller-accepted chain is the position.
+    private validateEnvelope(bounds: JogBounds, current: JogPosition = this.position()): void {
         validateJogBounds(bounds, current);
-        const travel = this.travelBounds();
+        const travel = this.travelBounds(current);
         for (const axis of ['x', 'y', 'z'] as const) {
             if (bounds[`${axis}Min`] < travel[`${axis}Min`] || bounds[`${axis}Max`] > travel[`${axis}Max`]) {
                 throw new Error(`Machine ${axis.toUpperCase()} bounds must stay within ${travel[`${axis}Min`]}..${travel[`${axis}Max`]} mm.`);
@@ -424,11 +455,15 @@ export class PendantRuntime {
         }
     }
 
-    private async tick(): Promise<void> {
-        const now = Date.now();
+    private watchdog(now: number): void {
         if (this.session.armed) {
             if (this.machineEpoch() !== this.epoch) { this.disarm('Machine connection changed. Re-arm at centre.'); } else if (now >= this.session.expiresAt) { this.disarm('The 10-minute jog approval expired. Review bounds and re-arm.'); } else if (now - this.pageAliveAt > 900) { this.disarm('Pendant page heartbeat exceeded the one-second limit. Keep the page visible and re-arm.'); } else if (now - this.session.receivedAt > 900) { this.disarm('Feather input exceeded the one-second limit. Check USB, centre axes and re-arm.'); }
         }
+    }
+
+    private async tick(): Promise<void> {
+        const now = Date.now();
+        this.watchdog(now);
         if (this.port?.isOpen && !this.feedbackWritePending && this.port.writableLength < 1024) {
             const dro = this.dro() as { machine: object | null; work: object | null; reliability: string;
                 // eslint-disable-next-line camelcase -- USB protocol keys
@@ -463,6 +498,11 @@ export class PendantRuntime {
         const from = this.position();
         const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
         if (!target) { this.release(); return; }
+        if (this.pipeline.requested && !this.pipeline.disabled && target.position.z === from.z) {
+            await this.pipelinedRun(from);
+            this.queueNextTick();
+            return;
+        }
         this.validateEnvelope(this.session.bounds as JogBounds);
         this.validateJogSegment(from, target.position);
         this.busy = true;
@@ -477,13 +517,156 @@ export class PendantRuntime {
             this.busy = false;
             this.release();
         }
-        // Service pending USB events before sampling the next intent. Do not add
-        // the periodic timer's 0–100 ms idle gap after each synchronous move.
+        this.queueNextTick();
+    }
+
+    // Service pending USB events before sampling the next intent. Do not add
+    // the periodic timer's 0–100 ms idle gap after each synchronous move.
+    private queueNextTick(): void {
         if (this.session.armed && this.nextJog === null) {
             this.nextJog = setImmediate(() => {
                 this.nextJog = null;
                 this.tick().catch((err: Error) => this.disarm(err.message));
             });
+        }
+    }
+
+    // assertMachineReadyForProcedure() minus its position-reliability check: beats
+    // inside the run's G53 window are set aside by design (machinePosition.ts), and
+    // the run starts from a ready() position and ends with a verified settle.
+    private readyInRun(): void {
+        const p = getPositionSnapshot();
+        if (p.reportAgeMs > HEARTBEAT_STALE_MS) { throw new Error(`The machine heartbeat is ${p.reportAgeMs} ms old; jog stopped.`); }
+        if (p.machineStatus !== 'idle') { throw new Error(`Machine is ${p.machineStatus || 'in an unknown state'}, not idle.`); }
+        if (p.isHomed !== true) { throw new Error('Machine does not report homed.'); }
+        const state = connectionManager.getLatestMachineState() as { headStatus?: unknown; headPower?: unknown } | null;
+        if (Number(state?.headPower) > 0 || state?.headStatus === true || state?.headStatus === 'on') {
+            throw new Error('Toolhead appears to be on.');
+        }
+        probeFeedService.assertNoOvertravel();
+        if (jobManager.getActive()?.state === 'started') { throw new Error('A machine job is active.'); }
+    }
+
+    /**
+     * Pipelined X/Y jogging (opt-in). Holds the machine frame and queues short
+     * G1 segments so the controller always has the next one before the current
+     * one ends, then settles ONCE. Invariants, all against a model that charges
+     * each segment its commanded time plus a full stop-and-restart whenever it
+     * starts from rest or changes direction or feed:
+     *  - modelled unfinished commanded motion never exceeds the operator's
+     *    maxSegmentMs (500-1000 ms), so nothing queued outlasts it after a stop;
+     *  - at most PIPELINE_MAX_SEGMENTS segments are unfinished;
+     *  - every segment passes the envelope and obstacle checks before it is sent,
+     *    from the endpoint of the one queued before it;
+     *  - the armed check, USB freshness (300 ms) and the watchdogs run
+     *    synchronously before every send, so after STOP, neutral, deadman
+     *    release or a disarm nothing further is queued;
+     *  - Z intent, a slow acknowledgement or a controller that drains late ends
+     *    the run; the latter two return the session to settled jogs.
+     */
+    private async pipelinedRun(from: JogPosition): Promise<void> {
+        const limitMs = this.session.maxSegmentMs;
+        const capMs = Math.floor((limitMs - PIPELINE_MARGIN_MS) / 2);
+        const startedAt = Date.now();
+        let chain = from;
+        let entered = false;
+        let uncertain = false;
+        let queueEndsAt = 0;
+        let ends: number[] = [];
+        let previous: { ux: number; uy: number; feed: number } | null = null;
+        let replyMs = 100;
+        let stopReason = 'input released';
+        const totals = { segments: 0, distanceMm: 0, commandedMs: 0, maxOutstandingMs: 0, feed: 0 };
+        this.busy = true;
+        this.pipeline.active = true;
+        probeFeedService.motionBegin();
+        try {
+            try {
+                for (;;) {
+                    let now = Date.now();
+                    this.watchdog(now);
+                    if (!this.session.armed) { stopReason = 'disarmed'; break; }
+                    if (now - startedAt >= PIPELINE_RUN_MAX_MS) { stopReason = 'periodic settle and verify'; break; }
+                    this.readyInRun();
+                    const target = this.session.target(chain, now, 0, capMs);
+                    if (!target) { stopReason = this.session.armed ? 'input released or stale' : 'disarmed'; break; }
+                    if (target.position.z !== chain.z) { stopReason = 'Z intent uses settled jogs'; break; }
+                    const ux = (target.position.x - chain.x) / target.distanceMm;
+                    const uy = (target.position.y - chain.y) / target.distanceMm;
+                    ends = ends.filter((end) => end > now);
+                    const outstanding = Math.max(0, queueEndsAt - now);
+                    const changed = !previous || outstanding === 0 || Math.abs(previous.feed - target.feed) > 1
+                        || ux * previous.ux + uy * previous.uy < 0.999;
+                    const restartMs = changed ? Math.max(target.feed, previous?.feed ?? 0) / 60 / PIPELINE_MODEL_ACCEL * 1000 : 0;
+                    const execMs = Math.max(PIPELINE_MIN_SEGMENT_MS, target.durationMs) + restartMs;
+                    if (ends.length >= PIPELINE_MAX_SEGMENTS || outstanding + execMs > limitMs) {
+                        await sleep(PIPELINE_POLL_MS);
+                        continue;
+                    }
+                    this.validateEnvelope(this.session.bounds as JogBounds, chain);
+                    this.validateJogSegment(chain, target.position);
+                    if (!entered) {
+                        // No motion; re-sample intent after the round trip.
+                        await enterMachineFrame('usb_pendant');
+                        entered = true;
+                        continue;
+                    }
+                    const sentAt = Date.now();
+                    uncertain = true;
+                    await queueMachineMove('usb_pendant', target.position, target.feed);
+                    uncertain = false;
+                    now = Date.now();
+                    queueEndsAt = Math.max(queueEndsAt, now) + execMs;
+                    ends.push(queueEndsAt);
+                    totals.maxOutstandingMs = Math.max(totals.maxOutstandingMs, queueEndsAt - now);
+                    totals.segments += 1;
+                    totals.distanceMm += target.distanceMm;
+                    totals.commandedMs += target.durationMs;
+                    totals.feed = target.feed;
+                    chain = target.position;
+                    previous = { ux, uy, feed: target.feed };
+                    const replyTook = now - sentAt;
+                    replyMs = replyMs * 0.7 + replyTook * 0.3;
+                    if (replyTook > PIPELINE_REPLY_LIMIT_MS) {
+                        this.pipeline.disabled = `A queued segment took ${replyTook} ms to be acknowledged (limit ${PIPELINE_REPLY_LIMIT_MS} ms); settled jogs until re-armed.`;
+                        stopReason = 'slow acknowledgement';
+                        log.warn(`Pipelined jog: ${this.pipeline.disabled}`);
+                        break;
+                    }
+                }
+            } catch (err) {
+                stopReason = (err as Error).message;
+                this.disarm((err as Error).message);
+            }
+            if (entered) {
+                const closeAt = Date.now();
+                try {
+                    if (totals.segments && !uncertain) {
+                        await settleQueuedMachineMoves('usb_pendant', chain, totals.feed);
+                        const lateMs = Date.now() - Math.max(queueEndsAt, closeAt + 4 * replyMs);
+                        if (lateMs > PIPELINE_DRAIN_LATE_MS && !this.pipeline.disabled) {
+                            this.pipeline.disabled = `The controller finished ${Math.round(lateMs)} ms after the modelled end of the queue (limit ${PIPELINE_DRAIN_LATE_MS} ms); settled jogs until re-armed.`;
+                            log.warn(`Pipelined jog: ${this.pipeline.disabled}`);
+                        }
+                    } else {
+                        // Nothing verifiably queued (or an unacknowledged G1): restore
+                        // G54 without commanding any position; fresh beats verify it.
+                        const result = await sendWorkFrameRestore('usb_pendant:pipeline-close');
+                        if (result.result !== 0) { throw new Error(result.text || 'Controller refused the work-frame restore.'); }
+                    }
+                } catch (err) {
+                    this.disarm(`Queued jog did not settle: ${(err as Error).message} Use Restore work frame if the machine frame is still selected.`);
+                }
+            }
+        } finally {
+            probeFeedService.motionEnd();
+            this.pipeline.active = false;
+            this.pipeline.lastRun = { ...totals, stopReason, elapsedMs: Date.now() - startedAt, segmentCapMs: capMs, limitMs };
+            if (totals.segments) {
+                this.lastJog = { durationMs: totals.commandedMs, distanceMm: totals.distanceMm, feed: totals.feed, elapsedMs: Date.now() - startedAt };
+            }
+            this.busy = false;
+            this.release();
         }
     }
 
@@ -538,6 +721,7 @@ export class PendantRuntime {
                 maxSegmentMs: this.session.maxSegmentMs,
                 limitedAxes: this.session.limitedAxes,
                 lastJog: this.lastJog,
+                pipeline: this.pipeline,
                 inputAgeMs: Date.now() - this.session.receivedAt,
                 port: this.port?.path || null,
                 firmware: this.firmware ?? null,
@@ -583,6 +767,7 @@ export class PendantRuntime {
                     manualControlGate.acquire(() => this.disarm('Stopped through MCP.'));
                     this.owned = true;
                     this.session.arm(bounds, this.position(), Date.now(), args.maxSegmentMs ?? 500);
+                    this.pipeline = { ...this.pipeline, requested: pipelineRequested(), disabled: null };
                     this.epoch = this.machineEpoch();
                     this.pageAliveAt = Date.now();
                     this.error = null;
