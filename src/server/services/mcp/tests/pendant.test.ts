@@ -17,6 +17,13 @@ export const tests: Array<[string, () => void]> = [
         assert.throws(() => parsePendantInput(' '.repeat(513)));
         assert.deepEqual(parsePendantInput(JSON.stringify(frame())), frame());
     }],
+    ['rejected frames name the failing field and accept firmware id and event text', () => {
+        assert.throws(() => parsePendantInput(JSON.stringify(frame({ feed: 60 }))), /feed 60 outside 300–3000/);
+        assert.throws(() => parsePendantInput('{"v":1,'), /not JSON/);
+        assert.throws(() => parsePendantInput(JSON.stringify({ ...frame(), fw: 'x'.repeat(33) })), /: fw\./);
+        const withFw = { ...frame(), fw: 'pendant-2026-10-05', log: 'linked' };
+        assert.deepEqual(parsePendantInput(JSON.stringify(withFw)), withFw);
+    }],
     ['no movement before operator arm, real neutral and deadman', () => {
         const session = new PendantSession();
         session.receive(frame({ x: 1, deadman: true }), 1000);

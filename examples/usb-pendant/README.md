@@ -177,7 +177,11 @@ USB data uses newline-delimited JSON at nominal 115200 baud. Input has
 `v:1`, increasing `seq`, normalized `x,y,z`, `mode:feed|z`, `feed:300..3000`,
 and booleans `ready`, `deadman`, `stop`. Additional diagnostics `raw` contain
 the X/Y/twist ADC samples, and `display` contains the initialized TFT dimensions.
-Feed mode must send Z=0. Luban replies
+Feed mode must send Z=0. Optional `fw` names the firmware build (Luban logs
+it on connect, so a board still running an older `code.py` is visible) and
+optional `log` carries one rare firmware event such as a link change or short
+write. A rejected frame is disarmed with the failing field named, for example
+`Invalid USB pendant frame: feed 60 outside 300–3000 mm/min`. Luban replies
 with `type:dro`, `armed`, `neutral`, `machine`, `work`, `reliability`, `age_ms`,
 `warnings` and an operator message. The board has no authority without the
 operator's armed session and fresh DRO reply.
@@ -187,6 +191,15 @@ python examples/usb-pendant/test_controller.py
 npm run test:mcp
 npm run typecheck:mcp
 ```
+
+To trace the USB link, start Luban with `LUBAN_PENDANT_TRACE=1` (for example
+`LUBAN_PENDANT_TRACE=1 snapmaker-luban` from a terminal). Every received frame,
+every DRO reply and every firmware `log` event is written under
+`service:mcp:pendant` as `[trace] rx …`, `[trace] tx …` and `[trace] feather …`,
+to that console and to `~/.config/snapmaker-luban/Logs/server.log`. That is
+about 30 lines per second, so it is off by default. The normal firmware runs
+without a REPL because the ESP32-S3 has no endpoints left for it, so this trace
+is the serial log.
 
 These tests use simulated input and do not move hardware. Hardware firmware
 version, serial enumeration and real display startup must also be verified.
