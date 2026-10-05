@@ -463,15 +463,31 @@ const startRun = async (f: Fixture, extra: object = {}, forMs = 1500, maxSegment
 };
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['a centred stick with D1 held idles the hold in G53 (no close, no re-entry) and closes after HOLD_IDLE_CLOSE_MS', async () => {
+        const idle = fixture(false, { pipeline: true });
+        idle.onQueue((count) => { if (count === 3) { idle.stream({ deadman: true, feed: 3000 }, 1200); } });
+        await startRun(idle, {}, 600);
+        let hold = (await readStatus(idle)).pipeline.lastHold;
+        assert.match(hold.stopReason, /Feather report gap/, 'centring did not close the hold; only the end of the Feather stream did');
+        assert.ok(hold.elapsedMs >= 1200, `the hold stayed open through the centred stick (${hold.elapsedMs} ms)`);
+        assert.deepEqual(idle.frames, ['latch', 'enter', 'restore', 'verify'], 'one G53 and one G54 for the whole press');
+        const parked = fixture(false, { pipeline: true });
+        parked.onQueue((count) => { if (count === 3) { parked.stream({ deadman: true, feed: 3000 }, 5000); } });
+        await startRun(parked, {}, 600);
+        hold = (await readStatus(parked)).pipeline.lastHold;
+        assert.equal(hold.stopReason, 'stick centred for 2000 ms');
+        assert.deepEqual(parked.frames, ['latch', 'enter', 'restore', 'verify']);
+        assert.equal(parked.motion(), 0);
+    }],
     ['M220 S100 is asserted once per arm, not on every hold press', async () => {
         const f = fixture(false, { pipeline: true });
-        f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input({ deadman: true }); } });
+        f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input(); } });
         await startRun(f, {}, 1500);
         assert.equal(f.m220Sends(), 1);
         const first = (await readStatus(f)).pipeline.lastHold.startedAt;
         f.advance(5000);
         await f.request('/pendant/keepalive', {}); f.input();
-        f.onQueue((count) => { if (count === 8) { f.stopStream(); f.input({ deadman: true }); } });
+        f.onQueue((count) => { if (count === 8) { f.stopStream(); f.input(); } });
         f.stream({ x: 1, deadman: true, feed: 3000 }, 1500); await f.tick(); await f.flush();
         const second = (await readStatus(f)).pipeline.lastHold;
         assert.notEqual(second.startedAt, first, 'a second hold ran');
@@ -480,7 +496,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
     }],
     ['a G53-window beat arriving after a proved hold close waits instead of disarming, within the grace', async () => {
         const f = fixture(false, { pipeline: true });
-        f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input({ deadman: true }); } });
+        f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input(); } });
         await startRun(f, {}, 1500);
         assert.equal((await readStatus(f)).pipeline.lastHold.restored, true);
         f.setWarnings(['Derived machine z (z=541.0) is more than 50 mm outside the travel - a mistake, not a position']);
@@ -954,7 +970,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         for (const feed of [300, 3000]) {
             const f = fixture(false, { pipeline: true });
             let stopAt = 0;
-            f.onQueue((count) => { if (count === 12) { f.stopStream(); f.input({ deadman: true }); stopAt = f.now(); } });
+            f.onQueue((count) => { if (count === 12) { f.stopStream(); f.input(); stopAt = f.now(); } });
             await startRun(f, { feed }, 5000);
             assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify'], `${feed}: one G53, one G54, one M114 proof`);
             assert.equal(f.queued.length, 12, `${feed}: nothing is sent after the stop`);
@@ -983,7 +999,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
             }
             const after = await readStatus(f);
             assert.equal(after.busy, false); assert.equal(after.armed, true); assert.equal(after.pipeline.disabled, null);
-            assert.equal(after.pipeline.lastHold.stopReason, 'stick centred');
+            assert.equal(after.pipeline.lastHold.stopReason, 'D1 released');
             assert.equal(after.pipeline.lastHold.moves, 12);
             assert.equal(after.pipeline.lastHold.restored, true); assert.equal(after.pipeline.lastHold.proved, true);
             assert.ok(after.pipeline.lastHold.maxOutstandingMs <= HOLD_QUEUE_AHEAD_MS);
@@ -1110,11 +1126,11 @@ export const tests: Array<[string, () => Promise<void>]> = [
     ['M114 Count is polled through the lease and traced; observe mode never gates, even with a stalled controller', async () => {
         const f = fixture(false, { pipeline: true });
         f.setSpeed(0.25); // The controller executes at a quarter of the commanded feed: Count falls behind the clock model.
-        f.onQueue((count) => { if (count === 15) { f.stopStream(); f.input({ deadman: true }); } });
+        f.onQueue((count) => { if (count === 15) { f.stopStream(); f.input(); } });
         await startRun(f, {}, 8000);
         const after = await readStatus(f);
         assert.equal(after.pipeline.countCheck.mode, 'observe');
-        assert.equal(after.pipeline.lastHold.stopReason, 'stick centred', 'observe never stops the hold');
+        assert.equal(after.pipeline.lastHold.stopReason, 'D1 released', 'observe never stops the hold');
         assert.equal(after.pipeline.disabled, null);
         assert.equal(f.queued.length, 15, 'open loop: the clock model kept sending');
         assert.ok(after.pipeline.lastHold.countSamples >= 3, `samples ${after.pipeline.lastHold.countSamples}`);
@@ -1138,7 +1154,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.ok(countTick.count.count && countTick.count.rawMm && countTick.count.derived && countTick.count.expected && typeof countTick.count.lagMm === 'number');
         assert.ok(Math.abs(countTick.count.rawMm.x - countTick.count.count.x / 400) < 1e-9, 'the raw Count stays in every trace record');
         assert.ok(traceBody.ticks.every((t: { outstandingMs: number; inputAgeMs: number }) => t.outstandingMs <= 200 && t.inputAgeMs >= 0));
-        assert.equal(traceBody.hold.stopReason, 'stick centred');
+        assert.equal(traceBody.hold.stopReason, 'D1 released');
     }],
     ['enforced Count check stops the hold on lag, on a late M114 reply and on a reply without Count fields', async () => {
         const cases: Array<[string, (f: Fixture) => void, RegExp]> = [
@@ -1179,10 +1195,10 @@ export const tests: Array<[string, () => Promise<void>]> = [
         }
         const steady = fixture(false, { pipeline: true, countCheck: 'enforced' });
         // 16 increments of 5 mm stay inside the 100 mm envelope.
-        steady.onQueue((count) => { if (count === 16) { steady.stopStream(); steady.input({ deadman: true }); } });
+        steady.onQueue((count) => { if (count === 16) { steady.stopStream(); steady.input(); } });
         await startRun(steady, {}, 5000);
         const after = await readStatus(steady);
-        assert.equal(after.pipeline.lastHold.stopReason, 'stick centred', `a controller that keeps up is never stopped by the enforced check: ${JSON.stringify([after.pipeline.lastHold, steady.counts])}`);
+        assert.equal(after.pipeline.lastHold.stopReason, 'D1 released', `a controller that keeps up is never stopped by the enforced check: ${JSON.stringify([after.pipeline.lastHold, steady.counts])}`);
         assert.ok(after.pipeline.lastHold.countSamples >= 3);
         assert.equal(after.pipeline.lastHold.maxLagMm <= 5.05, true);
     }],
@@ -1202,7 +1218,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         status = await readStatus(f);
         assert.deepEqual(status.pipeline.countCheck.countOffsetMm, { x: 19, y: 4, z: 0 });
         assert.equal(f.counts.length, 2, 'one offset sample per arm');
-        f.input(); f.onQueue((count) => { if (count === 8) { f.stopStream(); f.input({ deadman: true }); } });
+        f.input(); f.onQueue((count) => { if (count === 8) { f.stopStream(); f.input(); } });
         f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); await f.tick(); await f.flush();
         status = await readStatus(f);
         assert.ok(status.pipeline.lastHold.countSamples >= 1);
@@ -1216,10 +1232,10 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(status.pipeline.countCheck.countOffsetMm, null);
         assert.match(String(status.pipeline.countCheck.countOffsetProblem), /no Count fields/);
         assert.match(String(status.pipeline.notice), /Count offset unknown/);
-        blind.input(); blind.onQueue((count) => { if (count === 8) { blind.stopStream(); blind.input({ deadman: true }); } });
+        blind.input(); blind.onQueue((count) => { if (count === 8) { blind.stopStream(); blind.input(); } });
         blind.stream({ x: 1, deadman: true, feed: 3000 }, 3000); await blind.tick(); await blind.flush();
         status = await readStatus(blind);
-        assert.equal(status.pipeline.lastHold.stopReason, 'stick centred');
+        assert.equal(status.pipeline.lastHold.stopReason, 'D1 released');
         assert.ok(status.pipeline.lastHold.countSamples >= 1);
         assert.ok(status.pipeline.countCheck.last.count && status.pipeline.countCheck.last.rawMm, 'raw Count traced');
         assert.equal(status.pipeline.countCheck.last.derived, null); assert.equal(status.pipeline.countCheck.lastLagMm, null);
@@ -1348,7 +1364,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         await startRun(clean, {}, 1500);
         assert.equal((await readStatus(clean)).pipeline.lateEvents, 1);
         clean.setRtt(80);
-        clean.onQueue((count) => { if (count === 4) { clean.stopStream(); clean.input({ deadman: true }); } });
+        clean.onQueue((count) => { if (count === 4) { clean.stopStream(); clean.input(); } });
         clean.input(); clean.stream({ x: 1, deadman: true, feed: 3000 }, 1500); await clean.tick(); await clean.flush();
         assert.equal((await readStatus(clean)).pipeline.lateEvents, 0);
     }],
@@ -1386,10 +1402,10 @@ export const tests: Array<[string, () => Promise<void>]> = [
     ['serialized channel: an M114 in flight inflates the next G1 reply; isolated late replies are tolerated, a very late one stops the hold', async () => {
         const within = fixture(false, { pipeline: true, serialized: true });
         within.setCountRtt(100);
-        within.onQueue((count) => { if (count === 14) { within.stopStream(); within.input({ deadman: true }); } });
+        within.onQueue((count) => { if (count === 14) { within.stopStream(); within.input(); } });
         await startRun(within, {}, 5000);
         let after = await readStatus(within);
-        assert.equal(after.pipeline.lastHold.stopReason, 'stick centred');
+        assert.equal(after.pipeline.lastHold.stopReason, 'D1 released');
         assert.equal(after.pipeline.lastHold.lateMoveReplies, 0);
         assert.ok(after.pipeline.lastHold.countSamples >= 2);
         const sends = JSON.parse((await within.request('/pendant/hold-trace')).body).ticks.filter((t: { kind: string }) => t.kind === 'send') as Array<{ replyMs: number }>;
@@ -1397,11 +1413,11 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.ok(sends.every((t) => t.replyMs <= 200), 'but stayed within budget');
         const late = fixture(false, { pipeline: true, serialized: true });
         late.setCountRtt(150);
-        late.onQueue((count) => { if (count === 14) { late.stopStream(); late.input({ deadman: true }); } });
+        late.onQueue((count) => { if (count === 14) { late.stopStream(); late.input(); } });
         await startRun(late, {}, 5000);
         after = await readStatus(late);
         assert.ok(after.pipeline.lastHold.lateMoveReplies >= 1, 'the G1 behind a 150 ms M114 took over 200 ms');
-        assert.equal(after.pipeline.lastHold.stopReason, 'stick centred', 'isolated late replies (one per Count poll) are tolerated');
+        assert.equal(after.pipeline.lastHold.stopReason, 'D1 released', 'isolated late replies (one per Count poll) are tolerated');
         assert.equal(after.pipeline.disabled, null);
         assert.equal(after.armed, true);
         assert.deepEqual(late.frames, ['latch', 'enter', 'restore', 'verify']);

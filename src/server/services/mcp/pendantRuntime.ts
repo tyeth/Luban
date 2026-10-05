@@ -15,7 +15,7 @@ import { isLoopback } from './McpServer';
 import { JogBounds, JogPosition, PENDANT_FEED_MAX, PendantSession, firmwareMotionProblem, parsePendantInput, validateJogBounds } from './pendant';
 import {
     A350_STEPS_PER_MM, CountCheckMode, CountSample, HOLD_COUNT_POLL_MS, HOLD_FEATHER_GAP_MS, HOLD_HEARTBEAT_MAX_AGE_MS, HOLD_MIN_ACCEL, HOLD_MOVE_MS,
-    CountOffset, HOLD_LATE_EVENTS_TO_DISABLE, HOLD_LATE_REPLIES_TO_STOP, HOLD_POST_CLOSE_GRACE_MS, HOLD_QUEUE_AHEAD_MS,
+    CountOffset, HOLD_LATE_EVENTS_TO_DISABLE, HOLD_IDLE_CLOSE_MS, HOLD_LATE_REPLIES_TO_STOP, HOLD_POST_CLOSE_GRACE_MS, HOLD_QUEUE_AHEAD_MS,
     HOLD_REPLY_LATE_MS, HOLD_REPLY_STOP_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault,
     countToMachine, countToMm, extendAlong, holdMoveMm, holdRunoutMm, judgeCountSample, learnCountOffset, parseCountReport, parseStepsPerMm,
 } from './pendantHold';
@@ -162,6 +162,10 @@ export class PendantRuntime {
     // Until this time a rejected position report is the hold's own G53-window poll arriving late.
     private postHoldGraceUntil = 0;
 
+    // The last hold's end position when its close was proved by M114 in the work frame:
+    // the next press starts from it during the grace instead of waiting for a beat.
+    private lastProvedPosition: JogPosition | null = null;
+
     private lastPorts: Array<{ path: string; serialNumber?: string }> = [];
 
     private portsAt = 0;
@@ -242,11 +246,11 @@ export class PendantRuntime {
         return this.session.armed ? pendantPosition(p, record, getTrustedOffset(), Date.now(), HEARTBEAT_STALE_MS).warnings : p.warnings;
     }
 
-    private ready(): void {
+    private ready(provedPosition = false): void {
         assertMachineReadyForProcedure();
         probeFeedService.assertNoOvertravel();
         const record = getPositionOfRecord(currentGcodeSequence());
-        const warnings = this.positionWarnings();
+        const warnings = provedPosition ? [] : this.positionWarnings();
         if (warnings.length) { throw new Error(`Machine position unavailable: ${warnings.join(' ')}`); }
         if (record && record.source === 'estimated') { throw new Error('Last move was only estimated; wait for a verified position.'); }
         if (jobManager.getActive()?.state === 'started') { throw new Error('A machine job is active.'); }
@@ -597,9 +601,11 @@ export class PendantRuntime {
         // A status poll issued inside the hold's G53 window can arrive after the closing G54
         // (raw machine Z 329 + offset reads Z 541): wait for the next coherent beat, do not
         // disarm. After the grace the ordinary check applies.
-        if (now < this.postHoldGraceUntil && this.positionWarnings().length) { return; }
-        this.ready();
-        const from = this.position();
+        // When the close was proved by M114, start the next press from that proved end position.
+        const graced = now < this.postHoldGraceUntil && this.positionWarnings().length > 0;
+        if (graced && !this.lastProvedPosition) { return; }
+        this.ready(graced);
+        const from = graced ? { ...(this.lastProvedPosition as JogPosition) } : this.position();
         const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
         if (!target) { this.release(); return; }
         if (this.pipelineEligible(from, target) && this.holdAdmits(from, now)) {
@@ -988,6 +994,8 @@ export class PendantRuntime {
             restored: false,
             proved: null };
         let chain = origin;
+        let idleSince: number | null = null;
+        this.lastProvedPosition = null;
         let entered = false;
         let restored = false;
         let uncertain = false;
@@ -1038,7 +1046,23 @@ export class PendantRuntime {
                     }
                     if (inputAgeMs > HOLD_FEATHER_GAP_MS) { summary.stopReason = this.holdReleaseReason(now); break; }
                     const raw = this.session.target(chain, now, 0, HOLD_MOVE_MS);
-                    if (!raw) { summary.stopReason = this.holdReleaseReason(now); break; }
+                    if (!raw) {
+                        const reason = this.holdReleaseReason(now);
+                        // D1 still held, stick centred: idle in G53 so a reversal needs no close/re-entry.
+                        if (reason === 'stick centred') {
+                            if (idleSince === null) { idleSince = now; }
+                            if (now - idleSince < HOLD_IDLE_CLOSE_MS) {
+                                nextTickAt = Math.max(nextTickAt, now) + HOLD_TICK_MS;
+                                await sleep(Math.max(0, nextTickAt - now));
+                                continue;
+                            }
+                            summary.stopReason = `stick centred for ${HOLD_IDLE_CLOSE_MS} ms`;
+                            break;
+                        }
+                        summary.stopReason = reason;
+                        break;
+                    }
+                    idleSince = null;
                     if (raw.position.z !== chain.z) { summary.stopReason = 'Z motion uses settled jogs'; break; }
                     const target = this.holdTarget(chain, raw);
                     if (!target) { summary.stopReason = this.blocked ? `held at ${this.blocked.name}` : this.holdReleaseReason(now); break; }
@@ -1106,6 +1130,7 @@ export class PendantRuntime {
                     if (!uncertain) {
                         try {
                             summary.proved = await leased(async () => verifyRestoredPosition('usb_pendant:hold-close', chain));
+                            if (summary.proved) { this.lastProvedPosition = { ...chain }; }
                             if (!summary.proved) {
                                 log.warn('Continuous jog: M114 did not verify the commanded end position in the work frame; waiting for a verified beat.');
                             }

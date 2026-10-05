@@ -50,6 +50,13 @@ export const HOLD_LATE_REPLIES_TO_STOP = 2;
  */
 export const HOLD_POST_CLOSE_GRACE_MS = 4500;
 /**
+ * With D1 still held, a centred stick idles the hold (nothing queued, still in
+ * G53 under the lease) so quick back-and-forth nudges reverse at once instead of
+ * paying a G54 close and a G53 re-entry each time. It closes after this long
+ * centred, or at once when D1 is released or anything else stops it.
+ */
+export const HOLD_IDLE_CLOSE_MS = 2000;
+/**
  * A status report older than this during a hold means the connection is
  * faltering: stop. The WiFi poll runs every 2 s with a 3 s timeout, so one
  * late poll must not flip a hold into a settled burst and back; two missed
