@@ -28,6 +28,7 @@ import {
 import { ResolvedTravel, outsideTravel, resolveTravel } from '../machineTravel';
 import { statedTravel } from '../rotaryGeometry';
 import {
+    FrameLatch,
     ZERO_OFFSET_ACCEPT_BEATS,
     clearPositionOfRecord,
     clearTrustedOffset,
@@ -37,6 +38,8 @@ import {
     frameLatchVerified,
     getFrameLatch,
     getPositionOfRecord,
+    latchFrameUncertain,
+    onFrameLatchChange,
 } from '../positionOfRecord';
 import { resyncHint } from '../frameRecovery';
 import { McpToolError, ToolRegistry } from '../registry';
@@ -247,6 +250,42 @@ export function declareMachineFrameRun(envelope: { xMin: number; xMax: number; y
 export function endMachineFrameRun(): void {
     declaredRun = null;
 }
+
+// The frame-uncertainty latch survives a Luban restart: if Luban stopped while a
+// queued pendant run had G53 selected (or its restore failed), the controller
+// may still be in the machine workspace. On startup the latch is re-raised and
+// the gcode lease holds for recovery: only Restore work frame, homing, position
+// queries and job stop pass until a restore and a verified position clear it.
+const FRAME_LATCH_FILE = 'mcp-frame-latch.json';
+
+function frameLatchPath(): string | null {
+    try { return DataStorage.userDataDir ? path.join(DataStorage.userDataDir, FRAME_LATCH_FILE) : null; } catch (err) { return null; }
+}
+
+export function persistFrameLatch(latch: FrameLatch | null): void {
+    const file = frameLatchPath();
+    if (!file) { return; }
+    try {
+        if (latch) { fs.writeJsonSync(file, latch); } else if (fs.existsSync(file)) { fs.removeSync(file); }
+    } catch (err) { /* The in-memory latch still refuses motion. */ }
+}
+
+export function restorePersistedFrameLatch(): void {
+    const file = frameLatchPath();
+    try {
+        if (!file || !fs.existsSync(file)) { return; }
+        const saved = fs.readJsonSync(file) as Partial<FrameLatch>;
+        latchFrameUncertain(`Carried over from before Luban restarted: ${String(saved.reason || 'a queued pendant run')} `
+            + 'Restore the work frame before any motion.');
+        gcodeLease.holdForRecovery('frame uncertainty carried over a Luban restart');
+    } catch (err) { /* An unreadable file is treated as no latch. */ }
+}
+
+onFrameLatchChange((latch) => {
+    persistFrameLatch(latch);
+    if (!latch) { gcodeLease.endRecovery(); }
+});
+restorePersistedFrameLatch();
 
 /**
  * Which connection we are on. The position-of-record state is forgotten on

@@ -168,6 +168,20 @@ settle: the ordinary settled move to the last queued point, whose G54 restores
 the work frame and whose echo verifies the arrival. Z intent always uses the
 settled path, and so does any connection other than the A350's HTTP channel.
 
+**Smoothness trade-off, by default.** Nothing the A350 reports confirms
+execution during a run. Its heartbeat x/y/z is the planner's queued target, 16
+blocks ahead, and arrives every 2 s. So by default each run commands at most the
+approved segment duration (0.5–1 s), then settles and verifies. The backlog can
+then never exceed one approved duration of travel, however slowly the controller
+actually runs. With that default, a run moves no further between stops than one
+settled segment does, so it is not yet smoother than the settled path.
+
+After you have verified stop behaviour on hardware, you can raise
+`LUBAN_PENDANT_PIPELINE_RUN_MS`, up to 2000 ms, to get continuous runs. Raising
+it raises the worst-case backlog to the same figure. M114's `Count` fields may
+give a real executed-position signal that would lift this limit safely; that
+signal is unverified, and nothing relies on it yet.
+
 **Arming checks the controller.** Luban reads `M503 S` and keeps pipelining off
 (`pipeline.disabled` in `/pendant/status`) unless all of these are reported and
 fit the model:
@@ -177,55 +191,74 @@ fit the model:
 - `M204` P/T acceleration is at least 500 mm/s².
 
 The Snapmaker build's `M220` reports nothing, so the feed override cannot be
-read. Each run therefore sets it to 100% with `M220 S100`. That overrides any
-touchscreen speed percentage while you jog, so commanded and real feed agree.
+read. Each run therefore sends `M220 S100`. **That setting persists after
+jogging.** Any reduced touchscreen speed percentage is overridden for later file
+jobs too, so set it again before a job that relies on it. The page shows this
+warning whenever pipelining is active.
 
-**The run's limits:**
+**The run's guards:**
 
-- An exclusive gcode lease (`machine/gcodeLease.ts`) is held from before the G53
-  until the closing G54. Every other command is refused at the channel and at
-  Luban's job and jog entry points, including the Luban UI, MCP and file-job start
-  or resume. Nothing can land inside the machine-frame window.
-- A frame-uncertainty latch is set before the G53 is sent. Every exit path
-  restores G54: the normal settle, a no-motion `G90`/`G54` after a lost reply or
-  a failed settle, and an awaited `shutdown()`. The latch clears only after an
-  acknowledged restore and a verified fresh position. Until then pendant arming
-  and all MCP motion are refused. The latch appears in `get_position` warnings and
-  in diagnostics as `frameUncertain`. If even the restore fails, the crash guard
-  also stays armed until **Restore work frame** succeeds.
-- Each segment is at most (approved duration − 150 ms) / 2: 175 ms at the
-  default 0.5 s, 425 ms at 1 s. That leaves time for the next one to arrive
-  before the one ahead starts. Marlin never replans a block it is already
-  executing, so a block that starts with nothing behind it plans to stop.
-- Luban models the queue. Each segment counts its commanded time, plus a full
-  stop and restart at an assumed 500 mm/s² whenever it starts from rest or
-  changes direction or feed. A segment is sent only while the modelled unfinished
-  motion, including the new segment, stays within the approved duration, with at
-  most three segments unfinished.
-- Every target goes through the obstacle hold and approach logic from the previous
-  queued endpoint, rounded to the three decimals that are sent. The full envelope
-  and segment checks follow before transmission. A held or released stick ends
+- **Exclusive lease** (`machine/gcodeLease.ts`). It is held from before the G53
+  until the closing G54, and it does not lapse while the run may have G53
+  selected. The channel request timeout is 300 s, and `finally` releases the
+  lease.
+  - **What it refuses:**
+    - every channel's `executeGcode`;
+    - the SSTP job and override endpoints: start, resume, work-speed, laser-power
+      and Z-offset overrides, filament load and unload, and the laser
+      material-thickness probe;
+    - ConnectionManager `startGcode`, `startGcodeAction`, `resumeGcode`, `goHome`,
+      `coordinateMove` and `setWorkOrigin`;
+    - the MCP file-job start, which goes through `startGcodeJob`.
+  - **What it does not cover:** file upload and `prepare_print` (no motion), job
+    pause and stop (allowed on purpose), status polls, and enclosure and
+    air-purifier controls.
+  - **If the restore fails:** the lease becomes a recovery hold. It accepts only
+    `G90`/`G53`/`G54`/`G28`, `M5`, `M114`, `M400`, `M503`, homing and job
+    stop/pause until the frame latch clears.
+- **Frame-uncertainty latch.** It is set before the G53 is sent and persisted
+  across Luban restarts. On startup it returns together with the recovery hold.
+  - **Every exit path restores G54:** the normal settle; a no-motion `G90`/`G54`
+    after a lost reply or a failed settle; an awaited `shutdown()`.
+  - **A run that queued nothing** (stick released, obstacle hold or a Z switch
+    straight after the G53) restores and then proves the position with `M114`.
+    It stays armed.
+  - **Clearing:** the latch clears only after an acknowledged restore AND a
+    verified position. Until then pendant arming and all MCP motion are refused.
+    It appears in `get_position` warnings and in diagnostics.
+  - **If the restore fails,** the crash guard also stays armed until the latch
+    clears.
+- **Segments and queue model.** Each segment is at most (approved duration −
+  150 ms) / 2. Marlin never replans a block it is already executing, so the next
+  segment has to arrive before the one ahead starts. Luban sends a segment only
+  while the modelled unfinished motion stays within the approved duration, with
+  at most three segments unfinished.
+- **Obstacles.** Every target goes through the obstacle hold and approach logic
+  from the previous queued endpoint, rounded to the three decimals that are sent,
+  and then the full envelope and segment checks. A held or released stick ends
   the run with a settle.
-- The run settles, verifies and restores G54 at least every 2 s, of wall time or
-  of commanded travel, while the stick is held.
-- While the run is declared, the position tracker judges heartbeats as machine
-  coordinates. A beat that also reads as inside the envelope in the work frame
-  is set aside as ambiguous. If a beat puts the toolhead more than 2 mm behind
-  the slow model, or off the queued path, the run ends and the session returns to
-  settled jogs. So does an acknowledgement slower than 400 ms, or a drain that
-  finishes more than 300 ms after the modelled end. Re-arming resets this.
-- A heartbeat older than 2.5 s ends the run. The settled path still accepts beats
-  up to 10 s old.
-- **If the controller reports anything but idle during queued motion, the run ends
-  and the pendant disarms.** The page and TFT say so, and you must re-arm. If it
-  happens on every jog, this controller reports busy during queued moves:
+- **Heartbeats in a run.** While the run is declared (from its G53 reply to its
+  G54 reply), the tracker judges heartbeats as machine coordinates and sets
+  ambiguous ones aside. A lag check compares them with the queue model. It is
+  **unproven and expected to be inert on the A350**, because its beats show the
+  queued target, and nothing relies on it.
+- **Falling back.** An acknowledgement slower than 400 ms, or a drain that ends
+  more than 300 ms after the modelled end, returns the session to settled jogs
+  until it is re-armed.
+- **Stale heartbeat.** A heartbeat older than 2.5 s ends the run.
+- **If the controller reports anything but idle during queued motion, the run
+  ends and the pendant disarms.** The page and TFT say so, and you must re-arm. If
+  it happens on every jog, this controller reports busy during queued moves:
   restart Luban without `LUBAN_PENDANT_PIPELINE`.
 
 **Stop latency (pipelined X/Y, 3000 mm/min = 50 mm/s).** STOP, a released
 deadman and a centred stick are seen on the next 20 Hz USB frame. No segment is
-sent after that. What is already queued is at most the approved duration of
-commanded travel (0.5 s / 25 mm by default, at most 1.0 s / 50 mm). Worst case,
-from the event to standstill:
+sent after that. What is already queued is at most one run's commanded travel,
+and with the default budget that is the approved duration: 0.5 s / 25 mm by
+default, 1.0 s / 50 mm at most. This holds whatever the controller's real speed,
+including a stall or a touchscreen speed override. A slower controller takes
+longer to cover that distance, but cannot be asked to go further. Worst case at
+full speed, from the event to standstill:
 
 | Event | Default 0.5 s | Approved 1.0 s |
 |---|---|---|
@@ -233,25 +266,17 @@ from the event to standstill:
 | USB silent (no new segment after 300 ms) | about 0.86 s | about 1.36 s |
 | Browser keepalive lost (disarms at 900 ms) | about 1.46 s | about 1.96 s |
 
-The bound on the settled path is the same: one in-flight segment of up to the
-approved duration. Z jogs stay settled, so at the Z-mode limit of 1000 mm/min
-the in-flight travel is at most 8.3 mm (0.5 s) or 16.7 mm (1 s).
+If you raise `LUBAN_PENDANT_PIPELINE_RUN_MS`, a stalled controller could hold
+that much commanded travel, at most 2 s (100 mm). The settled path's bound is one
+in-flight segment of up to the approved duration. Z jogs stay settled: at the
+Z-mode limit of 1000 mm/min that is at most 8.3 mm (0.5 s) or 16.7 mm (1 s).
 
-These bounds assume the controller executes queued moves at the commanded feed
-and does not pause them. The `M503` check and `M220 S100` cover the known ways
-it could run slower. Suppose it stalled outright and its heartbeat showed only
-the queued target (see below). Then the backlog could reach one run's commanded
-travel, at most about 2.2 s (110 mm) by default or 2.4 s (120 mm) at 1 s,
-before the 2 s settle stopped queueing. The late drain would then turn
-pipelining off.
-
-Four things need checking on hardware:
+**Still needs hardware verification:**
 
 - `G53` does not synchronize, and plain G1 replies arrive once the move is queued.
 - The controller reports idle during queued direct moves.
-- `M503 S` text comes back through the HTTP API.
-- In-run heartbeats carry the executing position. If they carry the planner's
-  queued target instead, the lag check cannot fire.
+- `M503 S` and `M114` text come back through the HTTP API.
+- `M220 S100` is accepted.
 
 Marlin has `M410` (quickstop), but Luban does not use it: the Snapmaker build
 lacks the emergency parser, and its behaviour over this channel is unverified.

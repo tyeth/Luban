@@ -174,7 +174,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert(diagnostics.snapshot().recent.some(e => e.event === 'heartbeat_worker_exit' && e.reason === 'worker_rejected'));
     }],
     ['a held gcode lease refuses every other caller at the channel and admits only its holder', async () => {
-        const { channel, replies, sent, lease } = fixture();
+        const { channel, replies, sent, lease, requests } = fixture();
         const id = lease.acquire('the USB pendant (queued jog)', 30000);
         // A UI "go to work origin" inside the pendant's G53 window would be a machine-frame plunge.
         const ui = await channel.executeGcode('G0 X0 Y0\nG0 Z0');
@@ -189,6 +189,20 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         lease.release(id);
         replies.push({ res: { status: 200, text: 'ok' } });
         assert.equal((await channel.executeGcode('G54')).result, 0);
+        // The HTTP job and override endpoints are covered too: no request leaves while held.
+        const pendant = lease.acquire('the USB pendant (queued jog)', Infinity);
+        const emitted: object[] = [];
+        channel.socket = { emit: (_event: string, body: object) => { emitted.push(body); } };
+        const before = requests.length;
+        channel.updateWorkSpeedFactor({ eventName: 'speed', workSpeedValue: 50 });
+        channel.startGcode({ eventName: 'start' });
+        channel.resumeGcode({ eventName: 'resume' });
+        channel.updateLaserPower({ eventName: 'power', laserPower: 10 });
+        assert.equal((await channel.startGcodeJob()).ok, false);
+        assert.equal(requests.length, before, 'no HTTP request was made');
+        assert.equal(emitted.length, 4);
+        assert.ok(emitted.every((body) => /reserved by the USB pendant/.test(JSON.stringify(body))));
+        lease.release(pendant);
         // A holder that never releases cannot lock the machine out for ever.
         lease.acquire('stuck', 10, 0);
         assert.equal(lease.refusal('M5', 5) !== null, true);

@@ -547,14 +547,46 @@ export async function queueMachineMove(tool: string, target: Xyz, feed: number):
  * verify the arrival. No procedure-stop check here: a stop must still restore
  * the frame, and this adds no travel to what is already queued.
  */
-export async function settleQueuedMachineMoves(tool: string, last: Xyz, feed: number): Promise<void> {
+export async function settleQueuedMachineMoves(tool: string, last: Xyz, feed: number, onRestored?: () => void): Promise<void> {
     probeFeedService.motionBegin();
     try {
-        await moveMachineSettledUnguarded(tool, last, feed, { onReply: () => noteFrameRestored() });
+        await moveMachineSettledUnguarded(tool, last, feed, { onReply: () => {
+            noteFrameRestored();
+            if (onRestored) { onRestored(); }
+        } });
         traceMark('settled-exit');
     } finally {
         probeFeedService.motionEnd();
     }
+}
+
+/**
+ * After a no-motion G90/G54 restore that queued nothing, prove the position:
+ * M114's reply must match `expected` (machine coordinates) in either frame,
+ * judged with the engine's trusted offset first. A match becomes the position
+ * of record (source `echo`), which clears the frame-uncertainty latch. Returns
+ * whether it matched; no motion either way.
+ */
+export async function verifyRestoredPosition(tool: string, expected: Xyz): Promise<boolean> {
+    const executed = await sendGcodeVisible(getDirectChannel(), tool, 'M114');
+    const echo = executed.result === 0 ? parseEcho(executed.text) : null;
+    if (!echo) {
+        return false;
+    }
+    const trusted = getTrustedOffset();
+    const offsets: Xyz[] = trusted ? [trusted] : [];
+    try {
+        offsets.push(getPositionSnapshot().originOffset);
+    } catch (err) {
+        // No heartbeat: only the trusted offset can judge the reply.
+    }
+    const match = matchFrameWithOffsets(echo, offsets, expected, ECHO_TOLERANCE_MM);
+    const full = match ? completeTarget(machineFromReport(echo, match.offset, match.frame), expected) : null;
+    if (!full) {
+        return false;
+    }
+    setPositionOfRecord(full, 'echo', executed.sequence, tool);
+    return true;
 }
 
 /** The firmware's current motion limits (`M503 S`, read-only), for the caller to judge. */

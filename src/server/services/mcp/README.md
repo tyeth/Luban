@@ -1736,9 +1736,16 @@ the controller's planner (Marlin `select_coordinate_system()`). `LUBAN_PENDANT_P
 opt-in, hardware-unverified continuous X/Y mode. It queues bounded G1 segments in one `G53`
 window (`probing.ts` `enterMachineFrame` / `queueMachineMove` / `settleQueuedMachineMoves`) and
 settles once; the pendant README states its stop-latency bounds. While a run holds the window, an
-exclusive gcode lease (`machine/gcodeLease.ts`) refuses every other command at the channels and
-at ConnectionManager's job and jog entry points. The tracker judges in-run beats as machine
-coordinates (`declareMachineFrameRun`, `machinePosition.ts` `judgeDeclaredRun`). A persistent
-`frameUncertain` latch (`positionOfRecord.ts`, shown in `get_position` warnings and in
-`get_mcp_diagnostics`) refuses all motion until the work frame is restored and a fresh position
+exclusive gcode lease (`machine/gcodeLease.ts`) refuses every other command. It covers every
+channel's `executeGcode`, the SSTP job and override endpoints (including the MCP file-job start)
+and ConnectionManager's job, jog, home and origin entry points. After a failed restore it becomes
+a recovery hold that admits only frame recovery, homing, position queries and job stop.
+
+By default a run commands at most the approved segment duration before it settles. The A350
+heartbeat reports the planner's queued target, so it cannot confirm execution mid-run.
+`M220 S100` persists after jogging. The tracker judges in-run beats as machine coordinates
+(`declareMachineFrameRun`, `machinePosition.ts` `judgeDeclaredRun`).
+
+A persistent `frameUncertain` latch (`positionOfRecord.ts`) survives Luban restarts and shows in
+`get_position` warnings and in `get_mcp_diagnostics`. It refuses all motion until the work frame is restored and a fresh position
 verified.

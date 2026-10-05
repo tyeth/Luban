@@ -851,6 +851,12 @@ class ConnectionManager {
      */
     public startGcodeAction = async (socket: SocketServer, options) => {
         log.info('gcode action begin');
+        const leaseRefusal = gcodeLease.refusal('start job');
+        if (leaseRefusal) {
+            log.warn(leaseRefusal);
+            options?.eventName && socket && socket.emit(options.eventName, { err: true, msg: leaseRefusal });
+            return;
+        }
         this.channel.startGcode(options);
     };
 

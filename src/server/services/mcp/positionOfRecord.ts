@@ -389,13 +389,28 @@ export const FRAME_LATCH_BEAT_MS = 1000;
 
 let frameLatch: FrameLatch | null = null;
 
+// tools/machine.ts persists the latch across Luban restarts through this hook.
+let frameLatchListener: ((latch: FrameLatch | null) => void) | null = null;
+
+export function onFrameLatchChange(listener: ((latch: FrameLatch | null) => void) | null): void {
+    frameLatchListener = listener;
+}
+
+function notifyFrameLatch(): void {
+    if (frameLatchListener) {
+        frameLatchListener(frameLatch ? { ...frameLatch } : null);
+    }
+}
+
 export function latchFrameUncertain(reason: string, now: number = Date.now()): void {
     frameLatch = { reason, since: now, restoredAt: null };
+    notifyFrameLatch();
 }
 
 export function noteFrameRestored(now: number = Date.now()): void {
     if (frameLatch) {
         frameLatch.restoredAt = now;
+        notifyFrameLatch();
     }
 }
 
@@ -404,7 +419,10 @@ export function getFrameLatch(): FrameLatch | null {
 }
 
 export function clearFrameLatch(): void {
-    frameLatch = null;
+    if (frameLatch) {
+        frameLatch = null;
+        notifyFrameLatch();
+    }
 }
 
 /**

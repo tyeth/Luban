@@ -692,6 +692,7 @@ export async function homeMachine(tool: string, waitUntilHomed: boolean = true, 
     if (executed.result !== 0) {
         throw new McpToolError(`Homing rejected by controller: ${executed.text || executed.result}`);
     }
+    noteFrameRestored(); // G54 acknowledged after G28; a verified position must still follow.
 
     if (!waitUntilHomed) {
         return {

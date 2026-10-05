@@ -18,7 +18,10 @@ import { pendantPosition } from './pendantPosition';
 import { pendantSettings, updatePendantSettings } from './pendantSettings';
 import { currentGcodeSequence, getFrameLatch, getPositionOfRecord, getTrustedOffset, latchFrameUncertain } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
-import { assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queueMachineMove, readFirmwareMotionConfig, settleQueuedMachineMoves, sleep } from './probing';
+import {
+    assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queueMachineMove, readFirmwareMotionConfig, settleQueuedMachineMoves, sleep,
+    verifyRestoredPosition,
+} from './probing';
 import { homeMachine, sendWorkFrameRestore } from './tools/camera';
 import { HEARTBEAT_STALE_MS, connectionEpoch, declareMachineFrameRun, endMachineFrameRun, getMachineSizeByIdentifier, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
@@ -83,9 +86,20 @@ export const PIPELINE_REPLY_LIMIT_MS = 400;
 // The closing settle must finish this soon after the modelled end of the queue,
 // or the controller ran longer than modelled: fall back until re-armed.
 export const PIPELINE_DRAIN_LATE_MS = 300;
-// Settle, verify and restore G54 at least this often (wall time, and commanded
-// time sent) while the stick is held. Bounds the backlog if the controller stalls.
+// Settle, verify and restore G54 at least this often (wall time) while the stick is held.
 export const PIPELINE_RUN_MAX_MS = 2000;
+// Commanded-but-unconfirmed travel per run. Nothing the A350 reports confirms
+// execution mid-run (its heartbeat x/y/z is the planner's queued target), so by
+// default a run settles once it has commanded the operator's maxSegmentMs: the
+// backlog can never exceed that, whatever the controller's speed. An operator
+// who has verified stop behaviour on hardware may raise it, up to
+// PIPELINE_RUN_MAX_MS, with LUBAN_PENDANT_PIPELINE_RUN_MS (read on arm).
+const pipelineRunBudgetMs = (maxSegmentMs: number): number => {
+    const raw = typeof process !== 'undefined' ? Number(process.env?.LUBAN_PENDANT_PIPELINE_RUN_MS) : NaN;
+    return Number.isFinite(raw) ? Math.max(maxSegmentMs, Math.min(PIPELINE_RUN_MAX_MS, raw)) : maxSegmentMs;
+};
+// After a restore, wait this long for the verified position before ready() may refuse.
+const FRAME_VERIFY_WAIT_MS = 3000;
 const PIPELINE_POLL_MS = 10;
 // A run needs a heartbeat at most this old (the WiFi poll is 2 s); older ends the run.
 export const PIPELINE_HEARTBEAT_MAX_AGE_MS = 2500;
@@ -95,8 +109,9 @@ export const PIPELINE_LAG_LIMIT_MM = 2;
 const PIPELINE_BEAT_SAMPLE_SLACK_MS = 500;
 // Beats received this long after the G53 reply are judged as machine coordinates.
 const PIPELINE_DECLARE_GUARD_MS = 300;
-// The lease is renewed on every request of the run; it lapses only if the run hangs.
-const PIPELINE_LEASE_TTL_MS = 30000;
+// The lease never lapses while the run may have G53 selected; `finally` releases it,
+// or hands it to a recovery hold when the work frame could not be restored.
+const PIPELINE_LEASE_TTL_MS = Infinity;
 
 interface RunSegment { from: JogPosition; to: JogPosition; start: number; end: number; cum: number; len: number }
 
@@ -148,7 +163,12 @@ export class PendantRuntime {
 
     private epoch: number | null = null;
 
-    private pipeline = { requested: false, active: false, disabled: null as string | null, lastRun: null as object | null };
+    private pipeline = { requested: false,
+        active: false,
+        disabled: null as string | null,
+        notice: null as string | null,
+        runBudgetMs: 0,
+        lastRun: null as object | null };
 
     private runPromise: Promise<void> | null = null;
 
@@ -514,7 +534,11 @@ export class PendantRuntime {
             });
         }
         this.release();
+        if (this.heldMotionGuard && !getFrameLatch()) { this.releaseHeldMotionGuard(); }
         if (this.busy || !this.session.armed) { return; }
+        const latch = getFrameLatch();
+        // A restore was acknowledged; its verified position is still arriving. Hold, do not disarm.
+        if (latch && latch.restoredAt !== null && now - latch.restoredAt < FRAME_VERIFY_WAIT_MS) { return; }
         this.ready();
         const from = this.position();
         const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
@@ -582,9 +606,10 @@ export class PendantRuntime {
      * carries machine coordinates. If it shows the toolhead further back along the
      * queued path than the SLOW model allows (or off the path), the controller is
      * running slower than modelled: the real backlog is growing. Returns the reason.
-     * Caveat: if the controller reports its planner's queued target rather than the
-     * executing position, beats run ahead of the model and this check cannot fire;
-     * the firmware-limit check, M220 S100, the drain check and the 2 s run cap remain.
+     * UNPROVEN, and expected to be inert on the A350: its heartbeat x/y/z is the
+     * planner's QUEUED target (16 blocks ahead), and with a 2 s poll a short run sees
+     * at most one beat. Kept as a belt-and-braces check only. Nothing relies on it:
+     * the per-run budget (maxSegmentMs by default) bounds the backlog on its own.
      */
     private runLag(segments: RunSegment[]): string | null {
         if (!segments.length) { return null; }
@@ -618,7 +643,7 @@ export class PendantRuntime {
 
     /** Read the firmware's motion limits once per arm; pipelining stays off unless they fit the model. */
     private async preparePipeline(): Promise<void> {
-        this.pipeline = { ...this.pipeline, requested: false, disabled: null };
+        this.pipeline = { ...this.pipeline, requested: false, disabled: null, notice: null };
         if (!pipelineRequested()) { return; }
         let problem: string | null;
         try {
@@ -626,8 +651,12 @@ export class PendantRuntime {
         } catch (err) {
             problem = `Could not read the controller's motion limits: ${(err as Error).message}`;
         }
-        this.pipeline = { ...this.pipeline, requested: true, disabled: problem ? `${problem} Settled jogs only.` : null };
-        if (problem) { log.warn(`Pipelined jog refused: ${problem}`); }
+        const runBudgetMs = pipelineRunBudgetMs(this.session.maxSegmentMs);
+        const notice = problem ? null : 'Continuous jogging is on. Each run sends M220 S100, which STAYS in force afterwards: a '
+            + 'reduced touchscreen speed % is overridden for later file jobs too. Set it again before a job that relies on it. '
+            + `Runs settle every ${runBudgetMs} ms of commanded travel.`;
+        this.pipeline = { ...this.pipeline, requested: true, disabled: problem ? `${problem} Settled jogs only.` : null, notice, runBudgetMs };
+        if (problem) { log.warn(`Pipelined jog refused: ${problem}`); } else { log.info(`Pipelined jog enabled: ${notice}`); }
     }
 
     private pipelineEligible(from: JogPosition, target: JogTarget): boolean {
@@ -661,6 +690,7 @@ export class PendantRuntime {
     private async pipelinedRun(from: JogPosition): Promise<void> {
         const limitMs = this.session.maxSegmentMs;
         const capMs = Math.floor((limitMs - PIPELINE_MARGIN_MS) / 2);
+        const budgetMs = this.pipeline.runBudgetMs || limitMs;
         const bounds = this.session.bounds as JogBounds;
         const startedAt = Date.now();
         let leaseId: number;
@@ -695,7 +725,7 @@ export class PendantRuntime {
                     let now = Date.now();
                     this.watchdog(now);
                     if (!this.session.armed) { stopReason = 'disarmed'; break; }
-                    if (now - startedAt >= PIPELINE_RUN_MAX_MS || totals.commandedMs >= PIPELINE_RUN_MAX_MS) {
+                    if (now - startedAt >= PIPELINE_RUN_MAX_MS) {
                         stopReason = 'periodic settle and verify'; break;
                     }
                     const notReady = this.readyInRun();
@@ -707,7 +737,10 @@ export class PendantRuntime {
                         log.warn(`Pipelined jog: ${this.pipeline.disabled}`);
                         break;
                     }
-                    const target = this.obstacleSafeTarget(chain, this.session.target(chain, now, 0, capMs));
+                    // Unconfirmed commanded travel per run never exceeds the budget.
+                    const budgetLeftMs = budgetMs - totals.commandedMs;
+                    if (budgetLeftMs < PIPELINE_MIN_SEGMENT_MS) { stopReason = 'run budget reached; settle and verify'; break; }
+                    const target = this.obstacleSafeTarget(chain, this.session.target(chain, now, 0, Math.min(capMs, budgetLeftMs)));
                     if (!target) { stopReason = this.blocked?.held ? `held at ${this.blocked.name}` : 'input released or stale'; break; }
                     if (target.position.z !== chain.z) { stopReason = 'Z motion uses settled jogs'; break; }
                     const ux = (target.position.x - chain.x) / target.distanceMm;
@@ -761,12 +794,11 @@ export class PendantRuntime {
                 stopReason = (err as Error).message;
                 this.disarm((err as Error).message);
             }
-            endMachineFrameRun();
             if (entered) {
                 const closeAt = Date.now();
                 try {
                     if (totals.segments && !uncertain) {
-                        await leased(async () => settleQueuedMachineMoves('usb_pendant', chain, totals.feed));
+                        await leased(async () => settleQueuedMachineMoves('usb_pendant', chain, totals.feed, endMachineFrameRun));
                         restored = true;
                         const lateMs = Date.now() - Math.max(queueEndsAt, closeAt + 4 * replyMs);
                         if (lateMs > PIPELINE_DRAIN_LATE_MS && !this.pipeline.disabled) {
@@ -781,10 +813,20 @@ export class PendantRuntime {
                     // Nothing verifiably queued, an unacknowledged G1 or G53, or a failed
                     // settle: restore G54 without commanding any position. Its G54 also
                     // waits for anything still queued; fresh beats then verify it.
+                    endMachineFrameRun();
                     try {
                         const result = await leased(async () => sendWorkFrameRestore('usb_pendant:pipeline-close'));
                         restored = result.result === 0;
                         if (!restored) { throw new Error(result.text || 'Controller refused the work-frame restore.'); }
+                        // Nothing was queued, so the machine is where the run began: M114 proves it and
+                        // clears the latch without waiting for (or disarming on) the next heartbeat.
+                        if (!totals.segments && !uncertain) {
+                            try {
+                                await leased(async () => verifyRestoredPosition('usb_pendant:pipeline-close', from));
+                            } catch (err) {
+                                log.warn(`Queued jog: M114 did not verify the restored position: ${(err as Error).message}`);
+                            }
+                        }
                     } catch (err) {
                         this.disarm(`Queued jog could not restore the work frame: ${(err as Error).message} The machine workspace may `
                             + 'still be selected and queued motion may still be running. Motion stays refused; use Restore work frame.');
@@ -793,7 +835,13 @@ export class PendantRuntime {
             }
         } finally {
             endMachineFrameRun();
-            gcodeLease.release(leaseId);
+            if (!entered || restored) {
+                gcodeLease.release(leaseId);
+            } else {
+                // The machine workspace may still be selected: refuse everything but recovery
+                // (restore, homing, position queries, job stop) until the latch clears.
+                gcodeLease.holdForRecovery('a queued pendant jog could not restore the work frame', leaseId);
+            }
             // The crash guard stays armed while queued motion may still be running.
             if (!entered || restored) { probeFeedService.motionEnd(); } else { this.heldMotionGuard += 1; }
             this.pipeline.active = false;
