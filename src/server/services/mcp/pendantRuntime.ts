@@ -180,6 +180,12 @@ export class PendantRuntime {
     // the next press starts from it during the grace instead of waiting for a beat.
     private lastProvedPosition: JogPosition | null = null;
 
+    // Set when an in-hold M114 baseline disagreed with the dead-reckoned chain: the record Z
+    // is not trusted, so no Z word is sent by either engine until re-arm. The settled engine
+    // always carries an absolute Z word (even for X/Y), so it is refused entirely meanwhile;
+    // X/Y continue through the continuous hold, which omits Z.
+    private zRefused: string | null = null;
+
     // The last hold's commanded end when its close restored G54 but the M114 proof did not
     // match: the next press proves it on demand (proveLastHoldClose) instead of waiting for a beat.
     private lastHoldClose: { chain: JogPosition; latchSince: number | null } | null = null;
@@ -647,6 +653,13 @@ export class PendantRuntime {
             this.queueNextTick();
             return;
         }
+        if (this.zRefused) {
+            // Every settled segment carries an absolute Z word from the record Z the baseline refused.
+            const message = `Z refused until re-arm (the in-hold M114 disagreed: ${this.zRefused}). X/Y jog in continuous holds only.`;
+            if (this.error !== message) { this.error = message; log.info(`Settled jog refused: ${message}`); }
+            this.release();
+            return;
+        }
         this.validateEnvelope(this.session.bounds as JogBounds);
         this.validateJogSegment(from, target.position);
         this.busy = true;
@@ -751,6 +764,11 @@ export class PendantRuntime {
         // Position freshness is the newer of the heartbeat and the last prompt M114 that agreed
         // with the hold (pollCount, the Z baseline, a close proof). A failed, late or disagreeing
         // M114 never refreshes it, so a faltering connection still stops the hold.
+        // M114 never replaces the heartbeat entirely: machineStatus, homed and head power come
+        // from it, so a beat older than the stale threshold stops the hold regardless.
+        if (p.reportAgeMs > HEARTBEAT_STALE_MS) {
+            return `machine heartbeat ${p.reportAgeMs} ms old (hard limit ${HEARTBEAT_STALE_MS} ms even with fresh M114)`;
+        }
         const m114AgeMs = Date.now() - this.m114FreshAt;
         if (Math.min(p.reportAgeMs, m114AgeMs) > HOLD_HEARTBEAT_MAX_AGE_MS) {
             const m114 = Number.isFinite(m114AgeMs) ? `the last agreeing M114 ${m114AgeMs} ms old` : 'no agreeing M114 yet';
@@ -1283,6 +1301,11 @@ export class PendantRuntime {
                     }
                     idleSince = null;
                     if (this.pipeline.zDisabled && raw.position.z !== chain.z) { summary.stopReason = `Z motion uses settled jogs: ${this.pipeline.zDisabled}`; break; }
+                    if (this.zRefused && raw.position.z !== chain.z) {
+                        summary.stopReason = `Z refused until re-arm: ${this.zRefused}`;
+                        this.holdOffUntilNeutral = true;
+                        break;
+                    }
                     const target = this.holdTarget(chain, raw);
                     if (!target) { summary.stopReason = this.blocked ? `held at ${this.blocked.name}` : this.holdReleaseReason(now); break; }
                     const zWord = Math.abs(target.position.z - chain.z) >= 0.001;
@@ -1300,6 +1323,8 @@ export class PendantRuntime {
                         if (problem) {
                             summary.stopReason = `no Z word sent: ${problem}`;
                             this.holdOffUntilNeutral = true;
+                            this.zRefused = problem;
+                            log.warn(`Z jogging refused until re-arm: the in-hold M114 baseline disagreed (${problem}).`);
                             break;
                         }
                         zProved = true;
@@ -1570,6 +1595,7 @@ export class PendantRuntime {
                     manualControlGate.acquire(() => this.disarm('Stopped through MCP.'));
                     this.owned = true;
                     this.session.arm(bounds, this.position(), Date.now(), args.maxSegmentMs ?? 500);
+                    this.zRefused = null;
                     this.pipeline = { ...this.pipeline, requested: false, disabled: null };
                     this.epoch = this.machineEpoch();
                     this.pageAliveAt = Date.now();

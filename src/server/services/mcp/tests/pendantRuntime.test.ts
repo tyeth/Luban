@@ -1736,6 +1736,13 @@ export const tests: Array<[string, () => Promise<void>]> = [
                 await f.request('/pendant/keepalive', {}); f.input({ z: -1, mode: 'z', deadman: true, feed: 600 }); await f.tick(); await f.flush();
                 assert.equal(f.moves(), 0); assert.equal(f.queued.length, 0);
                 assert.equal(f.frames.filter((frame) => frame === 'enter').length, 1);
+                // Even once a beat clears the latch, the settled engine (which always sends an absolute
+                // record Z word) stays refused until re-arm: the baseline showed that Z is wrong.
+                f.verifiedBeat();
+                await f.request('/pendant/keepalive', {}); f.input(); f.input({ z: -1, mode: 'z', deadman: true, feed: 600 }); await f.tick(); await f.flush();
+                assert.equal(f.moves(), 0, 'no settled Z jog to the refused record Z');
+                const refused = await readStatus(f);
+                assert.match(`${refused.error} ${refused.pipeline.lastHold.stopReason}`, /Z refused until re-arm/);
             }
         }
     }],
@@ -1807,6 +1814,13 @@ export const tests: Array<[string, () => Promise<void>]> = [
         const ticks = JSON.parse((await f.request('/pendant/hold-trace')).body).ticks as Array<{ kind: string; at: number; count?: { fresh: boolean } }>;
         assert.ok(ticks.filter((t) => t.kind === 'count' && t.at >= idleAt).every((t) => t.count?.fresh === true), 'every idle reply agreed with the chain');
         assert.ok((await readStatus(f)).pipeline.m114FreshAgeMs !== null);
+    }],
+    ['fresh M114 replies never stretch a hold past the heartbeat stale threshold', async () => {
+        const f = fixture(false, { pipeline: true });
+        f.onQueue((count) => { if (count === 10) { f.setReportAge(11000); } });
+        await startRun(f, { feed: 300 }, 9000);
+        const hold = (await readStatus(f)).pipeline.lastHold;
+        assert.match(hold.stopReason, /machine heartbeat 11000 ms old \(hard limit 10000 ms even with fresh M114\)/, hold.stopReason);
     }],
     ['M114 freshness keeps a hold alive past 4.5 s without heartbeats; late, failing or disagreeing M114 replies do not', async () => {
         const run = async (arrange: (f: Fixture) => void, then?: (f: Fixture, count: number) => void) => {
