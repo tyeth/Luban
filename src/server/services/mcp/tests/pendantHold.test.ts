@@ -1,7 +1,8 @@
 import assert from 'assert';
 import {
-    A350_STEPS_PER_MM, HOLD_COUNT_POLL_MS, HOLD_FEATHER_GAP_MS, HOLD_MOVE_MS, HOLD_QUEUE_AHEAD_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault,
-    countToMm, extendAlong, holdMoveMm, holdRunoutMm, judgeCountSample, parseCountReport, parseStepsPerMm,
+    A350_STEPS_PER_MM, HOLD_COUNT_POLL_MS, HOLD_FEATHER_GAP_MS, HOLD_HEARTBEAT_MAX_AGE_MS, HOLD_LATE_EVENTS_TO_DISABLE, HOLD_MOVE_MS, HOLD_QUEUE_AHEAD_MS,
+    HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault, countToMm, extendAlong, holdMoveMm, holdRunoutMm, judgeCountSample, parseCountReport,
+    parseStepsPerMm, queuedMoveGcode,
 } from '../pendantHold';
 
 const origin = { x: 10, y: 20, z: 300 };
@@ -13,6 +14,8 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.equal(HOLD_QUEUE_AHEAD_MS, 200);
         assert.equal(HOLD_FEATHER_GAP_MS, 150);
         assert.equal(HOLD_COUNT_POLL_MS, 250);
+        assert.equal(HOLD_HEARTBEAT_MAX_AGE_MS, 4500, 'two 2 s poll periods plus jitter: one late poll never flips a hold');
+        assert.equal(HOLD_LATE_EVENTS_TO_DISABLE, 3);
         assert.equal(holdMoveMm(3000), 5);
         assert.equal(holdRunoutMm(3000), 10);
         assert.equal(holdRunoutMm(300), 1);
@@ -71,22 +74,26 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.equal(parseStepsPerMm('echo:  M92 X0 Y400 Z400'), null, 'a zero step count is not usable');
         assert.deepEqual(A350_STEPS_PER_MM, { x: 400, y: 400, z: 400 });
     }],
-    ['a Count sample is behind only beyond one increment plus the position tolerance; no Count is no verdict', () => {
+    ['a Count sample is off only beyond one increment plus the position tolerance, in either direction; no Count is no verdict', () => {
         const expected = { x: 20, y: 20, z: 300 };
-        assert.deepEqual(judgeCountSample(null, expected, 5, 0.05), { lagMm: null, behind: false });
-        assert.deepEqual(judgeCountSample({ x: 15.1, y: 20, z: 300 }, expected, 5, 0.05), { lagMm: 4.9, behind: false });
+        assert.deepEqual(judgeCountSample(null, expected, 5, 0.05), { lagMm: null, off: false });
+        assert.deepEqual(judgeCountSample({ x: 15.1, y: 20, z: 300 }, expected, 5, 0.05), { lagMm: 4.9, off: false });
         const edge = judgeCountSample({ x: 14.9, y: 20, z: 300 }, expected, 5, 0.05);
-        assert.ok(edge.lagMm !== null && Math.abs(edge.lagMm - 5.1) < 1e-9 && edge.behind);
-        assert.equal(judgeCountSample({ x: 20, y: 20, z: 0 }, expected, 5, 0.05).behind, false, 'Z is not judged: the hold never commands it');
-        assert.equal(judgeCountSample({ x: 26, y: 20, z: 300 }, expected, 5, 0.05).behind, true, 'leading the model by more than an increment also counts');
+        assert.ok(edge.lagMm !== null && Math.abs(edge.lagMm - 5.1) < 1e-9 && edge.off);
+        assert.equal(judgeCountSample({ x: 20, y: 20, z: 0 }, expected, 5, 0.05).off, false, 'Z is not judged: the hold never commands it');
+        assert.equal(judgeCountSample({ x: 26, y: 20, z: 300 }, expected, 5, 0.05).off, true, 'leading the model by more than an increment also counts (symmetric)');
+    }],
+    ['a hold increment is G1 X Y F with no Z word; the settled form still carries Z', () => {
+        assert.equal(queuedMoveGcode({ x: 12.3456, y: -0.5, z: 327.999 }, 300, true), 'G1 X12.346 Y-0.500 F300;');
+        assert.equal(queuedMoveGcode({ x: 12.3456, y: -0.5, z: 327.999 }, 300, false), 'G1 X12.346 Y-0.500 Z327.999 F300;');
     }],
     ['countFault names the late reply, the missing Count or the lag; a clean sample is no fault', () => {
         const xyz = { x: 1, y: 2, z: 3 };
-        const base = { at: 0, execMs: 40, late: false, count: xyz, derived: xyz, position: null, expected: xyz, lagMm: 0, behind: false, error: null };
+        const base = { at: 0, execMs: 40, late: false, count: xyz, derived: xyz, position: null, expected: xyz, lagMm: 0, off: false, error: null };
         assert.equal(countFault(base, 5), null);
         assert.match(String(countFault({ ...base, late: true, execMs: 140 }, 5)), /took 140 ms \(limit one tick, 100 ms\)/);
         assert.match(String(countFault({ ...base, count: null, derived: null }, 5)), /no Count fields/);
-        assert.match(String(countFault({ ...base, lagMm: 7.25, behind: true }, 5)),
+        assert.match(String(countFault({ ...base, lagMm: 7.25, off: true }, 5)),
             /7\.25 mm from the expected executed position \(limit one increment, 5\.00 mm\)/);
         assert.match(String(countFault({ ...base, error: 'transport_error' }, 5)), /M114 failed during the hold: transport_error/);
     }],

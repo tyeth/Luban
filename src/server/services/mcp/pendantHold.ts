@@ -35,8 +35,20 @@ export const HOLD_FEATHER_GAP_MS = 150;
 export const HOLD_COUNT_POLL_MS = 250;
 /** A G1 reply slower than this means the controller is holding the request (planner full): stop. */
 export const HOLD_REPLY_LATE_MS = HOLD_QUEUE_AHEAD_MS;
-/** A status report older than this during a hold means the connection is faltering: stop. */
-export const HOLD_HEARTBEAT_MAX_AGE_MS = 2500;
+/**
+ * A status report older than this during a hold means the connection is
+ * faltering: stop. The WiFi poll runs every 2 s with a 3 s timeout, so one
+ * late poll must not flip a hold into a settled burst and back; two missed
+ * periods (plus jitter) is the connection symptom this guards.
+ */
+export const HOLD_HEARTBEAT_MAX_AGE_MS = 4500;
+/**
+ * A late reply (a G1 acknowledged after HOLD_REPLY_LATE_MS, or in enforced
+ * mode an M114 slower than one tick) stops the hold it happens in. Only this
+ * many consecutive late events within one arm turn continuous jogging off
+ * until re-arm; a hold that ends for any other reason resets the count.
+ */
+export const HOLD_LATE_EVENTS_TO_DISABLE = 3;
 /**
  * Arm-time firmware check (M503 S): the clock model charges each increment
  * its commanded time only. Below this acceleration a 100 ms increment at the
@@ -64,6 +76,17 @@ export type CountCheckMode = 'enforced' | 'observe';
 
 export function countCheckMode(raw: string | undefined | null): CountCheckMode {
     return /^enforced$/i.test(String(raw || '').trim()) ? 'enforced' : 'observe';
+}
+
+/**
+ * The G1 for one queued machine-frame increment. The hold omits the Z word
+ * (Marlin keeps the current Z for `G1 X Y`): the hold's Z is the heartbeat-
+ * derived record Z, and a wrong reused offset must make the close's M114
+ * proof fail rather than move Z by the error at stick feed.
+ */
+export function queuedMoveGcode(target: JogPosition, feed: number, omitZ: boolean): string {
+    const words = `X${target.x.toFixed(3)} Y${target.y.toFixed(3)}${omitZ ? '' : ` Z${target.z.toFixed(3)}`}`;
+    return `G1 ${words} F${feed};`;
 }
 
 /** Distance a queue of HOLD_QUEUE_AHEAD_MS runs out at `feed` mm/min. */
@@ -193,20 +216,21 @@ export function countToMm(count: JogPosition, stepsPerMm: JogPosition): JogPosit
 export interface CountJudgement {
     /** XY distance between the Count-derived position and the expected executed position; null without Count. */
     lagMm: number | null;
-    /** True when that distance exceeds one increment (plus the position tolerance). */
-    behind: boolean;
+    /** True when that distance exceeds one increment (plus the position tolerance), in either direction. */
+    off: boolean;
 }
 
 /**
  * Judge one Count sample against the clock model. `moveMm` is one increment
- * at the current feed: the Count-derived position may trail (or lead) the
+ * at the current feed: the Count-derived position may trail OR lead the
  * expected executed position by up to that much plus `toleranceMm` before it
- * counts as behind. XY only: the hold never commands Z.
+ * counts as off (the distance is symmetric: a stall and a touchscreen speed
+ * override above 100 % both count). XY only: the hold never commands Z.
  */
 export function judgeCountSample(derived: JogPosition | null, expected: JogPosition, moveMm: number, toleranceMm: number): CountJudgement {
-    if (!derived) { return { lagMm: null, behind: false }; }
+    if (!derived) { return { lagMm: null, off: false }; }
     const lagMm = Math.hypot(derived.x - expected.x, derived.y - expected.y);
-    return { lagMm, behind: lagMm > moveMm + toleranceMm };
+    return { lagMm, off: lagMm > moveMm + toleranceMm };
 }
 
 /** One Count sample as traced and reported in `/pendant/status`. */
@@ -224,7 +248,7 @@ export interface CountSample {
     /** The model's expected executed position at the send time. */
     expected: JogPosition;
     lagMm: number | null;
-    behind: boolean;
+    off: boolean;
     error: string | null;
 }
 
@@ -237,7 +261,7 @@ export function countFault(sample: CountSample, moveMm: number): string | null {
     if (sample.error) { return `M114 failed during the hold: ${sample.error}`; }
     if (sample.late) { return `the M114 reply took ${sample.execMs} ms (limit one tick, ${HOLD_TICK_MS} ms)`; }
     if (!sample.derived) { return 'the M114 reply carried no Count fields, so the executed position cannot be checked'; }
-    if (sample.behind) {
+    if (sample.off) {
         return `the Count position is ${(sample.lagMm as number).toFixed(2)} mm from the expected executed position `
             + `(limit one increment, ${moveMm.toFixed(2)} mm)`;
     }

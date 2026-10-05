@@ -1,5 +1,6 @@
 import { connectionManager } from '../machine/ConnectionManager';
 import { mcpBroadcast } from './index';
+import { queuedMoveGcode } from './pendantHold';
 import {
     AXES,
     BeatObservation,
@@ -499,12 +500,16 @@ export async function enterMachineFrame(tool: string): Promise<SentGcode> {
  * Queue one absolute G1 in the machine frame that enterMachineFrame selected.
  * Returns when the controller accepted it, normally long before it finishes.
  * Never call it outside such a hold: on its own it would move in the work frame.
+ * `omitZ` sends `G1 X Y F` with no Z word (the controller keeps its current Z):
+ * the continuous hold uses it because its Z is the heartbeat-derived record Z,
+ * which may rest on a reused offset; with no Z word a wrong record Z fails the
+ * close's M114 proof instead of being driven to. The settled path's inherited
+ * record-Z word is unchanged here.
  */
-export async function queueMachineMove(tool: string, target: Xyz, feed: number): Promise<SentGcode> {
+export async function queueMachineMove(tool: string, target: Xyz, feed: number, options: { omitZ?: boolean } = {}): Promise<SentGcode> {
     probeFeedService.assertNoOvertravel();
     checkProcedureStop();
-    const words = `X${target.x.toFixed(3)} Y${target.y.toFixed(3)} Z${target.z.toFixed(3)}`;
-    const executed = await sendGcodeVisible(getDirectChannel(), tool, `G1 ${words} F${feed};`);
+    const executed = await sendGcodeVisible(getDirectChannel(), tool, queuedMoveGcode(target, feed, options.omitZ === true));
     if (executed.result !== 0) {
         throw new ProcedureAbort(`Controller rejected the queued move: ${executed.text || executed.result}`);
     }

@@ -1804,7 +1804,9 @@ opt-in continuous X/Y mode, not yet run on hardware in its current form: ONE hol
 release or any stop (`pendantRuntime.ts` `continuousHold`, pure pieces in `pendantHold.ts`). One
 `G53` at the press (`probing.ts` `enterMachineFrame`), clock-paced `G1` increments of 100 ms at
 the current feed every 100 ms with at most 200 ms queued ahead by a clock model
-(`queueMachineMove`), and one `G54` at the stop through the shared restore path
+(`queueMachineMove` with `omitZ`: hold increments carry no Z word, so a wrong heartbeat-derived
+record Z fails the close's M114 proof instead of being driven to; the settled path's record-Z word
+is unchanged), and one `G54` at the stop through the shared restore path
 (`tools/camera.ts` `sendWorkFrameRestore`, then `probing.ts` `verifyRestoredPosition`'s `M114`
 proves the commanded end position and clears the latch). The earlier run/settle design was
 retired after hardware feedback (2026-10-05: a second of motion, a 0.5-2 s stop, repeat). Every

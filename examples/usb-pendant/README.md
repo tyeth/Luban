@@ -198,7 +198,13 @@ any connection other than the A350's HTTP channel.
   clock, charging each increment its commanded time from its send time, and
   never lets more than 200 ms (`HOLD_QUEUE_AHEAD_MS`) be outstanding. Every `G1`
   reply is awaited before the next is sent, so at most one is unanswered. These
-  are constants, not settings.
+  are constants, not settings. Increments are `G1 X Y F` with **no Z word** (the
+  controller keeps its current Z): the hold's Z is the heartbeat-derived record
+  Z, which may rest on a reused offset, and with no Z word a wrong record Z makes
+  the close's `M114` proof fail (the latch then waits for a verified beat)
+  instead of being driven to at stick feed. The settled path still sends the
+  record-Z word it always has (hardware-proven, unchanged here); it should get
+  the same treatment once the trial confirms.
 - **The position of record is blind for the hold.** Heartbeats sampled inside
   the `G53` window are set aside by design, so the record holds at the press
   position. Every increment is therefore checked from the pendant's own
@@ -209,18 +215,34 @@ any connection other than the A350's HTTP channel.
   3000 mm/min, 1 mm at 300), so motion already queued when the stop is decided
   can never enter an exclusion. An obstacle stops the hold and the pendant
   stays armed, as the settled path holds; straight Z-up exits stay on the
-  settled path.
+  settled path. The same lookahead runs **before** a hold opens: a stick
+  pointed at a box within one increment plus run-out (15 mm at 3000 mm/min)
+  never sends the `G53`; the settled path jogs toward the pad and holds there
+  as the obstacle hold does, and continuous jogging stays off until the stick
+  returns to neutral (`pipeline.holdOffUntilNeutral`), so a stick held against
+  a box does not open and close a hold several times a second.
 - **Stops at once** (nothing further is sent, then the `G54`): D1 released, the
   stick centred, a gap of more than 150 ms since the last Feather report
-  (`HOLD_FEATHER_GAP_MS`), the page keepalive lost, a `G1` reply error, timeout
-  or rejection, a `G1` acknowledged later than 200 ms (the controller is holding
-  requests), any lease refusal, a crash or overtravel alarm, a connection
-  generation change, the frame latch changing under the hold, the controller
-  reporting anything but idle, a heartbeat older than 2.5 s, a switch to Z, and
-  (in `enforced` mode) the Count check. After the stop at most the queued
-  200 ms of motion runs out, plus up to half a round trip: the model starts each
-  increment at its send time and the controller receives it about RTT/2 later.
-  At 3000 mm/min that is 10 mm plus about 1.5 mm.
+  (`HOLD_FEATHER_GAP_MS`; the same press resumes with a new hold once reports
+  return within the 900 ms watchdog), the page keepalive lost, a `G1` reply
+  error, timeout or rejection, a `G1` acknowledged later than 200 ms (the
+  controller is holding requests; each late reply stops its hold, and three in
+  a row within one arm turn continuous jogging off until re-arm,
+  `HOLD_LATE_EVENTS_TO_DISABLE`), any lease refusal, a crash or overtravel
+  alarm, a connection generation change, the frame latch changing under the
+  hold, the controller reporting anything but idle, a heartbeat older than
+  4.5 s (two 2 s poll periods plus jitter, so one late poll never flips a hold
+  into a settled burst and back), a switch to Z, and (in `enforced` mode) the
+  Count check. After the stop the queued motion runs out. The clock model
+  charges commanded time only; the controller lags it by its acceleration
+  ramps (at 3000 mm/min and 1000 mm/s² about 75 ms over a hold's first blocks)
+  and by one-way transport (about half a round trip, 20–35 ms), so the
+  worst-case run-out after a release is about 310 ms: 15.5 mm at 3000 mm/min,
+  1.5 mm at 300. If a `G1` reply lands just under the 200 ms late limit the
+  controller may be holding one more block, about 24 mm at 3000 mm/min. Trial
+  data governs these numbers (the Count trace measures the real lag); safety
+  does not rest on them, because queued motion never passes a validated
+  endpoint and the obstacle lookahead adds the run-out on top.
 - **M114 Count check.** During a hold `M114` is polled every 250 ms
   (`HOLD_COUNT_POLL_MS`) through the same lease (it moves nothing). The reply's
   `Count X: Y: Z:` fields are stepper counts; they are turned into millimetres
@@ -228,24 +250,32 @@ any connection other than the A350's HTTP channel.
   default of 400 steps/mm when `M503 S` does not report `M92` (the status says
   which). Each sample records the reply time, the Count, the derived position,
   the reply's own X/Y/Z fields, the clock model's expected executed position at
-  the send time and the XY distance between the two (`lagMm`).
+  the send time and the XY distance between the two (`lagMm`; it is symmetric,
+  a controller running ahead of the model counts like one behind it).
   - `countCheck: observe` (the **default**): every sample is traced and shown,
     and the check never stops a hold. The open-loop clock pacing with the 200 ms
-    cap is the whole behaviour.
+    cap is the whole behaviour. Observe mode is inert for *gating* only: the
+    poll is still a request on the serialized HTTP channel, which cancels the
+    commands queued behind one that fails, so an `M114` transport failure can
+    still end a hold through the `G1` it cancels (that `G1` is then rejected,
+    and the hold closes through the restore path without an `M114` proof, like
+    any other rejected `G1`).
   - `countCheck: enforced`: the hold stops when the Count position is more than
-    one increment (plus 0.05 mm) from the expected executed position (a stall,
-    a touchscreen speed override, a controller slower than its `M503` limits),
-    when the `M114` reply takes longer than one tick (100 ms), or when the
-    reply carries no `Count` fields; continuous jogging then stays off until
-    re-arm. Flip it with `LUBAN_PENDANT_COUNT_CHECK=enforced` (read on arm)
+    one increment (plus 0.05 mm) from the expected executed position in either
+    direction (a stall, a touchscreen speed override, a controller slower than
+    its `M503` limits), when the `M114` reply takes longer than one tick
+    (100 ms), or when the reply carries no `Count` fields. An off position or a
+    missing Count turns continuous jogging off until re-arm; a late reply counts
+    as a late event like a late `G1` (three in a row turn it off). Flip it with `LUBAN_PENDANT_COUNT_CHECK=enforced` (read on arm)
     once hardware has shown that Count keeps up and that `M114` answers promptly
     during motion. Until then it stays in observe mode on purpose: an unproven
     gate would only stop good holds.
 - **Trace.** `/pendant/status` shows `pipeline.countCheck` (mode, steps/mm and
-  their source, the pacing constants, the last sample and `lastLagMm`) and
+  their source, the pacing constants, the last sample and `lastLagMm`),
   `pipeline.lastHold` (stop reason, increments, distance, commanded time,
   maximum outstanding, Count samples, maximum lag, late replies, whether the
-  close restored and proved the position). `/pendant/hold-trace` returns the
+  close restored and proved the position), `pipeline.lateEvents` (the current
+  late-reply streak) and `pipeline.holdOffUntilNeutral`. `/pendant/hold-trace` returns the
   per-tick records of the current or last hold: each send (target, feed, reply
   time, outstanding after it, Feather report age), each wait, each Count sample
   and the stop. With `LUBAN_PENDANT_TRACE=1` the same records go to the log as
@@ -333,14 +363,16 @@ tool's `failure_recovery` evidence carries it as `feed_override`.
 
 **Stop latency (continuous X/Y).** STOP, a released deadman and a centred stick
 are seen on the next 20 Hz USB frame and acted on within one 100 ms tick. What
-is already queued is at most 200 ms of motion plus about half a round trip,
-whatever the feed. Worst case from the event to standstill:
+is already queued is at most 200 ms of commanded motion by the clock model;
+with the acceleration ramps and the one-way transport delay above, about 310 ms
+of real motion in the worst case. Worst case from the event to standstill,
+until trial data replaces these estimates:
 
 | Event | At 300 mm/min | At 3000 mm/min |
 |---|---|---|
-| STOP, deadman release or neutral | about 0.4 s, 2 mm or less | about 0.4 s, 17 mm or less |
-| USB silent (Feather gap, 150 ms) | about 0.5 s | about 0.5 s, 20 mm or less |
-| Browser keepalive lost (disarms at 900 ms) | about 1.2 s | about 1.2 s, 57 mm or less |
+| STOP, deadman release or neutral | about 0.4 s, 2 mm or less | about 0.4 s, 18 mm or less |
+| USB silent (Feather gap, 150 ms, plus one tick) | about 0.6 s, 3 mm or less | about 0.6 s, 28 mm or less |
+| Browser keepalive lost (disarms at 900 ms, plus one tick) | about 1.3 s, 7 mm or less | about 1.3 s, 66 mm or less |
 
 This holds only while the controller executes at the commanded feed. A stalled
 controller or a touchscreen speed override lets the controller's own planner
@@ -365,10 +397,11 @@ its run-out) is the constant to revisit, not the tick.
   the machine position (not shifted by a constant).
 - Does `M114` answer promptly during motion (reply time under one tick), or does
   it synchronize the planner (then every poll would stall the queue).
-- Actual run-out after release at F300, F1000 and F3000 against the 200 ms plus
-  half a round trip stated above.
+- Actual run-out after release at F300, F1000 and F3000 against the ~310 ms
+  (15.5 mm at F3000) estimated above.
 - Feather gap detection: a 150 ms gap stops the hold without disarming, and the
-  next press starts a new one.
+  same press resumes with a new hold once reports return (within the 900 ms
+  watchdog).
 - Smoothness at F3000 with two blocks queued (see the caveat above).
 - The close: `G54` acknowledged after the queued motion drains, and the `M114`
   proof clears the latch so the next press starts at once.

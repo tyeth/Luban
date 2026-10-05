@@ -15,8 +15,8 @@ import { isLoopback } from './McpServer';
 import { JogBounds, JogPosition, PENDANT_FEED_MAX, PendantSession, firmwareMotionProblem, parsePendantInput, validateJogBounds } from './pendant';
 import {
     A350_STEPS_PER_MM, CountCheckMode, CountSample, HOLD_COUNT_POLL_MS, HOLD_FEATHER_GAP_MS, HOLD_HEARTBEAT_MAX_AGE_MS, HOLD_MIN_ACCEL, HOLD_MOVE_MS,
-    HOLD_QUEUE_AHEAD_MS, HOLD_REPLY_LATE_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault, countToMm, extendAlong, holdMoveMm, holdRunoutMm,
-    judgeCountSample, parseCountReport, parseStepsPerMm,
+    HOLD_LATE_EVENTS_TO_DISABLE, HOLD_QUEUE_AHEAD_MS, HOLD_REPLY_LATE_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault, countToMm, extendAlong,
+    holdMoveMm, holdRunoutMm, judgeCountSample, parseCountReport, parseStepsPerMm,
 } from './pendantHold';
 import { pendantPage } from './pendantPage';
 import { pendantPosition } from './pendantPosition';
@@ -194,6 +194,14 @@ export class PendantRuntime {
 
     // Per-tick records of the current or last hold, bounded by HOLD_TRACE_LIMIT.
     private holdTicks: HoldTick[] = [];
+
+    // A hold refused by the obstacle lookahead (or stopped at an obstacle) keeps
+    // continuous jogging off until the stick returns to neutral, so a stick held
+    // against a box does not open and close a hold several times a second.
+    private holdOffUntilNeutral = false;
+
+    // Consecutive late replies within this arm (HOLD_LATE_EVENTS_TO_DISABLE).
+    private lateStreak = 0;
 
     // Crash-guard brackets kept open after a hold could not prove its queue drained.
     private heldMotionGuard = 0;
@@ -567,6 +575,8 @@ export class PendantRuntime {
         }
         this.release();
         if (this.busy || !this.session.armed) { return; }
+        const latest = this.session.latest;
+        if (latest && latest.x === 0 && latest.y === 0 && latest.z === 0) { this.holdOffUntilNeutral = false; }
         const latch = getFrameLatch();
         // A restore was acknowledged; its verified position is still arriving. Hold, do not disarm.
         if (latch && latch.restoredAt !== null && now - latch.restoredAt < FRAME_VERIFY_WAIT_MS) { return; }
@@ -574,7 +584,7 @@ export class PendantRuntime {
         const from = this.position();
         const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
         if (!target) { this.release(); return; }
-        if (this.pipelineEligible(from, target)) {
+        if (this.pipelineEligible(from, target) && this.holdAdmits(from, now)) {
             this.holdPromise = this.continuousHold(from);
             try { await this.holdPromise; } finally { this.holdPromise = null; }
             this.queueNextTick();
@@ -636,6 +646,8 @@ export class PendantRuntime {
     private async preparePipeline(): Promise<void> {
         this.pipeline = { ...this.pipeline, requested: false, disabled: null, notice: null };
         this.countCheck = { ...this.countCheck, mode: requestedCountCheck(), stepsPerMm: A350_STEPS_PER_MM, stepsPerMmSource: 'default' };
+        this.lateStreak = 0;
+        this.holdOffUntilNeutral = false;
         if (!pipelineRequested()) { return; }
         let problem: string | null;
         try {
@@ -666,6 +678,51 @@ export class PendantRuntime {
         try { return getPositionSnapshot().reportAgeMs <= HOLD_HEARTBEAT_MAX_AGE_MS; } catch (err) { return false; }
     }
 
+    /**
+     * Whether a hold may open from `from` now: the first increment plus its
+     * queued run-out must clear the obstacle map, judged here BEFORE the G53 so a
+     * stick pointed at a box within one run-out does not open a hold that its
+     * first increment closes again (six requests and a latch cycle at ~3 Hz). A
+     * refused lookahead falls through to the settled path once (its clear
+     * prefix, as the obstacle hold does) and keeps continuous jogging off until
+     * the stick returns to neutral.
+     */
+    private holdAdmits(from: JogPosition, now: number): boolean {
+        if (this.holdOffUntilNeutral) { return false; }
+        const origin = this.holdOrigin(from);
+        const raw = this.session.target(origin, now, 0, HOLD_MOVE_MS);
+        if (!raw || raw.position.z !== origin.z) { return false; }
+        const hit = this.holdLookahead(origin, raw);
+        if (!hit) { return true; }
+        this.holdOffUntilNeutral = true;
+        log.info(`Continuous jog not started: the first increment plus ${holdRunoutMm(raw.feed).toFixed(2)} mm of queued run-out at F${raw.feed} `
+            + `would reach ${hit.box.name}; settled jogs until the stick returns to neutral.`);
+        return false;
+    }
+
+    // The hold's dead-reckoned origin: the press position at G-code precision (the
+    // heartbeat carries more decimals than a G1 can state).
+    private holdOrigin(from: JogPosition): JogPosition {
+        return { x: Number(from.x.toFixed(3)), y: Number(from.y.toFixed(3)), z: Number(from.z.toFixed(3)) };
+    }
+
+    /**
+     * The hold's obstacle test, side-effect free: the increment from `chain` to
+     * the rounded `raw` target plus the maximum queued run-out beyond it
+     * (HOLD_QUEUE_AHEAD_MS at the increment's feed, clipped to the envelope), or
+     * `chain` itself inside an exclusion below its required Z. Null when clear.
+     */
+    private holdLookahead(chain: JogPosition, raw: JogTarget): { box: ObstacleExclusion; inside: boolean } | null {
+        const bounds = this.session.bounds as JogBounds;
+        const position = { ...this.gcodePrecision(raw.position, bounds), z: chain.z };
+        const boxes = this.obstacleExclusions();
+        const inside = this.obstacleHit(chain, chain, boxes);
+        if (inside) { return { box: inside, inside: true }; }
+        const lookahead = { ...this.gcodePrecision(extendAlong(chain, position, holdRunoutMm(raw.feed)), bounds), z: chain.z };
+        const hit = this.obstacleHit(chain, lookahead, boxes, true);
+        return hit ? { box: hit, inside: false } : null;
+    }
+
     // G-code precision (three decimals), kept inside the armed envelope.
     private gcodePrecision(p: JogPosition, bounds: JogBounds): JogPosition {
         const out = { ...p };
@@ -690,14 +747,15 @@ export class PendantRuntime {
     private holdTarget(chain: JogPosition, raw: JogTarget): JogTarget | null {
         const bounds = this.session.bounds as JogBounds;
         // Z is pinned to the hold's own Z: the envelope clamp must never turn a head that
-        // reads a hair outside the Z bounds into a Z move.
+        // reads a hair outside the Z bounds into a Z move (and the G1 carries no Z word).
         const position = { ...this.gcodePrecision(raw.position, bounds), z: chain.z };
         const distanceMm = Math.hypot(position.x - chain.x, position.y - chain.y, position.z - chain.z);
         if (distanceMm < 0.001) { this.blocked = null; return null; }
         const target: JogTarget = { position, feed: raw.feed, durationMs: distanceMm / raw.feed * 60000, distanceMm };
-        const boxes = this.obstacleExclusions();
-        const inside = this.obstacleHit(chain, chain, boxes);
-        if (inside) {
+        const found = this.holdLookahead(chain, raw);
+        if (!found) { this.blocked = null; return target; }
+        if (found.inside) {
+            const inside = found.box;
             this.blocked = this.insideBlocked(inside, chain.z);
             if (!this.blockedLogged.has(inside.name)) {
                 this.blockedLogged.add(inside.name);
@@ -705,9 +763,7 @@ export class PendantRuntime {
             }
             return null;
         }
-        const lookahead = { ...this.gcodePrecision(extendAlong(chain, position, holdRunoutMm(target.feed)), bounds), z: chain.z };
-        const hit = this.obstacleHit(chain, lookahead, boxes, true);
-        if (!hit) { this.blocked = null; return target; }
+        const hit = found.box;
         const requestedZ = Number(chain.z.toFixed(3));
         const need = hit.requiredZ === null ? 'no entry, tool clearance unknown' : `Z>=${zUp(hit.requiredZ)} (asked ${zDown(requestedZ)})`;
         this.blocked = { name: hit.name, requiredZ: hit.requiredZ, requestedZ, held: true, inside: false, text: `BLOCKED ${hit.name}: ${need}` };
@@ -774,7 +830,7 @@ export class PendantRuntime {
                 position: report.position,
                 expected,
                 lagMm: judged.lagMm,
-                behind: judged.behind,
+                off: judged.off,
                 error: executed.result === 0 ? null : `controller result ${executed.result}: ${executed.text || 'no text'}` };
         } catch (err) {
             sample = { at: sentAt,
@@ -785,7 +841,7 @@ export class PendantRuntime {
                 position: null,
                 expected,
                 lagMm: null,
-                behind: false,
+                off: false,
                 error: (err as Error).message };
         }
         this.countCheck.last = sample;
@@ -813,10 +869,14 @@ export class PendantRuntime {
      *    position for the whole hold.
      *  - Stops at once (nothing further sent, then the G54) on: D1 release, a
      *    centred stick, a Feather report gap over HOLD_FEATHER_GAP_MS, page
-     *    keepalive loss, a G1 reply error, timeout or rejection, a late reply,
-     *    any lease refusal, a crash or overtravel alarm, a connection generation
-     *    change, the latch changing under it, a non-idle controller, and (in
-     *    'enforced' mode) the Count check. At most the queued motion runs out.
+     *    keepalive loss, a G1 reply error, timeout or rejection, a late reply
+     *    (a streak of HOLD_LATE_EVENTS_TO_DISABLE also turns continuous jogging
+     *    off until re-arm), any lease refusal, a crash or overtravel alarm, a
+     *    connection generation change, the latch changing under it, a non-idle
+     *    controller, and (in 'enforced' mode) the Count check. At most the
+     *    queued motion runs out. Increments carry no Z word (queueMachineMove
+     *    omitZ): the hold's Z is the heartbeat-derived record Z, and a wrong
+     *    reused offset must fail the close's M114 proof, not move Z.
      *  - M114 Count is polled every HOLD_COUNT_POLL_MS through the same lease and
      *    traced; 'observe' (default) never gates.
      */
@@ -834,10 +894,9 @@ export class PendantRuntime {
             gcodeLease.renew(leaseId, PIPELINE_LEASE_TTL_MS);
             return gcodeLease.runAs(leaseId, fn);
         };
-        // The dead-reckoned commanded position starts at the press position at G-code
-        // precision (the heartbeat carries more decimals than a G1 can state); every
+        // The dead-reckoned commanded position starts at the press position; every
         // increment is checked and sent from here, never from the position of record.
-        const origin: JogPosition = { x: Number(from.x.toFixed(3)), y: Number(from.y.toFixed(3)), z: Number(from.z.toFixed(3)) };
+        const origin = this.holdOrigin(from);
         const model = new HoldQueueModel(origin);
         const summary: HoldSummary = { startedAt,
             stopReason: 'input released',
@@ -861,6 +920,8 @@ export class PendantRuntime {
         let latchReason: string | null = null;
         let countPending: Promise<void> | null = null;
         let countStop: string | null = null;
+        let countStopLate = false;
+        let lateEvent = false;
         let lastCountAt = -Infinity;
         this.busy = true;
         this.pipeline.active = true;
@@ -889,9 +950,14 @@ export class PendantRuntime {
                     const notReady = this.readyInHold();
                     if (notReady) { summary.stopReason = notReady; break; }
                     if (countStop) {
-                        this.pipeline.disabled = `Continuous jog stopped: ${countStop}; settled jogs until re-armed.`;
                         summary.stopReason = countStop;
-                        log.warn(`Continuous jog: ${this.pipeline.disabled}`);
+                        if (countStopLate) {
+                            lateEvent = true;
+                            this.noteLateEvent(`Continuous jog stopped: ${countStop}.`);
+                        } else {
+                            this.pipeline.disabled = `Continuous jog stopped: ${countStop}; settled jogs until re-armed.`;
+                            log.warn(`Continuous jog: ${this.pipeline.disabled}`);
+                        }
                         break;
                     }
                     if (inputAgeMs > HOLD_FEATHER_GAP_MS) { summary.stopReason = this.holdReleaseReason(now); break; }
@@ -906,7 +972,7 @@ export class PendantRuntime {
                         this.validateJogSegment(chain, target.position);
                         const sentAt = Date.now();
                         uncertain = true;
-                        await leased(async () => queueMachineMove('usb_pendant', target.position, target.feed));
+                        await leased(async () => queueMachineMove('usb_pendant', target.position, target.feed, { omitZ: true }));
                         uncertain = false;
                         now = Date.now();
                         const replyMs = now - sentAt;
@@ -920,9 +986,10 @@ export class PendantRuntime {
                         this.recordHoldTick({ at: sentAt, kind: 'send', outstandingMs: Math.round(model.outstandingMs(now)), inputAgeMs, sent: target.position, feed: target.feed, replyMs });
                         if (replyMs > HOLD_REPLY_LATE_MS) {
                             summary.lateMoveReplies += 1;
-                            this.pipeline.disabled = `A queued increment took ${replyMs} ms to be acknowledged (limit ${HOLD_REPLY_LATE_MS} ms): the controller is holding requests; settled jogs until re-armed.`;
                             summary.stopReason = 'late acknowledgement';
-                            log.warn(`Continuous jog: ${this.pipeline.disabled}`);
+                            lateEvent = true;
+                            this.noteLateEvent(`Continuous jog stopped: a queued increment took ${replyMs} ms to be acknowledged (limit ${HOLD_REPLY_LATE_MS} ms): `
+                                + 'the controller is holding requests.');
                             break;
                         }
                         continue; // The cap may admit another increment at once (priming); re-check first.
@@ -934,7 +1001,7 @@ export class PendantRuntime {
                             const last = this.countCheck.last;
                             if (last?.late) { summary.lateCountReplies += 1; }
                             if (last && last.lagMm !== null) { summary.maxLagMm = Math.max(summary.maxLagMm ?? 0, last.lagMm); }
-                            if (fault && this.countCheck.mode === 'enforced' && !countStop) { countStop = fault; }
+                            if (fault && this.countCheck.mode === 'enforced' && !countStop) { countStop = fault; countStopLate = last?.late === true; }
                         }).finally(() => { countPending = null; });
                     }
                     this.recordHoldTick({ at: now, kind: 'wait', outstandingMs: Math.round(model.outstandingMs(now)), inputAgeMs });
@@ -992,12 +1059,25 @@ export class PendantRuntime {
             summary.maxOutstandingMs = Math.round(summary.maxOutstandingMs);
             this.pipeline.active = false;
             this.pipeline.lastHold = summary;
+            if (!lateEvent) { this.lateStreak = 0; }
+            if (this.blocked?.held && /^held at /.test(summary.stopReason)) { this.holdOffUntilNeutral = true; }
             log.info(`Continuous jog hold ended: ${JSON.stringify(summary)}`);
             if (summary.moves) {
                 this.lastJog = { durationMs: summary.commandedMs, distanceMm: summary.distanceMm, feed: summary.feed, elapsedMs: summary.elapsedMs };
             }
             this.busy = false;
             this.release();
+        }
+    }
+
+    /** A late reply stops the hold it happens in; only a streak of them turns continuous jogging off until re-arm. */
+    private noteLateEvent(what: string): void {
+        this.lateStreak += 1;
+        if (this.lateStreak >= HOLD_LATE_EVENTS_TO_DISABLE) {
+            this.pipeline.disabled = `${what} ${this.lateStreak} late replies in a row; settled jogs until re-armed.`;
+            log.warn(`Continuous jog: ${this.pipeline.disabled}`);
+        } else {
+            log.warn(`${what} Late reply ${this.lateStreak} of ${HOLD_LATE_EVENTS_TO_DISABLE} before continuous jogging is turned off until re-arm.`);
         }
     }
 
@@ -1065,6 +1145,8 @@ export class PendantRuntime {
                 // last Count delta from the clock model's expected executed position).
                 pipeline: { ...this.pipeline,
                     feedOverride: getFeedOverride(),
+                    lateEvents: this.lateStreak,
+                    holdOffUntilNeutral: this.holdOffUntilNeutral,
                     countCheck: { ...this.countCheck,
                         tickMs: HOLD_TICK_MS,
                         moveMs: HOLD_MOVE_MS,

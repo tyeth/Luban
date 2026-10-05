@@ -14,9 +14,9 @@ import { requiredToolheadZ } from '../landmarkClearance';
 import { GcodeLease } from '../../machine/gcodeLease';
 import * as pendantHold from '../pendantHold';
 
-interface Queued { sentAt: number; replyAt: number; target: { x: number; y: number; z: number }; feed: number; run: number }
+interface Queued { sentAt: number; replyAt: number; target: { x: number; y: number; z: number }; feed: number; run: number; gcode: string }
 
-function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enforced' | 'observe' } = {}) {
+function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enforced' | 'observe'; serialized?: boolean } = {}) {
     let now = 1000;
     // Pipelined-run doubles: the controller acknowledges each request after rttMs,
     // and an ideal executor (no acceleration) runs accepted segments back to back
@@ -26,6 +26,8 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
     // serialize it behind the G1 in flight; here it runs beside it on the fake clock).
     let countRttMs = 0;
     let countText: string | null = null;
+    // The M114 double answers result -1 (as SstpHttpChannel does for a transport error).
+    let countFail = false;
     let queueHold = false;
     let queueFail = false;
     let tripped = false;
@@ -72,6 +74,44 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
     const hooks = { stream: (): void => undefined,
         physicalAt: (t: number): { x: number; y: number; z: number } => ({ x: t * 0, y: 0, z: 0 }),
         clearLatch: (): void => { if (latch) { latch = null; for (const listener of latchListeners) { listener(null); } } } };
+    // Serialized channel double (options.serialized): one request in flight at a time,
+    // each taking its own reply time after the one ahead of it, and a failed request
+    // cancels the requests already waiting behind it, like
+    // SstpHttpChannel.consumeGCodeQueue ("Cancelled after an earlier command failed.").
+    // A G1 is awaited by the hold loop, so its wait advances the fake clock; an M114 is
+    // fire-and-forget, so it resolves once the loop's own sleeps (or a later G1) bring
+    // the clock to its reply time. Without the option each double advances the clock
+    // by its reply time at once and runs beside the others.
+    let channelTail: Promise<void> = Promise.resolve();
+    let channelBusyUntil = -Infinity;
+    let channelWaiting = 0;
+    let channelCancel = false;
+    const channel = async <T extends { result: number }>(kind: 'move' | 'query', rttMs0: number, run: () => Promise<T>): Promise<T> => {
+        if (!options.serialized) { now += rttMs0; hooks.stream(); return run(); }
+        const start = Math.max(now, channelBusyUntil);
+        const due = start + rttMs0;
+        channelBusyUntil = due;
+        const previous = channelTail;
+        let done: () => void = () => undefined;
+        channelTail = new Promise<void>((resolve) => { done = resolve; });
+        channelWaiting += 1;
+        try {
+            if (kind === 'move') { now = Math.max(now, start); hooks.stream(); } else {
+                while (now < due) { await new Promise<void>((resolve) => setImmediate(resolve)); } // eslint-disable-line no-await-in-loop
+            }
+            await previous;
+            channelWaiting -= 1;
+            if (channelCancel) {
+                if (channelWaiting === 0) { channelCancel = false; }
+                throw Error('Controller rejected the queued move: Cancelled after an earlier command failed.');
+            }
+            if (kind === 'move') { now = Math.max(now, due); hooks.stream(); }
+            let out: T;
+            try { out = await run(); } catch (err) { channelCancel = channelWaiting > 0; throw err; }
+            if (out.result !== 0) { channelCancel = channelWaiting > 0; }
+            return out;
+        } finally { done(); }
+    };
     let epoch = 1;
     let tick: (() => void) | null = null;
     let finish: (() => void) | null = null;
@@ -167,15 +207,17 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
                 feedOverride = { gcode: 'M220 S100', at: now, connection: 'c', certain: true, note: null }; // What recordModalSend notes for the accepted payload.
                 return { result: 0 };
             },
-            queueMachineMove: async (_tool: string, target: { x: number; y: number; z: number }, feed: number) => {
+            queueMachineMove: async (_tool: string, target: { x: number; y: number; z: number }, feed: number, opts?: { omitZ?: boolean }) => {
                 const sentAt = now;
                 leaseChecks.push(lease.refusal('G1'));
                 if (queueFail) { throw Error('Controller rejected the queued move: transport_error'); }
-                if (queueHold) { await new Promise<void>((resolve) => { held.push(resolve); }); } else { now += rttMs; }
-                queued.push({ sentAt, replyAt: now, target: { ...target }, feed, run: runNo });
-                hooks.stream();
-                if (onQueue) { onQueue(queued.length); }
-                return { result: 0 };
+                if (queueHold) { await new Promise<void>((resolve) => { held.push(resolve); }); }
+                return channel('move', queueHold ? 0 : rttMs, async () => {
+                    const gcode = pendantHold.queuedMoveGcode(target, feed, opts?.omitZ === true);
+                    queued.push({ sentAt, replyAt: now, target: { ...target }, feed, run: runNo, gcode });
+                    if (onQueue) { onQueue(queued.length); }
+                    return { result: 0 };
+                });
             },
             verifyRestoredPosition: async (_tool: string, expected: { x: number; y: number; z: number }) => {
                 frames.push('verify'); verified.push({ ...expected });
@@ -190,11 +232,17 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
                 const sentAt = now;
                 countLeaseChecks.push(lease.refusal('M114'));
                 const p = hooks.physicalAt(sentAt);
-                now += countRttMs; hooks.stream();
-                const text = countText !== null ? countText
-                    : `X:${p.x.toFixed(3)} Y:${p.y.toFixed(3)} Z:${p.z.toFixed(3)} E:0.00 Count X:${Math.round(p.x * 400)} Y:${Math.round(p.y * 400)} Z:${Math.round(p.z * 400)}`;
-                counts.push({ sentAt, execMs: now - sentAt, text });
-                return { result: 0, text, sequence: 0, execMs: now - sentAt };
+                return channel('query', countRttMs, async () => {
+                    if (countFail) {
+                        counts.push({ sentAt, execMs: now - sentAt, text: 'transport_error' });
+                        return { result: -1, text: 'transport_error', sequence: 0, execMs: now - sentAt };
+                    }
+                    const text = countText !== null ? countText
+                        : `X:${p.x.toFixed(3)} Y:${p.y.toFixed(3)} Z:${p.z.toFixed(3)} E:0.00 `
+                        + `Count X:${Math.round(p.x * 400)} Y:${Math.round(p.y * 400)} Z:${Math.round(p.z * 400)}`;
+                    counts.push({ sentAt, execMs: now - sentAt, text });
+                    return { result: 0, text, sequence: 0, execMs: now - sentAt };
+                });
             } },
         './tools/camera': {
             sendWorkFrameRestore: async () => {
@@ -356,6 +404,7 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
         setRtt: (ms: number) => { rttMs = ms; },
         setCountRtt: (ms: number) => { countRttMs = ms; },
         setCountText: (text: string | null) => { countText = text; },
+        failCount: () => { countFail = true; },
         holdQueue: (hold: boolean) => { queueHold = hold; },
         failQueue: () => { queueFail = true; },
         trip: () => { tripped = true; },
@@ -878,7 +927,10 @@ export const tests: Array<[string, () => Promise<void>]> = [
                 assert.ok(sends[i] - sends[i - 1] <= HOLD_TICK_MS + 1e-6, `${feed}: send ${i} came ${sends[i] - sends[i - 1]} ms after the previous`);
             }
             assert.ok(runs[runs.length - 1].end - stopAt <= HOLD_QUEUE_AHEAD_MS + 40 + 1e-6, `${feed}: run-out ${runs[runs.length - 1].end - stopAt} ms after the stop`);
-            assert.deepEqual(f.verified[0], f.queued[11].target, 'the close proves the commanded end position');
+            assert.deepEqual(f.verified[0], f.queued[11].target, 'the close proves the commanded end position, Z included');
+            for (const q of f.queued) {
+                assert.match(q.gcode, /^G1 X-?\d+\.\d{3} Y-?\d+\.\d{3} F\d+;$/, `${feed}: hold increments carry no Z word (${q.gcode})`);
+            }
             const after = await readStatus(f);
             assert.equal(after.busy, false); assert.equal(after.armed, true); assert.equal(after.pipeline.disabled, null);
             assert.equal(after.pipeline.lastHold.stopReason, 'stick centred');
@@ -913,7 +965,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
                 if (count !== 5) { return; }
                 stopAt = f.now();
                 f.stopStream();
-                if (how === 'release') { f.input(); } else if (how === 'deadman') { f.input({ x: 1, deadman: false }); } else if (how === 'stop') { f.input({ stop: true }); } else if (how === 'gap') { /* no more Feather reports */ } else if (how === 'keepalive') { f.stream({ x: 1, deadman: true, feed: 3000 }, 3000, false); } else if (how === 'reply-error') { f.failQueue(); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'alarm') { f.trip(); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'epoch') { f.reconnect(); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'latch') { f.raiseLatch('the failed-call hook'); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'status') { f.setMachineStatus('running'); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else { f.setReportAge(3000); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); }
+                if (how === 'release') { f.input(); } else if (how === 'deadman') { f.input({ x: 1, deadman: false }); } else if (how === 'stop') { f.input({ stop: true }); } else if (how === 'gap') { /* no more Feather reports */ } else if (how === 'keepalive') { f.stream({ x: 1, deadman: true, feed: 3000 }, 3000, false); } else if (how === 'reply-error') { f.failQueue(); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'alarm') { f.trip(); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'epoch') { f.reconnect(); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'latch') { f.raiseLatch('the failed-call hook'); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else if (how === 'status') { f.setMachineStatus('running'); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); } else { f.setReportAge(5000); f.stream({ x: 1, deadman: true, feed: 3000 }, 3000); }
             });
             await startRun(f, {}, 5000);
             const after = await readStatus(f);
@@ -941,7 +993,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
             if (how === 'alarm') { assert.match(after.error, /Overtravel tripwire/); }
             if (how === 'epoch') { assert.match(after.error, /connection changed/); }
             if (how === 'status') { assert.match(after.error, /reported "running" during queued motion.*re-arm/); }
-            if (how === 'stale') { assert.match(after.pipeline.lastHold.stopReason, /heartbeat 3000 ms old/); }
+            if (how === 'stale') { assert.match(after.pipeline.lastHold.stopReason, /heartbeat 5000 ms old/); }
             if (how === 'gap') { assert.match(after.pipeline.lastHold.stopReason, /Feather report gap/); }
             if (how === 'deadman') { assert.equal(after.pipeline.lastHold.stopReason, 'D1 released'); }
             if (how === 'reply-error') { assert.match(after.error, /rejected/); }
@@ -1017,7 +1069,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(f.queued.length, 15, 'open loop: the clock model kept sending');
         assert.ok(after.pipeline.lastHold.countSamples >= 3, `samples ${after.pipeline.lastHold.countSamples}`);
         assert.ok(f.countLeaseChecks.length >= 3 && f.countLeaseChecks.every((check) => check === null), 'M114 passes under the hold\'s own lease');
-        assert.ok(after.pipeline.countCheck.last.behind, 'the last sample saw the lag');
+        assert.ok(after.pipeline.countCheck.last.off, 'the last sample saw the lag');
         assert.ok(after.pipeline.countCheck.lastLagMm > 5, `lag ${after.pipeline.countCheck.lastLagMm} mm`);
         assert.ok(after.pipeline.lastHold.maxLagMm >= after.pipeline.countCheck.lastLagMm);
         assert.deepEqual(after.pipeline.countCheck.stepsPerMm, { x: 400, y: 400, z: 400 });
@@ -1046,7 +1098,12 @@ export const tests: Array<[string, () => Promise<void>]> = [
             const after = await readStatus(f);
             assert.equal(after.pipeline.countCheck.mode, 'enforced', name);
             assert.match(after.pipeline.lastHold.stopReason, why, `${name}: ${after.pipeline.lastHold.stopReason}`);
-            assert.match(String(after.pipeline.disabled), why, `${name}: settled jogs until re-armed`);
+            if (name === 'late') {
+                assert.equal(after.pipeline.disabled, null, 'one late M114 stops the hold; only a streak turns continuous jogging off');
+                assert.equal(after.pipeline.lateEvents, 1);
+            } else {
+                assert.match(String(after.pipeline.disabled), why, `${name}: settled jogs until re-armed`);
+            }
             assert.equal(after.armed, true, name);
             assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify'], name);
             assert.ok(f.queued.length < 40, `${name}: stopped at ${f.queued.length} increments`);
@@ -1057,9 +1114,13 @@ export const tests: Array<[string, () => Promise<void>]> = [
                 const sample = (failing as { count: { at: number; execMs: number } }).count;
                 assert.ok(f.queued[f.queued.length - 1].sentAt <= sample.at + sample.execMs + HOLD_TICK_MS + 1e-6, 'no send more than a tick after the failing sample');
             }
-            f.input(); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
-            assert.equal(f.moves(), 1, `${name}: settled jogs continue`);
-            await f.finish();
+            f.input(); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick(); await f.flush();
+            if (name === 'late') {
+                assert.equal(f.frames.filter((frame) => frame === 'enter').length, 2, 'continuous jogging is still on after one late reply');
+            } else {
+                assert.equal(f.moves(), 1, `${name}: settled jogs continue`);
+                await f.finish();
+            }
         }
         const steady = fixture(false, { pipeline: true, countCheck: 'enforced' });
         // 16 increments of 5 mm stay inside the 100 mm envelope.
@@ -1153,20 +1214,109 @@ export const tests: Array<[string, () => Promise<void>]> = [
         const f = fixture(false, { pipeline: true });
         f.setRtt(250);
         await startRun(f, {}, 1500);
-        const after = await readStatus(f);
-        assert.match(String(after.pipeline.disabled), /acknowledged/);
+        let after = await readStatus(f);
         assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement');
         assert.equal(after.pipeline.lastHold.lateMoveReplies, 1);
+        assert.equal(after.pipeline.lateEvents, 1);
+        assert.equal(after.pipeline.disabled, null, 'one late reply stops the hold but does not turn continuous jogging off');
         assert.equal(after.armed, true);
         assert.equal(f.queued.length, 1);
         assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify']);
+        // Two more late holds in the same arm turn it off.
+        for (let i = 2; i <= 3; i += 1) {
+            f.input(); f.stream({ x: 1, deadman: true, feed: 3000 }, 1500); await f.tick(); await f.flush();
+            after = await readStatus(f);
+            assert.equal(after.pipeline.lateEvents, i);
+            assert.equal(f.queued.length, i);
+        }
+        assert.match(String(after.pipeline.disabled), /3 late replies in a row/);
+        assert.equal(after.armed, true);
         await f.request('/pendant/keepalive', {}); f.input(); f.input({ x: -1, deadman: true, feed: 3000 }); await f.tick();
-        assert.equal(f.moves(), 1); assert.equal(f.queued.length, 1);
+        assert.equal(f.moves(), 1); assert.equal(f.queued.length, 3, 'settled jogs until re-arm');
         await f.finish();
         await f.request('/pendant/disarm', {});
         f.input();
         assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
-        assert.equal((await readStatus(f)).pipeline.disabled, null);
+        after = await readStatus(f);
+        assert.equal(after.pipeline.disabled, null); assert.equal(after.pipeline.lateEvents, 0);
+        // A hold that ends for any other reason resets the streak.
+        const clean = fixture(false, { pipeline: true });
+        clean.setRtt(250);
+        await startRun(clean, {}, 1500);
+        assert.equal((await readStatus(clean)).pipeline.lateEvents, 1);
+        clean.setRtt(80);
+        clean.onQueue((count) => { if (count === 4) { clean.stopStream(); clean.input({ deadman: true }); } });
+        clean.input(); clean.stream({ x: 1, deadman: true, feed: 3000 }, 1500); await clean.tick(); await clean.flush();
+        assert.equal((await readStatus(clean)).pipeline.lateEvents, 0);
+    }],
+    ['a stick pointed at an obstacle within one run-out never opens a hold: the settled prefix runs once, then nothing until neutral', async () => {
+        const f = fixture(false, { pipeline: true });
+        // Exclusion X starts at 25; the pad edge is 24.5. From X10 at F3000 the first increment (5 mm) plus 10 mm of run-out reaches it.
+        f.obstacles.push({ name: 'fixture', machine: { x0: 30, x1: 31, y0: 0, y1: 20 }, clearanceZ: 20 });
+        await startRun(f, {}, 3000);
+        assert.deepEqual(f.frames, [], 'no G53');
+        assert.equal(f.moves(), 1, 'the settled path sent its segment instead');
+        assert.ok(f.targets[0].x <= 24.5 && f.targets[0].x > 10, `settled segment to ${f.targets[0].x}`);
+        assert.ok(f.logs.some((line) => /Continuous jog not started: the first increment plus 10\.00 mm of queued run-out/.test(line)));
+        let status = await readStatus(f);
+        assert.equal(status.pipeline.holdOffUntilNeutral, true);
+        assert.equal(status.armed, true);
+        await f.finish();
+        // The stick stays pointed at the box: re-drive the timers; settled segments run up to
+        // the pad and then hold, and nothing opens a hold.
+        for (let i = 0; i < 8; i += 1) {
+            f.machine.x = f.targets[f.targets.length - 1].x;
+            f.input({ x: 1, deadman: true, feed: 3000 }); await f.request('/pendant/keepalive', {});
+            await f.immediate(); await f.tick(); await f.flush(); await f.finish();
+        }
+        assert.deepEqual(f.frames, [], 'still no G53 while the stick points at the box');
+        assert.ok(f.targets.every((t) => t.x <= 24.5), `settled targets stop at the pad: ${JSON.stringify(f.targets.map((t) => t.x))}`);
+        status = await readStatus(f);
+        assert.equal(status.blocked.held, true, 'held at the pad'); assert.equal(status.armed, true);
+        // Neutral, then away from the box: a hold opens.
+        f.input(); await f.tick();
+        assert.equal((await readStatus(f)).pipeline.holdOffUntilNeutral, false);
+        f.stream({ x: -1, deadman: true, feed: 3000 }, 600); await f.tick(); await f.flush();
+        assert.equal(f.frames.filter((frame) => frame === 'enter').length, 1);
+        assert.ok(f.queued.length >= 1 && f.queued[0].target.x < f.targets[f.targets.length - 1].x, 'the hold moves away from the box');
+    }],
+    ['serialized channel: an M114 in flight inflates the next G1 reply within budget; a slow one makes it late and stops the hold', async () => {
+        const within = fixture(false, { pipeline: true, serialized: true });
+        within.setCountRtt(100);
+        within.onQueue((count) => { if (count === 14) { within.stopStream(); within.input({ deadman: true }); } });
+        await startRun(within, {}, 5000);
+        let after = await readStatus(within);
+        assert.equal(after.pipeline.lastHold.stopReason, 'stick centred');
+        assert.equal(after.pipeline.lastHold.lateMoveReplies, 0);
+        assert.ok(after.pipeline.lastHold.countSamples >= 2);
+        const sends = JSON.parse((await within.request('/pendant/hold-trace')).body).ticks.filter((t: { kind: string }) => t.kind === 'send') as Array<{ replyMs: number }>;
+        assert.ok(sends.some((t) => t.replyMs > 80), 'a G1 queued behind the M114 waited for it');
+        assert.ok(sends.every((t) => t.replyMs <= 200), 'but stayed within budget');
+        const late = fixture(false, { pipeline: true, serialized: true });
+        late.setCountRtt(150);
+        await startRun(late, {}, 5000);
+        after = await readStatus(late);
+        assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement', 'the G1 behind a 150 ms M114 took over 200 ms');
+        assert.equal(after.pipeline.lateEvents, 1);
+        assert.equal(after.pipeline.disabled, null);
+        assert.equal(after.armed, true);
+        assert.deepEqual(late.frames, ['latch', 'enter', 'restore', 'verify']);
+        assert.equal(late.motion(), 0);
+    }],
+    ['serialized channel: a failed M114 cancels the G1 queued behind it, which closes the hold through the restore path even in observe mode', async () => {
+        const f = fixture(false, { pipeline: true, serialized: true });
+        f.setCountRtt(120); f.failCount();
+        await startRun(f, {}, 5000);
+        const after = await readStatus(f);
+        assert.equal(after.pipeline.countCheck.mode, 'observe');
+        assert.match(after.error, /Cancelled after an earlier command failed/);
+        assert.equal(after.armed, false);
+        assert.deepEqual(f.frames, ['latch', 'enter', 'restore'], 'a cancelled G1 is uncertain: restore without an M114 proof');
+        assert.ok(f.latch()?.restoredAt, 'a verified beat must still follow');
+        assert.ok(after.pipeline.countCheck.last.error, 'the poll failure itself was only recorded');
+        assert.equal(after.pipeline.disabled, null, 'observe mode gated nothing; the channel did');
+        f.verifiedBeat();
+        assert.equal(f.latch(), null); assert.equal(f.motion(), 0);
     }],
     ['a switch to Z mid-hold closes the hold and the Z jog goes to the settled engine', async () => {
         const f = fixture(false, { pipeline: true });
