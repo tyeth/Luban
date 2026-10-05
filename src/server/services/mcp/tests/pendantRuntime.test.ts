@@ -45,6 +45,12 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
     let onRestore: (() => void) | null = null;
     // M114 after the close matches only as machine coordinates (refused).
     let verifyFail = false;
+    // The next this-many close/on-demand proofs fail, then they match again.
+    let verifyFailTimes = 0;
+    // The controller's planner (machine) position: what an in-hold M114 prints in its X/Y/Z
+    // fields. Taken from the record at the G53, plus controllerError (a record that is off).
+    let controllerError = { x: 0, y: 0, z: 0 };
+    let planner: { x: number; y: number; z: number } | null = null;
     let reportAgeMs = 0;
     let latch: { reason: string; since: number; restoredAt: number | null } | null = null;
     let runNo = 0;
@@ -67,8 +73,10 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
     const countLeaseChecks: Array<string | null> = [];
     const held: Array<() => void> = [];
     const queued: Queued[] = [];
-    const counts: Array<{ sentAt: number; execMs: number; text: string }> = [];
+    const counts: Array<{ sentAt: number; execMs: number; text: string; tool: string }> = [];
     const verified: Array<{ x: number; y: number; z: number }> = [];
+    const verifiedAt: number[] = [];
+    const verifyLeaseChecks: Array<string | null> = [];
     let feedOverride: object | null = null;
     let m220Sends = 0;
     let streaming: object | null = null;
@@ -212,6 +220,7 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
             },
             enterMachineFrame: async () => {
                 frames.push('enter'); leaseChecks.push(lease.refusal('G53', now)); runNo += 1; holdOpen = true;
+                planner = { x: machine.x + controllerError.x, y: machine.y + controllerError.y, z: machine.z + controllerError.z };
                 now += rttMs; hooks.stream();
                 if (onEnter) { onEnter(); }
                 if (enterFail) { throw Error('transport_error after the request was sent'); }
@@ -225,36 +234,47 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
                 return channel('move', queueHold ? 0 : rttMs, async () => {
                     const gcode = pendantHold.queuedMoveGcode(target, feed, opts?.omitZ === true);
                     queued.push({ sentAt, replyAt: now, target: { ...target }, feed, run: runNo, gcode });
+                    if (planner) { planner = { x: target.x, y: target.y, z: opts?.omitZ === true ? planner.z : target.z }; }
                     if (onQueue) { onQueue(queued.length); }
                     return { result: 0 };
                 });
             },
             verifyRestoredPosition: async (_tool: string, expected: { x: number; y: number; z: number }) => {
-                frames.push('verify'); verified.push({ ...expected });
+                frames.push('verify'); verified.push({ ...expected }); verifiedAt.push(now);
+                verifyLeaseChecks.push(lease.refusal('M114', now));
                 if (verifyFail) { return false; }
+                if (verifyFailTimes > 0) { verifyFailTimes -= 1; return false; }
+                // The controller's work-frame M114 matches the chain only when the controller is there.
+                if (planner && ['x', 'y', 'z'].some((axis) => Math.abs((planner as Record<string, number>)[axis] - (expected as Record<string, number>)[axis]) > 0.05)) {
+                    return false;
+                }
                 Object.assign(machine, expected); // Proven: the next heartbeat shows it.
                 hooks.clearLatch();
                 return true;
             },
-            // M114 during the hold: the ideal executor's stepper position at the send time, as
-            // Marlin prints it (Count in steps at 400 steps/mm).
-            queryPositionReport: async () => {
+            // M114: Count is the ideal executor's stepper position at the send time (steps at 400
+            // steps/mm). The X/Y/Z fields are what Marlin prints: inside the hold the planner's
+            // position in the machine frame (the end of everything accepted so far), at arm the
+            // position at rest.
+            queryPositionReport: async (tool: string) => {
                 const sentAt = now;
                 countLeaseChecks.push(lease.refusal('M114', now));
                 const p = hooks.physicalAt(sentAt);
                 const override = holdOpen ? countText : armCountText;
-                // At arm nothing drives the clock, so the arm-time M114 takes its reply time like an awaited request.
-                return channel(holdOpen ? 'query' : 'move', countRttMs, async () => {
+                // At arm nothing drives the clock, and the Z baseline is awaited by the hold loop, so
+                // both take their reply time like an awaited request; the Count poll is fire-and-forget.
+                return channel(holdOpen && tool === 'usb_pendant:count' ? 'query' : 'move', countRttMs, async () => {
                     if (countFail && holdOpen) {
-                        counts.push({ sentAt, execMs: now - sentAt, text: 'transport_error' });
+                        counts.push({ sentAt, execMs: now - sentAt, text: 'transport_error', tool });
                         return { result: -1, text: 'transport_error', sequence: 0, execMs: now - sentAt };
                     }
                     const c = { x: Math.round((p.x + countOffset.x) * 400),
                         y: Math.round((p.y + countOffset.y) * 400),
                         z: Math.round((p.z + countOffset.z) * 400) };
+                    const at = holdOpen && planner ? planner : p;
                     const text = override !== null ? override
-                        : `X:${p.x.toFixed(3)} Y:${p.y.toFixed(3)} Z:${p.z.toFixed(3)} E:0.00 Count X:${c.x} Y:${c.y} Z:${c.z}`;
-                    counts.push({ sentAt, execMs: now - sentAt, text });
+                        : `X:${at.x.toFixed(2)} Y:${at.y.toFixed(2)} Z:${at.z.toFixed(2)} E:0.00 Count X:${c.x} Y:${c.y} Z:${c.z}`;
+                    counts.push({ sentAt, execMs: now - sentAt, text, tool });
                     return { result: 0, text, sequence: 0, execMs: now - sentAt };
                 });
             } },
@@ -436,6 +456,10 @@ function fixture(a350 = false, options: { pipeline?: boolean; countCheck?: 'enfo
         setM503: (text: string) => { m503 = text; },
         failEnter: () => { enterFail = true; },
         failVerify: () => { verifyFail = true; },
+        failVerifyTimes: (times: number) => { verifyFailTimes = times; },
+        verifiedAt,
+        verifyLeaseChecks,
+        setControllerError: (error: { x: number; y: number; z: number }) => { controllerError = error; },
         failRestore: (fail = true) => { restoreFail = fail; },
         onRestore: (fn: (() => void) | null) => { onRestore = fn; },
         setReportAge: (ms: number) => { reportAgeMs = ms; },
@@ -1026,6 +1050,8 @@ export const tests: Array<[string, () => Promise<void>]> = [
         const triggers = ['release', 'deadman', 'stop', 'gap', 'keepalive', 'reply-error', 'alarm', 'epoch', 'latch', 'status', 'stale'];
         for (const how of triggers) {
             const f = fixture(false, { pipeline: true });
+            // A stale heartbeat stops the hold only when no prompt, agreeing M114 stands in for it.
+            if (how === 'stale') { f.failCount(); }
             let stopAt = 0;
             f.onQueue((count) => {
                 if (count !== 5) { return; }
@@ -1059,7 +1085,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
             if (how === 'alarm') { assert.match(after.error, /Overtravel tripwire/); }
             if (how === 'epoch') { assert.match(after.error, /connection changed/); }
             if (how === 'status') { assert.match(after.error, /reported "running" during queued motion.*re-arm/); }
-            if (how === 'stale') { assert.match(after.pipeline.lastHold.stopReason, /heartbeat 5000 ms old/); }
+            if (how === 'stale') { assert.match(after.pipeline.lastHold.stopReason, /heartbeat 5000 ms old and no agreeing M114 yet/); }
             if (how === 'gap') { assert.match(after.pipeline.lastHold.stopReason, /Feather report gap/); }
             if (how === 'deadman') { assert.equal(after.pipeline.lastHold.stopReason, 'D1 released'); }
             if (how === 'reply-error') { assert.match(after.error, /rejected/); }
@@ -1098,7 +1124,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
             assert.equal(after.busy, false); assert.equal(f.moves(), 0);
         }
     }],
-    ['armed inside an exclusion the hold sends nothing (Z-up exits are settled jogs)', async () => {
+    ['armed inside an exclusion an X/Y stick opens no hold and sends nothing', async () => {
         const f = fixture(false, { pipeline: true });
         f.obstacles.push({ name: 'block', machine: { x0: 8, x1: 12, y0: 8, y1: 12 }, clearanceZ: 20, clearanceBasis: 'toolhead' });
         await startRun(f);
@@ -1324,12 +1350,17 @@ export const tests: Array<[string, () => Promise<void>]> = [
             }
         }
     }],
-    ['Z intent uses the settled engine; a late acknowledgement returns to it until re-arm', async () => {
+    ['Z intent uses the settled engine when the firmware\'s Z limits keep Z holds off; a late acknowledgement returns to it until re-arm', async () => {
         const z = fixture(false, { pipeline: true });
+        z.setM503('echo:  M92 X400.00 Y400.00 Z400.00 E212.00\necho:  M203 X120.00 Y120.00 Z40.00 E45.00\necho:  M201 X3000 Y3000 Z50 E10000\necho:  M204 P1000.00 R1000.00 T1000.00');
         await z.initialize();
         assert.equal((await z.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        const armed = await readStatus(z);
+        assert.equal(armed.pipeline.disabled, null, 'X/Y holds stay on');
+        assert.match(String(armed.pipeline.zDisabled), /Z acceleration 50/);
+        assert.match(String(armed.pipeline.notice), /Z jogs stay on the settled engine/);
         z.input(); z.input({ z: 1, mode: 'z', deadman: true, feed: 600 }); await z.tick();
-        assert.equal(z.moves(), 1); assert.equal(z.queued.length, 0); await z.finish();
+        assert.equal(z.moves(), 1); assert.equal(z.queued.length, 0); assert.deepEqual(z.frames, []); await z.finish();
         const f = fixture(false, { pipeline: true });
         f.setRtt(250);
         await startRun(f, {}, 1500);
@@ -1445,17 +1476,34 @@ export const tests: Array<[string, () => Promise<void>]> = [
         f.verifiedBeat();
         assert.equal(f.latch(), null); assert.equal(f.motion(), 0);
     }],
-    ['a switch to Z mid-hold closes the hold and the Z jog goes to the settled engine', async () => {
+    ['a switch to Z mid-hold drains the queue, proves Z with one in-hold M114 and carries on in the same hold', async () => {
         const f = fixture(false, { pipeline: true });
         f.onQueue((count) => { if (count === 3) { f.stream({ z: 1, mode: 'z', deadman: true, feed: 600 }, 1000); } });
         await startRun(f, {}, 400);
-        assert.equal((await readStatus(f)).pipeline.lastHold.stopReason, 'Z motion uses settled jogs');
-        assert.equal(f.queued.length, 3);
-        assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify']);
-        await f.immediate(); await f.flush();
-        assert.equal(f.moves(), 1, 'the Z intent went to the settled engine after the close');
-        assert.ok(f.targets[0].z > 10);
-        await f.finish();
+        const hold = (await readStatus(f)).pipeline.lastHold;
+        assert.match(hold.stopReason, /Feather report gap/);
+        assert.equal(hold.zBaseline, 'agreed');
+        assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify'], 'one G53 and one G54 for X/Y and Z together');
+        assert.equal(f.moves(), 0, 'nothing on the settled engine');
+        const xy = f.queued.filter((q) => !/ Z/.test(q.gcode));
+        const z = f.queued.filter((q) => / Z/.test(q.gcode));
+        assert.equal(xy.length, 3); assert.ok(z.length >= 3, `Z increments ${z.length}`);
+        assert.equal(hold.zMoves, z.length);
+        assert.ok(f.queued.indexOf(z[0]) === 3, 'every X/Y increment came first');
+        const baseline = f.counts.filter((c) => c.tool === 'usb_pendant:z-baseline');
+        assert.equal(baseline.length, 1, 'one baseline per hold');
+        const runs = f.executed();
+        assert.ok(baseline[0].sentAt >= runs[2].end - 40 - 1e-6, `the baseline waited for the clock model to drain (${baseline[0].sentAt} vs ${runs[2].end - 40})`);
+        const order = (JSON.parse((await f.request('/pendant/hold-trace')).body).ticks as Array<{ kind: string; zWord?: boolean }>)
+            .filter((t) => t.kind === 'baseline' || (t.kind === 'send' && t.zWord)).map((t) => t.kind);
+        assert.equal(order[0], 'baseline', 'the M114 came before the first Z word');
+        assert.ok(baseline[0].sentAt <= z[0].sentAt);
+        assert.ok(f.queued.slice(0, 3).every((q) => q.sentAt < baseline[0].sentAt), 'nothing was sent while it drained');
+        for (const q of z) {
+            assert.match(q.gcode, /^G1 X25\.000 Y10\.000 Z\d+\.\d{3} F600;$/, `straight up from the X/Y end: ${q.gcode}`);
+        }
+        assert.ok(z.every((q, i) => q.target.z > (i ? z[i - 1].target.z : 10)), 'Z rises');
+        assert.deepEqual(f.verified[0], f.queued[f.queued.length - 1].target, 'the close proves the end position, Z included');
     }],
     ['firmware limits below the model refuse pipelining at arm', async () => {
         for (const [m503, why] of [['echo:  M203 X120 Y120 Z40\necho:  M201 X200 Y3000 Z100\necho:  M204 P1000 R1000 T1000', /acceleration/],
@@ -1592,17 +1640,245 @@ export const tests: Array<[string, () => Promise<void>]> = [
         f.failVerify();
         f.onQueue((count) => { if (count === 3) { f.stopStream(); f.input(); } });
         await startRun(f);
-        assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify']);
+        assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify', 'verify', 'verify'], 'the proof is tried three times before falling back to a beat');
         assert.ok(f.latch(), 'not proven: a G53 reading is not a position');
         assert.ok(f.latch()?.restoredAt, 'the restore itself was acknowledged');
         assert.equal((await readStatus(f)).pipeline.lastHold.proved, false);
         assert.ok(f.logs.some((line) => /did not verify the commanded end position in the work frame/.test(line)));
         assert.equal((await readStatus(f)).armed, true, 'held, not disarmed: the beat may still verify it');
         f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+        assert.equal(f.frames.filter((frame) => frame === 'verify').length, 4, 'the press tried the on-demand proof');
         assert.equal(f.frames.filter((frame) => frame === 'enter').length, 1, 'no new hold while the latch waits for its beat');
+        f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+        assert.equal(f.frames.filter((frame) => frame === 'verify').length, 4, 'at most one on-demand M114 per 500 ms');
         f.verifiedBeat();
         assert.equal(f.latch(), null);
         f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick(); await f.flush();
         assert.equal(f.frames.filter((frame) => frame === 'enter').length, 2, 'the next press starts a new hold once verified');
+    }],
+    ['a Z hold streams G1 X Y Z F increments at F1000 or less, paced like X/Y, after one agreeing in-hold M114 baseline', async () => {
+        const f = fixture(false, { pipeline: true });
+        let stopAt = 0;
+        f.onQueue((count) => { if (count === 12) { f.stopStream(); f.input({ mode: 'z' }); stopAt = f.now(); } });
+        await startRun(f, { x: 0, z: 1, mode: 'z', feed: 1000 }, 5000);
+        const after = await readStatus(f);
+        assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify'], 'one G53, one G54, one proof');
+        assert.equal(f.moves(), 0, 'nothing on the settled engine');
+        assert.equal(after.pipeline.lastHold.stopReason, 'D1 released');
+        assert.equal(after.pipeline.lastHold.zBaseline, 'agreed');
+        assert.equal(after.pipeline.lastHold.zMoves, 12);
+        assert.equal(f.queued.length, 12);
+        const baseline = f.counts.filter((c) => c.tool === 'usb_pendant:z-baseline');
+        assert.equal(baseline.length, 1);
+        assert.ok(baseline[0].sentAt <= f.queued[0].sentAt, 'the baseline M114 came before the first Z word');
+        assert.match(baseline[0].text, /^X:10\.00 Y:10\.00 Z:10\.00 /, 'inside G53 it reports the machine chain');
+        assert.ok(f.countLeaseChecks.every((check) => check === null), 'every M114 passed under the hold\'s own lease');
+        for (const q of f.queued) {
+            assert.match(q.gcode, /^G1 X10\.000 Y10\.000 Z\d+\.\d{3} F1000;$/, q.gcode);
+            assert.ok(q.feed <= 1000);
+        }
+        const runs = f.executed();
+        for (const run of runs) {
+            assert.ok(run.commandedMs <= HOLD_MOVE_MS + 0.05, `increment (G-code rounding adds at most 0.03 ms) ${run.commandedMs} ms`);
+            assert.ok(run.outstandingAtArrival <= HOLD_QUEUE_AHEAD_MS + 40 + 1e-6, `outstanding ${run.outstandingAtArrival} ms`);
+        }
+        assert.ok(f.queued.every((q, i) => Math.abs(q.target.z - (i ? f.queued[i - 1].target.z : 10)) <= holdMoveMm(1000) + 1e-3), 'one increment of Z each');
+        const runoutMm = (runs[runs.length - 1].end - stopAt) * 1000 / 60000;
+        assert.ok(runoutMm <= pendantHold.holdRunoutMm(1000) + 40 * 1000 / 60000 + 1e-6, `Z run-out ${runoutMm.toFixed(2)} mm after D1 release`);
+        assert.deepEqual(f.verified[0], f.queued[11].target, 'the close proves the end position, Z included');
+        const ticks = JSON.parse((await f.request('/pendant/hold-trace')).body).ticks as Array<{ kind: string; zWord?: boolean; baseline?: { problem: string | null } }>;
+        assert.equal(ticks.filter((t) => t.kind === 'baseline').length, 1);
+        assert.equal(ticks.find((t) => t.kind === 'baseline')?.baseline?.problem, null);
+        assert.ok(ticks.filter((t) => t.kind === 'send').every((t) => t.zWord === true));
+    }],
+    ['the host caps every Z increment at F1000 even when the input asks for more', async () => {
+        const f = fixture(false, { pipeline: true });
+        await f.initialize();
+        // Past the Feather's own Z-mode check: the session sees F3000 with Z intent.
+        const session = f.runtime.session as { receive: (input: object, now: number) => void };
+        const receive = session.receive.bind(session);
+        session.receive = (input: object, now: number) => receive({ ...input, feed: 3000 }, now);
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        f.input();
+        f.onQueue((count) => { if (count === 6) { f.stopStream(); f.input({ mode: 'z' }); } });
+        f.stream({ z: 1, mode: 'z', deadman: true, feed: 1000 }, 3000);
+        await f.tick(); await f.flush();
+        const after = await readStatus(f);
+        assert.equal(after.armed, true, String(after.error));
+        assert.equal(f.queued.length, 6);
+        assert.ok(f.queued.every((q, i) => q.feed === 1000 && / Z\d/.test(q.gcode) && / F1000;$/.test(q.gcode)
+            && q.target.z - (i ? f.queued[i - 1].target.z : 10) <= holdMoveMm(1000) + 1e-3), JSON.stringify(f.queued.map((q) => q.gcode)));
+    }],
+    ['a disagreeing, failed or position-less Z baseline sends no Z word and closes the hold', async () => {
+        const cases: Array<[string, (f: Fixture) => void, RegExp]> = [
+            ['disagree', (f) => f.setControllerError({ x: 0, y: 0, z: 0.3 }), /no Z word sent: M114 reported machine X10\.000 Y10\.000 Z10\.300 .*Z off by 0\.300 mm, limit 0\.05 mm/],
+            ['failed', (f) => f.failCount(), /no Z word sent: the M114 failed \(controller result -1: transport_error\)/],
+            ['no position', (f) => f.setCountText('ok'), /no Z word sent: the M114 reply carried no X\/Y\/Z position/],
+        ];
+        for (const [name, arrange, why] of cases) {
+            const f = fixture(false, { pipeline: true });
+            arrange(f);
+            await startRun(f, { x: 0, z: -1, mode: 'z', feed: 600 }, 1500);
+            const after = await readStatus(f);
+            assert.match(after.pipeline.lastHold.stopReason, why, `${name}: ${after.pipeline.lastHold.stopReason}`);
+            assert.match(String(after.pipeline.lastHold.zBaseline), why.source.includes('Z off') ? /Z off by/ : /M114/, name);
+            assert.equal(f.queued.length, 0, `${name}: nothing at all was queued`);
+            assert.equal(after.pipeline.lastHold.zMoves, 0, name);
+            assert.equal(f.frames.filter((frame) => frame === 'enter').length, 1, name);
+            assert.equal(f.frames.filter((frame) => frame === 'restore').length, 1, `${name}: closed through the normal restore`);
+            assert.equal(after.armed, true, `${name}: a refused baseline stops the hold, it does not disarm`);
+            assert.equal(after.pipeline.holdOffUntilNeutral, true, `${name}: no hold re-opens until neutral`);
+            assert.equal(f.motion(), 0, name);
+            assert.ok(f.logs.some((line) => /no Z word sent, the hold's Z could not be confirmed/.test(line)), name);
+            if (name === 'disagree') {
+                // The close cannot prove the chain either: the latch waits, and the next press sends nothing.
+                assert.ok(f.latch(), 'the record that disagreed is not proved');
+                await f.request('/pendant/keepalive', {}); f.input({ z: -1, mode: 'z', deadman: true, feed: 600 }); await f.tick(); await f.flush();
+                assert.equal(f.moves(), 0); assert.equal(f.queued.length, 0);
+                assert.equal(f.frames.filter((frame) => frame === 'enter').length, 1);
+            }
+        }
+    }],
+    ['Z-down toward an obstacle is held one Z run-out short like X/Y; a straight Z-up climb leaves an exclusion inside the hold', async () => {
+        const down = fixture(false, { pipeline: true });
+        // Exclusion X/Y 3..17 around the head at X10 Y10 Z10; required toolhead Z 6 (legacy toolhead basis).
+        down.obstacles.push({ name: 'vise', machine: { x0: 8, x1: 12, y0: 8, y1: 12 }, clearanceZ: 6, clearanceBasis: 'toolhead' });
+        await startRun(down, { x: 0, z: -1, mode: 'z', feed: 600 }, 3000);
+        let after = await readStatus(down);
+        assert.match(after.pipeline.lastHold.stopReason, /held at vise/);
+        assert.equal(after.blocked.held, true); assert.match(after.blocked.text, /^BLOCKED vise: Z>=6/);
+        assert.ok(down.queued.length >= 1, 'it descended in the hold first');
+        const limit = 6 + 0.1 + pendantHold.holdRunoutMm(600); // required Z + approach pad + the 2 mm queued run-out at F600
+        assert.ok(down.queued.every((q) => q.target.z >= limit - 1e-6 && / Z/.test(q.gcode)), `never within one run-out: ${down.queued.map((q) => q.target.z)}`);
+        assert.ok(down.queued[down.queued.length - 1].target.z < limit + holdMoveMm(600) + 1e-6, 'stopped within one increment of it');
+        assert.equal(after.pipeline.holdOffUntilNeutral, true);
+        assert.deepEqual(down.frames, ['latch', 'enter', 'restore', 'verify']);
+        await down.immediate(); await down.flush();
+        assert.equal(down.moves(), 1, 'the settled path takes the rest of the approach');
+        assert.ok(down.targets[0].z >= 6.1 - 1e-6, `settled approach stops at the pad: ${down.targets[0].z}`);
+        await down.finish();
+        assert.equal(down.frames.filter((frame) => frame === 'enter').length, 1, 'no hold re-opens toward the box');
+        // Armed inside an exclusion below its required Z: a straight Z-up stick climbs out in a hold.
+        const up = fixture(false, { pipeline: true });
+        up.obstacles.push({ name: 'block', machine: { x0: 8, x1: 12, y0: 8, y1: 12 }, clearanceZ: 20, clearanceBasis: 'toolhead' });
+        up.onQueue((count) => { if (count === 8) { up.stopStream(); up.input({ mode: 'z' }); } });
+        await startRun(up, { x: 0, z: 1, mode: 'z', feed: 1000 }, 3000);
+        after = await readStatus(up);
+        assert.deepEqual(up.frames, ['latch', 'enter', 'restore', 'verify']);
+        assert.equal(up.queued.length, 8);
+        assert.ok(up.queued.every((q) => q.target.x === 10 && q.target.y === 10 && / Z/.test(q.gcode)), 'exactly vertical');
+        assert.ok(up.queued[7].target.z > 20, 'climbed past the required Z');
+        assert.equal(after.blocked, null, 'out of the exclusion');
+        // A climb with X in it stays held inside, as on the settled path.
+        const diagonal = fixture(false, { pipeline: true });
+        diagonal.obstacles.push({ name: 'block', machine: { x0: 8, x1: 12, y0: 8, y1: 12 }, clearanceZ: 20, clearanceBasis: 'toolhead' });
+        await startRun(diagonal, { x: 1, z: 1, mode: 'z', feed: 600 }, 600);
+        assert.deepEqual(diagonal.frames, []); assert.equal(diagonal.queued.length, 0); assert.equal(diagonal.moves(), 0);
+        assert.match((await readStatus(diagonal)).blocked.text, /^INSIDE block/);
+    }],
+    ['X/Y and Z together in Z mode move diagonally in one hold, every increment with a Z word at F1000 or less', async () => {
+        const f = fixture(false, { pipeline: true });
+        f.onQueue((count) => { if (count === 8) { f.stopStream(); f.input({ mode: 'z' }); } });
+        await startRun(f, { x: 1, z: 1, mode: 'z', feed: 1000 }, 3000);
+        assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify']);
+        assert.equal(f.queued.length, 8);
+        let previous = { x: 10, y: 10, z: 10 };
+        for (const q of f.queued) {
+            assert.match(q.gcode, /^G1 X\d+\.\d{3} Y10\.000 Z\d+\.\d{3} F1000;$/, q.gcode);
+            const dx = q.target.x - previous.x;
+            const dz = q.target.z - previous.z;
+            assert.ok(dx > 0 && dz > 0 && Math.abs(dx - dz) <= 0.002, `diagonal: ${dx} ${dz}`);
+            assert.ok(Math.hypot(dx, dz) <= holdMoveMm(1000) + 2e-3);
+            previous = q.target;
+        }
+        assert.equal((await readStatus(f)).pipeline.lastHold.zBaseline, 'agreed');
+    }],
+    ['an idle hold polls M114 at least every 500 ms, and those prompt agreeing replies are position freshness', async () => {
+        const f = fixture(false, { pipeline: true });
+        let idleAt = 0;
+        f.onQueue((count) => { if (count === 3) { idleAt = f.now(); f.stream({ deadman: true, feed: 3000 }, 1500); } });
+        await startRun(f, {}, 600);
+        const hold = (await readStatus(f)).pipeline.lastHold;
+        assert.match(hold.stopReason, /Feather report gap/, 'it idled until the stream ended');
+        const idle = f.counts.filter((c) => c.tool === 'usb_pendant:count' && c.sentAt >= idleAt);
+        assert.ok(idle.length >= 3, `idle polls ${idle.length}`);
+        const gaps = idle.slice(1).map((c, i) => c.sentAt - idle[i].sentAt);
+        assert.ok(gaps.every((gap) => gap <= pendantHold.HOLD_IDLE_POLL_MS + 1e-6), `gaps ${gaps}`);
+        const ticks = JSON.parse((await f.request('/pendant/hold-trace')).body).ticks as Array<{ kind: string; at: number; count?: { fresh: boolean } }>;
+        assert.ok(ticks.filter((t) => t.kind === 'count' && t.at >= idleAt).every((t) => t.count?.fresh === true), 'every idle reply agreed with the chain');
+        assert.ok((await readStatus(f)).pipeline.m114FreshAgeMs !== null);
+    }],
+    ['M114 freshness keeps a hold alive past 4.5 s without heartbeats; late, failing or disagreeing M114 replies do not', async () => {
+        const run = async (arrange: (f: Fixture) => void, then?: (f: Fixture, count: number) => void) => {
+            const f = fixture(false, { pipeline: true });
+            let staleAt = 0;
+            f.onQueue((count) => {
+                if (count === 10) { f.setReportAge(5000); staleAt = f.now(); arrange(f); }
+                if (then) { then(f, count); }
+            });
+            await startRun(f, { feed: 300 }, 9000);
+            return { f, staleAt, hold: (await readStatus(f)).pipeline.lastHold, sentAfter: f.queued.filter((q) => q.sentAt > staleAt).length };
+        };
+        const fresh = await run(() => undefined);
+        assert.match(fresh.hold.stopReason, /Feather report gap/, `fresh M114s carried the hold to the end of the stream: ${fresh.hold.stopReason}`);
+        assert.ok(fresh.f.now() - fresh.staleAt > 6000, 'over 4.5 s with a 5 s old heartbeat');
+        for (const [name, arrange] of [
+            ['late', (f: Fixture) => f.setCountRtt(250)],
+            ['failing', (f: Fixture) => f.failCount()],
+            ['disagreeing', (f: Fixture) => f.setCountText('X:0.00 Y:0.00 Z:0.00 E:0.00 Count X:0 Y:0 Z:0')],
+        ] as Array<[string, (f: Fixture) => void]>) {
+            const stale = await run(arrange);
+            assert.match(stale.hold.stopReason, /machine heartbeat 5000 ms old and the last agreeing M114 \d+ ms old \(limit 4500 ms\)/, `${name}: ${stale.hold.stopReason}`);
+            const freshAt = (JSON.parse((await stale.f.request('/pendant/hold-trace')).body).ticks as Array<{ kind: string; at: number; count?: { fresh: boolean } }>)
+                .filter((t) => t.kind === 'count' && t.count?.fresh).map((t) => t.at).pop() as number;
+            assert.ok(freshAt <= stale.staleAt, `${name}: no reply after the change counted as fresh`);
+            const lastSend = stale.f.queued[stale.f.queued.length - 1].sentAt;
+            assert.ok(lastSend - freshAt <= 4500 + HOLD_TICK_MS + 1e-6, `${name}: last send ${lastSend - freshAt} ms after the last agreeing M114`);
+            assert.ok(lastSend - freshAt >= 4500 - HOLD_TICK_MS - 250 - 1e-6, `${name}: the earlier agreeing M114 carried it ${lastSend - freshAt} ms, not less`);
+            assert.equal((await readStatus(stale.f)).armed, true, name);
+        }
+    }],
+    ['an unproved close retries its M114 proof; the next press proves it on demand instead of waiting for a beat', async () => {
+        const retried = fixture(false, { pipeline: true });
+        retried.failVerifyTimes(2);
+        retried.onQueue((count) => { if (count === 3) { retried.stopStream(); retried.input(); } });
+        await startRun(retried);
+        assert.deepEqual(retried.frames, ['latch', 'enter', 'restore', 'verify', 'verify', 'verify']);
+        const gaps = retried.verifiedAt.slice(1).map((t, i) => t - retried.verifiedAt[i]);
+        assert.ok(gaps.every((gap) => gap >= pendantHold.HOLD_CLOSE_PROOF_RETRY_MS), `retries ${gaps} ms apart`);
+        assert.equal((await readStatus(retried)).pipeline.lastHold.proved, true);
+        assert.equal(retried.latch(), null, 'the third try proved it');
+        // All three fail: the latch stands, and the next press proves the end position itself.
+        const f = fixture(false, { pipeline: true });
+        f.failVerifyTimes(3);
+        f.onQueue((count) => { if (count === 3) { f.stopStream(); f.input(); } });
+        await startRun(f);
+        assert.equal((await readStatus(f)).pipeline.lastHold.proved, false);
+        assert.ok(f.latch()?.restoredAt);
+        const closedAt = f.now();
+        await f.request('/pendant/keepalive', {}); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+        assert.equal(f.frames.filter((frame) => frame === 'verify').length, 4, 'one on-demand M114');
+        assert.equal(f.verifyLeaseChecks[3], null, 'M114 passes the recovery hold');
+        assert.deepEqual(f.verified[3], f.verified[0], 'it proves the last close\'s end position');
+        assert.equal(f.latch(), null, 'proved: the latch cleared without a beat');
+        assert.ok(f.logs.some((line) => /the next press proved the last hold's end position/.test(line)));
+        f.stream({ x: 1, deadman: true, feed: 3000 }, 400);
+        await f.immediate(); await f.flush();
+        assert.equal(f.frames.filter((frame) => frame === 'enter').length, 2, 'the next hold started at once');
+        assert.ok(f.queued.filter((q) => q.run === 2)[0].sentAt - closedAt < 1000, 'well inside the 4 s the beat wait would take');
+        // A late G53-window beat after an unproved close (latch already cleared by a beat): proved under the lease.
+        const late = fixture(false, { pipeline: true });
+        late.failVerifyTimes(3);
+        late.onQueue((count) => { if (count === 3) { late.stopStream(); late.input(); } });
+        await startRun(late);
+        late.verifiedBeat();
+        late.setWarnings(['Derived machine z (z=541.0) is more than 50 mm outside the travel - a mistake, not a position']);
+        await late.request('/pendant/keepalive', {}); late.input({ x: 1, deadman: true, feed: 3000 }); await late.tick();
+        assert.equal(late.frames.filter((frame) => frame === 'verify').length, 4);
+        assert.equal(late.lease.status().held, null, 'the proof lease was released');
+        late.stream({ x: 1, deadman: true, feed: 3000 }, 400);
+        await late.immediate(); await late.flush();
+        assert.equal(late.frames.filter((frame) => frame === 'enter').length, 2, 'started from the proved position despite the late beat');
+        assert.equal((await readStatus(late)).armed, true);
     }],
 ];

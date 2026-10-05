@@ -1,7 +1,9 @@
-// Continuous X/Y hold for the USB pendant (LUBAN_PENDANT_PIPELINE=1): the pure
-// parts. One G53 at D1 press, clock-paced G1 increments while the stick is
-// held, one G54 at release or at any stop. No server imports, so every piece
-// here is unit-tested without a machine (tests/pendantHold.test.ts).
+// Continuous X/Y/Z hold for the USB pendant (LUBAN_PENDANT_PIPELINE=1): the
+// pure parts. One G53 at D1 press, clock-paced G1 increments while the stick is
+// held, one G54 at release or at any stop. Z words are sent only after an
+// in-hold M114 has proved the hold's chain (zBaselineProblem). No server
+// imports, so every piece here is unit-tested without a machine
+// (tests/pendantHold.test.ts).
 //
 // Why there are no "runs" any more (operator, hardware, 2026-10-05): the
 // earlier pipeline queued about a second of G1 segments up front, closed the
@@ -31,8 +33,25 @@ export const HOLD_MOVE_MS = 100;
 export const HOLD_QUEUE_AHEAD_MS = 200;
 /** A Feather report older than this stops the hold (the Feather sends every 50 ms). */
 export const HOLD_FEATHER_GAP_MS = 150;
-/** `M114` (Count) is polled this often during a hold. */
+/** `M114` (Count) is polled this often during a hold while it is moving. */
 export const HOLD_COUNT_POLL_MS = 250;
+/**
+ * ...and at least this often while the hold idles in G53 (stick centred, D1
+ * held), so an idle hold keeps proving its position instead of running into
+ * the heartbeat age limit.
+ */
+export const HOLD_IDLE_POLL_MS = 500;
+/**
+ * An in-hold M114 counts as position freshness (see readyInHold) only when it
+ * answered within this long and its machine position agreed with the hold. A
+ * slower reply is the faltering connection the age limit exists to catch.
+ */
+export const HOLD_FRESH_REPLY_MS = 200;
+/** M114 work-frame proofs at a hold close: the first plus this many retries, this far apart. */
+export const HOLD_CLOSE_PROOF_ATTEMPTS = 3;
+export const HOLD_CLOSE_PROOF_RETRY_MS = 200;
+/** Between holds, an on-demand proof of the last close is tried at most this often while the stick asks for motion. */
+export const HOLD_ON_DEMAND_PROOF_GAP_MS = 500;
 /** A G1 reply slower than this means the controller is holding the request (planner full): stop. */
 export const HOLD_REPLY_LATE_MS = HOLD_QUEUE_AHEAD_MS;
 /**
@@ -100,10 +119,12 @@ export function countCheckMode(raw: string | undefined | null): CountCheckMode {
 }
 
 /**
- * The G1 for one queued machine-frame increment. The hold omits the Z word
- * (Marlin keeps the current Z for `G1 X Y`): the hold's Z is the heartbeat-
- * derived record Z, and a wrong reused offset must make the close's M114
- * proof fail rather than move Z by the error at stick feed.
+ * The G1 for one queued machine-frame increment. X/Y increments omit the Z
+ * word (Marlin keeps the current Z for `G1 X Y`): until the hold has proved
+ * its Z against the controller (zBaselineProblem), the hold's Z is the
+ * heartbeat-derived record Z, and a wrong reused offset must make the close's
+ * M114 proof fail rather than move Z by the error at stick feed. Only an
+ * increment with a Z component, after that proof, carries a Z word.
  */
 export function queuedMoveGcode(target: JogPosition, feed: number, omitZ: boolean): string {
     const words = `X${target.x.toFixed(3)} Y${target.y.toFixed(3)}${omitZ ? '' : ` Z${target.z.toFixed(3)}`}`;
@@ -118,6 +139,79 @@ export function holdRunoutMm(feed: number): number {
 /** Distance of one increment at `feed` mm/min. */
 export function holdMoveMm(feed: number): number {
     return feed * HOLD_MOVE_MS / 60000;
+}
+
+/**
+ * An increment with a Z component never runs faster than `maxFeed` (the
+ * operator's Z-mode cap, PENDANT_Z_FEED_MAX). The Feather already refuses a
+ * Z-mode frame above it; this is the host's own enforcement. A faster request
+ * is shortened along its own direction so it keeps its commanded duration.
+ */
+export function capZFeed(from: JogPosition, to: JogPosition, feed: number, maxFeed: number): { to: JogPosition; feed: number } {
+    if (Math.abs(to.z - from.z) < 0.001 || feed <= maxFeed) { return { to: { ...to }, feed }; }
+    const k = maxFeed / feed;
+    return { to: { x: from.x + (to.x - from.x) * k, y: from.y + (to.y - from.y) * k, z: from.z + (to.z - from.z) * k }, feed: maxFeed };
+}
+
+/**
+ * Before the first Z word of a hold, the hold's dead-reckoned chain must be
+ * proved against the controller: one M114 inside the hold (G53 selected, so
+ * its X/Y/Z fields are MACHINE coordinates; Marlin prints the planner's
+ * position, i.e. the end of everything accepted so far), taken with nothing
+ * queued by the clock model, must agree with the chain within `toleranceMm`
+ * on every axis. Then the Z word moves Z by the increment and nothing else.
+ * null when it agrees, else why no Z word may be sent. Pure.
+ */
+export function zBaselineProblem(reported: JogPosition | null, chain: JogPosition, toleranceMm: number): string | null {
+    if (!reported) { return 'the M114 reply carried no X/Y/Z position'; }
+    for (const axis of ['x', 'y', 'z'] as const) {
+        const off = Math.abs(reported[axis] - chain[axis]);
+        if (!(off <= toleranceMm)) {
+            return `M114 reported machine X${reported.x.toFixed(3)} Y${reported.y.toFixed(3)} Z${reported.z.toFixed(3)} but the hold's chain is `
+                + `X${chain.x.toFixed(3)} Y${chain.y.toFixed(3)} Z${chain.z.toFixed(3)} (${axis.toUpperCase()} off by ${off.toFixed(3)} mm, limit ${toleranceMm} mm)`;
+        }
+    }
+    return null;
+}
+
+/**
+ * Whether an in-hold M114's X/Y/Z fields (machine coordinates inside G53)
+ * agree with the hold: within `toleranceMm` per axis of the commanded chain
+ * at its send time (Marlin prints the planner position), or, for a controller
+ * that prints the stepper position instead, within one increment plus the
+ * tolerance of the clock model's expected executed position (judgeCountSample's
+ * rule). Only an agreeing, prompt reply counts as position freshness. Pure.
+ */
+export function holdPositionAgrees(reported: JogPosition | null, chain: JogPosition, expected: JogPosition, moveMm: number, toleranceMm: number): boolean {
+    if (!reported || !(['x', 'y', 'z'] as const).every((axis) => Number.isFinite(reported[axis]))) { return false; }
+    if ((['x', 'y', 'z'] as const).every((axis) => Math.abs(reported[axis] - chain[axis]) <= toleranceMm)) { return true; }
+    return Math.hypot(reported.x - expected.x, reported.y - expected.y, reported.z - expected.z) <= moveMm + toleranceMm;
+}
+
+/**
+ * Z inside the hold is paced by the same clock model, so the controller must
+ * run Z at the commanded feed: `M203 Z` (mm/s) at least the Z-mode cap, and
+ * Z acceleration (the lower of `M201 Z` and `M204 P`) high enough that
+ * reaching the cap costs at most one increment of lag (v / 2a <= HOLD_MOVE_MS).
+ * Below that the model would trail the head by more than an increment and the
+ * run-out bound would not hold. The Snapmaker default (Z40 mm/s, Z100 mm/s²)
+ * passes: 83 ms of lag at F1000. null when Z holds may run, else the reason
+ * Z jogs stay on the settled engine. Pure.
+ */
+export function firmwareZMotionProblem(m503: string, zFeedMaxMmMin: number): string | null {
+    const zFeed = m503.match(/M203\s+X-?[\d.]+\s+Y-?[\d.]+\s+Z(-?[\d.]+)/);
+    const zAccel = m503.match(/M201\s+X-?[\d.]+\s+Y-?[\d.]+\s+Z(-?[\d.]+)/);
+    const pAccel = m503.match(/M204\s+P(-?[\d.]+)/);
+    if (!zFeed || !zAccel || !pAccel) { return 'M503 S did not report M203 Z, M201 Z and M204 P, so the controller\'s Z limits are unknown.'; }
+    const need = zFeedMaxMmMin / 60;
+    const feed = Number(zFeed[1]);
+    const accel = Math.min(Number(zAccel[1]), Number(pAccel[1]));
+    if (!Number.isFinite(feed) || feed < need) { return `Controller max feed Z ${zFeed[1]} mm/s is below the Z-mode ${need.toFixed(1)} mm/s (M203).`; }
+    const minAccel = need / (2 * HOLD_MOVE_MS / 1000);
+    if (!Number.isFinite(accel) || accel < minAccel) {
+        return `Controller Z acceleration ${accel} mm/s² (M201 Z / M204 P) is below ${minAccel.toFixed(1)} mm/s²: reaching F${zFeedMaxMmMin} would lag the clock model by more than one increment.`;
+    }
+    return null;
 }
 
 /** `to` pushed `extraMm` further along the direction from `from`; `to` itself when they coincide. */
@@ -280,11 +374,11 @@ export interface CountJudgement {
  * at the current feed: the Count-derived position may trail OR lead the
  * expected executed position by up to that much plus `toleranceMm` before it
  * counts as off (the distance is symmetric: a stall and a touchscreen speed
- * override above 100 % both count). XY only: the hold never commands Z.
+ * override above 100 % both count). X, Y and Z: the hold commands Z too.
  */
 export function judgeCountSample(derived: JogPosition | null, expected: JogPosition, moveMm: number, toleranceMm: number): CountJudgement {
     if (!derived) { return { lagMm: null, off: false }; }
-    const lagMm = Math.hypot(derived.x - expected.x, derived.y - expected.y);
+    const lagMm = Math.hypot(derived.x - expected.x, derived.y - expected.y, derived.z - expected.z);
     return { lagMm, off: lagMm > moveMm + toleranceMm };
 }
 
@@ -307,6 +401,8 @@ export interface CountSample {
     lagMm: number | null;
     off: boolean;
     error: string | null;
+    /** The reply was prompt (HOLD_FRESH_REPLY_MS) and its position agreed with the hold: it counts as position freshness. */
+    fresh?: boolean;
 }
 
 /**
