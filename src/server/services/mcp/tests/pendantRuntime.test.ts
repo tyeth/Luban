@@ -362,6 +362,20 @@ export const tests: Array<[string, () => Promise<void>]> = [
         f.gate.enterTool('home')();
     }],
 
+    ['a reviewed -1 mm edge stands: overtravel to it is allowed, the head is never pulled', async () => {
+        const f = fixture(true); await f.initialize();
+        f.machine.y = -0.4;
+        const requested = { xMin: 100, xMax: 150, yMin: -1, yMax: 20, zMin: 280, zMax: 329 };
+        assert.equal((await f.request('/pendant/arm', { bounds: requested, clearanceConfirmed: true, maxSegmentMs: 500 })).status, 200);
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).bounds.yMin, -1);
+        f.input(); await f.tick(); assert.equal(f.moves(), 0, 'centred stick never moves the head');
+        f.input({ y: -1, deadman: true }); await f.tick(); assert.equal(f.moves(), 1, 'jogging out to the reviewed Y -1 is allowed');
+        await f.finish();
+        await f.request('/pendant/disarm', {});
+        f.input();
+        const strict = { ...requested, yMin: 0 };
+        assert.equal((await f.request('/pendant/arm', { bounds: strict, clearanceConfirmed: true })).status, 400, 'an explicit Y0 minimum still refuses Y -0.4');
+    }],
     ['A350 defaults include park; whole-bed request is clipped to known travel', async () => {
         const f = fixture(true); await f.initialize();
         const before = JSON.parse((await f.request('/pendant/status')).body);
@@ -371,7 +385,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         const requested = { xMin: -20, xMax: 331, yMin: -1, yMax: 343, zMin: 280, zMax: 329 };
         assert.equal((await f.request('/pendant/arm', { bounds: requested, clearanceConfirmed: true })).status, 200);
         const after = JSON.parse((await f.request('/pendant/status')).body);
-        assert.deepEqual(after.bounds, { xMin: -19, xMax: 330, yMin: 0, yMax: 342, zMin: 280, zMax: 328 });
+        assert.deepEqual(after.bounds, { xMin: -20, xMax: 331, yMin: -1, yMax: 343, zMin: 280, zMax: 329 }, 'travel ±1 mm stands as reviewed');
         assert.equal(f.moves(), 0);
         await f.request('/pendant/disarm', {});
         f.obstacles.push({ name: 'rotary', machine: { x0: 160, x1: 180, y0: 280, y1: 330 }, clearanceZ: 328 });

@@ -29,6 +29,8 @@ const log = logger('service:mcp:pendant');
 const traceEnabled = (): boolean => typeof process !== 'undefined' && /^(1|true|on|yes)$/i.test(process.env?.LUBAN_PENDANT_TRACE || '');
 const trace = (message: string): void => { if (traceEnabled()) { log.info(`[trace] ${message}`); } };
 const PORT_LIST_CACHE_MS = 2000;
+// The page's machine-fill margin: reviewed envelopes, and jogs, may reach this far past travel.
+const TRAVEL_FILL_MM = 1;
 // A shortened approach stops this far outside an obstacle (XY and Z), so heartbeat noise
 // cannot report the held toolhead inside the exclusion it was stopped against.
 const APPROACH_PAD_XY_MM = 0.5;
@@ -194,8 +196,8 @@ export class PendantRuntime {
         const travel = this.travelBounds();
         const bounds = { ...requested };
         for (const axis of ['x', 'y', 'z'] as const) {
-            bounds[`${axis}Min`] = Math.max(requested[`${axis}Min`], travel[`${axis}Min`]);
-            bounds[`${axis}Max`] = Math.min(requested[`${axis}Max`], travel[`${axis}Max`]);
+            bounds[`${axis}Min`] = Math.max(requested[`${axis}Min`], travel[`${axis}Min`] - TRAVEL_FILL_MM);
+            bounds[`${axis}Max`] = Math.min(requested[`${axis}Max`], travel[`${axis}Max`] + TRAVEL_FILL_MM);
         }
         this.validateEnvelope(bounds);
         return bounds;
@@ -206,9 +208,11 @@ export class PendantRuntime {
     private validateEnvelope(bounds: JogBounds, current: JogPosition = this.position()): void {
         validateJogBounds(bounds, current);
         const travel = this.travelBounds(current);
+        // Operator rule: the machine accepts attempted overtravel and so do we, up to
+        // TRAVEL_FILL_MM past known travel on every axis; the DRO corrects on the next sync.
         for (const axis of ['x', 'y', 'z'] as const) {
-            if (bounds[`${axis}Min`] < travel[`${axis}Min`] || bounds[`${axis}Max`] > travel[`${axis}Max`]) {
-                throw new Error(`Machine ${axis.toUpperCase()} bounds must stay within ${travel[`${axis}Min`]}..${travel[`${axis}Max`]} mm.`);
+            if (bounds[`${axis}Min`] < travel[`${axis}Min`] - TRAVEL_FILL_MM || bounds[`${axis}Max`] > travel[`${axis}Max`] + TRAVEL_FILL_MM) {
+                throw new Error(`Machine ${axis.toUpperCase()} bounds must stay within ${travel[`${axis}Min`] - TRAVEL_FILL_MM}..${travel[`${axis}Max`] + TRAVEL_FILL_MM} mm (travel ±${TRAVEL_FILL_MM} mm).`);
             }
         }
     }
