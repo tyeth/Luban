@@ -992,6 +992,24 @@ These are agent release requirements, not new runtime checks in `validate_gcode`
   before a work-frame `move_z` / `move_and_capture`). See "Coordinate frames and the position
   of record" below. Agent guidance: `.agents/skills/cnc-motion-rules/SKILL.md` (canonical) and
   `.agents/skills/README.md`.
+- **A failed tool call does not leave G53/G91 behind silently** (#221). `ToolRegistry.call()`
+  records every direct send of the call (`failureRecovery.ts`, per call via AsyncLocalStorage)
+  and, when the call throws or returns an error, checks whether it may have left `G53`, `G91`
+  or a mode an unfinished payload carried. If so, and only if the connection generation is
+  unchanged, none of THIS call's own payloads is still unanswered (the channel's queue is not
+  inspected), no other operation, job or pendant owns the controller, no crash/overtravel latch
+  or procedure stop request is set (read from the real state and re-checked before each send),
+  the machine is idle and the failure was not a stop/trip/overtravel, it sends `G90` and (for
+  `G53`/unknown workspace) `G54` as separate, axis-free commands. It never retries the
+  failed command and never turns the failure into success: the original error text comes
+  first, followed by `failure_recovery: {...}` evidence (or a `failure_recovery` field on a
+  structured error result). A call that SUCCEEDS but leaves `G53`/`G91`/unknown behind gets
+  the same field with status `skipped` and nothing sent. The distance mode is never claimed
+  verified. The workspace is claimed verified only when a status report at least one poll
+  period (2 s) after the cleanup reply reads as the work frame, the work offset exceeds 0.5 mm,
+  AND the raw report taken as a machine position would be outside the travel; otherwise it is
+  "consistent with work frame, unverified". Anything skipped or unverified names
+  `restore_work_frame` as the no-motion recovery.
 - **Compound motion and all cutting goes out as gcode FILES** through the same
   `prepare_print`/`start_print` path as Luban's Start button, so the controller job state
   machine and the enclosure **door interlock** apply (fork issue #23). The direct

@@ -32,6 +32,9 @@ import { McpToolError, ToolRegistry } from '../registry';
 import { gateDirectXy, planGotoWorkOrigin } from '../directMovePlan';
 import { clearanceOptions } from '../clearanceContext';
 import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
+import { NotSentError, RecoveryDeps, classifyReply, recordModalSend } from '../failureRecovery';
+import { procedureStopRequested } from '../probing';
+import { manualControlGate } from '../manualControl';
 import { landmarkStore } from '../landmarks';
 import { routeClearanceForPath } from '../routeClearance';
 import { probeFeedService } from '../probeFeed';
@@ -42,12 +45,13 @@ import {
     PositionSnapshot,
     assertWithinTravel,
     getPositionSnapshot,
+    machineBounds,
     motionFloorZ,
     requirePlanningTravel,
     safeTraverseZ,
 } from './machine';
 import { validateStagedEnvelope } from './staging';
-import { reliableForMotion } from '../machinePosition';
+import { outsideBounds, reliableForMotion } from '../machinePosition';
 import { DIRECT_MOVE_FEED, TRACK_PATCH_PX, TRACK_SEARCH_RADIUS_PX, TRAVEL_FEED, TRAVERSE_FEED, clampCount, clampTo } from '../procedureLimits';
 
 // Motion policy (#23, refined): the direct move path is for the odd single
@@ -112,6 +116,19 @@ export interface SendTiming {
     trace?: string;
 }
 
+/** Connection generation for the failure hook's ledger (#221); null when disconnected. */
+function currentConnectionId(): string | null {
+    try {
+        if (!connectionManager.getConnectionStatus().connected) {
+            return null;
+        }
+        const generation = (connectionManager as { getConnectionGeneration?: () => string }).getConnectionGeneration;
+        return typeof generation === 'function' ? generation.call(connectionManager) : 'unversioned';
+    } catch (err) {
+        return null;
+    }
+}
+
 export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcode: string, timing?: SendTiming): Promise<SentGcode> {
     const sequence = bumpGcodeSequence();
     const sentAt = Date.now();
@@ -159,9 +176,16 @@ export async function sendGcodeVisible(channel: GcodeChannel, tool: string, gcod
     }
     probeFeedService.motionBegin();
     noteDirectGcodeStart();
+    // The tool call's modal ledger (#221): what left, on which channel, and
+    // how it ended - read by the failure hook in ToolRegistry.call().
+    const settleLedger = recordModalSend(currentConnectionId() || 'none', gcode);
     let executed;
     try {
         executed = await channel.executeGcode(gcode);
+        settleLedger(classifyReply(executed));
+    } catch (err) {
+        settleLedger('indeterminate');
+        throw err;
     } finally {
         probeFeedService.motionEnd();
         noteDirectGcodeEnd();
@@ -755,7 +779,69 @@ export async function sendWorkFrameRestore(tool: string): Promise<SentGcode> {
     return sendGcodeVisible(channel, tool, WORK_FRAME_RESTORE_GCODE);
 }
 
+/**
+ * The runtime side of the failed-call modal cleanup (failureRecovery.ts):
+ * the SAME visible send path, the position of record, and the ownership
+ * signals. Settling waits two status periods, as restore_work_frame does.
+ */
+export const failureRecoveryDeps: RecoveryDeps = {
+    connectionId: currentConnectionId,
+    send: async (label, gcode) => {
+        const channel = connectionManager.getCurrentChannel() as unknown as GcodeChannel;
+        if (!channel || typeof channel.executeGcode !== 'function') {
+            throw new NotSentError('no machine channel with a direct command path');
+        }
+        return sendGcodeVisible(channel, label, gcode);
+    },
+    settle: async () => sleep(FRAME_RESTORE_SETTLE_MS),
+    readPosition: () => {
+        const snapshot = getPositionSnapshot();
+        return {
+            reliability: snapshot.reliability,
+            frame: snapshot.frame,
+            reportedAt: snapshot.machineReportedAt,
+            originOffset: snapshot.originOffset,
+            machineStatus: snapshot.machineStatus,
+            // `work` is the raw report; read as machine coordinates, is it impossible?
+            rawImpossibleAsMachine: outsideBounds(
+                snapshot.work,
+                machineBounds((connectionManager.getConnectionStatus() as { machineIdentifier?: string | null }).machineIdentifier || null),
+            ).length > 0,
+        };
+    },
+    reliableForMotion: (reliability) => reliableForMotion(reliability as PositionSnapshot['reliability']),
+    jobRunning: () => {
+        // starting/started: the controller is executing (or about to execute)
+        // a program, possibly this call's own direct job - either way cleanup
+        // would land inside it, so it is skipped and explained.
+        const job = jobManager.getActive();
+        return !!job && (job.state === 'starting' || job.state === 'started');
+    },
+    // The pendant arms manual control for its jogs and its own frame recovery.
+    manualControl: () => manualControlGate.isManual(),
+    // The real latches, not the error text: crash/overtravel trip (also the
+    // unexpected-contact guard) and a pending procedure stop request.
+    authorityClosed: () => {
+        const trip = probeFeedService.getTrip();
+        if (trip) {
+            return `${trip.kind === 'crash' ? 'crash' : 'overtravel'} alarm latched (${trip.channel})`;
+        }
+        try {
+            probeFeedService.assertNoOvertravel();
+        } catch (err) {
+            return (err as Error).message;
+        }
+        const stop = procedureStopRequested();
+        return stop ? `a procedure stop was requested (${stop.reason})` : null;
+    },
+    now: () => Date.now(),
+};
+
 export function registerCameraTools(registry: ToolRegistry): void {
+    // Guarded: inert test harnesses hand in a bare registry stub.
+    if (typeof registry.setFailureRecovery === 'function') {
+        registry.setFailureRecovery(failureRecoveryDeps);
+    }
     registry.register({
         name: 'list_cameras',
         description: 'List available capture sources: the configured snapshot URL, or DirectShow '

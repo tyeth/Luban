@@ -32,6 +32,7 @@ import { tests as directMovePlanTests } from './directMovePlan.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as gpioFeedTests } from './gpioFeed.test';
 import { tests as frameRecoveryTests } from './frameRecovery.test';
+import { tests as failureRecoveryTests } from './failureRecovery.test';
 import { tests as inspectionReportTests } from './inspectionReport.test';
 import { tests as jobDashboardTests } from './jobDashboard.test';
 import { tests as jobEndingTests } from './jobEnding.test';
@@ -91,6 +92,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['cameraSelection', cameraSelectionTests],
     ['bootstrapPlan', bootstrapPlanTests],
     ['frameRecovery', frameRecoveryTests],
+    ['failureRecovery', failureRecoveryTests],
     ['probeFeedHealth', probeFeedHealthTests],
     ['gpioFeed', gpioFeedTests],
     ['probeInspection', probeInspectionTests],
