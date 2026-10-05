@@ -32,7 +32,9 @@ export const HOLD_MOVE_MS = 100;
  */
 export const HOLD_QUEUE_AHEAD_MS = 200;
 /** A Feather report older than this stops the hold (the Feather sends every 50 ms). */
-export const HOLD_FEATHER_GAP_MS = 150;
+// Trial 2026-10-05 21:17: three holds stopped on 152-166 ms gaps from a Feather sending every 50 ms
+// (USB/scheduling jitter, not a dead link). The run-out after a stop is unchanged (queued <= 200 ms).
+export const HOLD_FEATHER_GAP_MS = 250;
 /** `M114` (Count) is polled this often during a hold while it is moving. */
 export const HOLD_COUNT_POLL_MS = 250;
 /**
@@ -53,7 +55,9 @@ export const HOLD_CLOSE_PROOF_RETRY_MS = 200;
 /** Between holds, an on-demand proof of the last close is tried at most this often while the stick asks for motion. */
 export const HOLD_ON_DEMAND_PROOF_GAP_MS = 500;
 /** A G1 reply slower than this means the controller is holding the request (planner full): stop. */
-export const HOLD_REPLY_LATE_MS = HOLD_QUEUE_AHEAD_MS;
+// Above the Wi-Fi p99 (253 ms, trial 2026-10-05 21:17): two consecutive replies this late stop a hold.
+// A late reply never admits extra queued motion (the queue is paced by send time).
+export const HOLD_REPLY_LATE_MS = 300;
 /**
  * A single increment reply this late stops the hold outright. Trial 2026-10-05:
  * p99 420 ms, max 643 ms over Wi-Fi; isolated spikes are tolerated because the

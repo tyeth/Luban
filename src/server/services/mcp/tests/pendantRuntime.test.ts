@@ -503,6 +503,29 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.deepEqual(parked.frames, ['latch', 'enter', 'restore', 'verify']);
         assert.equal(parked.motion(), 0);
     }],
+    ['D1 pressed with the stick centred opens the hold idle and prefetches the Z baseline; a long idle does not re-open', async () => {
+        const f = fixture(false, { pipeline: true });
+        await f.initialize();
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        f.input();
+        f.stream({ deadman: true, feed: 3000 }, 400);
+        await f.tick(); await f.flush();
+        let hold = (await readStatus(f)).pipeline.lastHold;
+        assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify'], 'G53 on the D1 press, before any stick motion');
+        assert.equal(f.queued.length, 0, 'nothing moved');
+        assert.equal(hold.zBaseline, 'agreed', 'the Z baseline was taken while idle');
+        assert.match(hold.stopReason, /Feather report gap/);
+        const parked = fixture(false, { pipeline: true });
+        await parked.initialize();
+        assert.equal((await parked.request('/pendant/arm', { clearanceConfirmed: true, bounds: wide })).status, 200);
+        parked.input();
+        parked.stream({ deadman: true, feed: 3000 }, 6000);
+        await parked.tick(); await parked.flush();
+        hold = (await readStatus(parked)).pipeline.lastHold;
+        assert.equal(hold.stopReason, 'stick centred for 2000 ms');
+        for (let i = 0; i < 5; i += 1) { await parked.request('/pendant/keepalive', {}); await parked.tick(); await parked.flush(); }
+        assert.equal(parked.frames.filter((frame) => frame === 'enter').length, 1, 'D1 still held: no G53/G54 churn every 2 s');
+    }],
     ['M220 S100 is asserted once per arm, not on every hold press', async () => {
         const f = fixture(false, { pipeline: true });
         f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input(); } });
@@ -1044,7 +1067,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify', 'latch', 'enter', 'restore', 'verify']);
         assert.ok(f.queued.length > 4);
         assert.ok(f.queued[f.queued.length - 1].target.x < f.queued[3].target.x, 'the second hold followed the reversed stick');
-        assert.match((await readStatus(f)).pipeline.lastHold.stopReason, /Feather report gap/);
+        assert.match((await readStatus(f)).pipeline.lastHold.stopReason, /Feather report gap|at the approved X limit/);
     }],
     ['every stop trigger ends the hold within one tick and closes it with exactly one G54', async () => {
         const triggers = ['release', 'deadman', 'stop', 'gap', 'keepalive', 'reply-error', 'alarm', 'epoch', 'latch', 'status', 'stale'];
@@ -1062,7 +1085,9 @@ export const tests: Array<[string, () => Promise<void>]> = [
             await startRun(f, {}, 5000);
             const after = await readStatus(f);
             const lastSend = f.queued[f.queued.length - 1].sentAt;
-            const extra = how === 'keepalive' ? 900 : 0; // The page watchdog allows 900 ms of silence before it disarms.
+            // The page watchdog allows 900 ms of silence before it disarms; a Feather gap is judged at HOLD_FEATHER_GAP_MS.
+            const extras: Record<string, number> = { keepalive: 900, gap: pendantHold.HOLD_FEATHER_GAP_MS - 150 };
+            const extra = extras[how] ?? 0;
             assert.ok(lastSend <= stopAt + extra + HOLD_TICK_MS + 1e-6, `${how}: last send ${lastSend - stopAt} ms after the trigger`);
             if (how === 'reply-error') {
                 assert.deepEqual(f.frames, ['latch', 'enter', 'restore'], `${how}: an unacknowledged G1 restores without proving a position`);
@@ -1362,7 +1387,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         z.input(); z.input({ z: 1, mode: 'z', deadman: true, feed: 600 }); await z.tick();
         assert.equal(z.moves(), 1); assert.equal(z.queued.length, 0); assert.deepEqual(z.frames, []); await z.finish();
         const f = fixture(false, { pipeline: true });
-        f.setRtt(250);
+        f.setRtt(350);
         await startRun(f, {}, 1500);
         let after = await readStatus(f);
         assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement');
@@ -1391,7 +1416,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(after.pipeline.disabled, null); assert.equal(after.pipeline.lateEvents, 0);
         // A hold that ends for any other reason resets the streak.
         const clean = fixture(false, { pipeline: true });
-        clean.setRtt(250);
+        clean.setRtt(350);
         await startRun(clean, {}, 1500);
         assert.equal((await readStatus(clean)).pipeline.lateEvents, 1);
         clean.setRtt(80);
@@ -1443,11 +1468,11 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.ok(sends.some((t) => t.replyMs > 80), 'a G1 queued behind the M114 waited for it');
         assert.ok(sends.every((t) => t.replyMs <= 200), 'but stayed within budget');
         const late = fixture(false, { pipeline: true, serialized: true });
-        late.setCountRtt(150);
+        late.setCountRtt(250);
         late.onQueue((count) => { if (count === 14) { late.stopStream(); late.input(); } });
         await startRun(late, {}, 5000);
         after = await readStatus(late);
-        assert.ok(after.pipeline.lastHold.lateMoveReplies >= 1, 'the G1 behind a 150 ms M114 took over 200 ms');
+        assert.ok(after.pipeline.lastHold.lateMoveReplies >= 1, 'the G1 behind a 250 ms M114 took over 300 ms');
         assert.equal(after.pipeline.lastHold.stopReason, 'D1 released', 'isolated late replies (one per Count poll) are tolerated');
         assert.equal(after.pipeline.disabled, null);
         assert.equal(after.armed, true);

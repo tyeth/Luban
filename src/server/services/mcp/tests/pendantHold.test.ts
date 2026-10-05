@@ -10,11 +10,11 @@ import { PENDANT_Z_FEED_MAX } from '../pendant';
 const origin = { x: 10, y: 20, z: 300 };
 
 export const tests: Array<[string, () => void | Promise<void>]> = [
-    ['the pacing constants are the operator\'s: 100 ms ticks and increments, 200 ms queued ahead, 150 ms Feather gap, 250 ms Count poll', () => {
+    ['the pacing constants are the operator\'s: 100 ms ticks and increments, 200 ms queued ahead, 250 ms Feather gap, 250 ms Count poll', () => {
         assert.equal(HOLD_TICK_MS, 100);
         assert.equal(HOLD_MOVE_MS, 100);
         assert.equal(HOLD_QUEUE_AHEAD_MS, 200);
-        assert.equal(HOLD_FEATHER_GAP_MS, 150);
+        assert.equal(HOLD_FEATHER_GAP_MS, 250);
         assert.equal(HOLD_COUNT_POLL_MS, 250);
         assert.equal(HOLD_HEARTBEAT_MAX_AGE_MS, 4500, 'two 2 s poll periods plus jitter: one late poll never flips a hold');
         assert.equal(HOLD_LATE_EVENTS_TO_DISABLE, 3);

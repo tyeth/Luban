@@ -186,6 +186,12 @@ export class PendantRuntime {
     // X/Y continue through the continuous hold, which omits Z.
     private zRefused: string | null = null;
 
+    // A D1 press edge (deadman false -> true) not yet acted on: the hold is entered on the press,
+    // with the stick still centred, so G90/G53 (and the Z baseline) are done before the stick moves.
+    private d1PressPending = false;
+
+    private lastInputDeadman = false;
+
     // The last hold's commanded end when its close restored G54 but the M114 proof did not
     // match: the next press proves it on demand (proveLastHoldClose) instead of waiting for a beat.
     private lastHoldClose: { chain: JogPosition; latchSince: number | null } | null = null;
@@ -561,6 +567,9 @@ export class PendantRuntime {
                             if (input.log) { trace(`feather ${input.log}`); }
                             this.feedbackHealthy = input.feedback_ok ?? null;
                             this.session.receive(input, Date.now());
+                            if (input.deadman && !this.lastInputDeadman) { this.d1PressPending = true; }
+                            if (!input.deadman) { this.d1PressPending = false; }
+                            this.lastInputDeadman = input.deadman;
                             if (input.stop) { this.disarm('Stopped with Feather D2.'); }
                             if (this.session.armed && input.feedback_ok === false) {
                                 this.disarm('Feather feedback exceeded one second. Centre axes and re-arm after the USB link recovers.');
@@ -646,7 +655,23 @@ export class PendantRuntime {
         this.ready(graced);
         const from = graced ? { ...(this.lastProvedPosition as JogPosition) } : this.position();
         const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
-        if (!target) { this.release(); return; }
+        if (!target) {
+            // Optimistic entry: D1 pressed with the stick centred opens the hold idle (no motion), so the
+            // first increment goes out as soon as the stick moves instead of after G90/G53 round trips.
+            const latestInput = this.session.latest;
+            const centred = !!latestInput && Math.hypot(latestInput.x, latestInput.y, latestInput.z) < 0.01;
+            if (this.d1PressPending && centred && latestInput?.deadman === true && !this.holdOffUntilNeutral
+                && this.pipelineEligible(from, { position: from, feed: 0, durationMs: 0, distanceMm: 0 } as JogTarget)) {
+                this.d1PressPending = false;
+                this.holdPromise = this.continuousHold(from);
+                try { await this.holdPromise; } finally { this.holdPromise = null; }
+                this.queueNextTick();
+                return;
+            }
+            this.release();
+            return;
+        }
+        this.d1PressPending = false;
         if (this.pipelineEligible(from, target) && this.holdAdmits(from, now)) {
             this.holdPromise = this.continuousHold(from);
             try { await this.holdPromise; } finally { this.holdPromise = null; }
@@ -1215,6 +1240,7 @@ export class PendantRuntime {
         let idleSince: number | null = null;
         // Z words only after this hold's in-hold M114 agreed with the chain (zBaseline).
         let zProved = false;
+        let zPrefetched = false;
         this.lastProvedPosition = null;
         this.lastHoldClose = null;
         let entered = false;
@@ -1286,6 +1312,23 @@ export class PendantRuntime {
                         if (reason === 'stick centred') {
                             if (idleSince === null) { idleSince = now; }
                             if (now - idleSince < HOLD_IDLE_CLOSE_MS) {
+                                // Idle with nothing queued: take the Z baseline now, once, so a first Z twist
+                                // streams at once instead of draining and proving first.
+                                if (!zProved && !zPrefetched && !this.zRefused && !this.pipeline.zDisabled
+                                    && model.outstandingMs(now) <= 0 && !poll.pending) {
+                                    zPrefetched = true;
+                                    const problem = await this.zBaseline(leased, chain, inputAgeMs);
+                                    summary.zBaseline = problem || 'agreed';
+                                    if (problem) {
+                                        summary.stopReason = `no Z word sent: ${problem}`;
+                                        this.holdOffUntilNeutral = true;
+                                        this.zRefused = problem;
+                                        log.warn(`Z jogging refused until re-arm: the in-hold M114 baseline disagreed (${problem}).`);
+                                        break;
+                                    }
+                                    zProved = true;
+                                    continue;
+                                }
                                 // Idle in G53: keep proving the position so the hold never ages out waiting for a beat.
                                 // The loop looks again a tick from now, so poll a tick early: gaps stay within HOLD_IDLE_POLL_MS.
                                 pollEvery(now, HOLD_IDLE_POLL_MS - HOLD_TICK_MS, summary.feed, inputAgeMs);
