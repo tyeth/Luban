@@ -202,6 +202,22 @@ class ConnectionManager {
     /**
      * The active channel, or null when disconnected. Read-only use (MCP).
      */
+    // Bumped on every channel (re)assignment, including a reconnect to the same
+    // singleton channel object: object identity proves nothing here.
+    private channelAssignments = 0;
+
+    /**
+     * Read-only connection identity for the MCP failure hook (#221): the
+     * assignment count plus the channel's own reconnect generation (SSTP over
+     * HTTP, the SACP TCP/UDP/serial channels and the text serial channel all
+     * keep one). Two equal values mean the same connection.
+     */
+    public getConnectionGeneration(): string {
+        const inner = this.channel as unknown as { getConnectionGeneration?: () => number } | null;
+        const own = inner && typeof inner.getConnectionGeneration === 'function' ? inner.getConnectionGeneration() : 0;
+        return `${this.channelAssignments}.${own}`;
+    }
+
     public getCurrentChannel(): Channel | null {
         return this.channel;
     }
@@ -394,6 +410,7 @@ class ConnectionManager {
         }
         this.unbindChannelEvents();
         this.channel = sstpHttpChannel;
+        this.channelAssignments += 1;
         this.connectionType = ConnectionType.WiFi;
         this.protocol = NetworkProtocol.HTTP;
         this.bindChannelEvents();
@@ -409,6 +426,7 @@ class ConnectionManager {
         const instance = this.machineInstance;
         this.unbindChannelEvents();
         this.channel = null;
+        this.channelAssignments += 1;
         this.machineIdentifier = null;
         this.machineInstance = null;
         octo.onStop();
@@ -473,6 +491,7 @@ class ConnectionManager {
         if (this.channel) {
             this.unbindChannelEvents();
             this.channel = null;
+            this.channelAssignments += 1;
         }
 
         const { connectionType, protocol } = options;
@@ -491,12 +510,16 @@ class ConnectionManager {
 
             if (this.protocol === NetworkProtocol.SacpOverTCP) {
                 this.channel = sacpTcpChannel;
+                this.channelAssignments += 1;
             } else if (this.protocol === NetworkProtocol.SacpOverUDP) {
                 this.channel = sacpUdpChannel;
+                this.channelAssignments += 1;
             } else if (this.protocol === NetworkProtocol.HTTP) {
                 this.channel = sstpHttpChannel;
+                this.channelAssignments += 1;
             } else {
                 this.channel = sstpHttpChannel;
+                this.channelAssignments += 1;
             }
         } else {
             const { port, baudRate } = options;
@@ -505,8 +528,10 @@ class ConnectionManager {
 
             if (this.protocol === SerialPortProtocol.SacpOverSerialPort) {
                 this.channel = sacpSerialChannel;
+                this.channelAssignments += 1;
             } else {
                 this.channel = textSerialChannel;
+                this.channelAssignments += 1;
             }
         }
 
@@ -601,6 +626,7 @@ class ConnectionManager {
         // destroy channel
         this.unbindChannelEvents();
         this.channel = null;
+        this.channelAssignments += 1;
         this.machineIdentifier = null;
 
         // destroy machine instance

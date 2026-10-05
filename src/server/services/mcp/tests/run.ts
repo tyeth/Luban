@@ -32,8 +32,10 @@ import { tests as directMovePlanTests } from './directMovePlan.test';
 import { tests as envelopeChecksTests } from './envelopeChecks.test';
 import { tests as gpioFeedTests } from './gpioFeed.test';
 import { tests as frameRecoveryTests } from './frameRecovery.test';
+import { tests as failureRecoveryTests } from './failureRecovery.test';
 import { tests as inspectionReportTests } from './inspectionReport.test';
 import { tests as jobDashboardTests } from './jobDashboard.test';
+import { tests as jobModalRecoveryTests } from './jobModalRecovery.test';
 import { tests as jobEndingTests } from './jobEnding.test';
 import { tests as landmarkClearanceTests } from './landmarkClearance.test';
 import { tests as machinePositionTests } from './machinePosition.test';
@@ -65,10 +67,12 @@ import { tests as spindleProgramTests } from './spindleProgram.test';
 import { tests as spindleTrackerTests } from './spindleTracker.test';
 import { tests as telemetryConfigTests } from './telemetryConfig.test';
 import { tests as telemetryRingTests } from './telemetryRing.test';
+import { tests as connectionGenerationTests } from './connectionGeneration.test';
 
 type TestCase = [string, () => void | Promise<void>];
 
 const suites: Array<[string, TestCase[]]> = [
+    ['connectionGeneration', connectionGenerationTests],
     ['pendant', pendantTests],
     ['pendantPosition', pendantPositionTests],
     ['pendantPage', pendantPageTests],
@@ -91,6 +95,8 @@ const suites: Array<[string, TestCase[]]> = [
     ['cameraSelection', cameraSelectionTests],
     ['bootstrapPlan', bootstrapPlanTests],
     ['frameRecovery', frameRecoveryTests],
+    ['failureRecovery', failureRecoveryTests],
+    ['jobModalRecovery', jobModalRecoveryTests],
     ['probeFeedHealth', probeFeedHealthTests],
     ['gpioFeed', gpioFeedTests],
     ['probeInspection', probeInspectionTests],
