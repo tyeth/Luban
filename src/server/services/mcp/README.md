@@ -1808,9 +1808,12 @@ channel's `executeGcode`, the SSTP job and override endpoints (including the MCP
 and ConnectionManager's job, jog, home and origin entry points, and it shortens every HTTP
 request to 10 s while held (`PIPELINE_REQUEST_TIMEOUT_MS`), so a hung request fails the run
 instead of blocking recovery for the channel's 300 s. After a failed restore the frame latch
-becomes a recovery hold that admits only frame recovery, homing as the whole `G53`/`G28`/`G54`
-sequence (a bare `G53` or `G28` is refused; Luban's Home button sends its three requests inside
-`runAsHomeSequence`), position queries, spindle off and job stop.
+becomes a recovery hold that admits only frame recovery (`restore_work_frame` or the pendant
+page's Restore work frame), Luban's own UI Home button as the whole `G53`/`G28`/`G54` sequence
+(a bare `G53` or `G28` is refused; the button sends its three requests inside
+`runAsHomeSequence`), position queries, spindle off and job stop. The MCP `home` tool and the
+pendant page's Home are NOT routes out: both go through `requireReliableMachine`, which refuses
+on any latch, and a re-home is not the remedy for a frame problem anyway.
 
 By default a run commands at most the approved segment duration before it settles. The A350
 heartbeat reports the planner's queued target, so it cannot confirm execution mid-run.

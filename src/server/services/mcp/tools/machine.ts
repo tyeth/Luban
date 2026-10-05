@@ -258,8 +258,9 @@ export function endMachineFrameRun(): void {
 // the controller may have had G53 selected (a queued pendant run, a failed
 // call's cleanup, a restore never verified), it may still be there. On startup
 // the latch is re-raised, and the gcode lease reads the latch as its recovery
-// hold, so only Restore work frame, homing, position queries and job stop pass
-// until a restore and a verified position clear it. The file is FAIL-SAFE
+// hold, so only Restore work frame, Luban's UI Home sequence, position queries
+// and job stop pass until a restore and a verified position clear it (the MCP
+// home tool is refused by requireReliableMachine like every other motion). The file is FAIL-SAFE
 // (2026-10-05 review): it is written whole (temp file + rename, never a torn
 // write), and a file that exists but cannot be read or parsed raises the latch
 // rather than being ignored - an unreadable record of uncertainty is still

@@ -149,7 +149,7 @@ function fixture(a350 = false, options: { pipeline?: boolean; runMs?: number } =
                 now += rttMs; hooks.stream();
                 if (onEnter) { onEnter(); }
                 if (enterFail) { throw Error('transport_error after the request was sent'); }
-                feedOverride = { gcode: 'M220 S100', at: now, connection: 'c' }; // What recordModalSend notes for the accepted payload.
+                feedOverride = { gcode: 'M220 S100', at: now, connection: 'c', certain: true, note: null }; // What recordModalSend notes for the accepted payload.
                 return { result: 0 };
             },
             queueMachineMove: async (_tool: string, target: { x: number; y: number; z: number }, feed: number) => {

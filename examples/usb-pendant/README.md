@@ -224,10 +224,14 @@ accepted override as `pipeline.feedOverride` (armed or not), and an MCP tool's
     IS the frame-uncertainty latch (below), read directly, so it cannot outlive
     it: `holdForRecovery` re-raises the latch if a verified beat had cleared it
     between the G54 acknowledgement and the failed fallback restore. It accepts
-    only `G90`/`G54`, `M5`, `M114`, `M400`, `M503`, job stop/pause, and homing
-    as the whole `G53`/`G28`/`G54` sequence: Luban's Home button sends its three
-    requests inside `runAsHomeSequence`, and its accepted `G54` marks the frame
-    restored; a bare `G53` or `G28` is refused.
+    only `G90`/`G54`, `M5`, `M114`, `M400`, `M503`, job stop/pause, and Luban's
+    own UI Home button as the whole `G53`/`G28`/`G54` sequence (it sends its
+    three requests inside `runAsHomeSequence`, and its accepted `G54` marks the
+    frame restored; a bare `G53` or `G28` is refused). The ways out are
+    **Restore work frame** (this page or MCP `restore_work_frame`) and that UI
+    Home button. This page's **Home** and the MCP `home` tool are refused while
+    the frame is uncertain: both check the position first, and a re-home is not
+    the remedy for a frame problem.
 - **Frame-uncertainty latch.** It is set before the G53 is sent and persisted
   across Luban restarts (`mcp-frame-latch.json`, written whole; a file that
   exists but cannot be read raises the latch). On startup it returns, and with

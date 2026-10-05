@@ -792,7 +792,33 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.equal(after.feed_override?.gcode, 'M220 S100');
         assert.ok(after.warnings.some((w) => /M220 S100 was sent at .* and PERSISTS/.test(w)));
         clearFeedOverride();
-        recordModalSend('3.1', 'M220 S50')('rejected');
-        assert.equal(getFeedOverride(), null, 'a rejected override changed nothing');
+        recordModalSend('3.1', 'M220 S50')('not-sent');
+        assert.equal(getFeedOverride(), null, 'a payload that never left changed nothing');
+    }],
+
+    ['an M220 in a payload that was not fully accepted is recorded as uncertain: SSTP stops at the first failure without saying which', async () => {
+        const h = harness();
+        // The pendant's `M220 S100 / G90 / G53;` with the G53 rejected: the M220 ran first, or was itself the failure.
+        recordModalSend('3.1', 'M220 S100\nG90\nG53;')('rejected');
+        const doubt = getFeedOverride();
+        assert.equal(doubt?.gcode, 'M220 S100');
+        assert.equal(doubt?.certain, false);
+        assert.match(String(doubt?.note), /stops at the first failure and does not report which line failed/);
+        failingTool(h, 'move_tool', [['G53', 'accepted'], ['G1 X10 F500', 'rejected']]);
+        const ev = (await callExpectingError(h, 'move_tool')).failureRecovery as RecoveryEvidence;
+        assert.equal(ev.feed_override?.certain, false);
+        assert.ok(ev.warnings.some((w) => /M220 S100 was sent .* but the payload carrying it was not fully accepted.*may or may not be in force/.test(w)));
+        // An indeterminate payload (transport error) is the same doubt; a certain record of the same word is not downgraded.
+        clearFeedOverride();
+        recordModalSend('3.1', 'M220 S100')('indeterminate');
+        assert.equal(getFeedOverride()?.certain, false);
+        recordModalSend('3.1', 'M220 S100')('accepted');
+        assert.equal(getFeedOverride()?.certain, true);
+        recordModalSend('3.1', 'M220 S100\nG90\nG53;')('rejected');
+        assert.equal(getFeedOverride()?.certain, true, 'S100 is already known to be in force');
+        recordModalSend('3.1', 'M220 S80\nG90')('rejected');
+        assert.equal(getFeedOverride()?.gcode, 'M220 S80');
+        assert.equal(getFeedOverride()?.certain, false, 'a different value in doubt replaces it');
+        clearFeedOverride();
     }],
 ];

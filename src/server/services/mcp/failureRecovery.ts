@@ -192,6 +192,14 @@ export interface FeedOverride {
     gcode: string;
     at: number;
     connection: string;
+    /**
+     * True when the whole payload was accepted. SSTP runs a payload line by
+     * line and stops at the first failure, and its reply does not say which
+     * line failed, so an M220 in a payload that was rejected or went
+     * indeterminate MAY have run: recorded with certain=false and `note`.
+     */
+    certain: boolean;
+    note: string | null;
 }
 
 let feedOverride: FeedOverride | null = null;
@@ -206,10 +214,17 @@ export function clearFeedOverride(): void {
     feedOverride = null;
 }
 
+const FEED_OVERRIDE_UNCERTAIN = 'the payload carrying it was not fully accepted; SSTP runs lines in order, stops at the first '
+    + 'failure and does not report which line failed, so the override may or may not be in force';
+
 function feedOverrideWarning(override: FeedOverride): string {
-    return `${override.gcode} was sent at ${new Date(override.at).toISOString()} (connection ${override.connection}) and PERSISTS: `
-        + 'the controller keeps that feed override for later file jobs too, so a reduced touchscreen speed % is overridden '
-        + 'until it is set again.';
+    const when = `at ${new Date(override.at).toISOString()} (connection ${override.connection})`;
+    if (!override.certain) {
+        return `${override.gcode} was sent ${when} but ${FEED_OVERRIDE_UNCERTAIN}. If it ran it PERSISTS: the controller keeps a feed `
+            + 'override for later file jobs too, so a reduced touchscreen speed % would be overridden until it is set again.';
+    }
+    return `${override.gcode} was sent ${when} and PERSISTS: the controller keeps that feed override for later file jobs too, so a `
+        + 'reduced touchscreen speed % is overridden until it is set again.';
 }
 
 /** Called by the direct send path for every payload; the ledger part is a no-op outside a tool call. */
@@ -224,7 +239,14 @@ export function recordModalSend(connection: string, gcode: string): (outcome: Se
     return (outcome: SendOutcome) => {
         settle(outcome);
         if (outcome === 'accepted') {
-            feedOverride = { gcode: word, at: Date.now(), connection };
+            feedOverride = { gcode: word, at: Date.now(), connection, certain: true, note: null };
+        } else if (outcome === 'rejected' || outcome === 'indeterminate') {
+            // The M220 line may have run before the line that failed (or it was
+            // the failed line itself); a certain record of the same word already
+            // in force is not downgraded by that doubt.
+            if (!(feedOverride && feedOverride.certain && feedOverride.gcode === word)) {
+                feedOverride = { gcode: word, at: Date.now(), connection, certain: false, note: FEED_OVERRIDE_UNCERTAIN };
+            }
         }
     };
 }
@@ -696,7 +718,7 @@ async function decideAndRecover(ctx: OperationContext, failureKind: FailureKind,
     const prior = getFrameLatch();
     if (prior) {
         return skip('another-operation-active', 'Another operation holds command authority: the frame-uncertainty latch is already '
-            + `set (${prior.reason}) and its recovery hold admits only ${MANUAL_RECOVERY}, homing and queries. A second cleanup `
+            + `set (${prior.reason}) and its recovery hold admits only ${MANUAL_RECOVERY}, Luban's UI Home and queries. A second cleanup `
             + `would duplicate that restore, so nothing was sent; call ${MANUAL_RECOVERY} once the controller is idle.`);
     }
     const problem = sendProblem(ctx, deps);

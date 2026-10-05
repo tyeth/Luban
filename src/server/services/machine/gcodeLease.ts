@@ -13,8 +13,10 @@
 // The RECOVERY HOLD is the frame-uncertainty latch (mcp/positionOfRecord.ts),
 // read directly: there is no second state to fall out of step with it. While
 // the latch is set, everyone is refused everything except no-motion frame
-// recovery, homing, position queries, spindle off and job stop/pause, and no
-// new lease is granted. The hold ends exactly when the latch clears - after an
+// recovery, Luban's own UI Home sequence, position queries, spindle off and
+// job stop/pause, and no new lease is granted. (The MCP `home` tool and the
+// pendant page's Home go through requireReliableMachine, which refuses on any
+// latch: the routes out are restore_work_frame and the UI Home button.) The hold ends exactly when the latch clears - after an
 // acknowledged restore AND a verified position (tools/machine.ts
 // getPositionSnapshot) - whoever raised it: the pendant, the failed-call
 // cleanup hook, or a Luban restart. `holdForRecovery` therefore re-raises the
@@ -179,9 +181,11 @@ export class GcodeLease {
         } else {
             const hold = this.recoveryHold();
             if (hold && !isRecoveryCommand(what, { homing: this.homing.getStore() === true })) {
-                reason = `the controller may still be in the machine workspace (${hold.reason}). Only Restore work frame, `
-                    + 'homing (Luban\'s Home button or the home tool, as the whole G53/G28/G54 sequence), position queries, '
-                    + 'spindle off and job stop are accepted until a verified position clears it.';
+                reason = `the controller may still be in the machine workspace (${hold.reason}). Only Restore work frame `
+                    + '(restore_work_frame or the pendant page\'s button), Luban\'s own UI Home button (its whole G53/G28/G54 '
+                    + 'sequence), position queries, spindle off and job stop are accepted until a verified position clears it. '
+                    + 'The MCP home tool and the pendant page\'s Home are refused while the frame is uncertain, and a re-home is '
+                    + 'not the remedy.';
             }
         }
         if (!reason) { return null; }

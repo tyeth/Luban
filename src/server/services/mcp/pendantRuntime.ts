@@ -101,8 +101,13 @@ const pipelineRunBudgetMs = (maxSegmentMs: number): number => {
     const raw = typeof process !== 'undefined' ? Number(process.env?.LUBAN_PENDANT_PIPELINE_RUN_MS) : NaN;
     return Number.isFinite(raw) ? Math.max(maxSegmentMs, Math.min(PIPELINE_RUN_MAX_MS, raw)) : maxSegmentMs;
 };
-// After a restore, wait this long for the verified position before ready() may refuse.
-const FRAME_VERIFY_WAIT_MS = 3000;
+// After a restore, wait this long for the verified position before ready() may
+// refuse. Only a WORK-frame reading clears the latch (positionOfRecord.ts
+// frameLatchVerified): the settle's own echo is read inside the G53 window, so
+// the clearing beat is the first heartbeat at least 1 s after the restore,
+// which on the 2 s poll can arrive up to 3 s after it; the extra second covers
+// HTTP jitter. Nothing moves while this waits.
+const FRAME_VERIFY_WAIT_MS = 4000;
 const PIPELINE_POLL_MS = 10;
 // A run needs a heartbeat at most this old (the WiFi poll is 2 s); older ends the run.
 export const PIPELINE_HEARTBEAT_MAX_AGE_MS = 2500;

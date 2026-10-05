@@ -214,10 +214,13 @@ G54;`;
     if (options.onReply) {
         options.onReply();
     }
-    const arrived = (machine: NullableXyz, source: PositionSource) => {
+    const arrived = (machine: NullableXyz, source: PositionSource, frame: 'work-frame' | 'machine-frame') => {
         const full = completeTarget(machine, target);
         if (full) {
-            setPositionOfRecord(full, source, executed.sequence, tool);
+            // The frame the report was read in travels with the record: a
+            // machine-frame echo (taken inside the G53 window) proves the
+            // arrival but never clears the frame latch (positionOfRecord.ts).
+            setPositionOfRecord(full, source, executed.sequence, tool, frame);
         }
         traceMark(`engine-exit:${source}`);
     };
@@ -241,7 +244,7 @@ G54;`;
             if (match.frame === 'work-frame') {
                 setTrustedOffset(match.offset);
             }
-            arrived(machineFromReport(echo, match.offset, match.frame), 'echo');
+            arrived(machineFromReport(echo, match.offset, match.frame), 'echo', match.frame);
             return;
         }
         traceMark('echo-miss');
@@ -317,7 +320,7 @@ G54;`;
                 if (match.frame === 'work-frame') {
                     setTrustedOffset(match.offset);
                 }
-                arrived(machineFromReport(now.work, match.offset, match.frame), 'heartbeat');
+                arrived(machineFromReport(now.work, match.offset, match.frame), 'heartbeat', match.frame);
                 return;
             }
         }
@@ -555,7 +558,8 @@ export async function verifyRestoredPosition(tool: string, expected: Xyz): Promi
     if (!full) {
         return false;
     }
-    setPositionOfRecord(full, 'echo', executed.sequence, tool);
+    // judgeRestoredEcho admits only a work-frame reading, so this record may clear the latch.
+    setPositionOfRecord(full, 'echo', executed.sequence, tool, 'work-frame');
     return true;
 }
 

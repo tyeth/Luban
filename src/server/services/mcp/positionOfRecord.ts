@@ -130,11 +130,23 @@ export interface PositionOfRecord {
      * verified X174, the next beat - stamped 750 ms later - still read X178).
      */
     previousMachine: Xyz | null;
+    /**
+     * In which frame the report that set this record was read (matchFrame):
+     * an echo taken inside a G53 window is 'machine-frame'. Estimates have
+     * none. The frame latch is cleared only by a 'work-frame' record.
+     */
+    frame?: 'work-frame' | 'machine-frame';
 }
 
 let record: PositionOfRecord | null = null;
 
-export function setPositionOfRecord(machine: Xyz, source: PositionSource, sequence: number, tool: string): PositionOfRecord {
+export function setPositionOfRecord(
+    machine: Xyz,
+    source: PositionSource,
+    sequence: number,
+    tool: string,
+    frame?: 'work-frame' | 'machine-frame'
+): PositionOfRecord {
     const previousMachine = record ? { ...record.machine } : null;
     record = {
         machine: { x: machine.x, y: machine.y, z: machine.z },
@@ -143,6 +155,7 @@ export function setPositionOfRecord(machine: Xyz, source: PositionSource, sequen
         sequence,
         tool,
         previousMachine,
+        ...(frame ? { frame } : {}),
     };
     return record;
 }
@@ -466,8 +479,12 @@ export function clearFrameLatch(): void {
 /**
  * Pure: whether this evidence verifies a fresh position after the restore. A
  * controller-verified arrival (echo or settled heartbeat, not an estimate)
- * recorded after the restore, or an accepted work-frame beat with a reported
- * offset received at least FRAME_LATCH_BEAT_MS after it.
+ * recorded after the restore AND read in the WORK frame, or an accepted
+ * work-frame beat with a reported offset received at least FRAME_LATCH_BEAT_MS
+ * after it. The frame requirement on the record matters (2026-10-05 review):
+ * the pendant's settle writes its echo record after the G54 reply, but that
+ * echo was read inside the G53 window as 'machine-frame' - it proves the
+ * arrival, not the workspace. A record with no frame never clears the latch.
  */
 export function frameLatchVerified(
     latch: FrameLatch,
@@ -477,7 +494,7 @@ export function frameLatchVerified(
     if (latch.restoredAt === null) {
         return false;
     }
-    if (rec && rec.source !== 'estimated' && rec.at >= latch.restoredAt) {
+    if (rec && rec.source !== 'estimated' && rec.frame === 'work-frame' && rec.at >= latch.restoredAt) {
         return true;
     }
     return beat.accepted && !beat.declaredRun && beat.frame === 'work-frame' && beat.offsetSource === 'heartbeat'

@@ -301,6 +301,33 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.ok(job.events.some((e) => e.phase === 'modal_recovery'));
     }],
 
+    ['an unreadable job file is judged conservatively: G53 possible, nothing sent, the shared frame latch raised', async () => {
+        clearFrameLatch();
+        const files = new Map<string, string>();
+        const manager = managerFixture(files);
+        const { judgeFileJobEnd } = gcodeTools(manager, files, { count: 0 });
+        const validation = { warnings: [], extents: {}, spindle: {}, motionLineCount: 0 } as unknown as McpJob['validation'];
+        // The program itself never selects G53; what matters is that it cannot be read back.
+        const job = manager.submit(G91_FILE, 'unreadable file', 'cnc', validation);
+        job.state = 'started';
+        job.modalTrack = { startConnection: CONN, lastLine: 3, totalLines: 8, lastProgress: null, stoppingSeen: false };
+        const read = files.get.bind(files);
+        files.get = (name: string) => { if (name === job.filePath) { throw new Error('EACCES'); } return read(name); };
+        const ev = await judgeFileJobEnd(job, 'completed', 'done') as RecoveryEvidence;
+        assert.equal(ev.exposure.g53_possible, true, 'explicit, not the "absent means possible" default');
+        // Field by field: the object was built in the vm-loaded module's realm.
+        assert.equal(ev.exposure.state.workspace, 'unknown');
+        assert.equal(ev.exposure.state.distance, 'unknown');
+        assert.ok(ev.exposure.reasons.some((r) => /could not be read back/.test(r)));
+        assert.equal(ev.skip_reason, 'job-completed-with-modal-exposure');
+        const latch = getFrameLatch();
+        assert.ok(latch, 'the shared latch is raised');
+        assert.match(String(latch?.reason), /file-job:unreadable[ _]file \(job [0-9a-f]+\) may have left the machine workspace \(G53\) selected/);
+        assert.deepEqual(ev.position.frame_uncertain, latch);
+        assert.equal(job.failureRecovery, ev);
+        clearFrameLatch();
+    }],
+
     ['a procedure runner that fails inside the start wait gets its own guarded cleanup, reported on the start error', async () => {
         const files = new Map<string, string>();
         const manager = managerFixture(files);
