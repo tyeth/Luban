@@ -526,6 +526,17 @@ export const tests: Array<[string, () => Promise<void>]> = [
         for (let i = 0; i < 5; i += 1) { await parked.request('/pendant/keepalive', {}); await parked.tick(); await parked.flush(); }
         assert.equal(parked.frames.filter((frame) => frame === 'enter').length, 1, 'D1 still held: no G53/G54 churn every 2 s');
     }],
+    ['Feather input wakes an idle hold at once on stick motion, release or STOP, not on a centred stick', async () => {
+        const f = fixture(false, { pipeline: true });
+        await f.initialize();
+        let woke = 0;
+        f.runtime.holdWake = () => { woke += 1; };
+        f.input({ deadman: true }); assert.equal(woke, 0, 'centred stick, D1 held: keep idling');
+        f.input({ x: 0.05, deadman: true }); assert.equal(woke, 1, 'stick motion wakes the hold');
+        f.input({ z: -0.2, mode: 'z', deadman: true }); assert.equal(woke, 2, 'a Z twist wakes it');
+        f.input(); assert.equal(woke, 3, 'D1 release wakes it');
+        f.input({ stop: true }); assert.equal(woke, 4, 'STOP wakes it');
+    }],
     ['M220 S100 is asserted once per arm, not on every hold press', async () => {
         const f = fixture(false, { pipeline: true });
         f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input(); } });
@@ -1825,15 +1836,21 @@ export const tests: Array<[string, () => Promise<void>]> = [
         }
         assert.equal((await readStatus(f)).pipeline.lastHold.zBaseline, 'agreed');
     }],
-    ['an idle hold polls M114 at least every 500 ms, and those prompt agreeing replies are position freshness', async () => {
+    ['an idle hold polls M114 only when its freshest evidence goes stale, and those agreeing replies are position freshness', async () => {
+        const fresh = fixture(false, { pipeline: true });
+        let freshIdleAt = 0;
+        fresh.onQueue((count) => { if (count === 3) { freshIdleAt = fresh.now(); fresh.stream({ deadman: true, feed: 3000 }, 1500); } });
+        await startRun(fresh, {}, 600);
+        assert.equal(fresh.counts.filter((c) => c.tool === 'usb_pendant:count' && c.sentAt >= freshIdleAt + 300).length, 0,
+            'a fresh heartbeat: no idle M114 to sit in front of the first increment');
         const f = fixture(false, { pipeline: true });
         let idleAt = 0;
-        f.onQueue((count) => { if (count === 3) { idleAt = f.now(); f.stream({ deadman: true, feed: 3000 }, 1500); } });
+        f.onQueue((count) => { if (count === 3) { idleAt = f.now(); f.setReportAge(3000); f.stream({ deadman: true, feed: 3000 }, 6000); } });
         await startRun(f, {}, 600);
         const hold = (await readStatus(f)).pipeline.lastHold;
-        assert.match(hold.stopReason, /Feather report gap/, 'it idled until the stream ended');
+        assert.match(hold.stopReason, /Feather report gap|stick centred for 2000 ms/, `it idled: ${hold.stopReason}`);
         const idle = f.counts.filter((c) => c.tool === 'usb_pendant:count' && c.sentAt >= idleAt);
-        assert.ok(idle.length >= 3, `idle polls ${idle.length}`);
+        assert.ok(idle.length >= 1, `idle polls ${idle.length}`);
         const gaps = idle.slice(1).map((c, i) => c.sentAt - idle[i].sentAt);
         assert.ok(gaps.every((gap) => gap <= pendantHold.HOLD_IDLE_POLL_MS + 1e-6), `gaps ${gaps}`);
         const ticks = JSON.parse((await f.request('/pendant/hold-trace')).body).ticks as Array<{ kind: string; at: number; count?: { fresh: boolean } }>;

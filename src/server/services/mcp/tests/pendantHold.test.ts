@@ -108,7 +108,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.ok(raw.lagMm !== null && raw.lagMm > 19 && raw.off);
     }],
     ['Z in the hold: the M114 freshness and proof constants, F1000 run-out of 3.33 mm and the host-side Z feed cap', () => {
-        assert.equal(HOLD_IDLE_POLL_MS, 500, 'an idle hold still proves its position at least twice a second');
+        assert.equal(HOLD_IDLE_POLL_MS, 2000, 'an idle hold polls only when its freshest evidence is older than 2 s, well inside the 4.5 s limit');
         assert.equal(HOLD_FRESH_REPLY_MS, 200, 'a slower M114 is never position freshness');
         assert.equal(HOLD_CLOSE_PROOF_ATTEMPTS, 3); assert.equal(HOLD_CLOSE_PROOF_RETRY_MS, 200);
         assert.equal(HOLD_ON_DEMAND_PROOF_GAP_MS, 500);

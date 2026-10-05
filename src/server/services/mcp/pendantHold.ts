@@ -38,11 +38,13 @@ export const HOLD_FEATHER_GAP_MS = 250;
 /** `M114` (Count) is polled this often during a hold while it is moving. */
 export const HOLD_COUNT_POLL_MS = 250;
 /**
- * ...and at least this often while the hold idles in G53 (stick centred, D1
- * held), so an idle hold keeps proving its position instead of running into
- * the heartbeat age limit.
+ * ...and, while the hold idles in G53 (stick centred, D1 held), only when the
+ * freshest position evidence (heartbeat or agreeing M114) is older than this,
+ * so an idle hold never runs into the heartbeat age limit but rarely has an
+ * M114 in flight on the one command channel when the stick moves (trial
+ * 2026-10-05 22:21: two first increments waited 44-65 ms behind an idle M114).
  */
-export const HOLD_IDLE_POLL_MS = 500;
+export const HOLD_IDLE_POLL_MS = 2000;
 /**
  * An in-hold M114 counts as position freshness (see readyInHold) only when it
  * answered within this long and its machine position agreed with the hold. A

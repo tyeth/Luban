@@ -192,6 +192,10 @@ export class PendantRuntime {
 
     private lastInputDeadman = false;
 
+    // Wakes an idle hold's tick sleep as soon as the Feather reports a change, instead of
+    // the next HOLD_TICK_MS tick (trial 2026-10-05 22:21: up to 100 ms of first-move delay).
+    private holdWake: (() => void) | null = null;
+
     // The last hold's commanded end when its close restored G54 but the M114 proof did not
     // match: the next press proves it on demand (proveLastHoldClose) instead of waiting for a beat.
     private lastHoldClose: { chain: JogPosition; latchSince: number | null } | null = null;
@@ -570,6 +574,9 @@ export class PendantRuntime {
                             if (input.deadman && !this.lastInputDeadman) { this.d1PressPending = true; }
                             if (!input.deadman) { this.d1PressPending = false; }
                             this.lastInputDeadman = input.deadman;
+                            if (this.holdWake && (!input.deadman || input.stop || Math.hypot(input.x, input.y, input.z) >= 0.01)) {
+                                this.holdWake();
+                            }
                             if (input.stop) { this.disarm('Stopped with Feather D2.'); }
                             if (this.session.armed && input.feedback_ok === false) {
                                 this.disarm('Feather feedback exceeded one second. Centre axes and re-arm after the USB link recovers.');
@@ -803,6 +810,21 @@ export class PendantRuntime {
     }
 
     /** Age of the freshest position evidence: the heartbeat, or a prompt agreeing M114. */
+    // The idle tick's sleep, cut short by holdWake when the Feather reports stick motion, release or STOP.
+    private async idleSleep(ms: number): Promise<void> {
+        await new Promise<void>((resolve) => {
+            let done = false;
+            const finish = (): void => {
+                if (done) { return; }
+                done = true;
+                if (this.holdWake === finish) { this.holdWake = null; }
+                resolve();
+            };
+            this.holdWake = finish;
+            sleep(ms).then(finish, finish);
+        });
+    }
+
     private positionFreshAgeMs(): number {
         return Math.min(getPositionSnapshot().reportAgeMs, Date.now() - this.m114FreshAt);
     }
@@ -1330,10 +1352,11 @@ export class PendantRuntime {
                                     continue;
                                 }
                                 // Idle in G53: keep proving the position so the hold never ages out waiting for a beat.
-                                // The loop looks again a tick from now, so poll a tick early: gaps stay within HOLD_IDLE_POLL_MS.
-                                pollEvery(now, HOLD_IDLE_POLL_MS - HOLD_TICK_MS, summary.feed, inputAgeMs);
+                                // Only when the freshest evidence is going stale (a tick early, as the loop looks again a
+                                // tick from now), so an idle M114 is rarely in flight ahead of the first increment.
+                                if (this.positionFreshAgeMs() > HOLD_IDLE_POLL_MS - HOLD_TICK_MS) { pollEvery(now, 0, summary.feed, inputAgeMs); }
                                 nextTickAt = Math.max(nextTickAt, now) + HOLD_TICK_MS;
-                                await sleep(Math.max(0, nextTickAt - now));
+                                await this.idleSleep(Math.max(0, nextTickAt - now));
                                 continue;
                             }
                             summary.stopReason = `stick centred for ${HOLD_IDLE_CLOSE_MS} ms`;
