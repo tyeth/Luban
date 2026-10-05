@@ -208,8 +208,9 @@ class ConnectionManager {
 
     /**
      * Read-only connection identity for the MCP failure hook (#221): the
-     * assignment count plus the channel's own reconnect generation where it
-     * keeps one (SSTP over HTTP). Two equal values mean the same connection.
+     * assignment count plus the channel's own reconnect generation (SSTP over
+     * HTTP, the SACP TCP/UDP/serial channels and the text serial channel all
+     * keep one). Two equal values mean the same connection.
      */
     public getConnectionGeneration(): string {
         const inner = this.channel as unknown as { getConnectionGeneration?: () => number } | null;

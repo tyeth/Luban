@@ -7,7 +7,9 @@ import {
     RecoveryDeps,
     RecoveryEvidence,
     assessExposure,
+    classifyFailure,
     classifyReply,
+    detachFromLedger,
     modalWords,
     recordModalSend,
 } from '../failureRecovery';
@@ -260,16 +262,18 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
 
     ['a stale beat does not verify the frame, but a verified position survives a delayed heartbeat', async () => {
         const h = harness();
-        // The only beat on hand predates the cleanup reply (clock 1000 > reportedAt 500).
+        // A real `verified` reading is an echo labelled machine-frame
+        // (machinePosition.ts); the only beat predates the cleanup reply.
         h.state.reading = {
-            reliability: 'verified', frame: 'work-frame', reportedAt: 500, originOffset: { x: 120, y: 0, z: 0 }, machineStatus: 'idle', rawImpossibleAsMachine: true,
+            reliability: 'verified', frame: 'machine-frame', reportedAt: 500, originOffset: { x: 120, y: 0, z: 0 }, machineStatus: 'idle', rawImpossibleAsMachine: true,
         };
         failingTool(h, 'g53_tool', [['G53', 'accepted']]);
         const ev = (await callExpectingError(h, 'g53_tool')).failureRecovery as RecoveryEvidence;
         assert.deepEqual(h.sent.map((s) => s.gcode), ['G90', 'G54']);
         assert.equal(ev.resulting_modes?.workspace_verified, false, 'a stale beat is not verification');
         assert.equal(ev.position.trustworthy, true, 'a verified position is not invalidated by a delayed heartbeat');
-        assert.ok(/predates it/.test(ev.position.note));
+        assert.ok(/voided that echo record/.test(ev.position.note), 'says the cleanup sends voided the echo record');
+        assert.ok(/get_position/.test(ev.position.note));
         assert.equal(ev.recovery_action, 'restore_work_frame');
     }],
 
@@ -297,6 +301,7 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         const ev = (await callExpectingError(h, 'g53_tool')).failureRecovery as RecoveryEvidence;
         assert.equal(ev.resulting_modes?.workspace_verified, false);
         assert.ok(/consistent with work frame, unverified/.test(ev.resulting_modes?.workspace || ''));
+        assert.equal(ev.position.trustworthy, false, 'an ambiguous frame is not a trustworthy position');
         assert.equal(ev.recovery_action, 'restore_work_frame');
     }],
 
@@ -517,5 +522,138 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         // No throw, no state: the pendant and background pollers use the same send path.
         const settle = recordModalSend('1.0', 'G53');
         settle('accepted');
+    }],
+
+    ['a detached background send still pending does not make a successful start look exposed', async () => {
+        const h = harness();
+        h.registry.register({
+            name: 'start_tool',
+            description: '',
+            inputSchema: {},
+            handler: async () => {
+                // A runner launched off the call and never settling within it.
+                detachFromLedger(async () => { fakeSend(h.connA, 'G53', 'pending'); }).catch(() => undefined);
+                return { running: true };
+            },
+        });
+        const result = await h.registry.call('start_tool', {}) as { running: boolean; failure_recovery?: unknown };
+        assert.equal(result.running, true);
+        assert.equal(result.failure_recovery, undefined);
+        assert.equal(h.sent.length, 0);
+    }],
+
+    ['a payload still pending when a call succeeds is not reported as that call\'s exposure', async () => {
+        const h = harness();
+        h.registry.register({
+            name: 'start_tool',
+            description: '',
+            inputSchema: {},
+            handler: async () => { fakeSend(h.connA, 'G53', 'pending'); return { running: true }; },
+        });
+        const result = await h.registry.call('start_tool', {}) as { failure_recovery?: unknown };
+        assert.equal(result.failure_recovery, undefined);
+    }],
+
+    ['a success under a running job is not reported', async () => {
+        const h = harness();
+        h.state.jobRunning = true;
+        h.registry.register({
+            name: 'ok_tool',
+            description: '',
+            inputSchema: {},
+            handler: async () => { fakeSend(h.connA, 'G53', 'accepted'); return { ok: true }; },
+        });
+        const result = await h.registry.call('ok_tool', {}) as { failure_recovery?: unknown };
+        assert.equal(result.failure_recovery, undefined);
+    }],
+
+    ['two concurrent calls record their sends on their own ledgers', async () => {
+        const h = harness();
+        const tick = async () => new Promise<void>((resolve) => { setTimeout(resolve, 5); });
+        h.registry.register({
+            name: 'g53_ok',
+            description: '',
+            inputSchema: {},
+            handler: async () => { await tick(); fakeSend(h.connA, 'G53', 'accepted'); await tick(); return { ok: true }; },
+        });
+        h.registry.register({
+            name: 'g91_ok',
+            description: '',
+            inputSchema: {},
+            handler: async () => { fakeSend(h.connA, 'G91', 'accepted'); await tick(); await tick(); return { ok: true }; },
+        });
+        const [a, b] = await Promise.all([h.registry.call('g53_ok', {}), h.registry.call('g91_ok', {})]) as Array<{ failure_recovery: RecoveryEvidence }>;
+        assert.deepEqual(a.failure_recovery.exposure.state, { workspace: 'G53', distance: 'G90' });
+        assert.deepEqual(b.failure_recovery.exposure.state, { workspace: 'G54', distance: 'G91' });
+    }],
+
+    ['restore_work_frame failing is reported, never retried by the hook', async () => {
+        const h = harness();
+        failingTool(h, 'restore_work_frame', [['G90', 'rejected']], 'G90 rejected: error:busy');
+        const err = await callExpectingError(h, 'restore_work_frame');
+        assert.equal(h.sent.length, 0, 'the recovery tool is not retried');
+        assert.equal(err.failureRecovery?.skip_reason, 'restore-tool-itself');
+        assert.ok(err.failureRecovery?.warnings[0].includes('SKIPPED'));
+    }],
+
+    ['a timeout that quotes a stopped machine status is a timeout, not a stop', async () => {
+        const h = harness();
+        failingTool(h, 'home', [['G53', 'accepted']], 'Homing timed out after 60 s (machineStatus stopped, cancel pending).');
+        const ev = (await callExpectingError(h, 'home')).failureRecovery as RecoveryEvidence;
+        assert.equal(ev.failure_kind, 'timeout');
+        assert.deepEqual(h.sent.map((s) => s.gcode), ['G90', 'G54']);
+        assert.equal(classifyFailure(true, new Error('Stopped on request (agent) at a step boundary'), undefined), 'stopped');
+        assert.equal(classifyFailure(true, new Error('Probe failed: UNEXPECTED CONTACT at Z3'), undefined), 'stopped');
+        assert.equal(classifyFailure(true, new Error('OVERTRAVEL ALARM latched at 10:00'), undefined), 'stopped');
+        assert.equal(classifyFailure(true, new Error('the job was stopped'), undefined), 'thrown');
+    }],
+
+    ['an unknown G55-G59 selection is warned about, never reset to G54', async () => {
+        const h = harness();
+        failingTool(h, 'ws_tool', [['G55', 'rejected']]);
+        const ev = (await callExpectingError(h, 'ws_tool')).failureRecovery as RecoveryEvidence;
+        assert.equal(h.sent.length, 0, 'distance known G90 and no G53: nothing to restore');
+        assert.equal(ev.skip_reason, 'workspace-selection-unknown');
+        assert.ok(ev.warnings.some((w) => /G55-G59/.test(w)));
+
+        const h2 = harness();
+        failingTool(h2, 'ws_tool', [['G55\nG91', 'rejected']]);
+        const ev2 = (await callExpectingError(h2, 'ws_tool')).failureRecovery as RecoveryEvidence;
+        assert.deepEqual(h2.sent.map((s) => s.gcode), ['G90'], 'G90 for the distance, no G54');
+        assert.ok(ev2.warnings.some((w) => /G55-G59/.test(w)));
+
+        const h3 = harness();
+        failingTool(h3, 'ws_tool', [['G53', 'accepted'], ['G55', 'rejected']]);
+        await callExpectingError(h3, 'ws_tool');
+        assert.deepEqual(h3.sent.map((s) => s.gcode), ['G90', 'G54'], 'G53 may still be active behind the unknown selection');
+    }],
+
+    ['the machine leaving idle between G90 and G54 stops the second command', async () => {
+        const h = harness();
+        h.state.reply = (gcode) => {
+            if (gcode === 'G90') {
+                (h.state.reading as PositionReading).machineStatus = 'running';
+            }
+            return { result: 0 };
+        };
+        failingTool(h, 'move_tool', [['G53', 'accepted']]);
+        const ev = (await callExpectingError(h, 'move_tool')).failureRecovery as RecoveryEvidence;
+        assert.deepEqual(h.sent.map((s) => s.gcode), ['G90']);
+        assert.equal(ev.commands[1].reply, 'blocked: machine-not-idle');
+    }],
+
+    ['an error whose message cannot be rewritten is rethrown untouched', async () => {
+        const h = harness();
+        const frozen = new McpToolError('original');
+        Object.defineProperty(frozen, 'message', { value: 'original', writable: false });
+        h.registry.register({
+            name: 'move_tool',
+            description: '',
+            inputSchema: {},
+            handler: async () => { fakeSend(h.connA, 'G53', 'accepted'); throw frozen; },
+        });
+        const err = await callExpectingError(h, 'move_tool');
+        assert.equal(err, frozen);
+        assert.equal(err.message, 'original');
     }],
 ];

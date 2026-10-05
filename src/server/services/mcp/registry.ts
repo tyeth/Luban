@@ -98,6 +98,11 @@ export class ToolRegistry {
         this.recoveryDeps = deps;
     }
 
+    /** The injected cleanup runtime, for jobs that end outside a tool call (file jobs, detached runners). */
+    public getFailureRecovery(): RecoveryDeps | null {
+        return this.recoveryDeps;
+    }
+
     public async call(name: string, args: object): Promise<object> {
         const tool = this.tools.get(name);
         if (!tool) {
@@ -128,14 +133,26 @@ export class ToolRegistry {
                 thrown = err;
             }
             closeLedger(ledger);
-            const kind = classifyFailure(threw, thrown, result);
+            let kind: ReturnType<typeof classifyFailure> = null;
+            try {
+                kind = classifyFailure(threw, thrown, result);
+            } catch (err) {
+                // An unreadable error is still a failure; its evidence is best effort.
+                kind = threw ? 'thrown' : null;
+            }
             if (kind && deps && ledger.mutating) {
                 // Runs while this call still holds the ownership gate, and
                 // never throws: the original failure is what gets reported.
-                evidence = await recoverAfterFailure(ledger, kind, deps).catch((err) => hookFailureEvidence(ledger, kind, err));
+                const failed = kind;
+                evidence = await recoverAfterFailure(ledger, failed, deps).catch((err) => hookFailureEvidence(ledger, failed, err));
             } else if (!kind && deps) {
-                // Success: never followed by commands, but a G53/G91 it left is reported.
-                evidence = exposureAfterSuccess(ledger);
+                // Success: never followed by commands, but a G53/G91 it left is reported
+                // (not a payload still pending for a detached runner, nor under a running job).
+                try {
+                    evidence = exposureAfterSuccess(ledger, deps);
+                } catch (err) {
+                    evidence = null;
+                }
             }
         } finally {
             closeLedger(ledger);
@@ -146,9 +163,20 @@ export class ToolRegistry {
                 // McpServer serialises only err.message: the original message
                 // stays first and unchanged, the evidence follows it. The same
                 // error object is rethrown, so its class and .partial survive.
-                thrown.message = `${thrown.message}
+                // An error whose message cannot be rewritten (frozen, getter)
+                // is rethrown untouched rather than replaced.
+                const original = thrown.message;
+                try {
+                    thrown.message = `${original}
 ${describeEvidence(evidence)}`;
-                (thrown as Error & { failureRecovery?: RecoveryEvidence }).failureRecovery = evidence;
+                    (thrown as Error & { failureRecovery?: RecoveryEvidence }).failureRecovery = evidence;
+                } catch (err) {
+                    try {
+                        thrown.message = original;
+                    } catch (restoreErr) {
+                        // Nothing more to do: the original error goes out as it is.
+                    }
+                }
             }
             throw thrown;
         }

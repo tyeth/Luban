@@ -31,9 +31,9 @@ import { decodeToGray, trackFeature } from '../tracking';
 import { McpToolError, ToolRegistry } from '../registry';
 import { gateDirectXy, planGotoWorkOrigin } from '../directMovePlan';
 import { clearanceOptions } from '../clearanceContext';
-import { WORK_FRAME_RESTORE_GCODE } from '../frameRecovery';
+import { FrameReading, WORK_FRAME_RESTORE_GCODE, frameRestoreJobRefusal, verifyWorkFrame, workFrameVerificationNote } from '../frameRecovery';
 import { NotSentError, RecoveryDeps, classifyReply, recordModalSend } from '../failureRecovery';
-import { procedureStopRequested } from '../probing';
+import { procedureStopRequested } from '../procedureAbort';
 import { manualControlGate } from '../manualControl';
 import { landmarkStore } from '../landmarks';
 import { routeClearanceForPath } from '../routeClearance';
@@ -779,6 +779,21 @@ export async function sendWorkFrameRestore(tool: string): Promise<SentGcode> {
     return sendGcodeVisible(channel, tool, WORK_FRAME_RESTORE_GCODE);
 }
 
+/** The position-of-record fields a frame verification reads (frameRecovery.verifyWorkFrame). */
+function frameReading(snapshot: PositionSnapshot): FrameReading {
+    return {
+        reliability: snapshot.reliability,
+        frame: snapshot.frame,
+        reportedAt: snapshot.machineReportedAt,
+        originOffset: snapshot.originOffset,
+        // `work` is the raw report; read as machine coordinates, is it impossible?
+        rawImpossibleAsMachine: outsideBounds(
+            snapshot.work,
+            machineBounds((connectionManager.getConnectionStatus() as { machineIdentifier?: string | null }).machineIdentifier || null),
+        ).length > 0,
+    };
+}
+
 /**
  * The runtime side of the failed-call modal cleanup (failureRecovery.ts):
  * the SAME visible send path, the position of record, and the ownership
@@ -796,18 +811,7 @@ export const failureRecoveryDeps: RecoveryDeps = {
     settle: async () => sleep(FRAME_RESTORE_SETTLE_MS),
     readPosition: () => {
         const snapshot = getPositionSnapshot();
-        return {
-            reliability: snapshot.reliability,
-            frame: snapshot.frame,
-            reportedAt: snapshot.machineReportedAt,
-            originOffset: snapshot.originOffset,
-            machineStatus: snapshot.machineStatus,
-            // `work` is the raw report; read as machine coordinates, is it impossible?
-            rawImpossibleAsMachine: outsideBounds(
-                snapshot.work,
-                machineBounds((connectionManager.getConnectionStatus() as { machineIdentifier?: string | null }).machineIdentifier || null),
-            ).length > 0,
-        };
+        return { ...frameReading(snapshot), machineStatus: snapshot.machineStatus };
     },
     reliableForMotion: (reliability) => reliableForMotion(reliability as PositionSnapshot['reliability']),
     jobRunning: () => {
@@ -1315,7 +1319,13 @@ export function registerCameraTools(registry: ToolRegistry): void {
             + 'reports an incoherent or machine-frame position after a job that declared G53 and never selected a '
             + 'work workspace again: the controller keeps reporting machine coordinates while the heartbeat still '
             + 'carries a work-origin offset, so every derived position is rejected until the frame is handed back. '
-            + 'Returns the position of record before and after, re-read two beats later. A re-home is not the remedy.',
+            + 'Returns the position of record before and after, re-read two beats later, and `workspace_verification`: '
+            + '`verified` (a status report taken a poll period after the reply is only possible in the work frame), '
+            + '`consistent-unverified` (reads as work but would also fit the machine frame), `unverifiable-zero-offset` '
+            + '(work offset ~0, both frames read alike), `no-fresh-beat` (nothing judged after the reply yet) or '
+            + '`machine-frame` (still in G53). `recovered` is true only when verified; `note` says what to do next. '
+            + 'Refused, sending nothing, while a job is starting or running: wait for it to end or stop it first. '
+            + 'A re-home is not the remedy.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1324,27 +1334,40 @@ export function registerCameraTools(registry: ToolRegistry): void {
             additionalProperties: false,
         },
         handler: async (args: { reason?: string }) => {
+            // Never inject G90/G54 into a starting or running job (#229 review).
+            const jobRefusal = frameRestoreJobRefusal(jobManager.getActive());
+            if (jobRefusal) {
+                throw new McpToolError(jobRefusal);
+            }
             const before = getPositionSnapshot();
             const reason = String(args.reason || '').trim();
             const executed = await sendWorkFrameRestore(`restore_work_frame${reason ? ` - ${reason.slice(0, 60)}` : ''}`);
+            const replyAt = Date.now();
             // Two status periods: the judgement needs a beat taken AFTER the
             // workspace change, and the poll runs on its own ~2 s cadence.
             await new Promise((resolve) => setTimeout(resolve, FRAME_RESTORE_SETTLE_MS));
             const after = getPositionSnapshot();
-            const recovered = reliableForMotion(after.reliability) && !reliableForMotion(before.reliability);
+            // The before/after reliability comparison missed the case this tool
+            // exists for: a sustained machine-frame state already reads as
+            // 'heartbeat'. Judge the frame itself, conservatively (#229).
+            const accepted = executed.result === 0;
+            const verification = verifyWorkFrame(frameReading(after), replyAt);
+            const recovered = accepted && verification === 'verified' && reliableForMotion(after.reliability);
             return {
                 sent: WORK_FRAME_RESTORE_GCODE,
                 result: executed.result,
                 text: executed.text || null,
                 before: { reliability: before.reliability, frame: before.frame, machine: before.machine },
                 after: { reliability: after.reliability, frame: after.frame, machine: after.machine },
+                frame_before: before.frame,
+                frame_after: after.frame,
+                workspace_verification: verification,
                 recovered,
                 warnings: after.warnings,
-                note: recovered
-                    ? 'The controller is back in the work workspace and the position of record is usable again.'
-                    : `The position of record is ${after.reliability} after the restore. `
-                        + 'Read get_position again in a couple of seconds; if it has not cleared, call '
-                        + 'query_firmware_position to see which frame the controller is actually in and tell the operator.',
+                note: accepted
+                    ? workFrameVerificationNote(verification, after.reliability)
+                    : `The controller did not accept the restore (result ${executed.result}). The workspace is unknown: `
+                        + 'do not move; call query_firmware_position and tell the operator.',
             };
         },
     });

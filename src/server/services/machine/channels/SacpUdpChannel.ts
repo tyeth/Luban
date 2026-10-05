@@ -30,6 +30,7 @@ class SacpUdpChannel extends SacpChannelBase {
         });
         this.socketClient.on('close', () => {
             log.info('UDP connection closed');
+            this.bumpConnectionGeneration('UDP socket closed');
             const result = {
                 code: 200,
                 data: {},
@@ -40,11 +41,13 @@ class SacpUdpChannel extends SacpChannelBase {
         });
         this.socketClient.on('error', (err) => {
             log.error(`UDP connection error: ${err}`);
+            this.bumpConnectionGeneration('UDP socket error');
         });
     }
 
     public async test(host: string, port: number): Promise<boolean> {
         const sacpResponse = (async () => {
+            this.bumpConnectionGeneration('UDP probe session created');
             this.sacpClient = new SacpClient('udp', {
                 socket: this.socketClient,
                 host,
@@ -66,6 +69,7 @@ class SacpUdpChannel extends SacpChannelBase {
 
         this.emit(ChannelEvent.Connecting);
 
+        this.bumpConnectionGeneration('UDP session created');
         this.sacpClient = new SacpClient('udp', {
             socket: this.socketClient,
             host: options.address,
@@ -93,6 +97,7 @@ class SacpUdpChannel extends SacpChannelBase {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     public async connectionClose(options?: { force: boolean }): Promise<boolean> {
         // UDP is stateless, not need to close
+        this.bumpConnectionGeneration('UDP connection closed');
         this.sacpClient?.dispose();
 
         return true;
