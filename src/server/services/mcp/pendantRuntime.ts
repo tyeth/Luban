@@ -15,7 +15,8 @@ import { isLoopback } from './McpServer';
 import { JogBounds, JogPosition, PENDANT_FEED_MAX, PendantSession, firmwareMotionProblem, parsePendantInput, validateJogBounds } from './pendant';
 import {
     A350_STEPS_PER_MM, CountCheckMode, CountSample, HOLD_COUNT_POLL_MS, HOLD_FEATHER_GAP_MS, HOLD_HEARTBEAT_MAX_AGE_MS, HOLD_MIN_ACCEL, HOLD_MOVE_MS,
-    CountOffset, HOLD_LATE_EVENTS_TO_DISABLE, HOLD_QUEUE_AHEAD_MS, HOLD_REPLY_LATE_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault,
+    CountOffset, HOLD_LATE_EVENTS_TO_DISABLE, HOLD_LATE_REPLIES_TO_STOP, HOLD_POST_CLOSE_GRACE_MS, HOLD_QUEUE_AHEAD_MS,
+    HOLD_REPLY_LATE_MS, HOLD_REPLY_STOP_MS, HOLD_TICK_MS, HoldQueueModel, countCheckMode, countFault,
     countToMachine, countToMm, extendAlong, holdMoveMm, holdRunoutMm, judgeCountSample, learnCountOffset, parseCountReport, parseStepsPerMm,
 } from './pendantHold';
 import { pendantPage } from './pendantPage';
@@ -157,6 +158,9 @@ export class PendantRuntime {
 
     private pageAliveAt = 0;
 
+    // Until this time a rejected position report is the hold's own G53-window poll arriving late.
+    private postHoldGraceUntil = 0;
+
     private lastPorts: Array<{ path: string; serialNumber?: string }> = [];
 
     private portsAt = 0;
@@ -231,12 +235,17 @@ export class PendantRuntime {
         return connectionEpoch();
     }
 
+    private positionWarnings(): string[] {
+        const record = getPositionOfRecord(currentGcodeSequence());
+        const p = getPositionSnapshot();
+        return this.session.armed ? pendantPosition(p, record, getTrustedOffset(), Date.now(), HEARTBEAT_STALE_MS).warnings : p.warnings;
+    }
+
     private ready(): void {
         assertMachineReadyForProcedure();
         probeFeedService.assertNoOvertravel();
         const record = getPositionOfRecord(currentGcodeSequence());
-        const p = getPositionSnapshot();
-        const warnings = this.session.armed ? pendantPosition(p, record, getTrustedOffset(), Date.now(), HEARTBEAT_STALE_MS).warnings : p.warnings;
+        const warnings = this.positionWarnings();
         if (warnings.length) { throw new Error(`Machine position unavailable: ${warnings.join(' ')}`); }
         if (record && record.source === 'estimated') { throw new Error('Last move was only estimated; wait for a verified position.'); }
         if (jobManager.getActive()?.state === 'started') { throw new Error('A machine job is active.'); }
@@ -244,7 +253,7 @@ export class PendantRuntime {
 
     private travelBounds(current: JogPosition = this.position()): JogBounds {
         const travel = requirePlanningTravel('manual jogging', current);
-        if (travel.conflicts.length) { throw new Error('Machine travel has unresolved conflicts.'); }
+        if (travel.conflicts.length) { throw new Error(`Machine travel has unresolved conflicts: ${travel.conflicts.join(' ')}`); }
         const size = getMachineSizeByIdentifier(connectionManager.getConnectionStatus().machineIdentifier);
         if (!size) { throw new Error('Machine travel is unknown.'); }
         // Match stagingFrameContext: A350 profile Z325 excludes its reachable Z328 park.
@@ -584,6 +593,10 @@ export class PendantRuntime {
         const latch = getFrameLatch();
         // A restore was acknowledged; its verified position is still arriving. Hold, do not disarm.
         if (latch && latch.restoredAt !== null && now - latch.restoredAt < FRAME_VERIFY_WAIT_MS) { return; }
+        // A status poll issued inside the hold's G53 window can arrive after the closing G54
+        // (raw machine Z 329 + offset reads Z 541): wait for the next coherent beat, do not
+        // disarm. After the grace the ordinary check applies.
+        if (now < this.postHoldGraceUntil && this.positionWarnings().length) { return; }
         this.ready();
         const from = this.position();
         const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
@@ -976,6 +989,7 @@ export class PendantRuntime {
         let countStop: string | null = null;
         let countStopLate = false;
         let lateEvent = false;
+        let consecutiveLate = 0;
         let lastCountAt = -Infinity;
         this.busy = true;
         this.pipeline.active = true;
@@ -1038,8 +1052,11 @@ export class PendantRuntime {
                         summary.feed = target.feed;
                         summary.maxOutstandingMs = Math.max(summary.maxOutstandingMs, model.outstandingMs(sentAt));
                         this.recordHoldTick({ at: sentAt, kind: 'send', outstandingMs: Math.round(model.outstandingMs(now)), inputAgeMs, sent: target.position, feed: target.feed, replyMs });
-                        if (replyMs > HOLD_REPLY_LATE_MS) {
-                            summary.lateMoveReplies += 1;
+                        if (replyMs > HOLD_REPLY_LATE_MS) { consecutiveLate += 1; } else { consecutiveLate = 0; }
+                        if (replyMs > HOLD_REPLY_LATE_MS) { summary.lateMoveReplies += 1; }
+                        // One Wi-Fi hiccup is tolerated: the queue model is paced by send time, so a
+                        // late reply never admits extra motion. Stop on a very late reply or a streak.
+                        if (replyMs > HOLD_REPLY_STOP_MS || consecutiveLate >= HOLD_LATE_REPLIES_TO_STOP) {
                             summary.stopReason = 'late acknowledgement';
                             lateEvent = true;
                             this.noteLateEvent(`Continuous jog stopped: a queued increment took ${replyMs} ms to be acknowledged (limit ${HOLD_REPLY_LATE_MS} ms): `
@@ -1108,6 +1125,7 @@ export class PendantRuntime {
             }
             // The crash guard stays armed while queued motion may still be running.
             if (!entered || restored) { probeFeedService.motionEnd(); } else { this.heldMotionGuard += 1; }
+            if (entered && restored) { this.postHoldGraceUntil = Date.now() + HOLD_POST_CLOSE_GRACE_MS; }
             summary.restored = restored;
             summary.elapsedMs = Date.now() - startedAt;
             summary.maxOutstandingMs = Math.round(summary.maxOutstandingMs);

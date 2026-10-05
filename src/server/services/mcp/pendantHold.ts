@@ -35,6 +35,16 @@ export const HOLD_FEATHER_GAP_MS = 150;
 export const HOLD_COUNT_POLL_MS = 250;
 /** A G1 reply slower than this means the controller is holding the request (planner full): stop. */
 export const HOLD_REPLY_LATE_MS = HOLD_QUEUE_AHEAD_MS;
+/** A single increment reply this late stops the hold outright. */
+export const HOLD_REPLY_STOP_MS = 2 * HOLD_REPLY_LATE_MS;
+/** Consecutive late increment replies that stop the hold (one Wi-Fi hiccup is tolerated). */
+export const HOLD_LATE_REPLIES_TO_STOP = 2;
+/**
+ * After a hold closes, a status poll issued inside its G53 window can still
+ * arrive; the pendant waits this long for a coherent beat before treating a
+ * rejected position as lost (same bound as HOLD_HEARTBEAT_MAX_AGE_MS).
+ */
+export const HOLD_POST_CLOSE_GRACE_MS = 4500;
 /**
  * A status report older than this during a hold means the connection is
  * faltering: stop. The WiFi poll runs every 2 s with a 3 s timeout, so one

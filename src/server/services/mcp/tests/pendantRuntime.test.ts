@@ -457,6 +457,24 @@ const startRun = async (f: Fixture, extra: object = {}, forMs = 1500, maxSegment
 };
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['a G53-window beat arriving after a proved hold close waits instead of disarming, within the grace', async () => {
+        const f = fixture(false, { pipeline: true });
+        f.onQueue((count) => { if (count === 4) { f.stopStream(); f.input({ deadman: true }); } });
+        await startRun(f, {}, 1500);
+        assert.equal((await readStatus(f)).pipeline.lastHold.restored, true);
+        f.setWarnings(['Derived machine z (z=541.0) is more than 50 mm outside the travel - a mistake, not a position']);
+        await f.request('/pendant/keepalive', {}); f.input(); await f.tick();
+        assert.equal((await readStatus(f)).armed, true, 'the late G53-window beat is waited out, not a lost position');
+        f.setWarnings([]);
+        await f.request('/pendant/keepalive', {}); f.input(); await f.tick();
+        assert.equal((await readStatus(f)).armed, true);
+        f.setWarnings(['Derived machine z (z=541.0) is more than 50 mm outside the travel - a mistake, not a position']);
+        f.advance(4600);
+        await f.request('/pendant/keepalive', {}); f.input(); await f.tick();
+        const after = await readStatus(f);
+        assert.equal(after.armed, false, 'past the grace a rejected position disarms as before');
+        assert.match(after.error, /Machine position unavailable/);
+    }],
     ['USB feedback stays compact while full position warnings remain on the page', async () => {
         const f = fixture(); await f.initialize();
         f.setWarnings(['frame detail '.repeat(300)]); await f.tick();
@@ -1280,23 +1298,23 @@ export const tests: Array<[string, () => Promise<void>]> = [
         await startRun(f, {}, 1500);
         let after = await readStatus(f);
         assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement');
-        assert.equal(after.pipeline.lastHold.lateMoveReplies, 1);
+        assert.equal(after.pipeline.lastHold.lateMoveReplies, 2, 'the first late reply is tolerated; the second in a row stops the hold');
         assert.equal(after.pipeline.lateEvents, 1);
-        assert.equal(after.pipeline.disabled, null, 'one late reply stops the hold but does not turn continuous jogging off');
+        assert.equal(after.pipeline.disabled, null, 'a late streak stops the hold but does not turn continuous jogging off');
         assert.equal(after.armed, true);
-        assert.equal(f.queued.length, 1);
+        assert.equal(f.queued.length, 2, 'two increments were queued before the late streak stopped the hold');
         assert.deepEqual(f.frames, ['latch', 'enter', 'restore', 'verify']);
         // Two more late holds in the same arm turn it off.
         for (let i = 2; i <= 3; i += 1) {
             f.input(); f.stream({ x: 1, deadman: true, feed: 3000 }, 1500); await f.tick(); await f.flush();
             after = await readStatus(f);
             assert.equal(after.pipeline.lateEvents, i);
-            assert.equal(f.queued.length, i);
+            assert.equal(f.queued.length, 2 * i);
         }
         assert.match(String(after.pipeline.disabled), /3 late replies in a row/);
         assert.equal(after.armed, true);
         await f.request('/pendant/keepalive', {}); f.input(); f.input({ x: -1, deadman: true, feed: 3000 }); await f.tick();
-        assert.equal(f.moves(), 1); assert.equal(f.queued.length, 3, 'settled jogs until re-arm');
+        assert.equal(f.moves(), 1); assert.equal(f.queued.length, 6, 'settled jogs until re-arm');
         await f.finish();
         await f.request('/pendant/disarm', {});
         f.input();
@@ -1344,7 +1362,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(f.frames.filter((frame) => frame === 'enter').length, 1);
         assert.ok(f.queued.length >= 1 && f.queued[0].target.x < f.targets[f.targets.length - 1].x, 'the hold moves away from the box');
     }],
-    ['serialized channel: an M114 in flight inflates the next G1 reply within budget; a slow one makes it late and stops the hold', async () => {
+    ['serialized channel: an M114 in flight inflates the next G1 reply; isolated late replies are tolerated, a very late one stops the hold', async () => {
         const within = fixture(false, { pipeline: true, serialized: true });
         within.setCountRtt(100);
         within.onQueue((count) => { if (count === 14) { within.stopStream(); within.input({ deadman: true }); } });
@@ -1358,14 +1376,22 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.ok(sends.every((t) => t.replyMs <= 200), 'but stayed within budget');
         const late = fixture(false, { pipeline: true, serialized: true });
         late.setCountRtt(150);
+        late.onQueue((count) => { if (count === 14) { late.stopStream(); late.input({ deadman: true }); } });
         await startRun(late, {}, 5000);
         after = await readStatus(late);
-        assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement', 'the G1 behind a 150 ms M114 took over 200 ms');
-        assert.equal(after.pipeline.lateEvents, 1);
+        assert.ok(after.pipeline.lastHold.lateMoveReplies >= 1, 'the G1 behind a 150 ms M114 took over 200 ms');
+        assert.equal(after.pipeline.lastHold.stopReason, 'stick centred', 'isolated late replies (one per Count poll) are tolerated');
         assert.equal(after.pipeline.disabled, null);
         assert.equal(after.armed, true);
         assert.deepEqual(late.frames, ['latch', 'enter', 'restore', 'verify']);
         assert.equal(late.motion(), 0);
+        const stalled = fixture(false, { pipeline: true, serialized: true });
+        stalled.setCountRtt(450);
+        await startRun(stalled, {}, 5000);
+        after = await readStatus(stalled);
+        assert.equal(after.pipeline.lastHold.stopReason, 'late acknowledgement', 'a G1 behind a 450 ms M114 is over the 400 ms stop limit');
+        assert.equal(after.armed, true);
+        assert.equal(stalled.motion(), 0);
     }],
     ['serialized channel: a failed M114 cancels the G1 queued behind it, which closes the hold through the restore path even in observe mode', async () => {
         const f = fixture(false, { pipeline: true, serialized: true });
