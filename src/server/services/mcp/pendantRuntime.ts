@@ -26,7 +26,8 @@ import { getFeedOverride } from './failureRecovery';
 import { currentGcodeSequence, getFrameLatch, getPositionOfRecord, getTrustedOffset, latchFrameUncertain, onFrameLatchChange } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
 import {
-    assertFullFeedrate, assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queryPositionReport, queueMachineMove, readFirmwareMotionConfig, sleep,
+    assertFullFeedrate, assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queryPositionReport, queueMachineMove,
+    readFirmwareMotionConfig, sleep,
     verifyRestoredPosition,
 } from './probing';
 import { homeMachine, sendWorkFrameRestore } from './tools/camera';
