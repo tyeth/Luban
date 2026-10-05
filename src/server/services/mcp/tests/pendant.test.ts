@@ -9,6 +9,18 @@ const frame = (over: Partial<PendantInput> = {}): PendantInput => ({
 });
 
 export const tests: Array<[string, () => void]> = [
+    ['the bounds clamp never pulls a head that starts outside them', () => {
+        const session = new PendantSession();
+        const outside = { x: 10, y: -0.4, z: 10 };
+        session.arm({ ...bounds, yMin: -0.4 }, outside, 1000);
+        session.bounds = bounds; // DRO corrected to just outside the envelope after arming
+        session.receive(frame({ seq: 1 }), 1010);
+        session.receive(frame({ seq: 2, y: -1, deadman: true }), 1020);
+        assert.equal(session.target(outside, 1300), null);
+        session.receive(frame({ seq: 3, y: 1, deadman: true }), 1400);
+        const inward = session.target(outside, 1700);
+        assert.ok(inward && inward.position.y > outside.y);
+    }],
     ['envelope accepts heartbeat noise within 0.05 mm of an edge, refuses beyond', () => {
         const edge: JogBounds = { xMin: -19, xMax: 339, yMin: 0, yMax: 342, zMin: 280, zMax: 328 };
         validateJogBounds(edge, { x: 10, y: -0.0000051269531127218215, z: 327.999 });

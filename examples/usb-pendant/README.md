@@ -97,9 +97,12 @@ obstacle exclusions. Then click **Arm**. This operator page is the session's dec
 
 The session lasts at most 10 minutes. X/Y default to ±5 mm around the current
 position; Z defaults to 280–329 mm. **Fill machine X**, **Fill machine Y** and
-**Fill both X/Y** fill known X/Y travel with 1 mm extra at each end. The page
-previews the usable intersection with known travel; arming clips the requested
-bounds to that intersection (A350 Z ends at 328, not the profile's 325).
+**Fill both X/Y** fill known X/Y travel with 1 mm extra at each end. Jogging may
+reach up to 1 mm past known travel on every axis (A350 Z travel ends at 328, not
+the profile's 325): the machine accepts attempted overtravel and the DRO corrects
+on the next position sync. Arming clips requested bounds to travel ±1 mm. A head
+already outside the envelope is never pulled back by the clamp; it moves only
+when the stick asks for a move.
 There is no arbitrary 100 mm envelope span limit. This is direct, supervised manual control:
 the operator approves the entire requested corridor, including its Z range, and
 holds D1 for each movement. It does not reuse or broaden an AI job approval.

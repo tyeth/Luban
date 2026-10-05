@@ -200,7 +200,12 @@ export class PendantSession {
         };
         this.limitedAxes = [];
         for (const axis of ['x', 'y', 'z'] as const) {
-            const clipped = Math.max(this.bounds[`${axis}Min`], Math.min(this.bounds[`${axis}Max`], position[axis]));
+            let clipped = Math.max(this.bounds[`${axis}Min`], Math.min(this.bounds[`${axis}Max`], position[axis]));
+            // A head already outside the bounds (heartbeat noise, or a DRO correction after
+            // overtravel) is never pulled by the clamp: unrequested or opposite moves hold.
+            if (clipped !== current[axis] && Math.sign(clipped - current[axis]) !== Math.sign(position[axis] - current[axis])) {
+                clipped = current[axis];
+            }
             if (clipped !== position[axis]) { this.limitedAxes.push(axis.toUpperCase()); }
             position[axis] = clipped;
         }
