@@ -63,6 +63,7 @@ async function pageFixture() {
     const posted: Array<{ url: string; body: { bounds?: object } }> = [];
     const intervals: Array<() => undefined> = [];
     let stallStatus = false;
+    let clock = 1000;
     const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
     assert.ok(script);
     vm.runInNewContext(script as string, {
@@ -72,7 +73,10 @@ async function pageFixture() {
             createElement: () => new Element(),
             addEventListener: () => undefined },
         setInterval: (callback: () => undefined) => { intervals.push(callback); },
-        AbortSignal: { timeout: () => undefined },
+        AbortController: class { public signal = {}; public abort() { return undefined; } },
+        setTimeout: () => 0,
+        clearTimeout: () => undefined,
+        Date: { now: () => clock },
         fetch: async (url: string, options?: { body: string }) => {
             if (!options) { return stallStatus ? new Promise(() => undefined) : { ok: true, json: async () => state }; }
             posted.push({ url, body: JSON.parse(options.body) });
@@ -94,20 +98,25 @@ async function pageFixture() {
         refresh: async () => { intervals[0](); await settle(); },
         keepalive: async () => { intervals[1](); await settle(); },
         stallStatus: () => { stallStatus = true; },
+        advance: (ms: number) => { clock += ms; },
         arm: async () => { await element('envelope').onsubmit?.({ preventDefault: () => undefined }); } };
 }
 
 export const tests: Array<[string, () => Promise<void>]> = [
-    ['keepalive runs on its own timer while armed even when a status poll stalls', async () => {
+    ['keepalive has its own timer but stops once status has not rendered for 1.5 s', async () => {
         const f = await pageFixture();
+        const keepalives = () => f.posted.filter((p) => p.url.endsWith('/keepalive')).length;
         await f.keepalive();
-        assert.equal(f.posted.filter((p) => p.url.endsWith('/keepalive')).length, 0);
+        assert.equal(keepalives(), 0);
         f.element('clear').checked = true;
         await f.arm();
         f.stallStatus();
         await f.refresh();
         for (let i = 0; i < 3; i += 1) { await f.keepalive(); }
-        assert.equal(f.posted.filter((p) => p.url.endsWith('/keepalive')).length, 3);
+        assert.equal(keepalives(), 3);
+        f.advance(1600);
+        await f.keepalive();
+        assert.equal(keepalives(), 3);
     }],
     ['DRO retains labelled values through in-flight motion and refreshes on verified arrival', async () => {
         const f = await pageFixture();

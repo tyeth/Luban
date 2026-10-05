@@ -56,7 +56,11 @@ export class PendantRuntime {
 
     private pageAliveAt = 0;
 
-    private portList: { at: number; ports: Promise<Array<{ path: string; serialNumber?: string }>> } | null = null;
+    private lastPorts: Array<{ path: string; serialNumber?: string }> = [];
+
+    private portsAt = 0;
+
+    private portsPending: Promise<Array<{ path: string; serialNumber?: string }>> | null = null;
 
     private firmware: string | null = null;
 
@@ -169,17 +173,24 @@ export class PendantRuntime {
     private async ports() {
         const ports = (await SerialPort.list()).filter((p) => p.vendorId?.toLowerCase() === '239a'
             && p.productId?.toLowerCase() === '8124');
-        this.portList = { at: Date.now(), ports: Promise.resolve(ports) };
+        this.lastPorts = ports;
+        this.portsAt = Date.now();
         return ports;
     }
 
-    // Status polls must stay cheap: enumerating serial ports can take hundreds of ms on Linux.
+    // Status polls must stay cheap and must never hang: enumerating serial ports can take
+    // hundreds of ms on Linux, so polls reuse the last list and wait at most 1 s for a refresh.
     private async cachedPorts() {
-        if (!this.portList || Date.now() - this.portList.at > PORT_LIST_CACHE_MS) {
-            const ports = this.ports().catch(() => []);
-            this.portList = { at: Date.now(), ports };
+        if (!this.portsPending && Date.now() - this.portsAt > PORT_LIST_CACHE_MS) {
+            this.portsPending = this.ports().catch(() => this.lastPorts)
+                .finally(() => { this.portsAt = Date.now(); this.portsPending = null; });
         }
-        return this.portList.ports;
+        if (!this.portsPending) { return this.lastPorts; }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const fallback = new Promise<Array<{ path: string; serialNumber?: string }>>((resolve) => {
+            timer = setTimeout(() => resolve(this.lastPorts), 1000);
+        });
+        try { return await Promise.race([this.portsPending, fallback]); } finally { clearTimeout(timer); }
     }
 
     private async connect(path: string): Promise<void> {

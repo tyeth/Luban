@@ -31,23 +31,24 @@ export interface JogPosition { x: number; y: number; z: number }
 export function pendantFrameProblem(p: PendantInput): string | null {
     if (!p || typeof p !== 'object') { return 'not an object'; }
     if (p.v !== 1) { return `protocol v ${JSON.stringify(p.v)}`; }
-    if (!Number.isSafeInteger(p.seq) || p.seq < 0) { return `seq ${JSON.stringify(p.seq)}`; }
+    // Live values (seq, axes, timings) stay out of the reason so a bad stream logs one line, not 20/s.
+    if (!Number.isSafeInteger(p.seq) || p.seq < 0) { return 'seq'; }
     for (const axis of ['x', 'y', 'z'] as const) {
         const n = p[axis];
-        if (typeof n !== 'number' || !Number.isFinite(n) || Math.abs(n) > 1) { return `${axis} ${JSON.stringify(n)}`; }
+        if (typeof n !== 'number' || !Number.isFinite(n) || Math.abs(n) > 1) { return `${axis} not a number in -1..1`; }
     }
     if (typeof p.feed !== 'number' || !Number.isFinite(p.feed) || p.feed < PENDANT_FEED_MIN || p.feed > PENDANT_FEED_MAX) {
         return `feed ${JSON.stringify(p.feed)} outside ${PENDANT_FEED_MIN}–${PENDANT_FEED_MAX} mm/min (update the Feather firmware?)`;
     }
     if (!['feed', 'z'].includes(p.mode)) { return `mode ${JSON.stringify(p.mode)}`; }
     for (const key of ['deadman', 'stop', 'ready'] as const) {
-        if (typeof p[key] !== 'boolean') { return `${key} ${JSON.stringify(p[key])}`; }
+        if (typeof p[key] !== 'boolean') { return `${key} not boolean`; }
     }
-    if (p.feedback_ok !== undefined && typeof p.feedback_ok !== 'boolean') { return `feedback_ok ${JSON.stringify(p.feedback_ok)}`; }
+    if (p.feedback_ok !== undefined && typeof p.feedback_ok !== 'boolean') { return 'feedback_ok not boolean'; }
     if (p.round_trip_ms != null && (!Number.isFinite(p.round_trip_ms) || p.round_trip_ms < 0)) {
-        return `round_trip_ms ${JSON.stringify(p.round_trip_ms)}`;
+        return 'round_trip_ms';
     }
-    if (p.mode === 'feed' && p.z !== 0) { return `z ${p.z} in feed mode`; }
+    if (p.mode === 'feed' && p.z !== 0) { return 'nonzero z in feed mode'; }
     if (p.fw !== undefined && (typeof p.fw !== 'string' || p.fw.length > 32)) { return 'fw'; }
     if (p.log !== undefined && (typeof p.log !== 'string' || p.log.length > 160)) { return 'log'; }
     return null;

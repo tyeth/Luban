@@ -121,7 +121,7 @@ while True:
                        "feedback_ok": bool(fresh), "round_trip_ms": link_watchdog.round_trip_ms,
                        "display": [display.width, display.height], "fw": FIRMWARE})
         if event:
-            packet["log"] = event
+            packet["log"] = event[:120]
         # Nonblocking: partial frames force a newline and neutral re-arm, never a backlog.
         payload = (json.dumps(packet) + "\n").encode("utf-8")
         try:
