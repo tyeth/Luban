@@ -28,6 +28,28 @@ const log = logger('service:mcp:pendant');
 const traceEnabled = (): boolean => typeof process !== 'undefined' && /^(1|true|on|yes)$/i.test(process.env?.LUBAN_PENDANT_TRACE || '');
 const trace = (message: string): void => { if (traceEnabled()) { log.info(`[trace] ${message}`); } };
 const PORT_LIST_CACHE_MS = 2000;
+// A shortened approach stops this far outside an obstacle (XY and Z), so heartbeat noise
+// cannot report the held toolhead inside the exclusion it was stopped against.
+const APPROACH_PAD_XY_MM = 0.5;
+const APPROACH_PAD_Z_MM = 0.1;
+const MIN_APPROACH_MM = 0.1;
+
+interface ObstacleExclusion {
+    name: string;
+    machine: { x0: number; x1: number; y0: number; y1: number };
+    requiredZ: number | null;
+}
+
+type JogTarget = { position: JogPosition; feed: number; durationMs: number; distanceMm: number };
+
+/** An obstacle that is holding (nothing sent) or limiting (part of the intent sent) the stick. */
+export interface PendantBlocked {
+    name: string;
+    requiredZ: number | null;
+    requestedZ: number;
+    held: boolean;
+    text: string;
+}
 
 export class PendantRuntime {
     private session = new PendantSession();
@@ -62,7 +84,12 @@ export class PendantRuntime {
 
     private portsPending: Promise<Array<{ path: string; serialNumber?: string }>> | null = null;
 
-    private firmware: string | null = null;
+    // undefined until the first frame of a connection, so a pre-fw board (null) still logs once.
+    private firmware: string | null | undefined = undefined;
+
+    private blocked: PendantBlocked | null = null;
+
+    private blockedLogged = new Set<string>();
 
     private timer: ReturnType<typeof setInterval> | null = null;
 
@@ -127,7 +154,7 @@ export class PendantRuntime {
         }
     }
 
-    private obstacleExclusions() {
+    private obstacleExclusions(): ObstacleExclusion[] {
         const opts = clearanceOptions();
         return landmarkStore.obstacleBoxes().map((box) => ({
             name: box.name,
@@ -142,17 +169,91 @@ export class PendantRuntime {
         }));
     }
 
-    private validateJogSegment(from: JogPosition, to: JogPosition): void {
-        for (const box of this.obstacleExclusions()) {
-            // Manual jogs get no probing exemption: check the complete segment,
-            // including Z-only descents and moves wholly inside a landmark footprint.
-            if (segmentHitsBox2D(from.x, from.y, to.x, to.y, box.machine, 0)
-                && (box.requiredZ === null || Math.min(from.z, to.z) < box.requiredZ - POSITION_EPSILON_MM)) {
-                const needed = box.requiredZ === null ? 'tool clearance is unknown; this region is excluded'
-                    : `requires machine Z at or above ${box.requiredZ.toFixed(3)} mm`;
-                throw new Error(`Jog blocked by ${box.name}: ${needed}. Requested segment reaches machine Z ${Math.min(from.z, to.z).toFixed(3)} mm. Review the obstacle exclusions before re-arming.`);
+    // Manual jogs get no probing exemption: check the complete segment, including
+    // Z-only descents and moves wholly inside a landmark footprint. `pad` widens the
+    // boxes (XY) and raises their required Z; only shortened approaches use it.
+    private obstacleHit(from: JogPosition, to: JogPosition, boxes: ObstacleExclusion[], pad = 0): ObstacleExclusion | null {
+        const padZ = pad > 0 ? APPROACH_PAD_Z_MM : 0;
+        for (const box of boxes) {
+            if (segmentHitsBox2D(from.x, from.y, to.x, to.y, box.machine, pad)
+                && (box.requiredZ === null || Math.min(from.z, to.z) < box.requiredZ + padZ - POSITION_EPSILON_MM)) {
+                return box;
             }
         }
+        return null;
+    }
+
+    private validateJogSegment(from: JogPosition, to: JogPosition): void {
+        const box = this.obstacleHit(from, to, this.obstacleExclusions());
+        if (box) {
+            const needed = box.requiredZ === null ? 'tool clearance is unknown; this region is excluded'
+                : `requires machine Z at or above ${box.requiredZ.toFixed(3)} mm`;
+            throw new Error(`Jog blocked by ${box.name}: ${needed}. Requested segment reaches machine Z ${Math.min(from.z, to.z).toFixed(3)} mm. Review the obstacle exclusions before re-arming.`);
+        }
+    }
+
+    /**
+     * Obstacles HOLD the stick instead of disarming. A segment that would enter an
+     * exclusion below its required Z is never sent. In its place this tries, in order:
+     * the longest clear prefix (stopping just outside the box), then the same intent with
+     * one or two axis components removed, like envelope clipping. Every alternative is a
+     * subset of the operator's own stick motion inside the armed envelope, and the caller
+     * still runs the full validateJogSegment on whatever is returned. null means hold:
+     * stay armed, send nothing, and report the blocking obstacle until the stick returns
+     * to neutral or a full segment is accepted.
+     */
+    private obstacleSafeTarget(from: JogPosition, target: JogTarget | null): JogTarget | null {
+        if (!target) { this.blocked = null; return null; }
+        const boxes = this.obstacleExclusions();
+        const hit = this.obstacleHit(from, target.position, boxes);
+        if (!hit) { this.blocked = null; return target; }
+        const bounds = this.session.bounds as JogBounds;
+        const clamp = (p: JogPosition): JogPosition => {
+            const out = { ...p };
+            for (const axis of ['x', 'y', 'z'] as const) {
+                out[axis] = Math.max(bounds[`${axis}Min`], Math.min(bounds[`${axis}Max`], p[axis]));
+            }
+            return out;
+        };
+        const segment = (position: JogPosition): JogTarget => {
+            const distanceMm = Math.hypot(position.x - from.x, position.y - from.y, position.z - from.z);
+            return { position, feed: target.feed, durationMs: distanceMm / target.feed * 60000, distanceMm };
+        };
+        const along = (t: number): JogPosition => clamp({ x: from.x + (target.position.x - from.x) * t,
+            y: from.y + (target.position.y - from.y) * t,
+            z: from.z + (target.position.z - from.z) * t });
+        let chosen: JogTarget | null = null;
+        // Hits are monotonic along a straight segment, so bisection finds the clear prefix.
+        let lo = 0;
+        let hi = 1;
+        for (let i = 0; i < 24; i += 1) {
+            const mid = (lo + hi) / 2;
+            if (this.obstacleHit(from, along(mid), boxes, APPROACH_PAD_XY_MM)) { hi = mid; } else { lo = mid; }
+        }
+        if (lo * target.distanceMm >= MIN_APPROACH_MM) { chosen = segment(along(lo)); }
+        const drops: Array<Array<'x' | 'y' | 'z'>> = [['z'], ['x'], ['y'], ['x', 'y'], ['x', 'z'], ['y', 'z']];
+        for (const axes of drops) {
+            if (chosen) { break; }
+            const position = { ...target.position };
+            for (const axis of axes) { position[axis] = from[axis]; }
+            const candidate = segment(clamp(position));
+            if (candidate.distanceMm >= 0.001 && !this.obstacleHit(from, candidate.position, boxes)) { chosen = candidate; }
+        }
+        const requestedZ = Number(Math.min(from.z, target.position.z).toFixed(3));
+        const need = hit.requiredZ === null ? 'no entry, tool clearance unknown'
+            : `Z>=${Number(hit.requiredZ.toFixed(3))} (asked ${requestedZ.toFixed(1)})`;
+        this.blocked = { name: hit.name,
+            requiredZ: hit.requiredZ,
+            requestedZ,
+            held: !chosen,
+            text: `${chosen ? 'LIMITED' : 'BLOCKED'} ${hit.name}: ${need}` };
+        if (!this.blockedLogged.has(hit.name)) {
+            this.blockedLogged.add(hit.name);
+            const needed = hit.requiredZ === null ? 'tool clearance is unknown; the region is excluded'
+                : `requires machine Z at or above ${hit.requiredZ.toFixed(3)} mm`;
+            log.info(`Jog ${chosen ? 'limited' : 'held'} at ${hit.name}: ${needed}; requested segment reaches machine Z ${requestedZ.toFixed(3)} mm. Still armed; that segment was not sent. Later refusals at this obstacle are not logged until the next arm.`);
+        }
+        return chosen;
     }
 
     private release(): void {
@@ -166,6 +267,7 @@ export class PendantRuntime {
         if (this.nextJog !== null) { clearImmediate(this.nextJog); this.nextJog = null; }
         if (this.session.armed || this.error !== reason) { log.info(`Disarmed: ${reason}`); }
         this.session.disarm();
+        this.blocked = null;
         this.error = reason;
         this.release();
     }
@@ -203,7 +305,7 @@ export class PendantRuntime {
             this.session.reset();
             this.feedbackHealthy = null;
             this.feedbackWritePending = false;
-            this.firmware = null;
+            this.firmware = undefined;
             const port = new SerialPort({ path, baudRate: 115200, autoOpen: false });
             this.port = port;
             port.on('error', (err: Error) => { if (port === this.port) { this.disarm(err.message); } });
@@ -225,7 +327,7 @@ export class PendantRuntime {
                                 }
                                 throw err;
                             }
-                            if ((input.fw ?? null) !== this.firmware) {
+                            if (this.firmware === undefined || (input.fw ?? null) !== this.firmware) {
                                 this.firmware = input.fw ?? null;
                                 log.info(`Feather firmware: ${this.firmware || 'unidentified (pre-fw build)'}`);
                             }
@@ -281,7 +383,9 @@ export class PendantRuntime {
                 warnings: dro.warnings.length ? [dro.warnings[0].slice(0, 160)] : [],
                 input_seq: this.session.inputSequence >= 0 ? this.session.inputSequence : null,
                 input_age_ms: now - this.session.receivedAt,
-                message: this.error?.slice(0, 240) || null })}\n`;
+                // The TFT shows `blocked` on its bottom row while linked; `message` only while not.
+                blocked: this.blocked ? { ...this.blocked, name: this.blocked.name.slice(0, 40), text: this.blocked.text.slice(0, 120) } : null,
+                message: (this.error || this.blocked?.text || '').slice(0, 240) || null })}\n`;
             trace(`tx ${frame.trimEnd()}`);
             this.port.write(frame, (err) => {
                 this.feedbackWritePending = false;
@@ -292,7 +396,7 @@ export class PendantRuntime {
         if (this.busy || !this.session.armed) { return; }
         this.ready();
         const from = this.position();
-        const target = this.session.target(from, now, this.commandOverheadMs);
+        const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
         if (!target) { this.release(); return; }
         this.validateEnvelope(this.session.bounds as JogBounds);
         this.validateJogSegment(from, target.position);
@@ -371,10 +475,11 @@ export class PendantRuntime {
                 lastJog: this.lastJog,
                 inputAgeMs: Date.now() - this.session.receivedAt,
                 port: this.port?.path || null,
-                firmware: this.firmware,
+                firmware: this.firmware ?? null,
                 trace: traceEnabled(),
                 input: this.session.latest,
                 error: this.error,
+                blocked: this.blocked,
                 dro: this.dro(),
                 bounds: this.session.bounds,
                 defaultBounds: this.defaultBounds(),
@@ -414,6 +519,8 @@ export class PendantRuntime {
                     this.epoch = this.machineEpoch();
                     this.pageAliveAt = Date.now();
                     this.error = null;
+                    this.blocked = null;
+                    this.blockedLogged.clear();
                     log.info(`Armed reviewed envelope: ${JSON.stringify(bounds)}`);
                     break;
                 }

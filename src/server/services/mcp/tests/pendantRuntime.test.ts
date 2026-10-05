@@ -29,6 +29,7 @@ function fixture(a350 = false) {
     const logs: string[] = [];
     const settingsChanges: object[] = [];
     const homes: unknown[][] = [];
+    const targets: Array<{ x: number; y: number; z: number }> = [];
     let restores = 0;
     const snapshot = () => ({ machine, work: machine, originOffset: { x: 0, y: 0, z: 0 }, originOffsetSource: 'heartbeat', machineStatus, reliability: 'heartbeat', warnings, reportAgeMs: 0 });
     class Port extends EventEmitter {
@@ -72,7 +73,9 @@ function fixture(a350 = false) {
         './positionOfRecord': { currentGcodeSequence: () => 0, getTrustedOffset: () => null, getPositionOfRecord: () => (estimated ? { source: 'estimated' } : null) },
         './probeFeed': { probeFeedService: { assertNoOvertravel: () => undefined } },
         './probing': { assertMachineReadyForProcedure: () => { if (readyError) { throw Error('not idle'); } },
-            moveMachineSettled: async () => { moves += 1; await new Promise<void>((resolve) => { finish = resolve; }); } },
+            moveMachineSettled: async (_label: string, position: { x: number; y: number; z: number }) => {
+                moves += 1; targets.push({ ...position }); await new Promise<void>((resolve) => { finish = resolve; });
+            } },
         './tools/camera': { sendWorkFrameRestore: async () => { restores += 1; return { result: 0 }; }, homeMachine: async (...args: unknown[]) => { homes.push(args); await new Promise<void>((resolve) => { finish = resolve; }); } },
         './tools/machine': { HEARTBEAT_STALE_MS: 10000,
             connectionEpoch: () => epoch,
@@ -140,6 +143,7 @@ function fixture(a350 = false) {
         logs,
         settingsChanges,
         homes,
+        targets,
         restores: () => restores,
         setWarnings: (value: string[]) => { warnings = value; },
         setMachineStatus: (status: string) => { machineStatus = status; },
@@ -235,7 +239,7 @@ export const tests: Array<[string, () => Promise<void>]> = [
         assert.equal(status.obstacleExclusions[0].machine.x0, 155);
         assert.equal(f.moves(), 0);
     }],
-    ['broad envelope permits clear low jogs but stops before entering an obstacle', async () => {
+    ['broad envelope permits clear low jogs, holds armed before an obstacle and recovers moving away', async () => {
         const f = fixture(); await f.initialize();
         f.obstacles.push({ name: 'fixture', machine: { x0: 20, x1: 21, y0: 5, y1: 15 }, clearanceZ: 20 });
         assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
@@ -243,13 +247,85 @@ export const tests: Array<[string, () => Promise<void>]> = [
         f.input(); f.input({ x: 1, deadman: true });
         await f.tick(); assert.equal(f.moves(), 1); await f.finish();
         f.machine.x = 14.95;
-        f.input({ x: 1, deadman: true }); await f.tick();
-        const stopped = JSON.parse((await f.request('/pendant/status')).body);
-        assert.equal(stopped.armed, false);
-        assert.match(stopped.error, /fixture.*machine Z at or above 20.000/);
-        assert.equal(f.moves(), 1);
+        f.input({ x: 1, deadman: true });
+        for (let i = 0; i < 5; i += 1) { await f.tick(); }
+        const held = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(held.armed, true);
+        assert.equal(held.error, null);
+        assert.deepEqual(held.blocked, { name: 'fixture', requiredZ: 20, requestedZ: 10, held: true, text: 'BLOCKED fixture: Z>=20 (asked 10.0)' });
+        assert.equal(f.moves(), 1, 'a refused segment is never transmitted, however many ticks pass');
+        assert.equal(f.logs.filter((line) => line.startsWith('Jog held at fixture')).length, 1);
+        assert.ok(!f.logs.slice(f.logs.findIndex((line) => line.startsWith('Armed reviewed'))).some((line) => line.startsWith('Disarmed')));
+        const frame = f.writes().slice(-1)[0] as { armed: boolean; blocked: { name: string; requiredZ: number; requestedZ: number }; message: string };
+        assert.equal(frame.armed, true);
+        assert.deepEqual([frame.blocked.name, frame.blocked.requiredZ, frame.blocked.requestedZ], ['fixture', 20, 10]);
+        assert.match(frame.message, /BLOCKED fixture: Z>=20 \(asked 10.0\)/);
+        f.input(); await f.tick();
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked, null, 'neutral stick clears the hold');
         await f.tick();
-        assert.match(JSON.stringify(f.writes().slice(-1)), /fixture/);
+        assert.equal((f.writes().slice(-1)[0] as { blocked: unknown }).blocked, null);
+        f.input({ x: -1, deadman: true }); await f.tick();
+        assert.equal(f.moves(), 2);
+        assert.ok(f.targets[1].x < 14.95);
+        await f.finish();
+    }],
+    ['Z-down over a landmark holds armed with no transmission; stick motion clear of it continues', async () => {
+        const f = fixture(true); await f.initialize();
+        f.obstacles.push({ name: 'rotary', machine: { x0: 140, x1: 200, y0: 0, y1: 350 }, clearanceZ: 328, clearanceBasis: 'toolhead' });
+        f.machine.x = 170; f.machine.z = 328;
+        const bounds = { xMin: -19, xMax: 330, yMin: 0, yMax: 342, zMin: 280, zMax: 328 };
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds })).status, 200);
+        f.input(); f.input({ z: -1, mode: 'z', deadman: true });
+        await f.tick(); await f.tick();
+        let status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(status.armed, true);
+        assert.equal(f.moves(), 0);
+        assert.equal(status.blocked.text, 'BLOCKED rotary: Z>=328 (asked 327.5)');
+        f.input({ x: 1, z: -1, mode: 'z', deadman: true }); await f.tick();
+        assert.equal(f.moves(), 1, 'the X component that stays at the required Z is sent');
+        assert.equal(f.targets[0].z, 328);
+        assert.ok(f.targets[0].x > 170);
+        status = JSON.parse((await f.request('/pendant/status')).body);
+        assert.equal(status.armed, true);
+        assert.equal(status.blocked.held, false);
+        assert.match(status.blocked.text, /^LIMITED rotary: Z>=328/);
+        await f.finish();
+        f.input({ x: 1, mode: 'z', deadman: true }); await f.tick();
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked, null, 'an accepted full segment clears the reason');
+        await f.finish();
+        assert.equal(f.logs.filter((line) => line.startsWith('Jog limited at rotary')).length, 0, 'only the first refusal per arm is logged');
+        assert.equal(f.logs.filter((line) => line.startsWith('Jog held at rotary')).length, 1);
+        await f.request('/pendant/disarm', {});
+        f.input(); assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true, bounds })).status, 200);
+        f.input(); f.input({ z: -1, mode: 'z', deadman: true }); await f.tick();
+        assert.equal(f.logs.filter((line) => line.startsWith('Jog held at rotary')).length, 2, 'a new arm logs again');
+        assert.equal(f.moves(), 2);
+    }],
+    ['an approach toward an obstacle stops just outside it, then holds', async () => {
+        const f = fixture(); await f.initialize();
+        f.obstacles.push({ name: 'clamp', machine: { x0: 17, x1: 18, y0: 5, y1: 15 }, clearanceZ: 20, clearanceBasis: 'toolhead' });
+        assert.equal((await f.request('/pendant/arm', { clearanceConfirmed: true,
+            bounds: { xMin: 0, xMax: 50, yMin: 0, yMax: 50, zMin: 0, zMax: 50 } })).status, 200);
+        f.input(); f.input({ x: 1, deadman: true, feed: 3000 }); await f.tick();
+        assert.equal(f.moves(), 1);
+        assert.ok(f.targets[0].x > 11.49 && f.targets[0].x < 11.5, `stopped ${f.targets[0].x} 0.5 mm outside the margin`);
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked.held, false);
+        await f.finish();
+        f.machine.x = f.targets[0].x;
+        await f.tick(); await f.tick();
+        assert.equal(f.moves(), 1);
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).blocked.held, true);
+    }],
+    ['a pre-fw Feather is logged once per connection as unidentified', async () => {
+        const f = fixture(); await f.initialize();
+        f.input(); f.input();
+        const unidentified = () => f.logs.filter((line) => line === 'Feather firmware: unidentified (pre-fw build)').length;
+        assert.equal(unidentified(), 1);
+        assert.equal(JSON.parse((await f.request('/pendant/status')).body).firmware, null);
+        assert.equal((await f.request('/pendant/connect', { path: 'COM42' })).status, 200);
+        f.input(); assert.equal(unidentified(), 2);
+        f.input({ fw: 'pendant-2026-10-05' }); f.input({ fw: 'pendant-2026-10-05' });
+        assert.equal(f.logs.filter((line) => line === 'Feather firmware: pendant-2026-10-05').length, 1);
     }],
     ['clearance check covers complete diagonals, Z-only descent, unknown tools and changed landmarks', async () => {
         for (const kind of ['diagonal', 'descent', 'unknown', 'changed']) {
@@ -271,11 +347,19 @@ export const tests: Array<[string, () => Promise<void>]> = [
                     clearanceBasis: kind === 'unknown' ? 'physical' : 'toolhead' });
                 f.input({ x: 1, deadman: true });
             }
-            await f.tick();
+            await f.tick(); await f.tick();
             const status = JSON.parse((await f.request('/pendant/status')).body);
-            assert.equal(status.armed, false, kind);
-            assert.match(status.error, new RegExp(kind));
-            assert.equal(f.moves(), 0, kind);
+            assert.equal(status.armed, true, kind);
+            assert.equal(status.blocked.name, kind);
+            // Diagonal slides along the clear axis; the others start inside the box and hold.
+            assert.equal(f.moves(), kind === 'diagonal' ? 1 : 0, kind);
+            assert.equal(status.blocked.held, kind !== 'diagonal', kind);
+            for (const to of f.targets) {
+                for (const box of status.obstacleExclusions) {
+                    assert.ok(!(envelopeChecks.segmentHitsBox2D(f.machine.x, f.machine.y, to.x, to.y, box.machine, 0)
+                        && (box.requiredZ === null || Math.min(f.machine.z, to.z) < box.requiredZ - 0.05)), `${kind} sent ${JSON.stringify(to)}`);
+                }
+            }
         }
     }],
     ['jogs over a landmark at its required Z accept normal heartbeat noise', async () => {
