@@ -9,6 +9,12 @@ const frame = (over: Partial<PendantInput> = {}): PendantInput => ({
 });
 
 export const tests: Array<[string, () => void]> = [
+    ['envelope accepts heartbeat noise within 0.05 mm of an edge, refuses beyond', () => {
+        const edge: JogBounds = { xMin: -19, xMax: 339, yMin: 0, yMax: 342, zMin: 280, zMax: 328 };
+        validateJogBounds(edge, { x: 10, y: -0.0000051269531127218215, z: 327.999 });
+        validateJogBounds(edge, { x: 339.04, y: 342.04, z: 328.04 });
+        assert.throws(() => validateJogBounds(edge, { x: 10, y: -0.06, z: 300 }), /contain current position/);
+    }],
     ['wire protocol rejects nonfinite axes, strings, bad mode, feed, version and oversized frames', () => {
         for (const over of [{ x: null }, { y: '1' }, { z: 2 }, { feed: 3001 }, { feed: 59 }, { feed: 0 }, { v: 2 },
             { mode: 'z', feed: 1001 },
