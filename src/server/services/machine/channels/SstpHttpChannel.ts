@@ -21,6 +21,7 @@ import Channel, { CncChannelInterface, ExecuteGcodeResult, FileChannelInterface,
 import { ChannelEvent } from './ChannelEvent';
 import { connectionDiagnostics, diagnosticId } from '../connectionDiagnostics';
 import { httpEvidence } from '../connectionDiagnosticState';
+import { gcodeLease } from '../gcodeLease';
 
 let waitConfirm: boolean;
 const log = logger('machine:channels:SstpHttpChannel');
@@ -626,6 +627,8 @@ class SstpHttpChannel extends Channel implements
      * Generic execute G-code commands.
      */
     public async executeGcode(gcode: string): Promise<ExecuteGcodeResult> {
+        const refusal = gcodeLease.refusal(gcode);
+        if (refusal) { return { result: -1, text: refusal }; }
         return new Promise((resolve) => {
             // enqueue G-code execution
             const split = gcode.split('\n');

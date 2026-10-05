@@ -1,6 +1,6 @@
 import assert from 'assert';
 import { ManualControlGate } from '../manualControl';
-import { JogBounds, PendantInput, PendantSession, parsePendantInput, validateJogBounds } from '../pendant';
+import { JogBounds, PendantInput, PendantSession, firmwareMotionProblem, parsePendantInput, validateJogBounds } from '../pendant';
 
 const bounds: JogBounds = { xMin: 0, xMax: 20, yMin: 0, yMax: 20, zMin: 0, zMax: 20 };
 const current = { x: 10, y: 10, z: 10 };
@@ -138,5 +138,14 @@ export const tests: Array<[string, () => void]> = [
         assert.throws(() => gate.acquire());
         gate.release();
         gate.enterTool('home')();
+    }],
+    ['firmware motion limits must be reported and fit the pipelining model', () => {
+        const snapmaker = 'echo:; Maximum feedrates (units/s):\necho:  M203 X120.00 Y120.00 Z40.00 E45.00\n'
+            + 'echo:  M201 X3000 Y3000 Z100 E10000\necho:  M204 P1000.00 R1000.00 T1000.00\nok';
+        assert.equal(firmwareMotionProblem(snapmaker, 3000, 500), null);
+        assert.match(String(firmwareMotionProblem(snapmaker.replace('M203 X120.00', 'M203 X40.00'), 3000, 500)), /max feed/);
+        assert.match(String(firmwareMotionProblem(snapmaker.replace('T1000.00', 'T400.00'), 3000, 500)), /acceleration/);
+        assert.match(String(firmwareMotionProblem(snapmaker.replace('M201 X3000 Y3000', 'M201 X3000 Y300'), 3000, 500)), /acceleration/);
+        assert.match(String(firmwareMotionProblem('ok', 3000, 500)), /unknown/);
     }],
 ];

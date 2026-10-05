@@ -3,6 +3,7 @@ import { mcpBroadcast } from './index';
 import {
     AXES,
     BeatObservation,
+    noteFrameRestored,
     NullableXyz,
     PositionSource,
     Xyz,
@@ -193,6 +194,8 @@ export interface MoveOptions {
      * Each segment is <= DESCENT_SEGMENT_MM and sensor-checked by the caller.
      */
     lenient?: boolean;
+    /** Called once the controller acknowledged the whole batch (result 0), before the arrival is judged. */
+    onReply?: () => void;
 }
 
 async function moveMachineSettledUnguarded(
@@ -240,6 +243,9 @@ G54;`;
     traceMark('reply-returned');
     if (executed.result !== 0) {
         throw new ProcedureAbort(`Controller rejected the move: ${executed.text || executed.result}`);
+    }
+    if (options.onReply) {
+        options.onReply();
     }
     const arrived = (machine: NullableXyz, source: PositionSource) => {
         const full = completeTarget(machine, target);
@@ -502,11 +508,16 @@ export async function moveMachineSettled(
 // across several queued segments and settle ONCE, with the same verified-settle
 // engine, at the end. The caller owns every bound on what it queues.
 
-/** Select absolute machine coordinates for a run of queued moves. No motion. */
+/**
+ * Select absolute machine coordinates for a run of queued moves. No motion.
+ * `M220 S100` first: the Snapmaker build's M220 reports nothing, so the feed
+ * override cannot be read, and the caller's queue model needs commanded feed
+ * to be real feed. It is asserted for every run instead.
+ */
 export async function enterMachineFrame(tool: string): Promise<SentGcode> {
     probeFeedService.assertNoOvertravel();
     checkProcedureStop();
-    const executed = await sendGcodeVisible(getDirectChannel(), tool, 'G90\nG53;');
+    const executed = await sendGcodeVisible(getDirectChannel(), tool, 'M220 S100\nG90\nG53;');
     if (executed.result !== 0) {
         throw new ProcedureAbort(`Controller rejected the machine-frame select: ${executed.text || executed.result}`);
     }
@@ -539,11 +550,20 @@ export async function queueMachineMove(tool: string, target: Xyz, feed: number):
 export async function settleQueuedMachineMoves(tool: string, last: Xyz, feed: number): Promise<void> {
     probeFeedService.motionBegin();
     try {
-        await moveMachineSettledUnguarded(tool, last, feed);
+        await moveMachineSettledUnguarded(tool, last, feed, { onReply: () => noteFrameRestored() });
         traceMark('settled-exit');
     } finally {
         probeFeedService.motionEnd();
     }
+}
+
+/** The firmware's current motion limits (`M503 S`, read-only), for the caller to judge. */
+export async function readFirmwareMotionConfig(tool: string): Promise<string> {
+    const executed = await sendGcodeVisible(getDirectChannel(), tool, 'M503 S');
+    if (executed.result !== 0 || !executed.text?.trim()) {
+        throw new ProcedureAbort(`M503 S returned no configuration: ${executed.text || executed.result}`);
+    }
+    return executed.text;
 }
 
 /** What raiseToTop did, so a runner can report the head's final Z honestly. */

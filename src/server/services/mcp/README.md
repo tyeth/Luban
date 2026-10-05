@@ -1735,4 +1735,10 @@ Settled pendant segments stop between moves because the engine's trailing `G54;`
 the controller's planner (Marlin `select_coordinate_system()`). `LUBAN_PENDANT_PIPELINE=1` is an
 opt-in, hardware-unverified continuous X/Y mode. It queues bounded G1 segments in one `G53`
 window (`probing.ts` `enterMachineFrame` / `queueMachineMove` / `settleQueuedMachineMoves`) and
-settles once; the pendant README states its stop-latency bounds.
+settles once; the pendant README states its stop-latency bounds. While a run holds the window, an
+exclusive gcode lease (`machine/gcodeLease.ts`) refuses every other command at the channels and
+at ConnectionManager's job and jog entry points. The tracker judges in-run beats as machine
+coordinates (`declareMachineFrameRun`, `machinePosition.ts` `judgeDeclaredRun`). A persistent
+`frameUncertain` latch (`positionOfRecord.ts`, shown in `get_position` warnings and in
+`get_mcp_diagnostics`) refuses all motion until the work frame is restored and a fresh position
+verified.

@@ -3,6 +3,7 @@ import http from 'http';
 import { SerialPort } from 'serialport';
 
 import logger from '../../lib/logger';
+import { gcodeLease } from '../machine/gcodeLease';
 import { connectionManager } from '../machine/ConnectionManager';
 import { clearanceOptions } from './clearanceContext';
 import { OBSTACLE_MARGIN_MM, POSITION_EPSILON_MM, isStraightZUp, segmentHitsBox2D } from './envelopeChecks';
@@ -11,15 +12,15 @@ import { landmarkStore } from './landmarks';
 import { requiredToolheadZ } from './landmarkClearance';
 import { manualControlGate } from './manualControl';
 import { isLoopback } from './McpServer';
-import { JogBounds, JogPosition, PendantSession, parsePendantInput, validateJogBounds } from './pendant';
+import { JogBounds, JogPosition, PENDANT_FEED_MAX, PendantSession, firmwareMotionProblem, parsePendantInput, validateJogBounds } from './pendant';
 import { pendantPage } from './pendantPage';
 import { pendantPosition } from './pendantPosition';
 import { pendantSettings, updatePendantSettings } from './pendantSettings';
-import { currentGcodeSequence, getPositionOfRecord, getTrustedOffset } from './positionOfRecord';
+import { currentGcodeSequence, getFrameLatch, getPositionOfRecord, getTrustedOffset, latchFrameUncertain } from './positionOfRecord';
 import { probeFeedService } from './probeFeed';
-import { assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queueMachineMove, settleQueuedMachineMoves, sleep } from './probing';
+import { assertMachineReadyForProcedure, enterMachineFrame, moveMachineSettled, queueMachineMove, readFirmwareMotionConfig, settleQueuedMachineMoves, sleep } from './probing';
 import { homeMachine, sendWorkFrameRestore } from './tools/camera';
-import { HEARTBEAT_STALE_MS, connectionEpoch, getMachineSizeByIdentifier, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
+import { HEARTBEAT_STALE_MS, connectionEpoch, declareMachineFrameRun, endMachineFrameRun, getMachineSizeByIdentifier, getPositionSnapshot, requirePlanningTravel, safeTraverseZ } from './tools/machine';
 
 const log = logger('service:mcp:pendant');
 
@@ -82,9 +83,22 @@ export const PIPELINE_REPLY_LIMIT_MS = 400;
 // The closing settle must finish this soon after the modelled end of the queue,
 // or the controller ran longer than modelled: fall back until re-armed.
 export const PIPELINE_DRAIN_LATE_MS = 300;
-// Settle, verify and restore G54 at least this often during a long hold.
-export const PIPELINE_RUN_MAX_MS = 10000;
+// Settle, verify and restore G54 at least this often (wall time, and commanded
+// time sent) while the stick is held. Bounds the backlog if the controller stalls.
+export const PIPELINE_RUN_MAX_MS = 2000;
 const PIPELINE_POLL_MS = 10;
+// A run needs a heartbeat at most this old (the WiFi poll is 2 s); older ends the run.
+export const PIPELINE_HEARTBEAT_MAX_AGE_MS = 2500;
+// In-run heartbeats: the toolhead may trail the slow model by at most this much.
+export const PIPELINE_LAG_LIMIT_MM = 2;
+// A status report may have been sampled up to this long before it was received.
+const PIPELINE_BEAT_SAMPLE_SLACK_MS = 500;
+// Beats received this long after the G53 reply are judged as machine coordinates.
+const PIPELINE_DECLARE_GUARD_MS = 300;
+// The lease is renewed on every request of the run; it lapses only if the run hangs.
+const PIPELINE_LEASE_TTL_MS = 30000;
+
+interface RunSegment { from: JogPosition; to: JogPosition; start: number; end: number; cum: number; len: number }
 
 export class PendantRuntime {
     private session = new PendantSession();
@@ -135,6 +149,13 @@ export class PendantRuntime {
     private epoch: number | null = null;
 
     private pipeline = { requested: false, active: false, disabled: null as string | null, lastRun: null as object | null };
+
+    private runPromise: Promise<void> | null = null;
+
+    private lagBeatAt: number | null = null;
+
+    // Crash-guard brackets kept open after a run could not prove its queue drained.
+    private heldMotionGuard = 0;
 
     private position(): JogPosition {
         const p = getPositionSnapshot();
@@ -498,8 +519,9 @@ export class PendantRuntime {
         const from = this.position();
         const target = this.obstacleSafeTarget(from, this.session.target(from, now, this.commandOverheadMs));
         if (!target) { this.release(); return; }
-        if (this.pipeline.requested && !this.pipeline.disabled && target.position.z === from.z) {
-            await this.pipelinedRun(from);
+        if (this.pipelineEligible(from, target)) {
+            this.runPromise = this.pipelinedRun(from);
+            try { await this.runPromise; } finally { this.runPromise = null; }
             this.queueNextTick();
             return;
         }
@@ -532,19 +554,86 @@ export class PendantRuntime {
     }
 
     // assertMachineReadyForProcedure() minus its position-reliability check: beats
-    // inside the run's G53 window are set aside by design (machinePosition.ts), and
-    // the run starts from a ready() position and ends with a verified settle.
-    private readyInRun(): void {
+    // inside the run's G53 window are judged by the declared run (machinePosition.ts),
+    // and the run starts from a ready() position and ends with a verified settle.
+    // Returns a reason to END the run (settle, stay armed); throws to disarm.
+    private readyInRun(): string | null {
         const p = getPositionSnapshot();
-        if (p.reportAgeMs > HEARTBEAT_STALE_MS) { throw new Error(`The machine heartbeat is ${p.reportAgeMs} ms old; jog stopped.`); }
-        if (p.machineStatus !== 'idle') { throw new Error(`Machine is ${p.machineStatus || 'in an unknown state'}, not idle.`); }
-        if (p.isHomed !== true) { throw new Error('Machine does not report homed.'); }
+        if (p.machineStatus !== 'idle') {
+            throw new Error(`Queued jog stopped: the controller reported "${p.machineStatus || 'unknown'}" during queued motion. `
+                + 'Pendant disarmed; re-arm to continue. If this happens on every jog, this controller reports busy during queued '
+                + 'moves: restart Luban without LUBAN_PENDANT_PIPELINE.');
+        }
+        if (p.isHomed !== true) { throw new Error('Queued jog stopped: the machine does not report homed. Pendant disarmed.'); }
         const state = connectionManager.getLatestMachineState() as { headStatus?: unknown; headPower?: unknown } | null;
         if (Number(state?.headPower) > 0 || state?.headStatus === true || state?.headStatus === 'on') {
-            throw new Error('Toolhead appears to be on.');
+            throw new Error('Queued jog stopped: the toolhead appears to be on. Pendant disarmed.');
         }
         probeFeedService.assertNoOvertravel();
-        if (jobManager.getActive()?.state === 'started') { throw new Error('A machine job is active.'); }
+        if (jobManager.getActive()?.state === 'started') { throw new Error('Queued jog stopped: a machine job is active. Pendant disarmed.'); }
+        if (p.reportAgeMs > PIPELINE_HEARTBEAT_MAX_AGE_MS) {
+            return `machine heartbeat ${p.reportAgeMs} ms old (limit ${PIPELINE_HEARTBEAT_MAX_AGE_MS} ms)`;
+        }
+        return null;
+    }
+
+    /**
+     * Reality check on the queue model. While the run is declared, a heartbeat
+     * carries machine coordinates. If it shows the toolhead further back along the
+     * queued path than the SLOW model allows (or off the path), the controller is
+     * running slower than modelled: the real backlog is growing. Returns the reason.
+     * Caveat: if the controller reports its planner's queued target rather than the
+     * executing position, beats run ahead of the model and this check cannot fire;
+     * the firmware-limit check, M220 S100, the drain check and the 2 s run cap remain.
+     */
+    private runLag(segments: RunSegment[]): string | null {
+        if (!segments.length) { return null; }
+        let p: ReturnType<typeof getPositionSnapshot>;
+        try { p = getPositionSnapshot(); } catch (err) { return null; }
+        if (!p.judged?.declaredRun || p.frame !== 'machine-frame' || p.reportedAt === this.lagBeatAt) { return null; }
+        if (!['x', 'y'].every((a) => Number.isFinite(p.machine[a as 'x' | 'y']))) { return null; }
+        this.lagBeatAt = p.reportedAt;
+        const sampleAt = p.reportedAt - PIPELINE_BEAT_SAMPLE_SLACK_MS;
+        let expected = 0;
+        for (const s of segments) {
+            if (sampleAt <= s.start) { break; }
+            expected = s.cum + s.len * Math.min(1, (sampleAt - s.start) / (s.end - s.start));
+        }
+        let best = { dist: Infinity, progress: 0 };
+        for (const s of segments) {
+            const dx = s.to.x - s.from.x;
+            const dy = s.to.y - s.from.y;
+            const bx = (p.machine.x as number) - s.from.x;
+            const by = (p.machine.y as number) - s.from.y;
+            const t = s.len > 0 ? Math.max(0, Math.min(1, (bx * dx + by * dy) / (s.len * s.len))) : 0;
+            const dist = Math.hypot(dx * t - bx, dy * t - by);
+            if (dist < best.dist) { best = { dist, progress: s.cum + s.len * t }; }
+        }
+        if (best.dist > PIPELINE_LAG_LIMIT_MM) {
+            return `a heartbeat put the toolhead ${best.dist.toFixed(2)} mm off the queued path`;
+        }
+        const lag = expected - best.progress;
+        return lag > PIPELINE_LAG_LIMIT_MM ? `the controller was ${lag.toFixed(2)} mm behind the queue model (limit ${PIPELINE_LAG_LIMIT_MM} mm)` : null;
+    }
+
+    /** Read the firmware's motion limits once per arm; pipelining stays off unless they fit the model. */
+    private async preparePipeline(): Promise<void> {
+        this.pipeline = { ...this.pipeline, requested: false, disabled: null };
+        if (!pipelineRequested()) { return; }
+        let problem: string | null;
+        try {
+            problem = firmwareMotionProblem(await readFirmwareMotionConfig('usb_pendant:pipeline-check'), PENDANT_FEED_MAX, PIPELINE_MODEL_ACCEL);
+        } catch (err) {
+            problem = `Could not read the controller's motion limits: ${(err as Error).message}`;
+        }
+        this.pipeline = { ...this.pipeline, requested: true, disabled: problem ? `${problem} Settled jogs only.` : null };
+        if (problem) { log.warn(`Pipelined jog refused: ${problem}`); }
+    }
+
+    private pipelineEligible(from: JogPosition, target: JogTarget): boolean {
+        if (!this.pipeline.requested || this.pipeline.disabled || target.position.z !== from.z || getFrameLatch()) { return false; }
+        if (connectionManager.getConnectionStatus().protocol !== 'HTTP') { return false; }
+        try { return getPositionSnapshot().reportAgeMs <= PIPELINE_HEARTBEAT_MAX_AGE_MS; } catch (err) { return false; }
     }
 
     /**
@@ -553,32 +642,52 @@ export class PendantRuntime {
      * one ends, then settles ONCE. Invariants, all against a model that charges
      * each segment its commanded time plus a full stop-and-restart whenever it
      * starts from rest or changes direction or feed:
+     *  - an exclusive gcode lease (machine/gcodeLease.ts) is held from before the
+     *    G53 until the closing G54, so no UI or other command lands in between;
+     *  - the frame-uncertainty latch is set before the G53 is sent and cleared only
+     *    by an acknowledged G54 plus a verified position; every exit path restores;
      *  - modelled unfinished commanded motion never exceeds the operator's
-     *    maxSegmentMs (500-1000 ms), so nothing queued outlasts it after a stop;
-     *  - at most PIPELINE_MAX_SEGMENTS segments are unfinished;
-     *  - every segment passes the envelope and obstacle checks before it is sent,
-     *    from the endpoint of the one queued before it;
+     *    maxSegmentMs (500-1000 ms), with at most PIPELINE_MAX_SEGMENTS unfinished;
+     *  - every target goes through obstacleSafeTarget from the previous queued
+     *    (rounded) endpoint and then the full envelope and segment checks before
+     *    it is sent; a held or released stick ENDS the run;
      *  - the armed check, USB freshness (300 ms) and the watchdogs run
      *    synchronously before every send, so after STOP, neutral, deadman
      *    release or a disarm nothing further is queued;
-     *  - Z intent, a slow acknowledgement or a controller that drains late ends
-     *    the run; the latter two return the session to settled jogs.
+     *  - the run settles at least every PIPELINE_RUN_MAX_MS; a heartbeat behind the
+     *    model, a slow acknowledgement or a late drain ends it and returns the
+     *    session to settled jogs until re-armed.
      */
     private async pipelinedRun(from: JogPosition): Promise<void> {
         const limitMs = this.session.maxSegmentMs;
         const capMs = Math.floor((limitMs - PIPELINE_MARGIN_MS) / 2);
+        const bounds = this.session.bounds as JogBounds;
         const startedAt = Date.now();
+        let leaseId: number;
+        try {
+            leaseId = gcodeLease.acquire('the USB pendant (queued jog)', PIPELINE_LEASE_TTL_MS);
+        } catch (err) {
+            this.disarm(`Queued jog refused: ${(err as Error).message}`);
+            return;
+        }
+        const leased = async <T>(fn: () => Promise<T>): Promise<T> => {
+            gcodeLease.renew(leaseId, PIPELINE_LEASE_TTL_MS);
+            return gcodeLease.runAs(leaseId, fn);
+        };
         let chain = from;
         let entered = false;
+        let restored = false;
         let uncertain = false;
         let queueEndsAt = 0;
         let ends: number[] = [];
+        const segments: RunSegment[] = [];
         let previous: { ux: number; uy: number; feed: number } | null = null;
         let replyMs = 100;
         let stopReason = 'input released';
         const totals = { segments: 0, distanceMm: 0, commandedMs: 0, maxOutstandingMs: 0, feed: 0 };
         this.busy = true;
         this.pipeline.active = true;
+        this.lagBeatAt = null;
         probeFeedService.motionBegin();
         try {
             try {
@@ -586,11 +695,21 @@ export class PendantRuntime {
                     let now = Date.now();
                     this.watchdog(now);
                     if (!this.session.armed) { stopReason = 'disarmed'; break; }
-                    if (now - startedAt >= PIPELINE_RUN_MAX_MS) { stopReason = 'periodic settle and verify'; break; }
-                    this.readyInRun();
-                    const target = this.session.target(chain, now, 0, capMs);
-                    if (!target) { stopReason = this.session.armed ? 'input released or stale' : 'disarmed'; break; }
-                    if (target.position.z !== chain.z) { stopReason = 'Z intent uses settled jogs'; break; }
+                    if (now - startedAt >= PIPELINE_RUN_MAX_MS || totals.commandedMs >= PIPELINE_RUN_MAX_MS) {
+                        stopReason = 'periodic settle and verify'; break;
+                    }
+                    const notReady = this.readyInRun();
+                    if (notReady) { stopReason = notReady; break; }
+                    const lag = entered ? this.runLag(segments) : null;
+                    if (lag) {
+                        this.pipeline.disabled = `Queued jog stopped: ${lag}; settled jogs until re-armed.`;
+                        stopReason = lag;
+                        log.warn(`Pipelined jog: ${this.pipeline.disabled}`);
+                        break;
+                    }
+                    const target = this.obstacleSafeTarget(chain, this.session.target(chain, now, 0, capMs));
+                    if (!target) { stopReason = this.blocked?.held ? `held at ${this.blocked.name}` : 'input released or stale'; break; }
+                    if (target.position.z !== chain.z) { stopReason = 'Z motion uses settled jogs'; break; }
                     const ux = (target.position.x - chain.x) / target.distanceMm;
                     const uy = (target.position.y - chain.y) / target.distanceMm;
                     ends = ends.filter((end) => end > now);
@@ -603,21 +722,25 @@ export class PendantRuntime {
                         await sleep(PIPELINE_POLL_MS);
                         continue;
                     }
-                    this.validateEnvelope(this.session.bounds as JogBounds, chain);
+                    this.validateEnvelope(bounds, chain);
                     this.validateJogSegment(chain, target.position);
                     if (!entered) {
-                        // No motion; re-sample intent after the round trip.
-                        await enterMachineFrame('usb_pendant');
+                        // Latched and marked BEFORE the send: a lost reply may still have selected G53.
+                        latchFrameUncertain('A queued USB pendant jog selected the machine workspace (G53).');
                         entered = true;
-                        continue;
+                        await leased(async () => enterMachineFrame('usb_pendant'));
+                        declareMachineFrameRun(bounds, Date.now() + PIPELINE_DECLARE_GUARD_MS);
+                        continue; // No motion yet; re-sample intent after the round trip.
                     }
                     const sentAt = Date.now();
                     uncertain = true;
-                    await queueMachineMove('usb_pendant', target.position, target.feed);
+                    await leased(async () => queueMachineMove('usb_pendant', target.position, target.feed));
                     uncertain = false;
                     now = Date.now();
-                    queueEndsAt = Math.max(queueEndsAt, now) + execMs;
+                    const start = Math.max(queueEndsAt, now);
+                    queueEndsAt = start + execMs;
                     ends.push(queueEndsAt);
+                    segments.push({ from: chain, to: target.position, start, end: queueEndsAt, cum: totals.distanceMm, len: target.distanceMm });
                     totals.maxOutstandingMs = Math.max(totals.maxOutstandingMs, queueEndsAt - now);
                     totals.segments += 1;
                     totals.distanceMm += target.distanceMm;
@@ -638,28 +761,41 @@ export class PendantRuntime {
                 stopReason = (err as Error).message;
                 this.disarm((err as Error).message);
             }
+            endMachineFrameRun();
             if (entered) {
                 const closeAt = Date.now();
                 try {
                     if (totals.segments && !uncertain) {
-                        await settleQueuedMachineMoves('usb_pendant', chain, totals.feed);
+                        await leased(async () => settleQueuedMachineMoves('usb_pendant', chain, totals.feed));
+                        restored = true;
                         const lateMs = Date.now() - Math.max(queueEndsAt, closeAt + 4 * replyMs);
                         if (lateMs > PIPELINE_DRAIN_LATE_MS && !this.pipeline.disabled) {
                             this.pipeline.disabled = `The controller finished ${Math.round(lateMs)} ms after the modelled end of the queue (limit ${PIPELINE_DRAIN_LATE_MS} ms); settled jogs until re-armed.`;
                             log.warn(`Pipelined jog: ${this.pipeline.disabled}`);
                         }
-                    } else {
-                        // Nothing verifiably queued (or an unacknowledged G1): restore
-                        // G54 without commanding any position; fresh beats verify it.
-                        const result = await sendWorkFrameRestore('usb_pendant:pipeline-close');
-                        if (result.result !== 0) { throw new Error(result.text || 'Controller refused the work-frame restore.'); }
                     }
                 } catch (err) {
-                    this.disarm(`Queued jog did not settle: ${(err as Error).message} Use Restore work frame if the machine frame is still selected.`);
+                    this.disarm(`Queued jog did not settle: ${(err as Error).message}`);
+                }
+                if (!restored) {
+                    // Nothing verifiably queued, an unacknowledged G1 or G53, or a failed
+                    // settle: restore G54 without commanding any position. Its G54 also
+                    // waits for anything still queued; fresh beats then verify it.
+                    try {
+                        const result = await leased(async () => sendWorkFrameRestore('usb_pendant:pipeline-close'));
+                        restored = result.result === 0;
+                        if (!restored) { throw new Error(result.text || 'Controller refused the work-frame restore.'); }
+                    } catch (err) {
+                        this.disarm(`Queued jog could not restore the work frame: ${(err as Error).message} The machine workspace may `
+                            + 'still be selected and queued motion may still be running. Motion stays refused; use Restore work frame.');
+                    }
                 }
             }
         } finally {
-            probeFeedService.motionEnd();
+            endMachineFrameRun();
+            gcodeLease.release(leaseId);
+            // The crash guard stays armed while queued motion may still be running.
+            if (!entered || restored) { probeFeedService.motionEnd(); } else { this.heldMotionGuard += 1; }
             this.pipeline.active = false;
             this.pipeline.lastRun = { ...totals, stopReason, elapsedMs: Date.now() - startedAt, segmentCapMs: capMs, limitMs };
             if (totals.segments) {
@@ -670,7 +806,13 @@ export class PendantRuntime {
         }
     }
 
-    public shutdown(): void {
+    /** A later successful work-frame restore proves queued motion ended (G54 synchronizes). */
+    private releaseHeldMotionGuard(): void {
+        for (; this.heldMotionGuard > 0; this.heldMotionGuard -= 1) { probeFeedService.motionEnd(); }
+    }
+
+    /** Stops jogging and resolves once any queued run has settled and restored its frame. */
+    public async shutdown(): Promise<void> {
         this.disarm('USB pendant closed.');
         if (this.timer) { clearInterval(this.timer); this.timer = null; }
         const port = this.port;
@@ -678,6 +820,7 @@ export class PendantRuntime {
         this.buffer = '';
         this.feedbackWritePending = false;
         if (port?.isOpen) { port.close(); }
+        if (this.runPromise) { await this.runPromise.catch(() => undefined); }
     }
 
     private defaultBounds(): JogBounds | null {
@@ -758,6 +901,10 @@ export class PendantRuntime {
                         throw new Error('Wait for the Feather to acknowledge host feedback within one second before arming.');
                     }
                     if (args.clearanceConfirmed !== true) { throw new Error('Review and confirm the entire envelope.'); }
+                    const latch = getFrameLatch();
+                    if (latch) {
+                        throw new Error(`The machine frame is uncertain (${latch.reason}). Use Restore work frame and wait for a verified position.`);
+                    }
                     this.ready();
                     const bounds = this.reviewedBounds(args.bounds);
                     const current = this.position();
@@ -767,7 +914,7 @@ export class PendantRuntime {
                     manualControlGate.acquire(() => this.disarm('Stopped through MCP.'));
                     this.owned = true;
                     this.session.arm(bounds, this.position(), Date.now(), args.maxSegmentMs ?? 500);
-                    this.pipeline = { ...this.pipeline, requested: pipelineRequested(), disabled: null };
+                    this.pipeline = { ...this.pipeline, requested: false, disabled: null };
                     this.epoch = this.machineEpoch();
                     this.pageAliveAt = Date.now();
                     this.error = null;
@@ -775,6 +922,7 @@ export class PendantRuntime {
                     this.blockedLogged.clear();
                     log.info(`Armed reviewed envelope: ${JSON.stringify(bounds)}`);
                     if (inside) { log.info(`Armed inside ${inside.name} below its required Z: only straight Z-up exits are sent until the toolhead leaves it.`); }
+                    await this.preparePipeline();
                     break;
                 }
                 case '/pendant/settings': {
@@ -810,10 +958,12 @@ export class PendantRuntime {
                     try {
                         if (homing) {
                             await homeMachine('usb_pendant:home', true, true);
+                            this.releaseHeldMotionGuard();
                             this.error = 'Homing completed and verified. Review bounds and re-arm to jog.';
                         } else {
                             const result = await sendWorkFrameRestore('usb_pendant:restore-frame');
                             if (result.result !== 0) { throw new Error(result.text || 'Controller refused frame recovery.'); }
+                            this.releaseHeldMotionGuard();
                             this.error = 'G90/G54 restored without axis motion. Wait for fresh coordinates, review bounds and re-arm.';
                         }
                     } finally {

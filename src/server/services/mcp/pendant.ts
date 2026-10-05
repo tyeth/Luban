@@ -204,3 +204,31 @@ export class PendantSession {
         return { position, feed, durationMs: distanceMm / feed * 60000, distanceMm };
     }
 }
+
+/**
+ * Pipelined jogging assumes the controller runs X/Y at the commanded feed with
+ * at least `minAccel` acceleration. Judge the firmware's own `M503 S` report
+ * (Marlin `M203` max feed mm/s, `M201` max acceleration, `M204` P/T
+ * acceleration) against that. null when every value is present and
+ * sufficient; otherwise the reason pipelining must stay off. Pure.
+ */
+export function firmwareMotionProblem(m503: string, maxFeedMmMin: number, minAccel: number): string | null {
+    const num = (re: RegExp): number[] | null => {
+        const m = m503.match(re);
+        return m ? m.slice(1).map(Number) : null;
+    };
+    const feeds = num(/M203\s+X(-?[\d.]+)\s+Y(-?[\d.]+)/);
+    const maxAccel = num(/M201\s+X(-?[\d.]+)\s+Y(-?[\d.]+)/);
+    const accel = num(/M204\s+P(-?[\d.]+)(?:\s+R-?[\d.]+)?\s+T(-?[\d.]+)/);
+    if (!feeds || !maxAccel || !accel || [...feeds, ...maxAccel, ...accel].some((v) => !Number.isFinite(v))) {
+        return 'M503 S did not report M203 X/Y, M201 X/Y and M204 P/T, so the controller\'s motion limits are unknown.';
+    }
+    const needFeed = maxFeedMmMin / 60;
+    if (Math.min(...feeds) < needFeed) {
+        return `Controller max feed X/Y ${feeds.join('/')} mm/s is below the pendant's ${needFeed} mm/s (M203).`;
+    }
+    if (Math.min(...maxAccel, ...accel) < minAccel) {
+        return `Controller acceleration (M201 X/Y ${maxAccel.join('/')}, M204 P/T ${accel.join('/')} mm/s²) is below the model's ${minAccel} mm/s².`;
+    }
+    return null;
+}
