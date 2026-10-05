@@ -16,8 +16,9 @@ export interface PendantInput {
     log?: string; // Rare firmware event (link change, short write), logged only when tracing.
 }
 
-export const PENDANT_FEED_MIN = 300;
+export const PENDANT_FEED_MIN = 60;
 export const PENDANT_FEED_MAX = 3000;
+export const PENDANT_Z_FEED_MAX = 1000;
 
 export interface JogBounds {
     xMin: number; xMax: number;
@@ -41,6 +42,9 @@ export function pendantFrameProblem(p: PendantInput): string | null {
         return `feed ${JSON.stringify(p.feed)} outside ${PENDANT_FEED_MIN}–${PENDANT_FEED_MAX} mm/min (update the Feather firmware?)`;
     }
     if (!['feed', 'z'].includes(p.mode)) { return `mode ${JSON.stringify(p.mode)}`; }
+    if (p.mode === 'z' && p.feed > PENDANT_Z_FEED_MAX) {
+        return `feed ${p.feed} above the Z-mode limit ${PENDANT_Z_FEED_MAX} mm/min (update the Feather firmware?)`;
+    }
     for (const key of ['deadman', 'stop', 'ready'] as const) {
         if (typeof p[key] !== 'boolean') { return `${key} not boolean`; }
     }

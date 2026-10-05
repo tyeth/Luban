@@ -9,10 +9,10 @@ import displayio
 import terminalio
 import usb_cdc
 from adafruit_display_text import label
-from controller import SLOW_FEED, Controller, DroDisplay, LinkWatchdog, normalize, deadzone
+from controller import DEFAULT_FEED, Controller, DroDisplay, LinkWatchdog, normalize, deadzone
 
 # Sent in every frame; Luban logs it on connect so a stale code.py/controller.py pair is visible.
-FIRMWARE = "pendant-2026-10-05"
+FIRMWARE = "pendant-2026-10-05b"
 
 if usb_cdc.data is None:
     print("Pendant maintenance console. Release D0 and reset to run USB data.")
@@ -53,7 +53,7 @@ for axis, y in zip("XYZ", (33, 60, 87)):
     dro_labels.append(area)
     group.append(area)
 feed_title = label.Label(terminalio.FONT, text="FEED", color=0x55DDFF, x=171, y=33)
-feed_value = label.Label(terminalio.FONT, text=str(SLOW_FEED), scale=3, color=0xFFFFFF, x=171, y=63)
+feed_value = label.Label(terminalio.FONT, text=str(DEFAULT_FEED), scale=3, color=0xFFFFFF, x=171, y=63)
 feed_units = label.Label(terminalio.FONT, text="mm/min", color=0xAAAAAA, x=171, y=87)
 group.append(feed_title)
 group.append(feed_value)
@@ -107,7 +107,6 @@ while True:
     fresh = link_watchdog.healthy(now, serial.connected, last_dro)
     linked = fresh and dro is not None and dro.get("armed") is True
     if linked != was_linked:
-        controller.feed = SLOW_FEED
         controller.neutral_required = True
         event = "linked" if linked else "unlinked"
     was_linked = linked
