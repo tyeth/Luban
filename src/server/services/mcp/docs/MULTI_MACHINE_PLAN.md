@@ -91,6 +91,13 @@ and a stated Z policy. A350 stays on by default; the others default off; Ray/Ori
 switch remains the master off. (New package WP9 `mcp/mm-motion-rules-ui`, base `mcp/mm-wave1`.) This replaces draft
 question Q7.
 
+**R13 (operator, 2026-10-19). Approval-free traverse at a computed safe height.** A second per-machine Motion rules
+toggle (operator-only, default off everywhere): when the lowest point of toolhead unit + tool is known as a machine-Z
+"bed contact" equivalent and the landmarks are confirmed, a traverse may run without approval at
+max(bed and obstacle tops on the path) + that offset + clearance, the clearance being the configurable ideal (default
+50 mm) and never below the configurable minimum. Settings/storage in WP9; planner and policy use in WP10 (after WP4a,
+WP5, WP9).
+
 ### Final package list and waves
 
 | Wave | Package | Branch | Base | Summary |
