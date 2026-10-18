@@ -2,8 +2,8 @@
 
 Status: reviewed by the lead (Opus) on 2026-10-18. The planning draft (sections 1-4 below, written by a
 Fable planning agent) is kept verbatim for its findings, capability table and inventories. **Where
-this review section conflicts with the draft, this section wins.** Tracking issue: see the PR that adds
-this file.
+this review section conflicts with the draft, this section wins.** Tracking issue: tyeth/Luban#265.
+
 
 ## Lead review - amendments (authoritative)
 
