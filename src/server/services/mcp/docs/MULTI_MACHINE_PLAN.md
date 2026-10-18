@@ -79,6 +79,18 @@ dialect is not `verifiedOnHardware`. The A350 defaults (328 / 320 / auto at top 
 with `-c core.hooksPath=/dev/null` if hooks block; no G-code or motion to any machine; no deploys; usage
 checked between tool calls with a hard stop at 99 %.
 
+**R11 (operator, 2026-10-19). Landmarks are temporary but only a human removes them.** A stale or unconfirmed
+landmark keeps being enforced in full; staleness makes the MCP ask and stage, never relax. Deleting or loosening a
+landmark (lower top, smaller box, legacy restatement that lowers the requirement) is staged for the operator's
+approval; adding or tightening applies at once. (WP5.)
+
+**R12 (operator, 2026-10-19). Motion rules live in the MCP settings.** A "Motion rules" section in Settings > MCP lists
+each known machine with its dialect, Z policy and a per-machine "Move at safe top Z without approval" toggle. Only the
+operator can turn it on (agents may only turn it off); eligible = has Z, `transportForm` 'sm2' (A150/A250/A350, Artisan)
+and a stated Z policy. A350 stays on by default; the others default off; Ray/Original/J1 are never eligible. The host-wide
+switch remains the master off. (New package WP9 `mcp/mm-motion-rules-ui`, base `mcp/mm-wave1`.) This replaces draft
+question Q7.
+
 ### Final package list and waves
 
 | Wave | Package | Branch | Base | Summary |
