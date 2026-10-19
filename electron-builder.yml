@@ -111,9 +111,6 @@ rpm:
     artifactName: Snapmaker-luban-${version}-linux.${arch}.${ext}
     afterInstall: build/linux-after-install.sh
     afterRemove: build/linux-after-remove.sh
-    fpm:
-        - --debug
-        - --debug-workspace
 
 #
 # Hooks

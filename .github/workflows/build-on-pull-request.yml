@@ -242,6 +242,8 @@ jobs:
         name: Build Linux Packages
         if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'linux' || inputs.platforms == 'all'
 
+        # ubuntu-latest (26.04, rpm 6.0.1) ignores rpmbuild's '--define buildroot'; the
+        # bundled fpm 1.9.3 relies on it, so the .rpm is built with a newer system fpm.
         runs-on: ubuntu-latest
         steps:
             -   name: Checkout Code
@@ -256,7 +258,8 @@ jobs:
             -   name: Install system dependencies
                 run: |
                     sudo apt-get update
-                    sudo apt-get install -y python3 make g++ build-essential fontconfig libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
+                    sudo apt-get install -y python3 make g++ build-essential fontconfig libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev ruby rpm
+                    sudo gem install fpm -v 1.17.0 --no-document
 
             -   name: Set up Python
                 uses: actions/setup-python@v6
@@ -283,18 +286,8 @@ jobs:
             # ----------------------------------------------------------------
             -   name: Build Linux x64 Binaries
                 run: npm run build:linux-x64
-
-            -   name: DEBUG rpmbuild
-                if: failure()
-                run: |
-                    set -x
-                    rpm --version; rpmbuild --version; dpkg -l | grep -E ' rpm|fpm|ruby' || true
-                    ls -la /tmp || true
-                    for d in /tmp/package-rpm-build-*; do
-                        echo "== $d"; find "$d" -maxdepth 2 | head -50
-                        cat "$d"/SPECS/*.spec | grep -v -E '^"?/opt' | head -200
-                        rpmbuild -bb -vv --target x86_64-unknown-linux --define "buildroot $d/BUILD" --define "_topdir $d" --define "_sourcedir $d" --define "_rpmdir $d/RPMS" --define "_tmppath /tmp" "$d"/SPECS/*.spec 2>&1 | grep -v -E '^D: |^/opt|Processing files' | tail -150
-                    done
+                env:
+                    USE_SYSTEM_FPM: 'true'
 
             -   run: |
                     PRODUCT_NAME="Snapmaker Luban"
