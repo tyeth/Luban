@@ -260,7 +260,8 @@ jobs:
 
         # ubuntu-latest (26.04) has rpm 6.0.1, which ignores the bundled fpm's
         # '--define buildroot'; build/rpmbuild-buildroot wraps rpmbuild to fix it.
-        runs-on: ubuntu-latest
+        # Pinned to 24.04: built on 26.04, serialport's native addon needs GLIBC 2.42 (breaks 24.04/Debian 12/RHEL 9).
+        runs-on: ubuntu-24.04
 
         steps:
             - name: Checkout Code
