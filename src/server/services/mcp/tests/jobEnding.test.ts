@@ -91,6 +91,12 @@ export const tests: Array<[string, () => void]> = [
         assert.equal(planJobStop('direct', 'started').action, 'machine-stop');
     }],
 
+    ['#328: an armed file job (uploaded to the Ray, waiting for its work switch) is withdrawn, and the note says the file stays', () => {
+        const plan = planJobStop('file', 'armed');
+        assert.equal(plan.action, 'withdraw-armed');
+        assert.match(plan.note, /REMAINS on the controller/);
+    }],
+
     ['a terminal job is already ended, whatever its kind', () => {
         const kinds: McpJobKind[] = ['file', 'direct', 'procedure'];
         const terminal: McpJobState[] = ['rejected', 'start_failed', 'stopped', 'completed'];

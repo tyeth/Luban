@@ -26,7 +26,15 @@ import { ComputedTravel, computeTravelHeight } from '../computedHeight';
 import { machineStore } from '../machineStore';
 import { COMPUTED_HEIGHT_TOGGLE } from '../motionRules';
 import { DirectStepContext, classifyProcedureEnding, countMeasured, directStepsLeft, planJobStop } from '../jobEnding';
-import { FILE_JOB_ACTIVE_STATUSES, FileStartReport, fileStartEvidence } from '../fileJobStart';
+import {
+    COMMAND_FILE_JOB_TRANSPORT,
+    FILE_JOB_ACTIVE_STATUSES,
+    FileJobTransport,
+    FileJobUploadOutcome,
+    FileStartReport,
+    fileJobTarget,
+    fileStartEvidence,
+} from '../fileJobStart';
 import { summarizeJobTiming } from '../jobTiming';
 import { landmarkStore } from '../landmarks';
 import { matchFrame } from '../positionOfRecord';
@@ -94,9 +102,11 @@ interface JobChannel {
     uploadGcodeFile?: (filePath: string, type: string, renderName: string, callback: (msg: unknown, data?: unknown) => void) => void;
     startGcodeJob?: () => Promise<{ ok: boolean; code?: number; text?: string; notSent?: boolean }>;
     stopGcodeJob?: () => Promise<{ ok: boolean; code?: number; text?: string }>;
+    /** How this channel starts and stops a file job (#328); absent = the A350's command start (COMMAND_FILE_JOB_TRANSPORT). */
+    fileJobTransport?: () => FileJobTransport;
 }
 
-type FileJobChannel = JobChannel & Required<Pick<JobChannel, 'uploadGcodeFile' | 'startGcodeJob'>>;
+type FileJobChannel = JobChannel & Required<Pick<JobChannel, 'uploadGcodeFile'>>;
 
 function getConnectedChannel(): JobChannel {
     const channel = connectionManager.getCurrentChannel() as unknown as JobChannel;
@@ -106,10 +116,44 @@ function getConnectedChannel(): JobChannel {
     return channel;
 }
 
+/** The channel's file-job transport, or the A350's command start when it declares none. */
+function channelFileJobTransport(channel: JobChannel): FileJobTransport {
+    return typeof channel.fileJobTransport === 'function' ? channel.fileJobTransport() : COMMAND_FILE_JOB_TRANSPORT;
+}
+
+/** The channel class for a refusal ("SacpSerialChannel"); the inert test stubs are plain objects. */
+function describeChannel(channel: object): string {
+    const name = channel && channel.constructor && channel.constructor.name;
+    return name && name !== 'Object' ? name : 'unnamed channel';
+}
+
+/**
+ * Why the connected channel cannot run a FILE job, or null when it can: it
+ * must upload, and either start by command (startGcodeJob) or declare an
+ * operator-switch start (fileJobTransport, the Ray over SACP-UDP). Judged at
+ * STAGING too (#328): until 2026-10-20 a Ray laser job was staged, validated
+ * and approved, and only start_gcode_job said "does not support file job
+ * submission" (job 8595d76f9e33) - an approval asked for a job that could
+ * never run.
+ */
+function fileJobChannelRefusal(channel: JobChannel): string | null {
+    const canUpload = typeof channel.uploadGcodeFile === 'function';
+    const canStart = typeof channel.startGcodeJob === 'function' || channelFileJobTransport(channel).start === 'operator-switch';
+    if (canUpload && canStart) {
+        return null;
+    }
+    return `File jobs cannot be started over the connected channel (${describeChannel(channel)}) ${connectedMachineTag()}: it has `
+        + `${canUpload ? 'a file upload but no file start' : 'no MCP file upload'}. Nothing was staged or sent. The A350 over Wi-Fi `
+        + '(SSTP) and the Ray over Wi-Fi (SACP-UDP, started at its work switch) run file jobs; the Ray over USB, the Original over USB '
+        + 'and the Artisan/J1 over Wi-Fi do not yet. Direct tools (traverse_xy, laser_frame, home) still run where the channel '
+        + 'executes G-code.';
+}
+
 function getJobChannel(): FileJobChannel {
     const channel = getConnectedChannel();
-    if (typeof channel.uploadGcodeFile !== 'function' || typeof channel.startGcodeJob !== 'function') {
-        throw new McpToolError('The connected channel does not support file job submission.');
+    const refusal = fileJobChannelRefusal(channel);
+    if (refusal) {
+        throw new McpToolError(refusal);
     }
     return channel as FileJobChannel;
 }
@@ -789,21 +833,33 @@ function markFileStarted(job: McpJob, observedAt?: number): void {
     if (job.startAttempt && observedAt && !job.startAttempt.observedRunningAt) {
         job.startAttempt.observedRunningAt = observedAt;
     }
-    if (job.state !== 'starting' && job.state !== 'start_unverified') {
+    if (job.state !== 'starting' && job.state !== 'start_unverified' && job.state !== 'armed') {
         return;
     }
+    const armed = job.state === 'armed';
     job.state = 'started';
     job.startedAt = observedAt || Date.now();
     job.error = null;
-    jobManager.appendEvent(job, 'started', { note: observedAt
-        ? 'fresh heartbeat confirms the machine is running the uploaded file; start response may be lost'
-        : 'controller acknowledged file start (door interlock applies)' });
+    let note = 'controller acknowledged file start (door interlock applies)';
+    if (armed) {
+        note = 'fresh heartbeat confirms the machine is running the uploaded file: the operator started it at the machine (#328)';
+    } else if (observedAt) {
+        note = 'fresh heartbeat confirms the machine is running the uploaded file; start response may be lost';
+    }
+    jobManager.appendEvent(job, 'started', { note });
     log.info(`MCP file job ${job.id} started: ${observedAt ? 'confirmed by fresh heartbeat' : 'controller acknowledged'}; reportAt=${observedAt || 'not yet observed'}`);
     spindleTelemetryService.startForJob(job);
     vibrationCaptureService.startForJob(job);
 }
 
-function watchFileJobCompletion(job: McpJob, channel: FileJobChannel): () => void {
+/**
+ * Poll the heartbeat for the uploaded file's run. `filename` is what the
+ * controller reports for it: the job's own name on the A350, `ray.nc` on the
+ * Ray (fileJobTarget). An `armed` job (operator-switch start, #328) waits here
+ * for the operator's switch: idle never completes it, only a fresh active
+ * report for its file adopts the run.
+ */
+function watchFileJobCompletion(job: McpJob, channel: FileJobChannel, filename: string): () => void {
     let sawActive = false;
     let idleStreak = 0;
     let unreadableStreak = 0;
@@ -831,7 +887,7 @@ function watchFileJobCompletion(job: McpJob, channel: FileJobChannel): () => voi
         const attempt = job.startAttempt;
         const sameConnection = (connectionManager.getCurrentChannel() as unknown) === channel
             && generation === connectionManager.getConnectionGeneration();
-        const evidence = fileStartEvidence(report, attempt?.requestedAt || 0, Date.now(), sameConnection, `${job.name}.nc`, job.identity.lineCount);
+        const evidence = fileStartEvidence(report, attempt?.requestedAt || 0, Date.now(), sameConnection, filename, job.identity.lineCount);
         const status = evidence === 'unknown' ? null : String(report?.status);
         if (attempt) {
             attempt.machineStatusAfter = status;
@@ -1067,7 +1123,9 @@ function directStepContext(job: McpJob): DirectStepContext | undefined {
     const stepInFlight = job.state === 'starting' || jobManager.getActive() === job;
     let firmwareStop = false;
     try {
-        firmwareStop = typeof getConnectedChannel().stopGcodeJob === 'function';
+        // The Ray's SACP job stop halts file prints only (#328): for a direct step it is no stop at all.
+        const channel = getConnectedChannel();
+        firmwareStop = typeof channel.stopGcodeJob === 'function' && channelFileJobTransport(channel).stop === 'any-job';
     } catch (err) {
         firmwareStop = false;
     }
@@ -1152,10 +1210,58 @@ export async function stopGcodeJob(args: { job_id?: string; wait_ms?: number }, 
     if (plan.action === 'no-firmware-stop') {
         throw new McpToolError(`${plan.note} ${connectedMachineTag()}`);
     }
+    if (plan.action === 'withdraw-armed') {
+        // Uploaded to a controller that starts it only from its switch (#328),
+        // and not started: nothing runs, so nothing is sent. The file stays on
+        // the controller (SACP has no delete); the note says so.
+        job.state = 'stopped';
+        job.endedAt = Date.now();
+        job.confirmToken = null;
+        const target = job.startAttempt && job.startAttempt.operatorStart ? job.startAttempt.operatorStart.target : 'the uploaded file';
+        job.ending = { kind: 'withdrawn', reason: `withdrawn by the ${actor} while armed (uploaded, not started at the machine); ${target} remains on the controller`, at: job.endedAt };
+        jobManager.appendEvent(job, 'stopped', { note: `withdrawn by the ${actor} while armed; nothing sent; ${target} remains on the controller until another upload replaces it` });
+        if (jobManager.getActive() === job) {
+            jobManager.setActive(null);
+        }
+        return { ok: true, stopped: true, stopping: false, withdrawn: true, note: `${plan.note} ${connectedMachineTag()}`, job: jobManager.describe(job) };
+    }
     // A started direct batch stops here too, so only the stop itself is required (not file upload).
     const channel = getConnectedChannel();
     if (typeof channel.stopGcodeJob !== 'function') {
         throw new McpToolError('The connected channel does not support stopping jobs.');
+    }
+    if (channelFileJobTransport(channel).stop === 'file-print-only' && machineStatus() === 'idle') {
+        // The Ray's 0xAC 0x06 outside a file print raises a non-blocking alarm
+        // (#328): an idle machine has nothing to stop. The watcher ends the job
+        // from the heartbeat; an uncertain upload stays unverified (its file may
+        // be on the controller) and the note says what to do.
+        const uncertain = job.state === 'start_unverified';
+        if (uncertain) {
+            job.state = 'stopped';
+            job.endedAt = Date.now();
+            job.confirmToken = null;
+            const reason = `withdrawn by the ${actor}: the machine reads idle and the upload's result was never received; `
+                + 'the file may be on the controller, where the work switch would run it';
+            job.ending = { kind: 'withdrawn', reason, at: job.endedAt };
+            const note = `withdrawn by the ${actor} with the machine idle; no stop sent (the Ray's job stop outside a `
+                + 'file print raises an alarm); the uploaded file may remain on the controller';
+            jobManager.appendEvent(job, 'stopped', { note });
+            if (jobManager.getActive() === job) {
+                jobManager.setActive(null);
+            }
+        }
+        return {
+            ok: true,
+            stopped: uncertain,
+            stopping: false,
+            withdrawn: uncertain,
+            text: null,
+            note: `The machine reads idle, so no job stop was sent ${connectedMachineTag()}: on this channel the SACP job stop halts a file `
+                + `print only and raises an alarm otherwise. ${uncertain
+                    ? 'The job is withdrawn; the uploaded file may remain on the controller - tell the operator not to press the work switch, or upload another job first.'
+                    : 'The watcher records the ending from the heartbeat; poll get_gcode_job_status.'}`,
+            job: jobManager.describe(job),
+        };
     }
     const stopped = await channel.stopGcodeJob();
     let evidence: RecoveryEvidence | null = null;
@@ -1255,7 +1361,10 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             + 'and the confirm page shows the program identity (SHA-256, bytes, lines, first/last motion lines). REFUSED: a '
             + 'program whose spindle is still on at the end - the signature of a truncated program; and anything the CONNECTED '
             + 'machine\'s G-code rules refuse (validate_gcode machine.refusals), including a code its reference calls '
-            + 'incompatible and a Luban header (;machine:) naming another machine.',
+            + 'incompatible and a Luban header (;machine:) naming another machine; and (#328) a connected channel that cannot '
+            + 'start file jobs (the Ray over USB, the Original, the Artisan/J1 over Wi-Fi), so the operator is never asked to '
+            + 'approve a job that cannot run. On the Ray over Wi-Fi (SACP-UDP) the result carries file_start: the controller has '
+            + 'no start command, so start_gcode_job uploads the file as ray.nc and the OPERATOR starts it at the work switch.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1286,6 +1395,16 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             if (!HEAD_TYPES.includes(headType)) {
                 throw new McpToolError(`head_type must be one of: ${HEAD_TYPES.join(', ')}`);
             }
+            // A channel that cannot start a file job refuses HERE (#328), so the
+            // operator is never asked to approve a job that can never run. With
+            // no machine connected the job stages as before and the machine
+            // binding refuses it at approval once one connects.
+            const stagingChannel = connectionManager.getCurrentChannel() as unknown as JobChannel | null;
+            const channelRefusal = stagingChannel ? fileJobChannelRefusal(stagingChannel) : null;
+            if (channelRefusal) {
+                throw new McpToolError(`submit_gcode_job refused: ${channelRefusal}`);
+            }
+            const fileTransport = stagingChannel ? channelFileJobTransport(stagingChannel) : null;
 
             const frameArgument = args.frame === undefined || args.frame === null ? null : String(args.frame) as JobFrame;
             if (frameArgument !== null && !JOB_FRAMES.includes(frameArgument)) {
@@ -1327,6 +1446,12 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             const validation = resolved.report;
             const job = jobManager.submit(input.text, args.name, headType, validation, 'file', undefined, input.source);
             input.consume();
+            // How the connected channel starts the file (#328): the confirm page
+            // tells the operator when their switch, not a command, starts it.
+            const operatorSwitch = fileTransport && fileTransport.start === 'operator-switch' ? fileTransport : null;
+            if (operatorSwitch) {
+                job.fileStart = operatorSwitch;
+            }
 
             return {
                 job: jobManager.describe(job),
@@ -1334,9 +1459,14 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 machine: validation.machine || null,
                 header: validation.header || null,
                 intake: describeInbox(),
-                next_step: 'Ask the operator to open confirm_url in a browser, review, and approve. Then either call '
-                    + 'start_gcode_job with wait_for_approval_ms (their click starts it - nothing to copy) or pass the '
-                    + 'one-time code they relay as confirm_token.',
+                ...(operatorSwitch ? { file_start: operatorSwitch } : {}),
+                next_step: `Ask the operator to open confirm_url in a browser, review, and approve. Then either call ${''
+                }start_gcode_job with wait_for_approval_ms (their click starts it - nothing to copy) or pass the ${''
+                }one-time code they relay as confirm_token.${operatorSwitch
+                    ? ` On this machine start_gcode_job only UPLOADS the program (as ${operatorSwitch.target}) and arms the job; `
+                        + `nothing moves until the operator starts it at the machine: ${operatorSwitch.instruction} Tell them so, then `
+                        + 'long-poll get_gcode_job_status for started / progress / completed.'
+                    : ''}`,
             };
         },
     });
@@ -1435,7 +1565,12 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             + 'Original, J1) a direct job\'s start, and each later step of a batch, is refused with "the head moved since staging - '
             + 'withdraw and restage" when the judged machine position differs by more than 0.05 mm from where the step was planned '
             + 'from (job.staged_at_machine, then the previous step\'s endpoint), or the machine is unhomed or its position unreliable; '
-            + 'nothing is sent and the approval is not used.',
+            + 'nothing is sent and the approval is not used. FILE JOBS ON THE RAY over Wi-Fi (#328): the firmware has no start command - '
+            + 'this call compress-uploads the program to the controller as ray.nc and returns armed: true with operator_start; nothing '
+            + 'moves until the operator presses and holds the work switch (~3 s). Tell them so. The job stays armed (and holds the '
+            + 'machine) until the heartbeat shows ray.nc running (then started, progress, completed as on the A350) or stop_gcode_job '
+            + 'withdraws it; a SHORT press runs the controller\'s stale boundary.nc, not this job. An upload whose result was lost is '
+            + 'start_unverified: the controller may hold the file; never retry.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1468,13 +1603,18 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             }
 
             if (job.kind === 'file' && job.startAttempt) {
+                const armed = job.state === 'armed' ? job.startAttempt.operatorStart : null;
                 return {
                     ok: false,
                     job: jobManager.describe(job),
                     machine_status_after: job.startAttempt.machineStatusAfter,
                     retry_safe: false,
-                    note: 'This file already had a start attempt. It may have run; this call sends nothing. '
-                        + 'Poll get_gcode_job_status. Do not retry or restage without the operator reviewing the outcome.',
+                    ...(armed ? { armed: true, operator_start: armed } : {}),
+                    note: armed
+                        ? `This file is already on the controller as ${armed.target}, waiting for the operator: ${armed.instruction} `
+                            + 'This call sends nothing. Long-poll get_gcode_job_status for started / progress / completed, or withdraw it with stop_gcode_job.'
+                        : 'This file already had a start attempt. It may have run; this call sends nothing. '
+                            + 'Poll get_gcode_job_status. Do not retry or restage without the operator reviewing the outcome.',
                 };
             }
 
@@ -1535,8 +1675,11 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             }
 
             const active = jobManager.getActive();
-            if (active && ['starting', 'started', 'start_unverified'].includes(active.state)) {
-                throw new McpToolError('Another job or step is still active; wait for it to finish before starting this job.');
+            if (active && ['starting', 'armed', 'started', 'start_unverified'].includes(active.state)) {
+                throw new McpToolError(active.state === 'armed'
+                    ? `Job ${active.id} is armed on the controller (uploaded, waiting for the operator's work switch); withdraw it with `
+                        + 'stop_gcode_job or let it run before starting another.'
+                    : 'Another job or step is still active; wait for it to finish before starting this job.');
             }
             // The Ray in Manual Mode (motor power SHUTAll) ACKs motion and
             // ignores it (#321): read the mode now - the operator can switch
@@ -1717,6 +1860,8 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
 
             // Only a file job reaches here; getJobChannelFor checked its upload and start.
             const fileChannel = channel as FileJobChannel;
+            const transport = channelFileJobTransport(fileChannel);
+            const target = fileJobTarget(transport, job.name);
             job.state = 'starting';
             jobManager.setActive(job);
             if (job.validation.machineZResolvedFor) {
@@ -1743,21 +1888,76 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             // A stop while the workspace check/upload is in flight must not
             // subsequently dispatch a start.
             if (job.state !== 'starting') return { ok: false, job: jobManager.describe(job), retry_safe: false };
-            const uploadError = await new Promise<string | null>((resolve) => {
-                fileChannel.uploadGcodeFile(job.filePath, job.headType, `${job.name}.nc`, (msg) => {
-                    resolve(msg ? String(msg) : null);
+            const upload = await new Promise<{ error: string | null; outcome: FileJobUploadOutcome }>((resolve) => {
+                fileChannel.uploadGcodeFile(job.filePath, job.headType, `${job.name}.nc`, (msg, data) => {
+                    const outcome = data && typeof data === 'object' ? data as FileJobUploadOutcome : {};
+                    resolve({ error: msg ? String(msg) : null, outcome });
                 });
-            }).catch((err: Error) => err.message);
+            }).catch((err: Error) => ({ error: err.message, outcome: {} as FileJobUploadOutcome }));
             if (job.state !== 'starting') return { ok: false, job: jobManager.describe(job), retry_safe: false };
-            if (uploadError) {
+            if (upload.error && !(upload.outcome.uncertain && transport.start === 'operator-switch')) {
                 job.state = 'start_failed';
-                job.error = `Upload failed: ${uploadError}`;
+                job.error = `Upload failed: ${upload.error}`;
                 job.endedAt = Date.now();
-                jobManager.appendEvent(job, 'failed', { note: job.error });
+                jobManager.appendEvent(job, 'failed', { note: job.error, not_sent: upload.outcome.notSent === true });
                 if (jobManager.getActive() === job) jobManager.setActive(null);
                 throw new McpToolError(job.error);
             }
-            jobManager.appendEvent(job, 'uploaded', { note: `${job.name}.nc uploaded to the machine` });
+            if (transport.start === 'operator-switch') {
+                // The Ray (#328): the file is on the controller and ONLY the
+                // operator's work switch starts it. No start command exists, so
+                // nothing more is sent: the job is armed, the watcher adopts the
+                // run from the heartbeat (status starting/running for ray.nc)
+                // and completes it on idle after that. An upload whose result
+                // never arrived is unverified: the controller may hold the file.
+                job.modalTrack = newModalTrack();
+                const armedAt = Date.now();
+                job.startAttempt = { requestedAt: armedAt,
+                    acknowledged: false,
+                    observedRunningAt: null,
+                    error: upload.error,
+                    machineStatusAfter: null,
+                    retrySafe: false,
+                    operatorStart: { target, instruction: transport.instruction || 'start it at the machine', armedAt } };
+                if (connectedDialect().toolhead.state === 'unknown') {
+                    // The file's own laser words will run in the firmware; the MCP's laser record can no longer vouch for them.
+                    noteMcpFileJob(connectedConnectionId() || 'none', job.name);
+                }
+                const poll = watchFileJobCompletion(job, fileChannel, target);
+                if (upload.error) {
+                    job.state = 'start_unverified';
+                    job.error = `Upload unverified: ${upload.error}. The controller may hold ${target}, which the work switch would run; `
+                        + 'do not retry or restage. Monitoring continues; stop_gcode_job withdraws it.';
+                    jobManager.appendEvent(job, 'start_unverified', { note: job.error, retry_safe: false });
+                    log.warn(`MCP file job ${job.id}: ${job.error}`);
+                    poll();
+                    return {
+                        ok: false,
+                        job: jobManager.describe(job),
+                        machine_status_after: job.startAttempt.machineStatusAfter,
+                        retry_safe: false,
+                        note: job.error,
+                    };
+                }
+                jobManager.appendEvent(job, 'uploaded', { note: `${job.name}.nc uploaded to the controller as ${target} (compressed SACP transfer)` });
+                job.state = 'armed';
+                jobManager.appendEvent(job, 'armed', { note: `${target} is on the controller; nothing moves until the operator starts it: ${transport.instruction}` });
+                log.info(`MCP file job ${job.id} armed: ${target} on the controller, waiting for the operator's work switch`);
+                poll();
+                return {
+                    ok: true,
+                    armed: true,
+                    job: jobManager.describe(job),
+                    operator_start: job.startAttempt.operatorStart,
+                    machine_status_after: job.startAttempt.machineStatusAfter,
+                    retry_safe: false,
+                    note: `Uploaded to the controller as ${target} and ARMED; nothing was started and nothing moves. This machine has no `
+                        + `start command: ${transport.instruction} Tell the operator so. The job stays armed until they start it (the `
+                        + 'heartbeat then marks it started and tracks progress to completion) or it is withdrawn with stop_gcode_job; '
+                        + 'while armed no other job can start. Long-poll get_gcode_job_status (wait_ms) for started / progress / completed.',
+                };
+            }
+            jobManager.appendEvent(job, 'uploaded', { note: `${target} uploaded to the machine` });
 
             // The connection the file will run on (#221): a later job-end judgement
             // must never treat a reconnected controller as the one that ran it.
@@ -1770,10 +1970,11 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                 retrySafe: false };
             // Observe before sending: even a slow/lost reply must not hide a
             // complete short run or its pauses/progress from the job record.
-            const poll = watchFileJobCompletion(job, fileChannel);
+            const poll = watchFileJobCompletion(job, fileChannel, target);
             let started: { ok: boolean; code?: number; text?: string; notSent?: boolean };
             try {
-                started = await fileChannel.startGcodeJob();
+                // A command-start channel (getJobChannel checked it has one).
+                started = await (fileChannel.startGcodeJob as NonNullable<JobChannel['startGcodeJob']>)();
             } catch (err) {
                 started = { ok: false, text: (err as Error).message };
             }
@@ -2513,6 +2714,9 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             + 'ending withdrawn, nothing sent. A step executing on a machine with no firmware stop (the Ray over Wi-Fi, USB text '
             + 'serial) cannot be stopped by command: the remaining steps are withdrawn (stopping: true), the running step finishes, '
             + 'and the job then ends withdrawn; a single running move there is refused with that reason. '
+            + 'A Ray FILE job (#328): armed (uploaded, not yet started at the switch) is withdrawn - nothing sent, and the note says '
+            + 'ray.nc stays on the controller until another upload replaces it; running gets the SACP job stop (0xAC 0x06, Luban\'s own '
+            + 'Stop); with the machine already idle nothing is sent (that stop alarms outside a file print). '
             + 'Result: {ok, stopped, stopping, withdrawn, note, job}.',
         inputSchema: {
             type: 'object',

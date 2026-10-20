@@ -124,8 +124,6 @@ class FakeSacpClient {
 
     public async subscribeLaserPowerState() { return 0; }
 
-    public async subscribeGetPrintCurrentLineNumber() { return 0; }
-
     public async subscribeGetPrintingTime() { return 0; }
 
     public async subscribeEnclosureInfo() { return { response: { result: 0 } }; }
@@ -138,10 +136,63 @@ class FakeSacpClient {
         FakeSacpClient.homeRequests += 1;
         return { response: { result: FakeSacpClient.homeResult } };
     }
+
+    // ---- MCP file jobs (#328) ----
+
+    /** Each compressed upload the channel asked for, and the result the test chose (null = never resolves). */
+    public static uploads: Array<{ filePath: string; renderName?: string; options: { onProgress?: (p: number) => void; onFailed?: (r: string) => void } }> = [];
+
+    public static uploadResult: boolean | null = true;
+
+    public static uploadFailure: string | null = null;
+
+    public static stopRequests = 0;
+
+    public static stopResult = 0;
+
+    public static lineNumber: ((data: object) => void) | null = null;
+
+    public static printingFileInfo = { filename: '/ray.nc', totalLine: 84, estimatedTime: 10 };
+
+    public async uploadFileCompressed(filePath: string,
+        options: { renderName?: string; onProgress?: (p: number) => void; onFailed?: (r: string) => void } = {}) {
+        FakeSacpClient.uploads.push({ filePath, renderName: options.renderName, options });
+        if (FakeSacpClient.uploadResult === null) {
+            return new Promise<boolean>(() => undefined);
+        }
+        if (!FakeSacpClient.uploadResult && FakeSacpClient.uploadFailure && options.onFailed) {
+            options.onFailed(FakeSacpClient.uploadFailure);
+        }
+        return FakeSacpClient.uploadResult;
+    }
+
+    public async stopPrint() {
+        FakeSacpClient.stopRequests += 1;
+        return { response: { result: FakeSacpClient.stopResult } };
+    }
+
+    public async getPrintingFileInfo() {
+        return { response: { result: 0 }, data: { ...FakeSacpClient.printingFileInfo } };
+    }
+
+    public async subscribeGetPrintCurrentLineNumber(_opts: object, callback: (data: object) => void) {
+        FakeSacpClient.lineNumber = callback;
+        return { code: 0 };
+    }
 }
 
 class FakeUdpSocket extends EventEmitter {
     public bind(): void { /* no port is bound */ }
+}
+
+/** The SDK's GcodeCurrentLine as the channel uses it: the test hands `{ currentLine }` as `response.data`. */
+class FakeGcodeCurrentLine {
+    public currentLine = 0;
+
+    public fromBuffer(data: { currentLine: number }) {
+        this.currentLine = data.currentLine;
+        return this;
+    }
 }
 
 /** The SDK model as the channel uses it: the test hands the report object itself as `response.data`. */
@@ -169,7 +220,7 @@ function udpChannel(diag: ConnectionDiagnosticState) {
         '@snapmaker/snapmaker-sacp-sdk/dist/helper': {
             readUint8: (buffer: Buffer, index: number) => buffer[index], readString: () => ({ result: '' }), readUint16: () => 0, readUint32: () => 0,
         },
-        '@snapmaker/snapmaker-sacp-sdk/dist/models': { CoordinateSystemInfo: FakeCoordinateSystemInfo },
+        '@snapmaker/snapmaker-sacp-sdk/dist/models': { CoordinateSystemInfo: FakeCoordinateSystemInfo, GcodeCurrentLine: FakeGcodeCurrentLine },
         '../../../../app/constants': { WORKFLOW_STATUS_MAP: { 0: 'idle', 1: 'running' }, HEAD_PRINTING: 'printing', HEAD_LASER: 'laser', HEAD_CNC: 'cnc' },
         '../../../../app/constants/machines': { MODULEID_MAP: {}, MODULEID_TOOLHEAD_MAP: { 0: 'extruder' } },
         lodash: { includes: (items: unknown[], value: unknown) => items.includes(value), find: () => undefined },
@@ -390,6 +441,103 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             FakeSacpClient.serialNumber = undefined;
             FakeSacpClient.machineInfoData = null;
         }
+    }],
+
+    // ---- MCP file jobs over SACP-UDP (#328) ----
+    ['#328 the UDP channel declares the Ray\'s operator-switch file transport and uploads the job as ray.nc by the compressed transfer', async () => {
+        const diag = diagnostics();
+        const { channel, timers } = udpChannel(diag);
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        const transport = channel.fileJobTransport();
+        assert.deepStrictEqual({ start: transport.start, target: transport.target, stop: transport.stop },
+            { start: 'operator-switch', target: 'ray.nc', stop: 'file-print-only' });
+        assert.match(transport.instruction, /Press and hold the work switch/);
+        assert.match(transport.instruction, /SHORT press runs the controller boundary\.nc/);
+        FakeSacpClient.uploads = [];
+        FakeSacpClient.uploadResult = true;
+        timers.pending.length = 0;
+        const result = await new Promise<{ msg: string | null; outcome: { target?: string } }>((resolve) => {
+            channel.uploadGcodeFile('/jobs/8595d76f9e33_ladder.nc', 'laser', 'ladder.nc', (msg: string | null, outcome: { target?: string }) => resolve({ msg, outcome }));
+        });
+        assert.strictEqual(result.msg, null);
+        assert.deepEqual(result.outcome, { target: 'ray.nc' }); // vm-context object: loose equality
+        assert.strictEqual(FakeSacpClient.uploads.length, 1);
+        assert.strictEqual(FakeSacpClient.uploads[0].filePath, '/jobs/8595d76f9e33_ladder.nc');
+        assert.strictEqual(FakeSacpClient.uploads[0].renderName, 'ray.nc', 'the only file the work switch starts, whatever the job is called');
+        assert.ok(timers.pending.some((timer) => timer.ms === 30000), 'the inactivity watchdog was armed');
+    }],
+
+    ['#328 an upload the controller refuses is a definite rejection; one that never answers is uncertain after 30 s of silence', async () => {
+        const diag = diagnostics();
+        const { channel, timers } = udpChannel(diag);
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        FakeSacpClient.uploads = [];
+        FakeSacpClient.uploadResult = false;
+        FakeSacpClient.uploadFailure = 'SD card unavailable.';
+        const refused = await new Promise<{ msg: string | null; outcome: object }>((resolve) => {
+            channel.uploadGcodeFile('/jobs/x.nc', 'laser', 'x.nc', (msg: string | null, outcome: object) => resolve({ msg, outcome }));
+        });
+        assert.strictEqual(refused.msg, 'SD card unavailable.');
+        assert.deepEqual(refused.outcome, { rejected: true });
+        FakeSacpClient.uploadFailure = null;
+        FakeSacpClient.uploadResult = null; // the 0xB0 0x02 result never arrives
+        timers.pending.length = 0;
+        let silent: { msg: string | null; outcome: object } | null = null;
+        channel.uploadGcodeFile('/jobs/y.nc', 'laser', 'y.nc', (msg: string | null, outcome: object) => { silent = { msg, outcome }; });
+        assert.strictEqual(silent, null, 'nothing yet');
+        const watchdog = timers.pending.filter((timer) => timer.ms === 30000).pop();
+        assert.ok(watchdog, 'the watchdog is armed');
+        // Progress re-arms it (a long file is not a silent one)...
+        FakeSacpClient.uploads[FakeSacpClient.uploads.length - 1].options.onProgress?.(0.5);
+        assert.ok(timers.pending.filter((timer) => timer.ms === 30000).length >= 2, 're-armed on progress');
+        // ...and when it fires, the outcome is uncertain: the controller may hold the file.
+        watchdog.fn();
+        assert.ok(silent, 'the watchdog ended the wait');
+        assert.match((silent as unknown as { msg: string }).msg, /no reply from the controller for 30 s/);
+        assert.deepEqual((silent as unknown as { outcome: object }).outcome, { uncertain: true });
+        FakeSacpClient.uploadResult = true;
+    }],
+
+    ['#328 stopGcodeJob is the SACP job stop (0xAC 0x06) Luban\'s own Stop sends, reported as ok/refused', async () => {
+        const diag = diagnostics();
+        const { channel } = udpChannel(diag);
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        FakeSacpClient.stopRequests = 0;
+        FakeSacpClient.stopResult = 0;
+        const ok = await channel.stopGcodeJob();
+        assert.strictEqual(ok.ok, true);
+        assert.match(ok.text, /0xAC 0x06/);
+        FakeSacpClient.stopResult = 9;
+        const refused = await channel.stopGcodeJob();
+        assert.strictEqual(refused.ok, false);
+        assert.strictEqual(FakeSacpClient.stopRequests, 2);
+        FakeSacpClient.stopResult = 0;
+    }],
+
+    ['#328 the job-progress subscription fills gcodePrintingInfo (name from 0xAC 0x1A, line from 0xAC 0xA0) in the MCP\'s state', async () => {
+        const diag = diagnostics();
+        const { channel } = udpChannel(diag);
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        await channel.startHeartbeatLegacy(channel.sacpClient, undefined, 'ray-id');
+        FakeSacpClient.lineNumber = null;
+        await channel.subscribeGetPrintCurrentLineNumber();
+        assert.ok(FakeSacpClient.lineNumber, 'subscribed to the current line');
+        (FakeSacpClient.heartbeat as (d: object) => void)(beat(0));
+        assert.strictEqual(channel.getLatestMachineState().gcodePrintingInfo, undefined, 'nothing before a progress report');
+        // The run starts: the heartbeat's idle -> running edge re-reads the file info (name, total lines).
+        (FakeSacpClient.heartbeat as (d: object) => void)(beat(1));
+        await new Promise((resolve) => setImmediate(resolve));
+        (FakeSacpClient.lineNumber as (d: object) => void)({ response: { data: { currentLine: 21 } } });
+        const state = channel.getLatestMachineState();
+        assert.deepStrictEqual(state.gcodePrintingInfo, { name: '/ray.nc', sent: 21, total: 84, progress: 0.25 });
+        assert.strictEqual(state.status, 'running');
+        // The progress report does not move the beat clock; the next heartbeat keeps the info.
+        const stamped = state.timestamp;
+        (FakeSacpClient.heartbeat as (d: object) => void)(beat(1));
+        assert.ok(channel.getLatestMachineState().timestamp >= stamped);
+        assert.deepStrictEqual(channel.getLatestMachineState().gcodePrintingInfo, { name: '/ray.nc', sent: 21, total: 84, progress: 0.25 });
+        await channel.stopHeartbeat('ray-id');
+        assert.strictEqual(channel.getLatestMachineState(), null, 'cleared with the rest of the state');
     }],
 
     ['the UDP channel\'s own home reports the controller\'s acceptance', async () => {

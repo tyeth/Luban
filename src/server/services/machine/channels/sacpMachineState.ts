@@ -60,6 +60,20 @@ export interface SacpMachineState {
     headType?: string;
     /** Laser current power or CNC current spindle speed, so the toolhead-off guards read SACP like SSTP. */
     headPower?: number;
+    /**
+     * The running file as the job-progress subscriptions report it (#328), in
+     * SstpHttpChannel's `gcodePrintingInfo` shape so the MCP's file-job watcher
+     * reads SACP like SSTP: `name` from 0xAC 0x1A (the Ray reports the SD path,
+     * `/ray.nc`), `sent` the current line from 0xAC 0xA0, `total` and `progress`.
+     */
+    gcodePrintingInfo?: SacpPrintingInfo;
+}
+
+export interface SacpPrintingInfo {
+    name: string;
+    sent: number;
+    total: number;
+    progress: number;
 }
 
 function axisValue(list: SacpAxisReading[], axis: Axis): number | null {
@@ -299,6 +313,17 @@ export class SacpMachineStateTracker {
     public noteHomed(isHomed: boolean): void {
         if (this.state) {
             this.state = { ...this.state, isHomed };
+        }
+    }
+
+    /**
+     * A job-progress report (#328): merged into the existing state without
+     * moving the beat clock (the heartbeat owns `timestamp`). Dropped before
+     * the first heartbeat: a progress line with no status is not a state.
+     */
+    public notePrintingInfo(info: SacpPrintingInfo): void {
+        if (this.state) {
+            this.state = { ...this.state, gcodePrintingInfo: { ...info } };
         }
     }
 

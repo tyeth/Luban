@@ -469,6 +469,8 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             }) } },
             '../jobs': { jobManager: manager, TERMINAL_JOB_STATES: jobEnding.TERMINAL_JOB_STATES },
             '../jobEnding': jobEnding,
+            // Pure (#328): the channel's file-job transport defaults live here.
+            '../fileJobStart': require('../fileJobStart'),
             '../registry': { McpToolError: Error },
             '../procedureLimits': { MAX_WAIT_MS: 120000, STOP_WAIT_DEFAULT_MS: 20000 },
             '../probing': { requestProcedureStop: (value: string) => { reason = value; return { requestedAt: Date.now() }; } },
