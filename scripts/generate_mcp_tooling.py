@@ -11,12 +11,15 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL_DIR = ROOT / 'src/server/services/mcp/tools'
+MCP_DIR = ROOT / 'src/server/services/mcp'
+TOOL_DIR = MCP_DIR / 'tools'
+# Tools registered outside tools/ (wired up directly in mcp/index.ts).
+EXTRA_FILES = [MCP_DIR / 'cameraProgram.ts']
 BEGIN = '<!-- BEGIN GENERATED MCP TOOLING -->'
 END = '<!-- END GENERATED MCP TOOLING -->'
 STRING = r"'(?:\\.|[^'\\])*'"
 REGISTER = re.compile(
-    rf'registry\.register\(\{{\s*name(?::\s*(?P<name>{STRING}))?\s*,\s*description:\s*',
+    rf'registry\.register\(\{{\s*name(?::\s*(?:(?P<name>{STRING})|(?P<const>[A-Z][A-Z0-9_]*)))?\s*,\s*description:\s*',
     re.S,
 )
 LITERAL = re.compile(STRING + r'|`(?:\\.|[^`\\])*`', re.S)
@@ -33,6 +36,9 @@ CATEGORIES = [
     'Touch-probe procedures',
     'CAM probing programs',
     'Workspaces and origins',
+    'Enclosure and motor power',
+    'Laser',
+    'Spindle telemetry and accelerometers',
 ]
 FILE_CATEGORY = {
     'status.ts': 'Status and connection',
@@ -40,6 +46,7 @@ FILE_CATEGORY = {
     'gcode.ts': 'G-code jobs',
     'threadMilling.ts': 'G-code jobs',
     'camera.ts': 'Camera and vision',
+    'cameraProgram.ts': 'Camera and vision',
     'cameraModel.ts': 'Camera model',
     'calibration.ts': 'Camera model',
     'landmarks.ts': 'Landmarks',
@@ -48,12 +55,18 @@ FILE_CATEGORY = {
     'probing.ts': 'Touch-probe procedures',
     'cam.ts': 'CAM probing programs',
     'workspace.ts': 'Workspaces and origins',
+    'enclosure.ts': 'Enclosure and motor power',
+    'motorPower.ts': 'Enclosure and motor power',
+    'laser.ts': 'Laser',
+    'telemetry.ts': 'Spindle telemetry and accelerometers',
+    'vibration.ts': 'Spindle telemetry and accelerometers',
 }
 SHORT_OVERRIDES = {
     'get_gcode_job_status': 'Report a job state, ending reason, events, results, and live machine progress.',
     'visual_servo': 'Use the stored camera calibration to move toward a target pixel and capture a new frame.',
     'probe_stock_outline': 'Stage a probe circuit to find a block top, outline, and centre from an estimated location.',
     'run_probing_gcode': 'Stage a CAM probing program for one operator approval and return an inspection report.',
+    'assign_machine_device': 'Stage the operator\'s answer to a device conflict: same machine (alias its records) or a new, empty entry.',
 }
 CATEGORY_OVERRIDES = {
     'move_z': 'Transport and direct motion',
@@ -80,13 +93,15 @@ def string_values(expression: str) -> str:
 
 def brief(description: str) -> str:
     compact = ' '.join(description.split())
-    first = re.split(r'(?<!e.g)(?<!i.e)\.\s+(?=[A-Za-z])', compact, maxsplit=1)[0]
+    first = re.split(r'(?<!e\.g)(?<!i\.e)\.\s+(?=[A-Za-z])', compact, maxsplit=1)[0]
     if len(first) > 180:
         # Descriptions are deliberately detailed for agents. A short first
         # clause gives the public list a useful action summary without
         # exposing an arbitrary, half-finished fragment.
         boundaries = [first.find(mark, 45) for mark in (': ', ' (', ' - ', ', ', '; ')]
-        boundaries = [index for index in boundaries if 45 <= index <= 180]
+        # Never cut inside a parenthesis: "(PipeWire nodes." reads as broken.
+        boundaries = [index for index in boundaries
+                      if 45 <= index <= 180 and first[:index].count('(') == first[:index].count(')')]
         if boundaries:
             first = first[:min(boundaries)]
         else:
@@ -97,9 +112,9 @@ def brief(description: str) -> str:
 
 def collect_tools():
     tools = []
-    files = sorted(TOOL_DIR.glob('*.ts'))
+    files = sorted(TOOL_DIR.glob('*.ts')) + EXTRA_FILES
     for path in files:
-        source = path.read_text()
+        source = path.read_text(encoding='utf-8')
         registrations = list(REGISTER.finditer(source))
         if source.count('registry.register({') != len(registrations):
             raise ValueError(f'Unrecognized registration in {path}')
@@ -113,6 +128,12 @@ def collect_tools():
                 raise ValueError(f'No inputSchema after registration in {path}')
             expression = source[match.end():match.end() + end.start()].strip()
             raw_name = match.group('name')
+            if match.group('const'):
+                # name: TOOL - resolve a module-level string constant.
+                constant = re.search(rf'^const {match.group("const")} = ({STRING});', source, re.M)
+                if constant is None:
+                    raise ValueError(f'Unresolved tool name constant {match.group("const")} in {path}')
+                raw_name = constant.group(1)
             if raw_name is None:
                 # The workspace registration loop generates two names and two
                 # descriptions. Require its exact shape before expanding it.
@@ -189,9 +210,12 @@ def main():
         parser.error('--notes-input and --notes-output must be supplied together')
     tools = collect_tools()
     summary = render(args.tag, tools, args.repository)
-    args.output.write_text(summary)
+    args.output.write_text(summary, encoding='utf-8')
     if args.notes_input:
-        args.notes_output.write_text(update_notes(args.notes_input.read_text(), summary, args.tag, len(tools), args.repository))
+        args.notes_output.write_text(
+            update_notes(args.notes_input.read_text(encoding='utf-8'), summary, args.tag, len(tools), args.repository),
+            encoding='utf-8',
+        )
     print(f'Generated {args.output} with {len(tools)} tools')
 
 
