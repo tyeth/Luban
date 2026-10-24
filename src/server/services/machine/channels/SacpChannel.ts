@@ -905,6 +905,9 @@ class SacpChannelBase extends Channel implements
                 remainingTime: remainingTime,
             };
 
+            // The MCP's copy (#328): the file-job watcher reads name/sent/total/progress from the machine state.
+            this.machineState.notePrintingInfo({ name: this.filename, sent: currentLine, total: this.totalLine || 0, progress });
+
             if (includes([WorkflowStatus.Running, WorkflowStatus.Paused], this.machineStatus)) {
                 this.socket && this.socket.emit('sender:status', ({ data }));
             }
@@ -1015,7 +1018,16 @@ class SacpChannelBase extends Channel implements
                 this.heartbeatTimerLegacy[id] && this.socket && this.socket.emit('connection:close');
             }, 10000);
 
-            this.machineStatus = WORKFLOW_STATUS_MAP[statusKey];
+            const nextStatus = WORKFLOW_STATUS_MAP[statusKey];
+            // A run begins (#328): forget the previous file's name and line count
+            // and read the new one's (0xAC 0x1A), as the status-only path does, so
+            // the MCP's file-job watcher never matches a new run against stale totals.
+            if (includes([WorkflowStatus.Unknown, WorkflowStatus.Idle, WorkflowStatus.Starting], this.machineStatus)
+                && includes([WorkflowStatus.Running], nextStatus)) {
+                this.resetPrintJobInfo();
+                this.getPrintJobFileInfo().catch((err) => log.warn(`get print file info failed: ${err}`));
+            }
+            this.machineStatus = nextStatus;
 
             // The MCP's copy of this beat (#260): the same payload the renderer
             // gets below, kept with a timestamp. pos/originOffset/isHomed are
@@ -1244,12 +1256,15 @@ class SacpChannelBase extends Channel implements
                     log.info('Get print file info...');
                     this.sacpClient.getPrintingFileInfo().then((result) => {
                         // log.debug('Get print file info, result =', result);
-                        const { totalLine, estimatedTime } = result.data;
+                        const { totalLine, estimatedTime, filename } = result.data;
                         if (totalLine) {
                             this.totalLine = totalLine;
                         }
                         if (estimatedTime) {
                             this.estimatedTime = estimatedTime;
+                        }
+                        if (filename) {
+                            this.filename = filename;
                         }
                     });
                 }
@@ -1269,6 +1284,11 @@ class SacpChannelBase extends Channel implements
                 remainingTime: remainingTime,
                 printStatus: currentLine >= this.totalLine ? COMPLUTE_STATUS : ''
             };
+
+            // The MCP's copy (#328); a total still unknown reads 0, never NaN.
+            this.machineState.notePrintingInfo({
+                name: this.filename, sent: currentLine, total: this.totalLine || 0, progress: Number.isFinite(data.progress) ? data.progress : 0,
+            });
 
             if (includes([WorkflowStatus.Running, WorkflowStatus.Paused], this.machineStatus)) {
                 this.socket && this.socket.emit('sender:status', ({ data }));

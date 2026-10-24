@@ -21,7 +21,7 @@ import { GcodeValidationReport } from './validator';
 import { StagedLandmarks, StagedMachine, describeStagedLandmarks, machineBindingRefusal } from './jobMachineBinding';
 import { describeActiveTool } from './activeTool';
 import type { RecoveryEvidence } from './failureRecovery';
-import type { FileStartAttempt } from './fileJobStart';
+import type { FileJobTransport, FileStartAttempt } from './fileJobStart';
 import type { HoldRecord } from './approachHold';
 import type { StagedPosition } from './startPosition';
 
@@ -287,6 +287,12 @@ export interface McpJob {
     /** File jobs: what start and the status polls established, for judging the modes the file may have left. */
     modalTrack?: FileJobModalTrack;
     startAttempt?: FileStartAttempt;
+    /**
+     * File jobs: how the connected channel starts a file (#328), recorded at
+     * staging so the confirm page can say that the Ray runs it only from its
+     * work switch. Absent on a command-start channel (the A350).
+     */
+    fileStart?: FileJobTransport | null;
     /**
      * A procedure HOLDING for the operator (probe_approach_and_hold, #188):
      * where, what the sensor reads, the handoff text, what changed during the
@@ -595,6 +601,8 @@ export class JobManager {
             startedAt: job.startedAt,
             // eslint-disable-next-line camelcase
             start_attempt: job.startAttempt || null,
+            // eslint-disable-next-line camelcase
+            ...(job.fileStart ? { file_start: job.fileStart } : {}),
             endedAt: job.endedAt,
             error: job.error,
             ending: job.ending,
@@ -792,6 +800,15 @@ export class JobManager {
         const landmarksText = describeStagedLandmarks(job.landmarksAtStaging);
 
         let directBanner = '';
+        if (job.kind === 'file' && job.fileStart && job.fileStart.start === 'operator-switch') {
+            directBanner = `<p style="background:#fff3cd;border:1px solid #b8860b;padding:10px">
+                   <strong>STARTED AT THE MACHINE</strong>: ${escapeHtml(job.stagedFor ? job.stagedFor.identifier : 'this machine')} starts a
+                   file job only from its own work switch - there is no start command. Approving here and start_gcode_job
+                   upload the program to the controller as <code>${escapeHtml(job.fileStart.target || 'the job file')}</code> and
+                   nothing moves; the job runs when you ${escapeHtml(job.fileStart.instruction || 'start it at the machine.')}
+                   The MCP follows the run from the heartbeat and can stop it (stop_gcode_job, or Stop on the Jobs page). Until
+                   you start it the job reads <code>armed</code>; withdraw it with stop_gcode_job if it should not run.</p>`;
+        }
         if (job.kind === 'direct') {
             directBanner = `<p style="background:#fff3cd;border:1px solid #b8860b;padding:10px">
                    <strong>DIRECT MOVE</strong>: on start this executes over the realtime path so the

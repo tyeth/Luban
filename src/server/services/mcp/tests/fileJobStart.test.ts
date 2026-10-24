@@ -15,9 +15,16 @@ import { managerFixture } from './jobModalRecovery.test';
 // Exercise the registered tool with the real job manager and a fake clock,
 // channel and heartbeat. No machine/server/network access.
 // Channel shapes: 'file+direct' is the A350 over Wi-Fi (SstpHttpChannel: file
-// upload/start AND executeGcode); 'direct-only' is the Ray (SacpUdpChannel) or
-// the Original (TextSerialChannel): executeGcode, no file-job path.
-type ChannelShape = 'file+direct' | 'direct-only' | 'none';
+// upload/start AND executeGcode); 'direct-only' is the Original (TextSerialChannel)
+// or the Ray over USB: executeGcode, no file-job path; 'ray-switch' is the Ray
+// over Wi-Fi since #328 (SacpUdpChannel: executeGcode, a compressed upload to
+// ray.nc, a file-print-only stop and an operator-switch start - no start command).
+type ChannelShape = 'file+direct' | 'direct-only' | 'ray-switch' | 'none';
+
+/** The Ray's transport exactly as SacpUdpChannel.fileJobTransport declares it. */
+const RAY_TRANSPORT: fileStart.FileJobTransport = {
+    start: 'operator-switch', target: 'ray.nc', instruction: 'Press and hold the work switch for about 3 seconds.', stop: 'file-print-only',
+};
 
 /** `machine` 'ray' loads the Ray's dialect row, whose motor-power mode is read through `readMotorPowerMode` (#321). */
 /**
@@ -50,17 +57,27 @@ export function fixture(shape: ChannelShape = 'file+direct', machine: { dialect?
     let vibrations = 0;
     let stops = 0;
     let start: () => Promise<{ ok: boolean; text?: string; notSent?: boolean }> = async () => ({ ok: true });
-    let upload: (callback: (msg: unknown) => void) => void = (callback) => callback(null);
+    let upload: (callback: (msg: unknown, outcome?: fileStart.FileJobUploadOutcome) => void) => void = (callback) => callback(null);
     const executed: string[] = [];
+    /** What each uploadGcodeFile call was asked for (the Ray channel renames to ray.nc itself; the MCP must still pass the job's name). */
+    const uploadRequests: Array<{ path: string; head: string; name: string }> = [];
     const fileApi = {
-        uploadGcodeFile: (_path: string, _head: string, _name: string, callback: (msg: unknown) => void) => { uploads++; upload(callback); },
+        uploadGcodeFile: (filePath: string, head: string, name: string, callback: (msg: unknown, outcome?: fileStart.FileJobUploadOutcome) => void) => {
+            uploads++; uploadRequests.push({ path: filePath, head, name }); upload(callback);
+        },
         startGcodeJob: async () => { starts++; return start(); },
         stopGcodeJob: async () => { stops++; return { ok: true }; },
+    };
+    // The Ray over SACP-UDP: upload and stop, NO startGcodeJob, and the transport that says why.
+    const rayApi = {
+        uploadGcodeFile: fileApi.uploadGcodeFile,
+        stopGcodeJob: fileApi.stopGcodeJob,
+        fileJobTransport: () => RAY_TRANSPORT,
     };
     // Runs while a direct step's send is in flight (a stop pressed mid-step, #320).
     let onExecute: () => Promise<void> = async () => undefined;
     const executeGcode = async (gcode: string) => { executed.push(gcode); await onExecute(); return { result: 0, text: 'ok' }; };
-    const channel = { 'file+direct': { ...fileApi, executeGcode }, 'direct-only': { executeGcode }, none: {} }[shape];
+    const channel = { 'file+direct': { ...fileApi, executeGcode }, 'direct-only': { executeGcode }, 'ray-switch': { ...rayApi, executeGcode }, none: {} }[shape];
     const dependencies: Record<string, unknown> = {};
     const source = fs.readFileSync(path.join(__dirname, '../tools/gcode.ts'), 'utf8');
     for (const match of source.matchAll(/from '([^']+)'/g)) dependencies[match[1]] = {};
@@ -140,7 +157,9 @@ export function fixture(shape: ChannelShape = 'file+direct', machine: { dialect?
             position = { ...position, ...rest, machine: { ...position.machine, ...(at || {}) } };
         },
         executed,
+        uploadRequests,
         startDirect: async (job: McpJob) => handlers.start_gcode_job({ job_id: job.id, confirm_token: 'human', wait_until_moved: false }),
+        submit: async (args: object) => handlers.submit_gcode_job(args),
         handlers,
         setStart: (fn: typeof start) => { start = fn; },
         setUpload: (fn: typeof upload) => { upload = fn; },
@@ -286,11 +305,150 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.ok(!/^;/m.test(f.executed[0]), 'comment lines are not sent');
         assert.equal(f.counts().uploads, 0); assert.equal(f.counts().starts, 0);
     }],
-    ['executeGcode-only channel still refuses a FILE job, before the approval is consumed', async () => {
+    ['executeGcode-only channel still refuses a FILE job, before the approval is consumed, naming the channel and machine', async () => {
         const f = fixture('direct-only'); const job = f.createJob();
-        await assert.rejects(f.call(job), /does not support file job submission/);
+        await assert.rejects(f.call(job),
+            /File jobs cannot be started over the connected channel \(unnamed channel\) \(machine: direct-only\): it has no MCP file upload/);
         assert.equal(job.state, 'approved'); assert.equal(job.confirmToken, 'human'); assert.ok(!job.tokenUsed);
         assert.equal(f.executed.length, 0); assert.equal(f.counts().uploads, 0);
+    }],
+    // #328: live 2026-10-20 (job 8595d76f9e33) a Ray laser job was staged, validated and
+    // approved, and only start_gcode_job refused it. The refusal now comes at staging.
+    ['#328: submit_gcode_job REFUSES at staging on a channel that cannot start file jobs, so no approval is ever asked for', async () => {
+        for (const shape of ['direct-only', 'none'] as const) {
+            const f = fixture(shape);
+            const before = f.manager.dashboardJobs().length;
+            await assert.rejects(f.submit({ gcode: 'G54\nG90\nG1 X1 F100\nM5', name: 'ladder', frame: 'work', head_type: 'laser' }),
+                /submit_gcode_job refused: File jobs cannot be started over the connected channel \(unnamed channel\) \(machine: .*\)/, shape);
+            assert.equal(f.manager.dashboardJobs().length, before, `${shape}: nothing staged`);
+        }
+    }],
+    ['#328 Ray: start uploads to the controller (the job\'s own name requested; the channel renames to ray.nc), sends no start, and the job is ARMED', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createJob();
+        const result = await f.call(job);
+        assert.equal(result.ok, true, JSON.stringify(result));
+        assert.equal(result.armed, true);
+        assert.equal(result.retry_safe, false);
+        assert.equal(result.operator_start.target, 'ray.nc');
+        assert.match(result.note, /ARMED; nothing was started/);
+        assert.equal(job.state, 'armed'); assert.equal(job.startedAt, null);
+        assert.deepEqual(f.counts(), { uploads: 1, starts: 0, telemetry: 0, vibrations: 0, stops: 0 });
+        assert.deepEqual(f.uploadRequests, [{ path: job.filePath, head: 'cnc', name: 'drill.nc' }]);
+        assert.equal(job.startAttempt?.acknowledged, false);
+        assert.equal(job.startAttempt?.operatorStart?.target, 'ray.nc');
+        assert.ok(job.events.some((e) => e.phase === 'uploaded') && job.events.some((e) => e.phase === 'armed'));
+        assert.equal(f.manager.getActive(), job, 'an armed job holds the machine');
+        // Idle beats NEVER complete an armed job (the A350 path completes a never-seen-active job after 20 idle polls).
+        for (let i = 0; i < 30; i++) { f.setReport('idle', '/ray.nc'); f.tick(); }
+        assert.equal(job.state, 'armed');
+        // A second start sends nothing and says it is armed; another job cannot start meanwhile.
+        const again = await f.call(job);
+        assert.equal(again.ok, false); assert.equal(again.armed, true); assert.equal(f.counts().uploads, 1);
+        await assert.rejects(f.call(f.createJob()), /is armed on the controller/);
+        // The operator presses the switch: SYSTEM_STATUS_STARTING, then running for /ray.nc (the SD path the firmware reports).
+        f.setReport('starting', '/ray.nc'); f.tick();
+        assert.equal(job.state, 'started', 'a fresh starting beat for ray.nc adopts the run');
+        assert.ok(job.startedAt);
+        assert.match(String(job.events.find((e) => e.phase === 'started')?.note), /operator started it at the machine/);
+        f.setReport('running', '/ray.nc'); f.tick();
+        assert.ok(job.events.some((e) => e.phase === 'progress'));
+        assert.equal(job.modalTrack?.lastLine, 2);
+        for (let i = 0; i < 3; i++) { f.setReport('idle', '/ray.nc'); f.tick(); }
+        assert.equal(job.state, 'completed'); assert.equal(f.manager.getActive(), null);
+        assert.equal(f.counts().telemetry, 1);
+    }],
+    ['#328 Ray: a run of ANOTHER file never adopts an armed job', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createJob();
+        await f.call(job);
+        f.setReport('running', '/boundary.nc'); f.tick();
+        assert.equal(job.state, 'armed', 'the boundary run (a short press) is not this job');
+        f.setReport('idle', '/boundary.nc'); f.tick(); f.setReport('idle', '/boundary.nc'); f.tick(); f.setReport('idle', '/boundary.nc'); f.tick();
+        assert.equal(job.state, 'armed');
+    }],
+    ['#328 Ray: stop while armed WITHDRAWS without a firmware stop and says the file remains on the controller', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createJob();
+        await f.call(job);
+        const result = await f.stop(job);
+        assert.equal(result.withdrawn, true); assert.equal(result.stopped, true);
+        assert.match(result.note, /REMAINS on the controller/);
+        assert.equal(job.state, 'stopped'); assert.equal(job.ending?.kind, 'withdrawn');
+        assert.match(job.ending?.reason || '', /ray\.nc remains on the controller/);
+        assert.equal(job.confirmToken, null);
+        assert.equal(f.counts().stops, 0, 'the Ray alarms on a job stop outside a file print: none sent');
+        assert.equal(f.manager.getActive(), null);
+        f.setReport('running', '/ray.nc'); f.tick();
+        assert.equal(job.state, 'stopped', 'a withdrawn job is never resurrected');
+    }],
+    ['#328 Ray: stop while running sends the SACP job stop; stop while the machine reads idle sends nothing', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createJob();
+        await f.call(job);
+        f.setReport('running', '/ray.nc'); f.tick();
+        assert.equal(job.state, 'started');
+        const stopped = await f.stop(job);
+        assert.equal(stopped.stopped, true); assert.equal(f.counts().stops, 1);
+        assert.equal(job.state, 'stopped'); assert.equal(job.ending?.kind, 'machine-stopped');
+        // A started job whose machine already reads idle: no 0xAC 0x06 to an idle Ray.
+        const g = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const other = g.createJob();
+        await g.call(other);
+        g.setReport('running', '/ray.nc'); g.tick();
+        g.setReport('idle', '/ray.nc'); g.tick();
+        assert.equal(other.state, 'started', 'one idle beat is not completion yet');
+        const idle = await g.stop(other);
+        assert.equal(idle.stopped, false); assert.match(idle.note, /machine reads idle, so no job stop was sent/);
+        assert.equal(g.counts().stops, 0);
+        assert.equal(other.state, 'started');
+        g.setReport('idle', '/ray.nc'); g.tick(); g.setReport('idle', '/ray.nc'); g.tick();
+        assert.equal(other.state, 'completed', 'the watcher still ends it from the heartbeat');
+    }],
+    ['#328 Ray: an upload whose result was lost is start_unverified (the controller may hold the file), never retried, adopted if it runs', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createJob();
+        f.setUpload((callback) => callback('no reply from the controller for 30 s during the upload', { uncertain: true }));
+        const result = await f.call(job);
+        assert.equal(result.ok, false); assert.equal(result.retry_safe, false);
+        assert.equal(job.state, 'start_unverified');
+        assert.match(job.error || '', /Upload unverified: no reply.*may hold ray\.nc/);
+        assert.equal(f.manager.getActive(), job);
+        assert.equal((await f.call(job)).retry_safe, false, 'no blind retry');
+        assert.equal(f.counts().uploads, 1);
+        await assert.rejects(f.call(f.createJob()), /still active/);
+        // It runs after all (the operator pressed the switch): adopted from the heartbeat.
+        f.setReport('running', '/ray.nc'); f.tick();
+        assert.equal(job.state, 'started'); assert.equal(f.counts().telemetry, 1);
+        // The same with the machine idle: a stop withdraws it without a firmware stop.
+        const g = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const other = g.createJob();
+        g.setUpload((callback) => callback('upload request failed: timeout', { uncertain: true }));
+        await g.call(other);
+        g.setReport('idle', '/ray.nc'); g.tick();
+        const stop = await g.stop(other);
+        assert.equal(stop.withdrawn, true); assert.equal(g.counts().stops, 0);
+        assert.equal(other.state, 'stopped'); assert.match(other.ending?.reason || '', /may be on the controller/);
+    }],
+    ['#328 Ray: a definite upload refusal fails the job (nothing usable on the controller); a lease refusal is not_sent', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createJob();
+        f.setUpload((callback) => callback('SD card unavailable.', { rejected: true }));
+        await assert.rejects(f.call(job), /Upload failed: SD card unavailable/);
+        assert.equal(job.state, 'start_failed'); assert.equal(f.manager.getActive(), null);
+        const g = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const other = g.createJob();
+        g.setUpload((callback) => callback('lease held', { notSent: true }));
+        await assert.rejects(g.call(other), /Upload failed: lease held/);
+        assert.equal(other.events.find((e) => e.phase === 'failed')?.not_sent, true);
+    }],
+    ['#328 Ray: the Manual-Mode refusal still comes before the upload for a file job', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 1 }); const job = f.createJob();
+        await assert.rejects(f.call(job), /Manual Mode|SHUTAll/);
+        assert.equal(job.state, 'approved'); assert.equal(f.counts().uploads, 0);
+    }],
+    ['#328 Ray: the file-print-only stop is NO stop for a direct step - #320 semantics hold although stopGcodeJob exists', async () => {
+        const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createDirectJob();
+        job.state = 'started';
+        await assert.rejects(f.stop(job), /cannot be stopped by firmware command over this transport/);
+        assert.equal(f.counts().stops, 0);
+    }],
+    ['#328: fileStartEvidence treats the Ray\'s /ray.nc as ray.nc and SYSTEM_STATUS_STARTING as active', () => {
+        assert.equal(fileStart.fileStartEvidence({ status: 'starting', timestamp: 200, gcodePrintingInfo: { name: '/ray.nc' } }, 100, 1000, true, 'ray.nc'), 'active');
+        assert.equal(fileStart.fileStartEvidence({ status: 'running', timestamp: 200, gcodePrintingInfo: { name: '/boundary.nc' } }, 100, 1000, true, 'ray.nc'), 'unknown');
+        assert.equal(fileStart.fileJobTarget(RAY_TRANSPORT, 'drill'), 'ray.nc');
+        assert.equal(fileStart.fileJobTarget(fileStart.COMMAND_FILE_JOB_TRANSPORT, 'drill'), 'drill.nc');
     }],
     ['a channel without executeGcode refuses direct jobs and procedures by name, before the approval is consumed', async () => {
         const f = fixture('none');

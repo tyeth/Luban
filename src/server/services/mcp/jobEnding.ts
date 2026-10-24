@@ -13,6 +13,8 @@ export type McpJobState =
     | 'approved'
     | 'rejected'
     | 'starting'
+    /** A file job uploaded to a controller that starts it only from its own switch (the Ray, #328): waiting for the operator. */
+    | 'armed'
     | 'start_unverified'
     | 'started'
     | 'start_failed'
@@ -137,7 +139,7 @@ export function countMeasured(result: unknown): number | undefined {
  * Without the context (every caller before #320) the plan is unchanged.
  */
 export type JobStopAction = 'already-ended' | 'withdraw' | 'request-procedure-stop' | 'machine-stop'
-    | 'withdraw-remaining' | 'withdraw-after-step' | 'no-firmware-stop';
+    | 'withdraw-remaining' | 'withdraw-after-step' | 'no-firmware-stop' | 'withdraw-armed';
 
 /** A direct job's step position, for planJobStop (#320). */
 export interface DirectStepContext {
@@ -149,7 +151,7 @@ export interface DirectStepContext {
     stepInFlight: boolean;
     /** No step call is executing but the machine is not (known to be) idle: a step that was not awaited may still be moving. */
     machineMoving: boolean;
-    /** The connected channel has a firmware stop (stopGcodeJob). */
+    /** The connected channel has a firmware stop that halts a DIRECT step (the Ray's SACP job stop halts file prints only, #328). */
     firmwareStop: boolean;
 }
 
@@ -182,6 +184,16 @@ export function planJobStop(kind: McpJobKind, state: McpJobState, step?: DirectS
         return {
             action: 'withdraw',
             note: 'Procedure withdrawn before it started. Its confirm link is dead - approving it now does nothing.',
+        };
+    }
+    if (kind === 'file' && state === 'armed') {
+        // The file is on the controller but nothing runs (#328): nothing to
+        // stop by command, and the file cannot be removed over SACP.
+        return {
+            action: 'withdraw-armed',
+            note: 'Job withdrawn before the operator started it at the machine: nothing was sent and nothing is running. The uploaded '
+                + 'file REMAINS on the controller until another upload replaces it, so a press of the work switch would still run it - '
+                + 'tell the operator not to press it, or upload another job first.',
         };
     }
     if (state === 'awaiting_confirmation' || state === 'approved') {

@@ -1115,7 +1115,14 @@ These are agent release requirements, not new runtime checks in `validate_gcode`
 - **Compound motion and all cutting goes out as gcode FILES** through the same
   `prepare_print`/`start_print` path as Luban's Start button, so the controller job state
   machine and the enclosure **door interlock** apply (fork issue #23). The direct
-  (`execute_code`) path is reserved for single guarded actions.
+  (`execute_code`) path is reserved for single guarded actions. **On the Snapmaker Ray over
+  Wi-Fi (SACP-UDP, #328)** the file goes out exactly as Luban's own Ray "Upload Job" does - the
+  compressed SACP transfer to `/ray.nc` - and the firmware (V1.7.4, RayController
+  `file_manager.cpp`) has **no start command**: the job reads `armed` and the operator presses
+  and holds the work switch (~3 s); the MCP adopts the run from the heartbeat and tracks it to
+  completion, and can stop it with the SACP job stop. A channel that can neither upload nor
+  start (the Ray over USB, the Original, the Artisan/J1 over Wi-Fi) is refused at
+  `submit_gcode_job`, before any approval is asked for (`docs/TOOLS.md`, Jobs).
 - **Human confirm page** (`/confirm/<id>`, loopback + Origin-checked): shows validation,
   extents, warnings, and for direct moves a banner stating the interlock does NOT apply.
   Approval mints a one-time code (15 min TTL). Only the operator's click authorises motion:

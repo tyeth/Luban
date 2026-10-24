@@ -139,6 +139,8 @@ function gcodeTools(manager: JobManager, files: Map<string, string>, firmwareSto
         },
         '../jobs': { jobManager: manager, TERMINAL_JOB_STATES: jobEnding.TERMINAL_JOB_STATES, approvalHandoff: () => 'agent' },
         '../jobEnding': jobEnding,
+        // Pure (#328): the channel's file-job transport defaults live here.
+        '../fileJobStart': require('../fileJobStart'),
         '../jobTiming': { summarizeJobTiming: () => ({}) },
         '../failureRecovery': failureRecovery,
         '../manualControl': require('../manualControl'),
