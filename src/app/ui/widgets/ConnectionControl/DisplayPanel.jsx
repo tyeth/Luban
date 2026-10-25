@@ -10,6 +10,7 @@ import Dropdown from '../../components/Dropdown';
 import Menu from '../../components/Menu';
 import SvgIcon from '../../components/SvgIcon';
 import styles from './styles.styl';
+import { planCoordinateGoto } from './coordinateGoto';
 
 const OperationDropdown = (
     {
@@ -60,8 +61,30 @@ class DisplayPanel extends PureComponent {
         workPosition: PropTypes.object.isRequired,
         headType: PropTypes.string,
         originOffset: PropTypes.object.isRequired,
-        state: PropTypes.object
+        state: PropTypes.object,
+        // Machine-frame travel a typed position must stay within (the Ray's work area), or null
+        travel: PropTypes.object
     };
+
+    // The coordinate being typed into: { axis, frame } or null
+    state = {
+        editing: null,
+        draft: '',
+        initial: '',
+        error: ''
+    };
+
+    // Set when Enter or Escape has already closed the editor, so the blur
+    // that follows does not commit a second time.
+    skipBlur = false;
+
+    componentDidUpdate() {
+        // A job starting, a disconnect or a move in progress ends the edit unsent.
+        if (this.state.editing && !(this.props.state && this.props.state.canClick)) {
+            this.skipBlur = true;
+            this.setState({ editing: null, error: '' });
+        }
+    }
 
     actions = {
         onClick: (event, isSetOrigin = false) => {
@@ -78,8 +101,115 @@ class DisplayPanel extends PureComponent {
                     this.props.executeGcode(data);
                 }
             }
+        },
+        beginEdit: (axis, frame, initial) => {
+            if (!(this.props.state && this.props.state.canClick)) return;
+            this.skipBlur = false;
+            this.setState({ editing: { axis, frame }, draft: String(initial), initial: String(initial), error: '' });
+        },
+        changeDraft: (event) => {
+            this.setState({ draft: event.target.value });
+        },
+        cancelEdit: () => {
+            this.skipBlur = true;
+            this.setState({ editing: null, error: '' });
+        },
+        // Enter keeps the editor open on a bad value; a blur closes it either way.
+        commitEdit: (fromBlur) => {
+            const { editing, draft, initial } = this.state;
+            if (!editing) return;
+            if (!(this.props.state && this.props.state.canClick)) {
+                this.actions.cancelEdit();
+                return;
+            }
+            const result = planCoordinateGoto({
+                axis: editing.axis,
+                frame: editing.frame,
+                raw: draft,
+                initial,
+                originOffset: this.props.originOffset,
+                isPrinting: this.props.headType === HEAD_PRINTING,
+                jogSpeed: Number(this.props.state.jogSpeed),
+                travel: this.props.travel
+            });
+            let error = '';
+            if (result.kind === 'invalid') {
+                error = i18n._('key-Workspace/Control/DisplayPanel-Not a number: {{value}}', { value: draft });
+            } else if (result.kind === 'outside-travel') {
+                error = i18n._('key-Workspace/Control/DisplayPanel-{{axis}} {{target}} mm is outside the machine travel ({{min}} to {{max}} mm), not moved', {
+                    axis: editing.axis.toUpperCase(),
+                    target: result.machineTarget,
+                    min: result.min,
+                    max: result.max
+                });
+            } else if (result.kind === 'move') {
+                this.props.executeGcode(result.gcode);
+            }
+            if (error && !fromBlur) {
+                this.setState({ error });
+                return;
+            }
+            this.skipBlur = true;
+            this.setState({ editing: null, error });
+        },
+        onEditKeyDown: (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                this.actions.commitEdit(false);
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                this.actions.cancelEdit();
+            }
+        },
+        onEditBlur: () => {
+            if (this.skipBlur) {
+                this.skipBlur = false;
+                return;
+            }
+            this.actions.commitEdit(true);
         }
     };
+
+    // A coordinate readout that turns into an input when clicked while the machine is idle.
+    renderValue(axis, frame, initial, readout) {
+        const { editing, draft } = this.state;
+        const canClick = !!(this.props.state && this.props.state.canClick);
+        if (editing && editing.axis === axis && editing.frame === frame) {
+            return (
+                <input
+                    className={styles['coordinate-input']}
+                    type="text"
+                    inputMode="decimal"
+                    autoFocus
+                    value={draft}
+                    onChange={this.actions.changeDraft}
+                    onFocus={e => e.target.select()}
+                    onKeyDown={this.actions.onEditKeyDown}
+                    onBlur={this.actions.onEditBlur}
+                />
+            );
+        }
+        if (!canClick) {
+            return readout;
+        }
+        const title = frame === 'machine'
+            ? i18n._('key-Workspace/Control/DisplayPanel-Click to type a machine position to go to')
+            : i18n._('key-Workspace/Control/DisplayPanel-Click to type a work position to go to');
+        return (
+            <div
+                className={styles['coordinate-editable']}
+                role="button"
+                tabIndex={0}
+                title={title}
+                onClick={() => this.actions.beginEdit(axis, frame, initial)}
+                onKeyDown={(e) => {
+                    if (e.key === 'Enter') this.actions.beginEdit(axis, frame, initial);
+                }}
+            >
+                {readout}
+            </div>
+        );
+    }
 
     render() {
         const { state, workPosition, originOffset, headType } = this.props;
@@ -114,17 +244,21 @@ class DisplayPanel extends PureComponent {
                             <tr>
                                 <td className={styles['field-axis']}>X</td>
                                 <td className={styles['field-position']}>
-                                    <div>
-                                        <span className={styles['integer-part']}>{machinePositionX}</span>
-                                    </div>
+                                    {this.renderValue('x', 'machine', machinePositionX, (
+                                        <div>
+                                            <span className={styles['integer-part']}>{machinePositionX}</span>
+                                        </div>
+                                    ))}
                                     <span className={styles.unit}>{lengthUnits}</span>
                                 </td>
                                 <td className={styles['field-position']}>
-                                    <div>
-                                        <span className={styles['integer-part']}>{workPosition.x.split('.')[0]}</span>
-                                        <span className={styles['decimal-point']}>.</span>
-                                        <span className={styles['fractional-part']}>{workPosition.x.split('.')[1]}</span>
-                                    </div>
+                                    {this.renderValue('x', 'work', workPosition.x, (
+                                        <div>
+                                            <span className={styles['integer-part']}>{workPosition.x.split('.')[0]}</span>
+                                            <span className={styles['decimal-point']}>.</span>
+                                            <span className={styles['fractional-part']}>{workPosition.x.split('.')[1]}</span>
+                                        </div>
+                                    ))}
                                     <span className={styles.unit}>{lengthUnits}</span>
                                 </td>
                                 <td className={styles.action}>
@@ -147,18 +281,22 @@ class DisplayPanel extends PureComponent {
                             <tr>
                                 <td className={styles['field-axis']}>Y</td>
                                 <td className={styles['field-position']}>
-                                    <div>
-                                        <span className={styles['integer-part']}>{machinePositionY}</span>
-                                    </div>
+                                    {this.renderValue('y', 'machine', machinePositionY, (
+                                        <div>
+                                            <span className={styles['integer-part']}>{machinePositionY}</span>
+                                        </div>
+                                    ))}
                                     <span className={styles.unit}>{lengthUnits}</span>
                                 </td>
                                 <td className={styles['field-position']}>
                                     <span className={styles.unit}>{lengthUnits}</span>
-                                    <div>
-                                        <span className={styles['integer-part']}>{workPosition.y.split('.')[0]}</span>
-                                        <span className={styles['decimal-point']}>.</span>
-                                        <span className={styles['fractional-part']}>{workPosition.y.split('.')[1]}</span>
-                                    </div>
+                                    {this.renderValue('y', 'work', workPosition.y, (
+                                        <div>
+                                            <span className={styles['integer-part']}>{workPosition.y.split('.')[0]}</span>
+                                            <span className={styles['decimal-point']}>.</span>
+                                            <span className={styles['fractional-part']}>{workPosition.y.split('.')[1]}</span>
+                                        </div>
+                                    ))}
                                 </td>
                                 <td className={styles.action}>
                                     <OperationDropdown
@@ -180,17 +318,21 @@ class DisplayPanel extends PureComponent {
                             <tr>
                                 <td className={styles['field-axis']}>Z</td>
                                 <td className={styles['field-position']}>
-                                    <div>
-                                        <span className={styles['integer-part']}>{machinePositionZ}</span>
-                                    </div>
+                                    {this.renderValue('z', 'machine', machinePositionZ, (
+                                        <div>
+                                            <span className={styles['integer-part']}>{machinePositionZ}</span>
+                                        </div>
+                                    ))}
                                     <span className={styles.unit}>{lengthUnits}</span>
                                 </td>
                                 <td className={styles['field-position']}>
-                                    <div>
-                                        <span className={styles['integer-part']}>{workPosition.z.split('.')[0]}</span>
-                                        <span className={styles['decimal-point']}>.</span>
-                                        <span className={styles['fractional-part']}>{workPosition.z.split('.')[1]}</span>
-                                    </div>
+                                    {this.renderValue('z', 'work', workPosition.z, (
+                                        <div>
+                                            <span className={styles['integer-part']}>{workPosition.z.split('.')[0]}</span>
+                                            <span className={styles['decimal-point']}>.</span>
+                                            <span className={styles['fractional-part']}>{workPosition.z.split('.')[1]}</span>
+                                        </div>
+                                    ))}
                                     <span className={styles.unit}>{lengthUnits}</span>
                                 </td>
                                 <td className={styles.action}>
@@ -213,17 +355,21 @@ class DisplayPanel extends PureComponent {
                             <tr>
                                 <td className={styles['field-axis']}>B</td>
                                 <td className={styles['field-position']}>
-                                    <div>
-                                        <span className={styles['integer-part']}>{machinePositionB}</span>
-                                    </div>
+                                    {this.renderValue('b', 'machine', machinePositionB, (
+                                        <div>
+                                            <span className={styles['integer-part']}>{machinePositionB}</span>
+                                        </div>
+                                    ))}
                                     <span className={styles.unit}>°</span>
                                 </td>
                                 <td className={styles['field-position']}>
-                                    <div>
-                                        <span className={styles['integer-part']}>{(workPosition.b || '').split('.')[0]}</span>
-                                        <span className={styles['decimal-point']}>.</span>
-                                        <span className={styles['fractional-part']}>{(workPosition.b || '').split('.')[1]}</span>
-                                    </div>
+                                    {this.renderValue('b', 'work', (workPosition.b || ''), (
+                                        <div>
+                                            <span className={styles['integer-part']}>{(workPosition.b || '').split('.')[0]}</span>
+                                            <span className={styles['decimal-point']}>.</span>
+                                            <span className={styles['fractional-part']}>{(workPosition.b || '').split('.')[1]}</span>
+                                        </div>
+                                    ))}
                                     <span className={styles.unit}>°</span>
                                 </td>
                                 <td className={styles.action}>
@@ -244,6 +390,9 @@ class DisplayPanel extends PureComponent {
                         )}
                     </tbody>
                 </table>
+                {this.state.error && (
+                    <div className={styles['coordinate-error']}>{this.state.error}</div>
+                )}
             </div>
         );
     }

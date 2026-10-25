@@ -16,6 +16,7 @@ import { actions as workspaceActions } from '../../../flux/workspace';
 import { MachineAgent } from '../../../flux/workspace/MachineAgent';
 import usePrevious from '../../../lib/hooks/previous';
 import { in2mm, mm2in } from '../../../lib/units';
+import { SnapmakerRayMachine } from '../../../machines';
 import ControlPanel from './ControlPanel';
 import DisplayPanel from './DisplayPanel';
 import { ANGLE_OPTIONS, DEFAULT_AXES, DISTANCE_MAX, DISTANCE_MIN, DISTANCE_STEP, getDistanceOptions } from './constants';
@@ -75,6 +76,17 @@ const Control: React.FC<ConnectionControlProps> = ({ widgetId, isNotInWorkspace,
 
     const { isConnected } = useSelector((state: RootState) => state.workspace);
     const { headType } = useSelector((state: RootState) => state.workspace);
+    const { activeMachine } = useSelector((state: RootState) => state.workspace);
+
+    // A position typed into the coordinate table must stay inside the Ray's
+    // work area, as the jog pad's absolute moves do (ControlPanel).
+    const gotoTravel = useMemo(() => {
+        if (!activeMachine || activeMachine.identifier !== SnapmakerRayMachine.identifier) {
+            return null;
+        }
+        const { size } = activeMachine.metadata;
+        return { x: size.x, y: size.y };
+    }, [activeMachine]);
 
     const server: MachineAgent = useSelector((state: RootState) => state.workspace.server);
     const {
@@ -445,6 +457,7 @@ const Control: React.FC<ConnectionControlProps> = ({ widgetId, isNotInWorkspace,
                     headType={headType}
                     executeGcode={actions.executeGcode}
                     state={state}
+                    travel={gotoTravel}
                 />
             )}
             {/* Comment this since Luban v4.0 and will be used in the future */}
