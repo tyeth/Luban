@@ -27,6 +27,7 @@ import { machineStore } from '../machineStore';
 import { COMPUTED_HEIGHT_TOGGLE } from '../motionRules';
 import { DirectStepContext, classifyProcedureEnding, countMeasured, directStepsLeft, planJobStop } from '../jobEnding';
 import {
+    BoundaryRefresh,
     COMMAND_FILE_JOB_TRANSPORT,
     FILE_JOB_ACTIVE_STATUSES,
     FileJobTransport,
@@ -34,6 +35,7 @@ import {
     FileStartReport,
     fileJobTarget,
     fileStartEvidence,
+    operatorStartInstruction,
 } from '../fileJobStart';
 import { summarizeJobTiming } from '../jobTiming';
 import { landmarkStore } from '../landmarks';
@@ -104,6 +106,9 @@ interface JobChannel {
     stopGcodeJob?: () => Promise<{ ok: boolean; code?: number; text?: string }>;
     /** How this channel starts and stops a file job (#328); absent = the A350's command start (COMMAND_FILE_JOB_TRANSPORT). */
     fileJobTransport?: () => FileJobTransport;
+    /** The Ray: put this job's frame on the controller for a short press of the switch (boundary.nc), unless already there. */
+    uploadJobBoundary?: (gcodeFilePath: string, extents?: { x?: { min: number; max: number } | null; y?: { min: number; max: number } | null } | null)
+        => Promise<BoundaryRefresh>;
 }
 
 type FileJobChannel = JobChannel & Required<Pick<JobChannel, 'uploadGcodeFile'>>;
@@ -289,6 +294,37 @@ function machineStatus(): string | null {
 }
 
 const log = logger('service:mcp:gcode-jobs');
+
+/**
+ * After a Ray job is on the controller: put its frame there too, so a SHORT
+ * press of the work switch frames THIS job (boundary.nc; the channel skips the
+ * transfer when this connection already sent the same bytes). Never throws:
+ * a failed frame is reported on the job and the result, and the job stays armed.
+ * Null when the channel frames nothing (the A350, test stubs).
+ */
+async function refreshJobBoundary(job: McpJob, channel: JobChannel): Promise<BoundaryRefresh | null> {
+    if (typeof channel.uploadJobBoundary !== 'function') {
+        return null;
+    }
+    const extents = job.validation && job.validation.extents
+        ? { x: job.validation.extents.x || null, y: job.validation.extents.y || null }
+        : null;
+    const boundary: BoundaryRefresh = await channel.uploadJobBoundary(job.filePath, extents).catch((err: Error) => ({
+        status: 'failed' as const, target: 'boundary.nc', reason: err.message, basis: null, frame: null,
+    }));
+    const failed = boundary.status === 'failed' || boundary.status === 'not-framed';
+    let note = `${boundary.target} NOT updated for this job: ${boundary.reason}. A short press runs the previous frame; the job stays armed.`;
+    if (boundary.status === 'uploaded') {
+        note = `${boundary.target} updated to this job's frame (${boundary.basis})`;
+    } else if (boundary.status === 'unchanged') {
+        note = `${boundary.target} already held this job's frame on this connection; not re-sent`;
+    }
+    jobManager.appendEvent(job, failed ? 'boundary_failed' : 'boundary', { note, boundary });
+    if (failed) {
+        log.warn(`MCP file job ${job.id}: ${boundary.target} not updated (${boundary.status}): ${boundary.reason}`);
+    }
+    return boundary;
+}
 
 type DirectSettle = { position: PositionSnapshot | null; verified: boolean; warning?: string };
 
@@ -1364,7 +1400,8 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             + 'incompatible and a Luban header (;machine:) naming another machine; and (#328) a connected channel that cannot '
             + 'start file jobs (the Ray over USB, the Original, the Artisan/J1 over Wi-Fi), so the operator is never asked to '
             + 'approve a job that cannot run. On the Ray over Wi-Fi (SACP-UDP) the result carries file_start: the controller has '
-            + 'no start command, so start_gcode_job uploads the file as ray.nc and the OPERATOR starts it at the work switch.',
+            + 'no start command, so start_gcode_job uploads the file as ray.nc (and its frame as boundary.nc, for a short '
+            + 'press) and the OPERATOR starts it at the work switch.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1569,8 +1606,12 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
             + 'this call compress-uploads the program to the controller as ray.nc and returns armed: true with operator_start; nothing '
             + 'moves until the operator presses and holds the work switch (~3 s). Tell them so. The job stays armed (and holds the '
             + 'machine) until the heartbeat shows ray.nc running (then started, progress, completed as on the A350) or stop_gcode_job '
-            + 'withdraws it; a SHORT press runs the controller\'s stale boundary.nc, not this job. An upload whose result was lost is '
-            + 'start_unverified: the controller may hold the file; never retry.',
+            + 'withdraws it. A SHORT press runs the controller\'s boundary.nc: after ray.nc this call uploads the job\'s frame there '
+            + '(Luban\'s own Run Boundary G-code from the job\'s header, or its work-frame extents; skipped when this connection '
+            + 'already sent the same frame) and returns `boundary` {status uploaded | unchanged | failed | not-framed, frame, '
+            + 'reason}; operator_start.instruction says what a short press runs. A failed frame never fails the start - the job '
+            + 'stays armed and the short press runs the previous frame. An upload whose result was lost is start_unverified: the '
+            + 'controller may hold the file; never retry.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -1940,19 +1981,33 @@ export function registerGcodeTools(registry: ToolRegistry, getConfirmBaseUrl: ()
                     };
                 }
                 jobManager.appendEvent(job, 'uploaded', { note: `${job.name}.nc uploaded to the controller as ${target} (compressed SACP transfer)` });
+                // Armed (and watched) before the frame goes up: a stop withdraws it
+                // and a switch press is adopted while the boundary transfers.
                 job.state = 'armed';
-                jobManager.appendEvent(job, 'armed', { note: `${target} is on the controller; nothing moves until the operator starts it: ${transport.instruction}` });
-                log.info(`MCP file job ${job.id} armed: ${target} on the controller, waiting for the operator's work switch`);
                 poll();
+                const boundary = await refreshJobBoundary(job, fileChannel);
+                const operatorStart = job.startAttempt.operatorStart;
+                if (boundary && operatorStart) {
+                    operatorStart.boundary = boundary;
+                    operatorStart.instruction = operatorStartInstruction(transport, boundary);
+                }
+                const instruction = operatorStart ? operatorStart.instruction : transport.instruction;
+                if (job.state !== 'armed') {
+                    // Withdrawn (or already started at the switch) while the frame was uploading.
+                    return { ok: job.state !== 'stopped', job: jobManager.describe(job), ...(boundary ? { boundary } : {}), retry_safe: false };
+                }
+                jobManager.appendEvent(job, 'armed', { note: `${target} is on the controller; nothing moves until the operator starts it: ${instruction}` });
+                log.info(`MCP file job ${job.id} armed: ${target} on the controller, waiting for the operator's work switch`);
                 return {
                     ok: true,
                     armed: true,
                     job: jobManager.describe(job),
-                    operator_start: job.startAttempt.operatorStart,
+                    operator_start: operatorStart,
+                    ...(boundary ? { boundary } : {}),
                     machine_status_after: job.startAttempt.machineStatusAfter,
                     retry_safe: false,
                     note: `Uploaded to the controller as ${target} and ARMED; nothing was started and nothing moves. This machine has no `
-                        + `start command: ${transport.instruction} Tell the operator so. The job stays armed until they start it (the `
+                        + `start command: ${instruction} Tell the operator so. The job stays armed until they start it (the `
                         + 'heartbeat then marks it started and tracks progress to completion) or it is withdrawn with stop_gcode_job; '
                         + 'while armed no other job can start. Long-poll get_gcode_job_status (wait_ms) for started / progress / completed.',
                 };

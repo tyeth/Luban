@@ -98,9 +98,13 @@ const UploadView: React.FC = () => {
 
     const dispatch = useDispatch();
 
-    const uploadBoundary = useCallback(async () => {
+    // The job's frame for a short press of the work switch. The server skips
+    // the transfer when this connection already put the same bytes on the
+    // controller (SacpUdpChannel). A failure is reported with the job's
+    // result and never stops the job upload.
+    const uploadBoundary = useCallback(async (): Promise<{ ok: boolean; text?: string }> => {
         if (!gcodeFile) {
-            return false;
+            return { ok: false, text: 'no G-code loaded' };
         }
 
         log.info('Run Boundary... bbox =', gcodeFile.gcodeAxisWorkRange);
@@ -110,9 +114,15 @@ const UploadView: React.FC = () => {
         const blob = new Blob([gcode], { type: 'text/plain' });
         const file = new File([blob], 'boundary.nc');
 
-        const gcodeFileObject: GCodeFileMetadata = await dispatch(gcodeActions.uploadGcodeFile(file));
+        let gcodeFileObject: GCodeFileMetadata;
+        try {
+            gcodeFileObject = await dispatch(gcodeActions.uploadGcodeFile(file));
+        } catch (err) {
+            log.error('Unable to stage boundary G-code.', err);
+            return { ok: false, text: String((err as Error)?.message || err) };
+        }
 
-        return new Promise<boolean>((resolve) => {
+        return new Promise((resolve) => {
             controller
                 .emitEvent(SocketEvent.CompressUploadFile, {
                     filePath: gcodeFileObject.uploadName,
@@ -120,26 +130,20 @@ const UploadView: React.FC = () => {
                 })
                 .once(SocketEvent.CompressUploadFile, ({ err, text }) => {
                     if (err) {
-                        log.error('Unable to upload G-code to execute.');
+                        log.error('Unable to upload boundary G-code.');
                         log.error(err);
                         log.error(`Reason: ${text}`);
-                        modalSmallHOC({
-                            title: i18n._('key-Workspace/WifiTransport-Failed to send file.'),
-                            text: text,
-                            iconColor: '#FF4D4F',
-                            img: 'WarningTipsError'
-                        });
-                        resolve(false);
+                        resolve({ ok: false, text });
                         return;
                     }
 
                     log.info('Uploaded boundary G-code.');
-                    resolve(true);
+                    resolve({ ok: true });
                 });
         });
     }, [dispatch, gcodeFile, jobOffsetMode, setupCoordinateMethod]);
 
-    const uploadJob = useCallback(async () => {
+    const uploadJob = useCallback(async (boundary: { ok: boolean; text?: string }) => {
         setIsUploading(true);
 
         return new Promise<boolean>((resolve) => {
@@ -167,11 +171,15 @@ const UploadView: React.FC = () => {
                         });
                         resolve(false);
                     } else {
+                        const sent = i18n._('File sent successfully. Press and hold the work switch on the integrated controller (for about 3 seconds) until the machine starts the task.');
                         modalSmallHOC({
                             title: i18n._('key-Workspace/WifiTransport-File sent successfully.'),
-                            text: i18n._('File sent successfully. Press and hold the work switch on the integrated controller (for about 3 seconds) until the machine starts the task.'),
-                            iconColor: '#4CB518',
-                            img: 'WarningTipsSuccess'
+                            text: boundary.ok
+                                ? sent
+                                : `${sent} ${i18n._('The job frame (boundary.nc) could not be updated, so a short press of the work switch runs the previous frame, not this job.')}`
+                                    + ` (${boundary.text || i18n._('unknown error')})`,
+                            iconColor: boundary.ok ? '#4CB518' : '#FFA940',
+                            img: boundary.ok ? 'WarningTipsSuccess' : 'WarningTipsTips'
                         });
                         resolve(true);
                     }
@@ -180,12 +188,8 @@ const UploadView: React.FC = () => {
     }, [gcodeFile]);
 
     const onClickUploadJob = useCallback(async () => {
-        const success = await uploadBoundary();
-        if (!success) {
-            return;
-        }
-
-        await uploadJob();
+        const boundary = await uploadBoundary();
+        await uploadJob(boundary);
     }, [uploadBoundary, uploadJob]);
 
     return (
