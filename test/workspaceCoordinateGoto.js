@@ -72,6 +72,12 @@ test('no feed word without a usable jog speed', (t) => {
     t.end();
 });
 
+test('feedMove sends G1 so GRBL honours the jog speed', (t) => {
+    t.equal(planCoordinateGoto({ ...base, feedMove: true, raw: '42.25' }).gcode, 'G90\nG1 X42.25 F1500');
+    t.equal(planCoordinateGoto({ ...base, feedMove: false, raw: '42.25' }).gcode, 'G90\nG0 X42.25 F1500');
+    t.end();
+});
+
 test('Ray travel: the machine target must be inside the work area', (t) => {
     const ray = { ...base, travel: { x: 600, y: 400 } };
     const inside = planCoordinateGoto({ ...ray, frame: 'machine', initial: '1', raw: '600' });

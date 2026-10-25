@@ -63,7 +63,9 @@ class DisplayPanel extends PureComponent {
         originOffset: PropTypes.object.isRequired,
         state: PropTypes.object,
         // Machine-frame travel a typed position must stay within (the Ray's work area), or null
-        travel: PropTypes.object
+        travel: PropTypes.object,
+        // Move with G1 so the jog speed applies (the Ray's GRBL ignores F on G0)
+        feedMove: PropTypes.bool
     };
 
     // The coordinate being typed into: { axis, frame } or null
@@ -130,7 +132,8 @@ class DisplayPanel extends PureComponent {
                 originOffset: this.props.originOffset,
                 isPrinting: this.props.headType === HEAD_PRINTING,
                 jogSpeed: Number(this.props.state.jogSpeed),
-                travel: this.props.travel
+                travel: this.props.travel,
+                feedMove: this.props.feedMove
             });
             let error = '';
             if (result.kind === 'invalid') {

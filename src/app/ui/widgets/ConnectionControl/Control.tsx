@@ -87,6 +87,9 @@ const Control: React.FC<ConnectionControlProps> = ({ widgetId, isNotInWorkspace,
         const { size } = activeMachine.metadata;
         return { x: size.x, y: size.y };
     }, [activeMachine]);
+    // The Ray's GRBL runs G0 flat out per axis and ignores F, so typed
+    // positions move with G1 at the jog speed there, as the jog pad does.
+    const gotoFeedMove = !!activeMachine && activeMachine.identifier === SnapmakerRayMachine.identifier;
 
     const server: MachineAgent = useSelector((state: RootState) => state.workspace.server);
     const {
@@ -458,6 +461,7 @@ const Control: React.FC<ConnectionControlProps> = ({ widgetId, isNotInWorkspace,
                     executeGcode={actions.executeGcode}
                     state={state}
                     travel={gotoTravel}
+                    feedMove={gotoFeedMove}
                 />
             )}
             {/* Comment this since Luban v4.0 and will be used in the future */}

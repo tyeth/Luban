@@ -23,6 +23,8 @@ export interface CoordinateGotoRequest {
     isPrinting: boolean;
     jogSpeed: number;
     travel?: MachineTravel | null;
+    /** Send G1 rather than G0: GRBL (the Ray) runs G0 at each axis's maximum rate and ignores F, as the jog pad does. */
+    feedMove?: boolean;
 }
 
 export type CoordinateGotoResult =
@@ -58,7 +60,7 @@ function roundMm(value: number): number {
 }
 
 export function planCoordinateGoto(request: CoordinateGotoRequest): CoordinateGotoResult {
-    const { axis, frame, raw, initial, originOffset, isPrinting, jogSpeed, travel } = request;
+    const { axis, frame, raw, initial, originOffset, isPrinting, jogSpeed, travel, feedMove } = request;
     const typed = parseCoordinate(raw);
     if (typed === null) {
         return { kind: 'invalid', raw };
@@ -83,6 +85,6 @@ export function planCoordinateGoto(request: CoordinateGotoRequest): CoordinateGo
     }
 
     const feed = Number.isFinite(jogSpeed) && jogSpeed > 0 ? ` F${jogSpeed}` : '';
-    const gcode = `G90\nG0 ${axis.toUpperCase()}${workTarget}${feed}`;
+    const gcode = `G90\n${feedMove ? 'G1' : 'G0'} ${axis.toUpperCase()}${workTarget}${feed}`;
     return { kind: 'move', gcode, workTarget, machineTarget };
 }

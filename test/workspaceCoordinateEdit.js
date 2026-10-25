@@ -47,7 +47,7 @@ function loadDisplayPanel() {
     return module.exports.default;
 }
 
-function mount({ canClick = true, travel = null, headType = 'cnc' } = {}) {
+function mount({ canClick = true, travel = null, headType = 'cnc', feedMove = false } = {}) {
     const DisplayPanel = loadDisplayPanel();
     const commands = [];
     const props = {
@@ -56,7 +56,8 @@ function mount({ canClick = true, travel = null, headType = 'cnc' } = {}) {
         originOffset: { x: 10, y: 0, z: 2, b: 0 },
         headType,
         state: { units: 'mm', canClick, axes: ['x', 'y', 'z'], jogSpeed: 1500 },
-        travel
+        travel,
+        feedMove
     };
     let renderer;
     act(() => { renderer = create(React.createElement(DisplayPanel, props)); });
@@ -160,6 +161,16 @@ test('Ray: a target outside the work area is refused with the reason', (t) => {
     ui.key('Enter');
     t.deepEqual(ui.commands, []);
     t.ok(ui.error()[0].includes('outside the machine travel'), 'says why');
+    ui.close();
+    t.end();
+});
+
+test('Ray: a typed position moves with G1 at the jog speed', (t) => {
+    const ui = mount({ travel: { x: 600, y: 400 }, feedMove: true });
+    ui.open('work', 0);
+    ui.type('42');
+    ui.key('Enter');
+    t.deepEqual(ui.commands, ['G90\nG1 X42 F1500'], 'G1 so GRBL honours F');
     ui.close();
     t.end();
 });
