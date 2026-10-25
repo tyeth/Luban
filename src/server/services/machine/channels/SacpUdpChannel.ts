@@ -1,13 +1,27 @@
+import crypto from 'crypto';
 import dgram from 'dgram';
+import fs from 'fs';
+import path from 'path';
 
 import { SACP_TYPE_SERIES_MAP } from '../../../../app/constants/machines';
+import {
+    BoundaryExtents,
+    RAY_BOUNDARY_FILENAME,
+    SETUP_BY_CONTROL_PANEL,
+    boundaryFrameSummary,
+    boundaryUploadNeeded,
+    getRunBoundaryCode,
+    jobBoundarySource,
+} from '../../../../shared/lib/rayBoundary';
+import DataStorage from '../../../DataStorage';
 import logger from '../../../lib/logger';
 import SacpClient from '../sacp/SacpClient';
 import { ChannelEvent } from './ChannelEvent';
 import SacpChannelBase from './SacpChannel';
 import { ExecuteGcodeResult } from './Channel';
 import { gcodeLease } from '../gcodeLease';
-import type { FileJobTransport, FileJobUploadOutcome } from '../../mcp/fileJobStart';
+import type { BoundaryRefresh, FileJobTransport, FileJobUploadOutcome } from '../../mcp/fileJobStart';
+import type { UploadFileOptions } from './Channel';
 
 const log = logger('machine:channels:SacpUdpChannel');
 
@@ -19,10 +33,14 @@ const log = logger('machine:channels:SacpUdpChannel');
  */
 export const RAY_JOB_FILENAME = 'ray.nc';
 
-/** What Luban's Ray UI tells the operator after the upload (RayUploadWidget), plus what a SHORT press does. */
-export const RAY_START_INSTRUCTION = 'Press and hold the work switch on the Ray integrated controller for about 3 seconds until '
-    + 'the machine starts the task. A SHORT press runs the controller boundary.nc - the LAST boundary Luban uploaded, '
-    + 'not the frame of this job - so frame this job with laser_frame instead.';
+/** What Luban's Ray UI tells the operator after the upload (RayUploadWidget). */
+export const RAY_HOLD_INSTRUCTION = 'Press and hold the work switch on the Ray integrated controller for about 3 seconds until '
+    + 'the machine starts the task.';
+
+/** The staging-time instruction: the start uploads the job's frame too, and its result says what a SHORT press runs. */
+export const RAY_START_INSTRUCTION = `${RAY_HOLD_INSTRUCTION} A SHORT press runs the controller ${RAY_BOUNDARY_FILENAME}: `
+    + 'start_gcode_job updates it to this job\'s frame with the upload (only when it differs from the one already there) and '
+    + 'its result says whether that succeeded; until then it is the LAST boundary uploaded, not this job\'s frame.';
 
 /** No reply from the controller for this long during an upload ends it as uncertain (never retried blindly). */
 export const UPLOAD_INACTIVITY_MS = 30000;
@@ -32,6 +50,9 @@ class SacpUdpChannel extends SacpChannelBase {
     private socketClient = dgram.createSocket('udp4');
 
     private heartbeatTimer2 = null;
+
+    /** The boundary.nc this connection last put on the controller; null = unknown (see boundaryUploadNeeded). */
+    private lastBoundary: { digest: string; generation: number } | null = null;
 
     public constructor() {
         super();
@@ -180,7 +201,96 @@ class SacpUdpChannel extends SacpChannelBase {
     // subscriptions (SacpChannel) feed the watcher that adopts the run.
 
     public fileJobTransport(): FileJobTransport {
-        return { start: 'operator-switch', target: RAY_JOB_FILENAME, instruction: RAY_START_INSTRUCTION, stop: 'file-print-only' };
+        return {
+            start: 'operator-switch',
+            target: RAY_JOB_FILENAME,
+            instruction: RAY_START_INSTRUCTION,
+            holdInstruction: RAY_HOLD_INSTRUCTION,
+            stop: 'file-print-only',
+        };
+    }
+
+    /**
+     * Every upload to boundary.nc (Luban's Run Boundary and Upload Job, the
+     * MCP's job frame) goes through here: the transfer is skipped when this
+     * connection already put the same bytes on the controller.
+     */
+    public async compressUploadFile(options: UploadFileOptions): Promise<boolean> {
+        if (options.targetFilename !== RAY_BOUNDARY_FILENAME) {
+            return super.compressUploadFile(options);
+        }
+        const result = await this.uploadBoundaryFile(options);
+        return result.status !== 'failed';
+    }
+
+    /** Upload a boundary file unless it is already current; 'failed' carries the reason. */
+    private async uploadBoundaryFile(options: UploadFileOptions): Promise<{ status: 'uploaded' | 'unchanged' | 'failed'; reason?: string }> {
+        let digest: string;
+        try {
+            digest = crypto.createHash('sha256').update(fs.readFileSync(options.filePath)).digest('hex');
+        } catch (err) {
+            const reason = `cannot read ${options.filePath}: ${(err as Error).message}`;
+            options.onFailed?.(reason);
+            return { status: 'failed', reason };
+        }
+        const generation = this.getConnectionGeneration();
+        if (!boundaryUploadNeeded(this.lastBoundary, digest, generation)) {
+            log.info(`${RAY_BOUNDARY_FILENAME} unchanged on this connection (sha256 ${digest.slice(0, 12)}); not re-sent`);
+            return { status: 'unchanged' };
+        }
+        // Unknown while the transfer runs: an interrupted upload may leave anything there.
+        this.lastBoundary = null;
+        let failure: string | null = null;
+        const ok = await super.compressUploadFile({
+            ...options,
+            targetFilename: RAY_BOUNDARY_FILENAME,
+            onFailed: (reason: string) => {
+                failure = reason;
+                options.onFailed?.(reason);
+            },
+        }).catch((err: Error) => {
+            failure = `upload request failed: ${err.message}`;
+            options.onFailed?.(failure);
+            return false;
+        });
+        if (!ok) {
+            return { status: 'failed', reason: failure || 'the controller did not accept the file' };
+        }
+        // Only the session the file went out on vouches for it.
+        this.lastBoundary = this.getConnectionGeneration() === generation ? { digest, generation } : null;
+        return { status: 'uploaded' };
+    }
+
+    /**
+     * Frame an MCP file job for a short press of the work switch: Luban's own
+     * Run Boundary G-code (shared/lib/rayBoundary getRunBoundaryCode) from the
+     * job's Luban header, or from the validator's work-frame extents when the
+     * file has none, uploaded to boundary.nc unless already current. The MCP
+     * starts Ray jobs only in Control Mode (motors held, homed), so the frame
+     * is the control-panel form: no G92, back to the frame's centre at the end.
+     */
+    public async uploadJobBoundary(gcodeFilePath: string, extents?: BoundaryExtents | null): Promise<BoundaryRefresh> {
+        let text = '';
+        try {
+            text = fs.readFileSync(gcodeFilePath, 'utf8');
+        } catch (err) {
+            return { status: 'failed', target: RAY_BOUNDARY_FILENAME, reason: `cannot read the job file: ${(err as Error).message}`, basis: null, frame: null };
+        }
+        const source = jobBoundarySource(text, extents);
+        if (!source) {
+            return { status: 'not-framed', target: RAY_BOUNDARY_FILENAME, reason: 'the job has no Luban header bounding box and no X/Y extents', basis: null, frame: null };
+        }
+        const frame = boundaryFrameSummary(source);
+        const gcode = getRunBoundaryCode(source.range, source.jobOffsetMode, source.isRotate, SETUP_BY_CONTROL_PANEL);
+        // One armed job at a time holds the machine, so one scratch name is enough.
+        const filePath = path.join(DataStorage.tmpDir, 'mcp-job-boundary.nc');
+        try {
+            fs.writeFileSync(filePath, gcode, 'utf8');
+        } catch (err) {
+            return { status: 'failed', target: RAY_BOUNDARY_FILENAME, reason: `cannot write the frame file: ${(err as Error).message}`, basis: source.basis, frame };
+        }
+        const result = await this.uploadBoundaryFile({ filePath, targetFilename: RAY_BOUNDARY_FILENAME });
+        return { status: result.status, target: RAY_BOUNDARY_FILENAME, reason: result.reason || null, basis: source.basis, frame };
     }
 
     /**

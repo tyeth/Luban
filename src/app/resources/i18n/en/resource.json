@@ -239,6 +239,8 @@
     "Fan Speed Override": "Fan Speed Override",
     "Feeder Wheel Diameter": "Feeder Wheel Diameter",
     "File sent successfully. Press and hold the work switch on the integrated controller (for about 3 seconds) until the machine starts the task.": "File sent successfully. Press and hold the work switch on the integrated controller (for about 3 seconds) until the machine starts the task.",
+    "The job frame (boundary.nc) could not be updated: {{reason}}. A short press of the work switch runs the previous frame, not this job.": "The job frame (boundary.nc) could not be updated: {{reason}}. A short press of the work switch runs the previous frame, not this job.",
+    "unknown error": "unknown error",
     "Fill": "Fill",
     "Fill Interval": "Fill Interval",
     "Final Printing Temperature": "Final Printing Temperature",
