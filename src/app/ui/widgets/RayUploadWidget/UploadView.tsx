@@ -176,9 +176,8 @@ const UploadView: React.FC = () => {
                             title: i18n._('key-Workspace/WifiTransport-File sent successfully.'),
                             text: boundary.ok
                                 ? sent
-                                : `${sent} ${i18n._('The job frame (boundary.nc) could not be updated: {{reason}}. A short press of the work switch runs the previous frame, not this job.', {
-                                    reason: boundary.text || i18n._('unknown error'),
-                                })}`,
+                                : `${sent} ${i18n._('The job frame (boundary.nc) could not be updated, so a short press of the work switch runs the previous frame, not this job.')}`
+                                    + ` (${boundary.text || i18n._('unknown error')})`,
                             iconColor: boundary.ok ? '#4CB518' : '#FFA940',
                             img: boundary.ok ? 'WarningTipsSuccess' : 'WarningTipsTips'
                         });
