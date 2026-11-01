@@ -10,7 +10,7 @@ import { JobOffsetMode } from '../../../constants/coordinate';
 import { RootState } from '../../../flux/index.def';
 import { actions as workspaceActions } from '../../../flux/workspace';
 import gcodeActions from '../../../flux/workspace/actions-gcode';
-import { AxisWorkRange, GCodeFileMetadata } from '../../../flux/workspace/types';
+import { GCodeFileMetadata } from '../../../flux/workspace/types';
 import { Button } from '../../components/Buttons';
 import i18n from '../../../lib/i18n';
 import log from '../../../lib/log';
@@ -18,115 +18,11 @@ import ControlPanel from '../ConnectionControl/Control';
 import RunBoundaryModal from './modals/RunBoundaryModal';
 import HomeTipModal from './modals/HomeTipModal';
 import { MotorPowerMode, SetupCoordinateMethod } from '../../../constants';
+import { getRunBoundaryCode } from '../../../../shared/lib/rayBoundary';
 
-export const getRunBoundaryCode = (
-    axisWorkRange: AxisWorkRange,
-    jobOffsetMode: JobOffsetMode,
-    isRotate: boolean = false,
-    setupCoordinateMethod: SetupCoordinateMethod
-) => {
-    const useBInsteadOfX = isRotate;
-    const gCommand = jobOffsetMode === JobOffsetMode.Crosshair ? 'G1 S0' : 'G1 S10';
-
-    const goto = (x: number, y: number): string => {
-        let code = gCommand;
-
-        if (useBInsteadOfX) {
-            code += ` B${x || 0}`;
-        } else {
-            code += ` X${x || 0}`;
-        }
-
-        code += ` Y${y}`;
-        code += ' F6000';
-
-        return code;
-    };
-
-    const gcodeList = [];
-
-    if (setupCoordinateMethod === SetupCoordinateMethod.ByControlPanel) {
-        gcodeList.push(
-            ';motor_mode: 3',
-        );
-    }
-
-    if (jobOffsetMode === JobOffsetMode.Crosshair) {
-        // Use crosshair to run boundary
-        gcodeList.push('M2000 L13 P1'); // turn on crosshair
-    } else if (jobOffsetMode === JobOffsetMode.LaserSpot) {
-        // Use laser spot to run boundary
-        gcodeList.push('M3 S0');
-        gcodeList.push(`${gCommand} F6000`); // turn on laser spot
-    }
-
-    gcodeList.push(
-        'G90', // absolute position
-    );
-
-    // set current position as origin
-    if (setupCoordinateMethod !== SetupCoordinateMethod.ByControlPanel) {
-        gcodeList.push(
-            'G92 X0 Y0 B0',
-        );
-    }
-
-    if (useBInsteadOfX) {
-        gcodeList.push(
-            // run bounding box
-            goto(axisWorkRange.min.b, axisWorkRange.min.y),
-            goto(axisWorkRange.max.b, axisWorkRange.min.y),
-            goto(axisWorkRange.max.b, axisWorkRange.max.y),
-            goto(axisWorkRange.min.b, axisWorkRange.max.y),
-            goto(axisWorkRange.min.b, axisWorkRange.min.y),
-        );
-    } else {
-        gcodeList.push(
-            // run bounding box
-            goto(axisWorkRange.min.x, axisWorkRange.min.y),
-            goto(axisWorkRange.max.x, axisWorkRange.min.y),
-            goto(axisWorkRange.max.x, axisWorkRange.max.y),
-            goto(axisWorkRange.min.x, axisWorkRange.max.y),
-            goto(axisWorkRange.min.x, axisWorkRange.min.y),
-        );
-    }
-
-
-    if (setupCoordinateMethod === SetupCoordinateMethod.ByControlPanel) {
-        // go back to origin
-        if (useBInsteadOfX) {
-            gcodeList.push(
-                goto(
-                    axisWorkRange.min.b + (axisWorkRange.max.b - axisWorkRange.min.b) / 2,
-                    axisWorkRange.min.y + (axisWorkRange.max.y - axisWorkRange.min.y) / 2
-                )
-            );
-        } else {
-            gcodeList.push(
-                goto(
-                    axisWorkRange.min.x + (axisWorkRange.max.x - axisWorkRange.min.x) / 2,
-                    axisWorkRange.min.y + (axisWorkRange.max.y - axisWorkRange.min.y) / 2
-                )
-            );
-        }
-    } else {
-        gcodeList.push(
-            goto(0, 0)
-        );
-    }
-
-    if (jobOffsetMode === JobOffsetMode.LaserSpot) {
-        gcodeList.push('M5 S0'); // turn off laser spot
-    }
-
-    gcodeList.push(
-        ';End', // empty line
-    );
-
-    const gcode = gcodeList.join('\n');
-
-    return gcode;
-};
+// Luban's Run Boundary G-code lives in shared/lib/rayBoundary so the server
+// (MCP file jobs on the Ray) frames a job with the same bytes.
+export { getRunBoundaryCode };
 
 
 /**

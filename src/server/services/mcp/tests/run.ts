@@ -114,6 +114,7 @@ import { tests as cameraModelStoreTests } from './cameraModelStore.test';
 import { tests as sacpGcodeReplyTests } from './sacpGcodeReply.test';
 import { tests as firmwareQueryTests } from './firmwareQuery.test';
 import { tests as rayFirmwareLimitsTests } from './rayFirmwareLimits.test';
+import { tests as rayBoundaryTests } from './rayBoundary.test';
 import { tests as toolheadStateTests } from './toolheadState.test';
 import { tests as stagingConfirmLinkTests } from './stagingConfirmLink.test';
 import { tests as motorPowerTests } from './motorPower.test';
@@ -227,6 +228,7 @@ const suites: Array<[string, TestCase[]]> = [
     ['sacpGcodeReply', sacpGcodeReplyTests],
     ['firmwareQuery', firmwareQueryTests],
     ['rayFirmwareLimits', rayFirmwareLimitsTests],
+    ['rayBoundary', rayBoundaryTests],
     ['toolheadState', toolheadStateTests],
     ['stagingConfirmLink', stagingConfirmLinkTests],
     ['motorPower', motorPowerTests],

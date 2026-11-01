@@ -23,8 +23,14 @@ type ChannelShape = 'file+direct' | 'direct-only' | 'ray-switch' | 'none';
 
 /** The Ray's transport exactly as SacpUdpChannel.fileJobTransport declares it. */
 const RAY_TRANSPORT: fileStart.FileJobTransport = {
-    start: 'operator-switch', target: 'ray.nc', instruction: 'Press and hold the work switch for about 3 seconds.', stop: 'file-print-only',
+    start: 'operator-switch',
+    target: 'ray.nc',
+    instruction: 'Press and hold the work switch for about 3 seconds. A SHORT press runs the controller boundary.nc.',
+    holdInstruction: 'Press and hold the work switch for about 3 seconds.',
+    stop: 'file-print-only',
 };
+
+type BoundaryUpload = (filePath: string, extents: unknown) => Promise<fileStart.BoundaryRefresh>;
 
 /** `machine` 'ray' loads the Ray's dialect row, whose motor-power mode is read through `readMotorPowerMode` (#321). */
 /**
@@ -38,7 +44,8 @@ export interface FixturePosition {
     connectedMachine: { hasZ: boolean };
 }
 
-export function fixture(shape: ChannelShape = 'file+direct', machine: { dialect?: DialectId; readMotorPowerMode?: () => Promise<unknown> } = {}) {
+export function fixture(shape: ChannelShape = 'file+direct',
+    machine: { dialect?: DialectId; readMotorPowerMode?: () => Promise<unknown>; uploadJobBoundary?: BoundaryUpload } = {}) {
     const dialect = dialectById(machine.dialect || 'sm2-marlin');
     let position: FixturePosition = {
         machine: { x: 1, y: 399, z: 0 }, reliability: 'heartbeat', isHomed: true, connectedMachine: { hasZ: dialect.id !== 'ray-grbl' },
@@ -73,6 +80,8 @@ export function fixture(shape: ChannelShape = 'file+direct', machine: { dialect?
         uploadGcodeFile: fileApi.uploadGcodeFile,
         stopGcodeJob: fileApi.stopGcodeJob,
         fileJobTransport: () => RAY_TRANSPORT,
+        // The channel's job frame (SacpUdpChannel.uploadJobBoundary), only when the test supplies one.
+        ...(machine.uploadJobBoundary ? { uploadJobBoundary: machine.uploadJobBoundary } : {}),
     };
     // Runs while a direct step's send is in flight (a stop pressed mid-step, #320).
     let onExecute: () => Promise<void> = async () => undefined;
@@ -356,6 +365,71 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         for (let i = 0; i < 3; i++) { f.setReport('idle', '/ray.nc'); f.tick(); }
         assert.equal(job.state, 'completed'); assert.equal(f.manager.getActive(), null);
         assert.equal(f.counts().telemetry, 1);
+    }],
+    ['Ray frame: after ray.nc the start uploads the job\'s frame and says a short press runs it', async () => {
+        const calls: Array<{ filePath: string; extents: unknown }> = [];
+        const frame = { min_x: 1, max_x: 110.8, min_y: 1, max_y: 54.3, axis: 'x' as const, mode: 'crosshair' };
+        const f = fixture('ray-switch', { dialect: 'ray-grbl',
+            readMotorPowerMode: async () => 3,
+            uploadJobBoundary: async (filePath, extents) => {
+                calls.push({ filePath, extents });
+                return { status: 'uploaded', target: 'boundary.nc', reason: null, basis: 'header', frame };
+            } });
+        const job = f.createJob();
+        job.validation.extents = { x: { min: 1, max: 110.8 }, y: { min: 1, max: 54.3 }, z: null, b: null };
+        const result = await f.call(job);
+        assert.equal(result.ok, true, JSON.stringify(result));
+        assert.equal(result.armed, true); assert.equal(job.state, 'armed');
+        assert.deepEqual(calls, [{ filePath: job.filePath, extents: { x: { min: 1, max: 110.8 }, y: { min: 1, max: 54.3 } } }]);
+        assert.equal(result.boundary.status, 'uploaded');
+        assert.equal(result.operator_start.boundary.status, 'uploaded');
+        assert.match(result.operator_start.instruction,
+            /^Press and hold the work switch for about 3 seconds\. A SHORT press runs this job's frame \(X 1\.\.110\.8, Y 1\.\.54\.3/);
+        assert.match(result.note, /A SHORT press runs this job's frame/);
+        const phases = job.events.map((e) => e.phase);
+        assert.ok(phases.indexOf('uploaded') < phases.indexOf('boundary') && phases.indexOf('boundary') < phases.indexOf('armed'), phases.join(','));
+        assert.equal(f.counts().uploads, 1, 'the job went up once; the frame is the channel\'s own transfer');
+    }],
+    ['Ray frame: an unchanged frame is reported as current; a failed or uncomputable one never fails the start', async () => {
+        const unchanged = fixture('ray-switch', { dialect: 'ray-grbl',
+            readMotorPowerMode: async () => 3,
+            uploadJobBoundary: async () => ({ status: 'unchanged', target: 'boundary.nc', reason: null, basis: 'header', frame: null }) });
+        const u = await unchanged.call(unchanged.createJob());
+        assert.equal(u.ok, true); assert.equal(u.boundary.status, 'unchanged');
+        assert.match(u.operator_start.instruction, /already matched it \(uploaded earlier on this connection\)/);
+        for (const outcome of [
+            async (): Promise<fileStart.BoundaryRefresh> => ({ status: 'failed', target: 'boundary.nc', reason: 'SD card unavailable.', basis: 'header', frame: null }),
+            async (): Promise<fileStart.BoundaryRefresh> => ({ status: 'not-framed', target: 'boundary.nc', reason: 'no X/Y extents', basis: null, frame: null }),
+            async (): Promise<fileStart.BoundaryRefresh> => { throw new Error('socket closed'); },
+        ]) {
+            const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3, uploadJobBoundary: outcome });
+            const job = f.createJob();
+            const result = await f.call(job);
+            assert.equal(result.ok, true, JSON.stringify(result)); assert.equal(result.armed, true);
+            assert.equal(job.state, 'armed', 'the job stays armed');
+            assert.ok(['failed', 'not-framed'].includes(result.boundary.status));
+            assert.match(result.operator_start.instruction, /A SHORT press runs the controller boundary\.nc, which (could NOT be updated|was not updated)/);
+            assert.match(result.operator_start.instruction, /LAST boundary uploaded, not this job's frame - frame this job with laser_frame instead/);
+            const event = job.events.find((e) => e.phase === 'boundary_failed');
+            assert.ok(event, 'reported on the job');
+            assert.match(String(event?.note), /NOT updated for this job: (SD card unavailable\.|no X\/Y extents|socket closed)/);
+        }
+    }],
+    ['Ray frame: a stop while the frame is uploading withdraws the armed job and the start reports it', async () => {
+        let f: ReturnType<typeof fixture> | null = null;
+        let job: McpJob | null = null;
+        f = fixture('ray-switch', { dialect: 'ray-grbl',
+            readMotorPowerMode: async () => 3,
+            uploadJobBoundary: async () => {
+                await f!.stop(job!);
+                return { status: 'uploaded', target: 'boundary.nc', reason: null, basis: 'header', frame: null };
+            } });
+        job = f.createJob();
+        const result = await f.call(job);
+        assert.equal(result.ok, false); assert.equal(result.armed, undefined);
+        assert.equal(job.state, 'stopped'); assert.equal(job.ending?.kind, 'withdrawn');
+        assert.equal(result.boundary.status, 'uploaded');
+        assert.ok(!job.events.some((e) => e.phase === 'armed'), 'no armed event after the withdrawal');
     }],
     ['#328 Ray: a run of ANOTHER file never adopts an armed job', async () => {
         const f = fixture('ray-switch', { dialect: 'ray-grbl', readMotorPowerMode: async () => 3 }); const job = f.createJob();

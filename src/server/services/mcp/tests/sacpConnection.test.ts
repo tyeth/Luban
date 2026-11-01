@@ -4,11 +4,14 @@
 // connection diagnostics see a worker and beats. Inert: fake transport and
 // SACP client, captured timers, nothing reaches a machine.
 import assert from 'assert';
+import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import vm from 'vm';
 import ts from 'typescript';
+import * as rayBoundary from '../../../../shared/lib/rayBoundary';
 import { ConnectionDiagnosticState } from '../../machine/connectionDiagnosticState';
 import * as sacpMachineState from '../../machine/channels/sacpMachineState';
 import { GcodeLease } from '../../machine/gcodeLease';
@@ -213,6 +216,9 @@ export function diagnostics() {
     return new ConnectionDiagnosticState({ instanceId: 'test', pid: 1, startedAt: 0, version: 'test', build: 'test' }, () => undefined);
 }
 
+/** Where the channel writes an MCP job's frame (DataStorage.tmpDir); a fresh scratch directory per test run. */
+export const UDP_TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'luban-ray-boundary-'));
+
 function udpChannel(diag: ConnectionDiagnosticState) {
     const timers: Timers = { pending: [] };
     const base = load('channels/SacpChannel.ts', {
@@ -240,6 +246,12 @@ function udpChannel(diag: ConnectionDiagnosticState) {
         './Channel': {},
         '../../../../app/constants/machines': { SACP_TYPE_SERIES_MAP: { 5: 'Ray' } },
         '../gcodeLease': { gcodeLease: new GcodeLease() },
+        // The job frame (boundary.nc): real file I/O and hashing in a scratch dir, Luban's real frame G-code.
+        crypto,
+        fs,
+        path,
+        '../../../../shared/lib/rayBoundary': rayBoundary,
+        '../../../DataStorage': { tmpDir: UDP_TMP_DIR },
     }, timers);
     const UdpChannel = module.default;
     const channel = new UdpChannel();
@@ -496,6 +508,122 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.match((silent as unknown as { msg: string }).msg, /no reply from the controller for 30 s/);
         assert.deepEqual((silent as unknown as { outcome: object }).outcome, { uncertain: true });
         FakeSacpClient.uploadResult = true;
+    }],
+
+    ['Ray frame: boundary.nc is sent only when this connection has not already put the same bytes there; ray.nc always goes', async () => {
+        const diag = diagnostics();
+        const { channel } = udpChannel(diag);
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        FakeSacpClient.uploads = []; FakeSacpClient.uploadResult = true; FakeSacpClient.uploadFailure = null;
+        const write = (name: string, text: string) => { const file = path.join(UDP_TMP_DIR, name); fs.writeFileSync(file, text); return file; };
+        const a = write('frame-a.nc', 'G90\nG1 S0 X1 Y1 F6000\n;End');
+        const aCopy = write('frame-a-copy.nc', 'G90\nG1 S0 X1 Y1 F6000\n;End');
+        const b = write('frame-b.nc', 'G90\nG1 S0 X2 Y2 F6000\n;End');
+        const send = (filePath: string, targetFilename = 'boundary.nc') => channel.compressUploadFile({ filePath, targetFilename });
+        assert.strictEqual(await send(a), true);
+        assert.strictEqual(FakeSacpClient.uploads.length, 1);
+        assert.strictEqual(FakeSacpClient.uploads[0].renderName, 'boundary.nc');
+        assert.strictEqual(await send(aCopy), true, 'the same bytes under another local name: success, nothing sent');
+        assert.strictEqual(FakeSacpClient.uploads.length, 1);
+        assert.strictEqual(await send(b), true);
+        assert.strictEqual(await send(a), true, 'back to the first frame: it is no longer what the controller holds');
+        assert.strictEqual(FakeSacpClient.uploads.length, 3);
+        // The job itself is never deduplicated.
+        await send(a, 'ray.nc'); await send(a, 'ray.nc');
+        assert.strictEqual(FakeSacpClient.uploads.length, 5);
+        // A reconnect forgets what was sent: the controller may have changed meanwhile.
+        await channel.connectionClose();
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        assert.strictEqual(await send(a), true);
+        assert.strictEqual(FakeSacpClient.uploads.length, 6, 'a new connection re-sends');
+        // A refused transfer leaves it unknown: the next identical frame is sent, and the refusal is reported.
+        FakeSacpClient.uploadResult = false; FakeSacpClient.uploadFailure = 'SD card unavailable.';
+        const failures: string[] = [];
+        assert.strictEqual(await channel.compressUploadFile({ filePath: b, targetFilename: 'boundary.nc', onFailed: (r: string) => failures.push(r) }), false);
+        assert.deepStrictEqual(failures, ['SD card unavailable.']);
+        FakeSacpClient.uploadResult = true; FakeSacpClient.uploadFailure = null;
+        assert.strictEqual(await send(b), true);
+        assert.strictEqual(FakeSacpClient.uploads.length, 8);
+        assert.strictEqual(await send(b), true);
+        assert.strictEqual(FakeSacpClient.uploads.length, 8, 'now current again');
+    }],
+
+    ['Ray frame: Luban\'s Upload Job / Run Boundary socket path gets the dedupe too, and still reports success', async () => {
+        const diag = diagnostics();
+        const { channel } = udpChannel(diag);
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        const cm = connectionManager(channel, diag, {
+            path,
+            fs,
+            '../../DataStorage': { tmpDir: UDP_TMP_DIR },
+            '../../../app/communication/socket-events': { __esModule: true, default: { CompressUploadFile: 'connection:compress-upload-file' } },
+        });
+        FakeSacpClient.uploads = []; FakeSacpClient.uploadResult = true; FakeSacpClient.uploadFailure = null;
+        const file = path.join(UDP_TMP_DIR, 'ui-boundary.nc');
+        fs.writeFileSync(file, 'G90\nG1 S0 X5 Y5 F6000\n;End');
+        const emitted: Array<[string, unknown]> = [];
+        const socket = { emit: (event: string, data?: unknown) => { emitted.push([event, data]); } };
+        await cm.compressUploadFile(socket, { filePath: file, targetFilename: 'boundary.nc' });
+        await cm.compressUploadFile(socket, { filePath: file, targetFilename: 'boundary.nc' });
+        assert.strictEqual(FakeSacpClient.uploads.length, 1, 'the second identical frame is not transferred');
+        const results = emitted.filter(([event]) => event === 'connection:compress-upload-file');
+        assert.strictEqual(results.length, 2, `two results reported: ${JSON.stringify(emitted)}`);
+        for (const [, data] of results) {
+            assert.strictEqual((data as { err: unknown }).err, null, 'both report success to the renderer');
+        }
+    }],
+
+    ['Ray frame: an MCP job is framed from its Luban header with Luban\'s Run Boundary G-code (control-panel form), once', async () => {
+        const diag = diagnostics();
+        const { channel } = udpChannel(diag);
+        await channel.connectionOpen({ address: '192.0.2.9' });
+        FakeSacpClient.uploads = []; FakeSacpClient.uploadResult = true; FakeSacpClient.uploadFailure = null;
+        const job = path.join(UDP_TMP_DIR, 'job-header.nc');
+        fs.writeFileSync(job, [';Header Start', ';header_type: laser', ';machine: Ray', ';is_rotate: false', ';max_x(mm): 110.77699999999999',
+            ';max_y(mm): 54.291000000000004', ';max_b(mm): 0', ';min_x(mm): 1', ';min_y(mm): 0.9990000000000023', ';min_b(mm): 0',
+            'M2003', 'M2004', ';Header End', 'G90', 'G1 X1 Y1 S1000', 'M5'].join('\n'));
+        const sentFrames: string[] = [];
+        const realUpload = FakeSacpClient.prototype.uploadFileCompressed;
+        FakeSacpClient.prototype.uploadFileCompressed = async function capture(filePath: string, options: object) {
+            sentFrames.push(fs.readFileSync(filePath, 'utf8'));
+            return realUpload.call(this, filePath, options);
+        };
+        try {
+            const first = await channel.uploadJobBoundary(job, { x: { min: 0, max: 1 }, y: { min: 0, max: 1 } });
+            assert.strictEqual(first.status, 'uploaded', JSON.stringify(first));
+            assert.strictEqual(first.target, 'boundary.nc');
+            assert.strictEqual(first.basis, 'header', 'the header wins over the validator extents, as the renderer frames it');
+            assert.deepEqual(first.frame,
+                { min_x: 1, max_x: 110.77699999999999, min_y: 0.9990000000000023, max_y: 54.291000000000004, axis: 'x', mode: 'crosshair' });
+            assert.strictEqual(FakeSacpClient.uploads[0].renderName, 'boundary.nc');
+            const box = { min: { x: 1, y: 0.9990000000000023, b: 0 }, max: { x: 110.77699999999999, y: 54.291000000000004, b: 0 } };
+            const expected = rayBoundary.getRunBoundaryCode(box, 'Crosshair', false, 'control-panel');
+            assert.strictEqual(sentFrames[0], expected);
+            assert.ok(sentFrames[0].startsWith(';motor_mode: 3\nM2000 L13 P1\nG90\nG1 S0 X1 Y0.9990000000000023 F6000'), sentFrames[0]);
+            const again = await channel.uploadJobBoundary(job, null);
+            assert.strictEqual(again.status, 'unchanged');
+            assert.strictEqual(FakeSacpClient.uploads.length, 1, 'the same job again sends nothing');
+            // A file with no Luban header falls back to the validator's work-frame extents (Crosshair, the Ray default).
+            const bare = path.join(UDP_TMP_DIR, 'job-bare.nc');
+            fs.writeFileSync(bare, 'G90\nG1 X10 Y20 S500\nG1 X30 Y40\nM5');
+            const fallback = await channel.uploadJobBoundary(bare, { x: { min: 10, max: 30 }, y: { min: 20, max: 40 } });
+            assert.strictEqual(fallback.status, 'uploaded');
+            assert.strictEqual(fallback.basis, 'extents');
+            assert.match(sentFrames[1],
+                /G1 S0 X10 Y20 F6000\nG1 S0 X30 Y20 F6000\nG1 S0 X30 Y40 F6000\nG1 S0 X10 Y40 F6000\nG1 S0 X10 Y20 F6000\nG1 S0 X20 Y30 F6000/);
+            const none = await channel.uploadJobBoundary(bare, null);
+            assert.strictEqual(none.status, 'not-framed');
+            const missing = await channel.uploadJobBoundary(path.join(UDP_TMP_DIR, 'no-such-job.nc'), null);
+            assert.strictEqual(missing.status, 'failed');
+            assert.match(missing.reason, /cannot read the job file/);
+            FakeSacpClient.uploadResult = false; FakeSacpClient.uploadFailure = 'SD card unavailable.';
+            const refused = await channel.uploadJobBoundary(job, null);
+            assert.strictEqual(refused.status, 'failed', 'the controller refused: reported, with its reason');
+            assert.strictEqual(refused.reason, 'SD card unavailable.');
+        } finally {
+            FakeSacpClient.prototype.uploadFileCompressed = realUpload;
+            FakeSacpClient.uploadResult = true; FakeSacpClient.uploadFailure = null;
+        }
     }],
 
     ['#328 stopGcodeJob is the SACP job stop (0xAC 0x06) Luban\'s own Stop sends, reported as ok/refused', async () => {

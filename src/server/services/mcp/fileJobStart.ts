@@ -39,6 +39,53 @@ export interface FileJobTransport {
     /** What the operator must do to start it; null for a command start. */
     instruction: string | null;
     stop: 'any-job' | 'file-print-only';
+    /**
+     * The start alone (no short-press sentence), when the channel also frames
+     * each job for a short press of the switch (the Ray's boundary.nc): the
+     * start result then says what that press runs (operatorStartInstruction).
+     */
+    holdInstruction?: string | null;
+}
+
+/**
+ * What refreshing the controller's frame file did for one job (the Ray's
+ * `boundary.nc`, run by a SHORT press of its work switch). `unchanged` means
+ * this connection already put exactly these bytes there, so nothing was sent.
+ */
+export interface BoundaryRefresh {
+    status: 'uploaded' | 'unchanged' | 'failed' | 'not-framed';
+    target: string;
+    /** Why it failed or could not be framed; null otherwise. */
+    reason: string | null;
+    /** Where the frame came from: the job's Luban header (as the renderer frames it) or the validator's work-frame extents. */
+    basis: 'header' | 'extents' | null;
+    /** The work-frame box the frame runs (B replaces X for a rotary job), and how it is shown. */
+    // eslint-disable-next-line camelcase
+    frame: { min_x: number; max_x: number; min_y: number; max_y: number; axis: 'x' | 'b'; mode: string } | null;
+}
+
+/** What a SHORT press of the switch runs after this refresh, for the operator. */
+export function shortPressNote(refresh: BoundaryRefresh): string {
+    const box = refresh.frame
+        ? ` (${refresh.frame.axis.toUpperCase()} ${refresh.frame.min_x}..${refresh.frame.max_x}, Y ${refresh.frame.min_y}..${refresh.frame.max_y} in the work frame, ${refresh.frame.mode})`
+        : '';
+    if (refresh.status === 'uploaded') {
+        return `A SHORT press runs this job's frame${box}: ${refresh.target} was updated to it.`;
+    }
+    if (refresh.status === 'unchanged') {
+        return `A SHORT press runs this job's frame${box}: ${refresh.target} on the controller already matched it (uploaded earlier on this connection).`;
+    }
+    const why = refresh.status === 'failed' ? 'could NOT be updated' : 'was not updated (no frame could be computed)';
+    return `A SHORT press runs the controller ${refresh.target}, which ${why} for this job${refresh.reason ? ` (${refresh.reason})` : ''}: `
+        + 'it is the LAST boundary uploaded, not this job\'s frame - frame this job with laser_frame instead.';
+}
+
+/** The operator's start instruction once the job is on the controller, with what a short press runs. */
+export function operatorStartInstruction(transport: FileJobTransport, refresh: BoundaryRefresh | null): string {
+    if (refresh && transport.holdInstruction) {
+        return `${transport.holdInstruction} ${shortPressNote(refresh)}`;
+    }
+    return transport.instruction || 'start it at the machine';
 }
 
 /** The transport of a channel that declares none: the A350's HTTP path, unchanged. */
@@ -79,7 +126,7 @@ export interface FileStartAttempt {
     machineStatusAfter: string | null;
     retrySafe: boolean;
     /** An operator-switch transport: the file is on the controller, waiting for the switch (#328). */
-    operatorStart?: { target: string; instruction: string; armedAt: number } | null;
+    operatorStart?: { target: string; instruction: string; armedAt: number; boundary?: BoundaryRefresh | null } | null;
 }
 
 /** `/ray.nc` and `ray.nc` are the same file: the Ray reports the SD path, Luban uploads the basename. */
