@@ -211,6 +211,17 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         await assert.rejects(pending, /quickstop requested|Stop requested/);
         assert.deepStrictEqual(written, ['G1 X1', 'M410']);
     }],
+    ['native Stop quickstops a faulted session after a timed-out move', async () => {
+        const machine = controller();
+        const written: string[] = [];
+        machine.event = { trigger: () => undefined };
+        machine.emitAll = () => undefined;
+        machine.serialport = { port: { drain: (done: (err: Error | null) => void) => done(null) } };
+        machine.mcpTransactionFault = 'G1 timed out; motion may continue';
+        machine.writeln = (line: string) => { written.push(line); return true; };
+        machine.command(null, 'gcode:stop');
+        assert.deepStrictEqual(written, ['M410']);
+    }],
     ['USB fault latch blocks legacy motion writes and commands', () => {
         const machine = controller();
         const written: string[] = [];

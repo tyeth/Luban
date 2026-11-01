@@ -1402,9 +1402,7 @@ class MarlinController extends EventEmitter {
                 this.workflow.stop();
                 if (this.mcpTransactionActive || this.mcpTransactionPending || this.mcpTransactionFault) {
                     this.mcpTransactionFault = 'Stop requested during or after an uncertain MCP serial transaction';
-                    if (this.mcpTransactionActive) {
-                        this.requestMcpQuickstop().catch(err => log.error('MCP quickstop failed', err));
-                    }
+                    this.requestMcpQuickstop().catch(err => log.error('MCP quickstop failed', err));
                 }
             },
             'feedhold': () => {
