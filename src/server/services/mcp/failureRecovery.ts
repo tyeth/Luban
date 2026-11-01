@@ -59,7 +59,7 @@ export class NotSentError extends Error {
 // controller itself stays a rejection.
 const INDETERMINATE_REPLY = new RegExp(
     'ECONN[A-Z]*|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EPIPE|REQUEST_ERROR|transport[ _]error'
-    + '|connection changed during command execution',
+    + '|connection changed during command execution|USB serial command not confirmed',
     'i',
 );
 

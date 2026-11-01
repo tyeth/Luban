@@ -120,10 +120,12 @@ import { tests as motorPowerTests } from './motorPower.test';
 import { tests as startPositionTests } from './startPosition.test';
 import { tests as batchWithdrawTests } from './batchWithdraw.test';
 import { tests as motorPowerSwitchTests } from './motorPowerSwitch.test';
+import { tests as serialTransactionTests } from './serialTransaction.test';
 
 type TestCase = [string, () => void | Promise<void>];
 
 const suites: Array<[string, TestCase[]]> = [
+    ['serialTransaction', serialTransactionTests],
     ['connectionGeneration', connectionGenerationTests],
     ['sacpMachineState', sacpMachineStateTests],
     ['sacpConnection', sacpConnectionTests],

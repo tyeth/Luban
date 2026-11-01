@@ -852,9 +852,9 @@ export class ProbeFeedService {
             (async () => {
                 if (typeof machineChannel.stopGcodeJob === 'function') {
                     try {
-                        await machineChannel.stopGcodeJob();
-                        actions.push('stop_gcode_job sent');
-                        log.error(`${kind} abort: stop sent to the machine`);
+                        const result = await machineChannel.stopGcodeJob() as { ok?: boolean; text?: string } | null;
+                        actions.push(result?.ok === true ? 'stop_gcode_job confirmed' : `stop_gcode_job unverified: ${result?.text || 'no stop confirmation'}`);
+                        log.error(`${kind} abort: ${result?.text || 'stop result unknown'}`);
                     } catch (err) {
                         actions.push(`stop_gcode_job failed: ${(err as Error).message}`);
                         log.error(`${kind} abort: stop failed: ${(err as Error).message}`);

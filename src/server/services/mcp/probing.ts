@@ -176,6 +176,10 @@ async function moveMachineSettledUnguarded(
     traceMark('engine-enter');
     probeFeedService.assertNoOvertravel();
     const channel = getDirectChannel();
+    // USB text serial now returns an M114 after M400. If that report cannot
+    // prove the target, never promote the commanded point to an arrival.
+    const serialMustProve = typeof connectionManager.getConnectionStatus === 'function'
+        && connectionManager.getConnectionStatus()?.channelName === 'text-serial';
     const words = [
         target.x !== undefined ? `X${target.x.toFixed(3)}` : '',
         target.y !== undefined ? `Y${target.y.toFixed(3)}` : '',
@@ -254,7 +258,7 @@ G54;`;
         traceMark('echo-absent');
     }
 
-    if (options.lenient) {
+    if (options.lenient && !serialMustProve) {
         const estimate = completeTarget(from, target);
         if (estimate) {
             setPositionOfRecord(estimate, 'estimated', executed.sequence, tool);
@@ -287,7 +291,7 @@ G54;`;
     });
     const settleStartedAt = Date.now();
     const deadline = issuedAt + SETTLE_TIMEOUT_MS;
-    let graceUntil: number | null = inchMove && !echoContradicts ? issuedAt + INCH_GRACE_MS : null;
+    let graceUntil: number | null = !serialMustProve && inchMove && !echoContradicts ? issuedAt + INCH_GRACE_MS : null;
     let previous: string | null = null;
     let previousReportTime: number | null = null;
     while (Date.now() < deadline) {

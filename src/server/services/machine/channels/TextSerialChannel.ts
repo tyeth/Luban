@@ -261,14 +261,29 @@ class TextSerialChannel extends Channel implements
     public async executeGcode(gcode: string): Promise<ExecuteGcodeResult> {
         const refusal = gcodeLease.refusal(gcode);
         if (refusal) { return { result: -1, text: refusal }; }
-        const gcodeLines = gcode.split('\n');
-
         const controller = this.controller;
-        controller.command(null, 'gcode', gcodeLines);
+        if (!controller || !controller.isOpen()) {
+            return { result: -1, text: 'USB serial controller is disconnected; nothing was sent.' };
+        }
+        try {
+            return await controller.executeMcpGcode(gcode, gcodeLease.requestTimeoutMs(30000));
+        } catch (err) {
+            return { result: -1, text: `USB serial command not confirmed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+    }
 
+    /** M410 is sent outside the transaction queue, but is not a verified physical stop. */
+    public async stopGcodeJob(): Promise<{ ok: boolean; text: string }> {
+        const controller = this.controller;
+        if (!controller || !controller.isOpen()) {
+            return { ok: false, text: 'USB serial controller is disconnected; physical stop is unknown.' };
+        }
+        const sent = await controller.requestMcpQuickstop();
         return {
-            result: 0,
-            text: 'ok',
+            ok: false,
+            text: sent
+                ? 'M410 quickstop sent; physical stop and position are unverified. Re-home before further motion.'
+                : 'M410 quickstop could not be sent; physical stop is unknown.',
         };
     }
 
