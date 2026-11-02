@@ -385,9 +385,25 @@ class MarlinController extends EventEmitter {
         // Marlin
         this.controller = new Marlin();
 
-        // A firmware restart can keep the host port open. Old OFF evidence
-        // belongs to the previous firmware session even without a port close.
-        this.controller.on('start', () => this.serialToolhead.reset());
+        // A firmware restart can keep the host port open. It invalidates the
+        // selected frame, homing, pending replies and output evidence together.
+        // The initial boot banner is normal; a restart of an established or
+        // reserved session must remain faulted until an explicit reconnect.
+        this.controller.on('start', () => {
+            const established = this.ready || this.mcpTransactionActive || this.mcpTransactionPending;
+            this.ready = false;
+            this.controller.state = { ...this.controller.state, isHomed: false };
+            this.serialToolhead.reset();
+            this.query.type = null;
+            if (established) {
+                this.mcpTransactionFault = 'USB firmware restarted; reconnect and reverify homing, position and workspace before motion';
+                this.feeder?.clear();
+            }
+            this.emit('firmwareReset');
+            // Reject an outstanding fence or command immediately, before an
+            // old ACK can release a line in the firmware's new coordinate frame.
+            this.emit('mcpClosed');
+        });
 
         this.controller.on('firmware', (res) => {
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {

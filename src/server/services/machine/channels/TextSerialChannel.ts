@@ -33,7 +33,8 @@ class TextSerialChannel extends Channel implements
     // Bumped at every port open/close this channel performs. MarlinController
     // also closes the port on its own (serial 'close'), and every reopen
     // creates a new serial connection object, so a change in that object is
-    // counted as well when the generation is read.
+    // counted as well when the generation is read. A firmware restart on the
+    // same open port also starts a new generation.
     private connectionGeneration = 0;
 
     private observedPort: unknown = null;
@@ -173,6 +174,10 @@ class TextSerialChannel extends Channel implements
 
             controller.on('Ready', (data) => {
                 this.emit(ChannelEvent.Ready, data);
+            });
+            controller.on('firmwareReset', () => {
+                this.connectionGeneration++;
+                this.machineState.clear();
             });
             controller.on('positionReport', (payload) => {
                 this.machineState.notePosition(payload, this.getConnectionGeneration());

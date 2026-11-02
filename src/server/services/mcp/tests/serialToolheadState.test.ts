@@ -250,4 +250,45 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.strictEqual(controller.assess().state, 'on');
         assert.strictEqual(controller.serialToolhead.snapshot().offAcknowledged, false);
     }],
+    ['firmware restart after frame selection aborts the batch before motion and latches future writes', async () => {
+        const controller = machine();
+        const sent: string[] = [];
+        let resets = 0;
+        controller.controller.state.isHomed = true;
+        controller.on('firmwareReset', () => { resets++; });
+        controller.serialport.on('written', (line: string) => sent.push(line));
+        respond(controller, (line) => {
+            if (line === 'G53;') { controller.receive('start'); }
+            return true;
+        });
+        await assert.rejects(controller.executeMcpGcode('G90\nG53;\nG1 Z303 F100;\nG54;', 1000), /closed|restarted/);
+        assert.deepStrictEqual(sent.slice(1), ['G90', 'G53;'], 'no move may follow the reset even if an old ACK arrives');
+        assert.strictEqual(resets, 1);
+        assert.strictEqual(controller.ready, false);
+        assert.strictEqual(controller.controller.state.isHomed, false);
+        assert.ok(controller.mcpTransactionFault);
+        await assert.rejects(controller.executeMcpGcode('G1 Z302 F100', 1000), /transaction fault/);
+        assert.strictEqual(controller.writeln('G1 Z302 F100'), false, 'legacy writes also fail closed');
+    }],
+    ['firmware restart cancels a pending reservation and a later ready report cannot clear the fault', async () => {
+        const controller = machine();
+        const sent: string[] = [];
+        controller.serialport.on('written', (line: string) => sent.push(line));
+        controller.history.writeSource = 'query';
+        const pending = controller.executeMcpGcode('G1 Z303 F100', 1000);
+        controller.receive('start');
+        controller.receive('ok');
+        await assert.rejects(pending, /restarted/);
+        controller.checkMachineIsReady({ machineIdentifier: 'A350' });
+        await assert.rejects(controller.executeMcpGcode('G1 Z303 F100', 1000), /transaction fault/);
+        assert.deepStrictEqual(sent, [], 'no fence or motion was written after the pending-session reset');
+    }],
+    ['initial firmware boot clears evidence without faulting a new unready connection', () => {
+        const controller = machine();
+        controller.ready = false;
+        controller.controller.state.isHomed = true;
+        controller.receive('start');
+        assert.strictEqual(controller.mcpTransactionFault, null);
+        assert.strictEqual(controller.controller.state.isHomed, false);
+    }],
 ];

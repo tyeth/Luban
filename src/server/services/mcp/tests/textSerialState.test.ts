@@ -308,4 +308,22 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         assert.strictEqual(channel.getLatestMachineState().timestamp, 3000);
         assert.strictEqual(channel.getLatestMachineState().controllerOriginOffset, null);
     }],
+    ['channel: firmware reset on an open port advances the session and discards coordinate evidence', async () => {
+        const channel = textChannel();
+        await channel.connectionOpen({ port: 'COM3' });
+        const controller = channel.getController() as FakeMarlinController;
+        controller.receive(ORIGINAL_M114);
+        controller.receive('Origin offset X: 12.5');
+        const port = controller.serialport;
+        const generation = channel.getConnectionGeneration();
+        assert.ok(channel.getLatestMachineState());
+        controller.emit('firmwareReset');
+        assert.strictEqual(controller.serialport, port, 'the USB port stays open');
+        assert.ok(channel.getConnectionGeneration() > generation);
+        assert.strictEqual(channel.getLatestMachineState(), null);
+        controller.receive(SM2_M114);
+        const fresh = channel.getLatestMachineState();
+        assert.strictEqual(fresh.controllerOriginOffset, null, 'old offsets do not cross the firmware session');
+        assert.strictEqual(fresh.reportAtRest, false, 'old planner synchronization does not cross the firmware session');
+    }],
 ];
