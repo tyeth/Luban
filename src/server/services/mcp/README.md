@@ -1157,6 +1157,18 @@ These are agent release requirements, not new runtime checks in `validate_gcode`
   because of an allowance). Every planner that puts a waypoint, station or march limit in
   XY uses the same travel (`requirePlanningTravel` / `assertWithinTravel`); a bound it has
   to clip is reported, never swallowed (issue #140).
+- **USB text toolhead provenance**: Luban keeps the requested M3/M4 power in its UI
+  after M5. Only a command-derived setpoint followed by an M5 acknowledged in the
+  existing M118-fenced serial transaction can be excluded from the toolhead-on guard,
+  once that whole transaction (including its M400/M114 completion checks) succeeds.
+  `serialToolhead` on the channel state (`serial_toolhead` on the toolhead assessment)
+  preserves that distinction and the separate firmware power/status reports. The
+  normal CNC UI toggle and speed setter use this transaction; raw console/feeder ACKs,
+  default or optimistic `headStatus=false`, and unsolicited OFF reports do not prove
+  an M5 completed. A positive firmware power/status report still refuses, including
+  when the UI shows Off. New M3/M4 commands, positive reports, uncertain transactions
+  and connection changes invalidate OFF evidence. This adds no commands or settling
+  delay to the low-latency path; a firmware-positive refusal still requires diagnosis.
 - **Verified-settle contract**: motion tools block until the returned position verifiably
   matches the move (Z parsed from the executed gcode, ±0.15 mm; XY at target; home must
   leave its pre-G28 position at least once). `wait_until_moved: false` opts out and always

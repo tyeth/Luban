@@ -9,6 +9,7 @@ import { L20WLaserToolModule, L40WLaserToolModule } from '../../../../app/machin
 import { HEAD_LASER } from '../../../constants';
 import { gcodeLease } from '../gcodeLease';
 import { TextSerialMachineState, TextSerialMachineStateTracker } from './textSerialMachineState';
+import type { SerialToolheadEvidence } from '../../../controllers/Marlin/SerialToolheadState';
 
 const log = logger('machine:channels:TextSerialChannel');
 
@@ -71,6 +72,7 @@ class TextSerialChannel extends Channel implements
             isOpen?: () => boolean;
             controller?: { state?: { [key: string]: unknown } } | null;
             workflow?: { state?: unknown } | null;
+            serialToolhead?: { snapshot: () => SerialToolheadEvidence };
         } | null;
         if (!controller || typeof controller.isOpen !== 'function' || !controller.isOpen()) {
             this.machineState.clear();
@@ -83,6 +85,7 @@ class TextSerialChannel extends Channel implements
             headType: marlinState.headType,
             headStatus: marlinState.headStatus,
             headPower: marlinState.headPower,
+            serialToolhead: controller.serialToolhead?.snapshot(),
         });
     }
 

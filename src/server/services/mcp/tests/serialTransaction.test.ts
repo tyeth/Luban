@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import vm from 'vm';
 import ts from 'typescript';
+import { SerialToolheadState } from '../../../controllers/Marlin/SerialToolheadState';
 
 /** Load only the controller class; each test supplies an inert serial port. */
 function controller(): EventEmitter & Record<string, any> { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -39,6 +40,7 @@ function controller(): EventEmitter & Record<string, any> { // eslint-disable-li
     instance.query = { type: null };
     instance.mcpTransactionActive = false;
     instance.mcpTransactionFault = null;
+    instance.serialToolhead = new SerialToolheadState();
     return instance;
 }
 

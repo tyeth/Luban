@@ -49,6 +49,7 @@ import {
     WRITE_SOURCE_UNKNOWN
 } from '../constants';
 import Marlin from './Marlin';
+import { SerialToolheadState } from './SerialToolheadState';
 
 // % commands
 const WAIT = '%wait';
@@ -91,6 +92,7 @@ class MarlinController extends EventEmitter {
         },
         error: (err) => {
             this.ready = false;
+            this.serialToolhead.invalidate();
             this.mcpTransactionFault = `USB serial port error: ${err?.message || String(err)}`;
             this.emit('mcpClosed');
             if (err) {
@@ -101,6 +103,8 @@ class MarlinController extends EventEmitter {
 
     // Marlin
     controller = null;
+
+    serialToolhead = new SerialToolheadState();
 
     ready = false;
 
@@ -381,6 +385,10 @@ class MarlinController extends EventEmitter {
         // Marlin
         this.controller = new Marlin();
 
+        // A firmware restart can keep the host port open. Old OFF evidence
+        // belongs to the previous firmware session even without a port close.
+        this.controller.on('start', () => this.serialToolhead.reset());
+
         this.controller.on('firmware', (res) => {
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
                 this.emitAll('serialport:read', { data: res.raw });
@@ -438,6 +446,7 @@ class MarlinController extends EventEmitter {
             this.emit('originOffsetReport', res);
         });
         this.controller.on('headStatus', (res) => {
+            this.serialToolhead.reportStatus(res.headStatus);
             // log.silly(`controller.on('originOffset'): source=${this.history.writeSource},
             //      line=${JSON.stringify(this.history.writeLine)}, res=${JSON.stringify(res)}`);
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
@@ -452,6 +461,7 @@ class MarlinController extends EventEmitter {
             }
         });
         this.controller.on('headPower', (res) => {
+            this.serialToolhead.reportPower(res.headPower);
             // log.silly(`controller.on('originOffset'): source=${this.history.writeSource},
             //      line=${JSON.stringify(this.history.writeLine)}, res=${JSON.stringify(res)}`);
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
@@ -742,6 +752,7 @@ class MarlinController extends EventEmitter {
     }
 
     destroy() {
+        this.serialToolhead.reset();
         this.connections = {};
 
         if (this.serialport) {
@@ -801,6 +812,7 @@ class MarlinController extends EventEmitter {
             return;
         }
 
+        this.serialToolhead.reset();
         this.serialport = new SerialConnection({
             ...this.options,
             isScreenProtocol: false,
@@ -828,6 +840,7 @@ class MarlinController extends EventEmitter {
                 let spindle = 0;
 
                 interpret(line, (cmd, params) => {
+                    this.serialToolhead.command(cmd, params.P !== undefined || params.S !== undefined);
                     // motion
                     if (includes(['G0', 'G1'], cmd)) {
                         modal.motion = cmd;
@@ -864,7 +877,7 @@ class MarlinController extends EventEmitter {
                     if (cmd === 'G1' && params.F) {
                         workSpeed = params.F;
                     }
-                    if (cmd === 'M3') {
+                    if (cmd === 'M3' || cmd === 'M4') {
                         headStatus = true;
                         if (params.P !== undefined) {
                             headPower = params.P;
@@ -1080,6 +1093,7 @@ class MarlinController extends EventEmitter {
         const configurationOnly = lines.length === 1 && /^M503\s+S\s*;?$/i.test(lines[0]);
         const sequence = positionOnly || configurationOnly ? lines : [...lines, 'M400', 'M114'];
         let position = null;
+        let acknowledgedOff = null;
         const configurationLines = [];
         this.query.type = null;
         try {
@@ -1140,6 +1154,7 @@ class MarlinController extends EventEmitter {
                     this.on('mcpPositionReport', onPosition);
                 }
                 try {
+                    let toolheadRevision;
                     const reply = await new Promise((resolve, reject) => {
                         const remaining = deadline - Date.now();
                         if (remaining <= 0) {
@@ -1163,12 +1178,16 @@ class MarlinController extends EventEmitter {
                             cleanup();
                             reject(new Error(`Could not write ${line} to USB serial`));
                         }
+                        toolheadRevision = this.serialToolhead.revision;
                     });
                     if (!reply.ok) {
                         throw new Error(`${line} failed: ${reply.raw}`);
                     }
                     if (this.mcpTransactionFault) {
                         throw new Error(this.mcpTransactionFault);
+                    }
+                    if (/^M0*5\s*(?:;[^\r\n]*)?$/i.test(line)) {
+                        acknowledgedOff = { line, revision: toolheadRevision };
                     }
                     if (needsPosition) {
                         if (!linePosition || !/\bX:-?\d/.test(linePosition)
@@ -1190,8 +1209,15 @@ class MarlinController extends EventEmitter {
             if (configurationOnly && !configuration) {
                 throw new Error('M503 acknowledged without configuration text');
             }
+            // Promote OFF only after the whole fenced request, including
+            // M400/M114, succeeded. Later commands/reports still invalidate
+            // the captured revision; no transient OFF escapes a failed batch.
+            if (acknowledgedOff) {
+                this.serialToolhead.acknowledge(acknowledgedOff.line, acknowledgedOff.revision);
+            }
             return { result: 0, text: configurationOnly ? configuration : position };
         } catch (err) {
+            this.serialToolhead.invalidate();
             this.mcpTransactionFault = err.message || String(err);
             this.feeder?.clear();
             throw err;
@@ -1269,6 +1295,7 @@ class MarlinController extends EventEmitter {
 
     refresh(options) {
         const { isScreenProtocol } = options;
+        this.serialToolhead.reset();
         this.serialport.refresh(options);
         const nextState = {
             ...this.controller.state,
