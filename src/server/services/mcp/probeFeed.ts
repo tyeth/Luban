@@ -10,6 +10,7 @@ import { MqttClient } from './mqtt';
 import { describeFeedHealth } from './probeFeedHealth';
 import { PROBE_CHANNELS, ProbeChannel, ProbeTransport, ProbeTransportKind, ReadingMeta } from './probeTransport';
 import { McpToolError } from './registry';
+import type { ContinuousProbeState } from './continuousProbe';
 
 const log = logger('service:mcp:probe-feed');
 
@@ -495,6 +496,8 @@ export class ProbeFeedService {
 
     private contactCounts = new Map<ProbeChannel, number>();
 
+    private transportGeneration = 0;
+
     private trip: SafetyTrip | null = null;
 
     // Crash guard (added after the 2026-09-01 probe crash): while any
@@ -561,6 +564,23 @@ export class ProbeFeedService {
 
     public getReading(channel: ProbeChannel): ProbeReading | null {
         return this.readings.get(channel) || null;
+    }
+
+    /** Live continuous GPIO evidence; cached readings from an older feed cannot qualify. */
+    public getContinuousState(channel: ProbeChannel): ContinuousProbeState | null {
+        if (this.activeConfig?.kind !== 'gpio' || this.activeConfig.disabled.includes(channel)
+            || !this.isConnected() || this.lastError || !resolveSensorEnabled()[channel]) { return null; }
+        const progress = this.transport?.getContinuousProgress?.();
+        const reading = this.readings.get(channel);
+        if (!progress || !reading) { return null; }
+        return {
+            generation: this.transportGeneration,
+            progress,
+            contactCount: this.contactCount(channel),
+            triggered: reading.triggered,
+            value: reading.value,
+            receivedAt: reading.receivedAt,
+        };
     }
 
     /**
@@ -700,12 +720,18 @@ export class ProbeFeedService {
             return;
         }
         this.connecting = true;
+        this.transportGeneration++;
+        this.readings.clear();
         this.activeConfig = cfg;
         const transport = buildTransport(cfg.kind);
         this.transport = transport;
 
-        transport.on('reading', (channel: ProbeChannel, value: string, meta?: ReadingMeta) => this.onReading(channel, value, false, meta));
-        transport.on('refresh', (channel: ProbeChannel, value: string) => this.onReading(channel, value, true));
+        transport.on('reading', (channel: ProbeChannel, value: string, meta?: ReadingMeta) => {
+            if (this.transport === transport) { this.onReading(channel, value, false, meta); }
+        });
+        transport.on('refresh', (channel: ProbeChannel, value: string) => {
+            if (this.transport === transport) { this.onReading(channel, value, true); }
+        });
         transport.on('error', (err: Error) => {
             // An unplugged sensor bridge produces the same error on every
             // retry - log a new message once, then stay quiet about repeats.

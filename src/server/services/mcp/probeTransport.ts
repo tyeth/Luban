@@ -2,6 +2,8 @@
 // the orchestrator (probeFeed.ts) and the transport backends (MQTT in
 // probeFeed.ts, Blinka GPIO in gpioFeed.ts) can all import it without cycles.
 
+import type { ProbeProgress } from './continuousProbe';
+
 export type ProbeChannel = 'toolsetter' | 'overtravel' | 'probe';
 
 export const PROBE_CHANNELS: ProbeChannel[] = ['toolsetter', 'overtravel', 'probe'];
@@ -37,6 +39,8 @@ export interface ProbeTransport {
     isConnected(): boolean;
     /** Transport-specific fields merged into get_probe_feed_status. */
     describe(): object;
+    /** GPIO polling-loop health, independent of pin changes. MQTT has none. */
+    getContinuousProgress?(): ProbeProgress | null;
     on(event: 'reading', listener: (channel: ProbeChannel, value: string, meta?: ReadingMeta) => void): this;
     on(event: 'refresh', listener: (channel: ProbeChannel, value: string) => void): this;
     on(event: 'error', listener: (err: Error) => void): this;

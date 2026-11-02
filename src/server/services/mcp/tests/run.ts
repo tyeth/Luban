@@ -116,6 +116,9 @@ import { tests as firmwareQueryTests } from './firmwareQuery.test';
 import { tests as rayFirmwareLimitsTests } from './rayFirmwareLimits.test';
 import { tests as toolheadStateTests } from './toolheadState.test';
 import { tests as serialToolheadStateTests } from './serialToolheadState.test';
+import { tests as continuousProbeTests } from './continuousProbe.test';
+import { tests as pointProbeContinuousTests } from './pointProbeContinuous.test';
+import { tests as usbContinuousAdapterTests } from './usbContinuousAdapter.test';
 import { tests as stagingConfirmLinkTests } from './stagingConfirmLink.test';
 import { tests as motorPowerTests } from './motorPower.test';
 import { tests as startPositionTests } from './startPosition.test';
@@ -232,6 +235,9 @@ const suites: Array<[string, TestCase[]]> = [
     ['rayFirmwareLimits', rayFirmwareLimitsTests],
     ['toolheadState', toolheadStateTests],
     ['serialToolheadState', serialToolheadStateTests],
+    ['continuousProbe', continuousProbeTests],
+    ['pointProbeContinuous', pointProbeContinuousTests],
+    ['usbContinuousAdapter', usbContinuousAdapterTests],
     ['stagingConfirmLink', stagingConfirmLinkTests],
     ['motorPower', motorPowerTests],
     ['startPosition', startPositionTests],

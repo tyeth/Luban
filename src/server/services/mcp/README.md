@@ -662,7 +662,35 @@ press is bounded by the segment, whatever the step. This is what the "never 2 mm
 2026-09-05 is about, and why `probe_circle` may keep its 2 mm radial step. Every coarse
 ladder (marchToContact for outline / CAM programs, probe_point, probe_vector,
 probe_sequence, probe_circle, the surface scans, the tool setter's coarse descent) goes
-through it; retreats move away from the work and stay whole.
+through it, except the continuous USB/GPIO point-probe coarse path below; retreats move
+away from the work and stay whole.
+
+**Continuous USB/GPIO point-probe coarse search (#336).** `probe_point` can check the
+continuous probe level and contact counter immediately after each completed **≤ 1 mm**
+coarse segment. The USB transaction must finish its ACK fence, `M400`, and matching
+`M114` position report. A bare acceptance ACK, estimated position, or heartbeat fallback
+cannot release the next fast-path segment. This removes the unconditional
+`sensor_delay_ms` dwell only from the coarse search: 25 released segments configured at
+300 ms avoid 7.5 seconds of added waits (deterministic test arithmetic, not a hardware
+timing measurement). Other procedures and the point probe's release, fine, and confirmation
+windows retain their existing behavior.
+
+Eligibility requires a connected GPIO monitor polling at ≤ 50 ms, a current reading from
+that feed generation, and healthy continuous progress. The Python loop emits a lightweight
+100 ms progress pulse independently of pin changes; sample/arrival age and observed gaps
+must stay within 300 ms. Missing pulses, delayed delivery, reconnects, and backwards
+sequence/time are remembered, including a gap that recovers while a move is in flight.
+This is a bounded feed-health check, **not a requirement for an unchanged-pin sample after
+each move**. Once enabled, loss of sensor or USB synchronization aborts and holds position,
+with no automatic retreat and no claimed contact/hold coordinate. MQTT or an ineligible
+GPIO feed uses the existing sensor-window path from the start.
+
+Contact edges remain immediate change messages; the counter also catches a brief contact
+followed by release. A delayed edge can allow one additional ≤ 1 mm coarse segment at the
+existing F100 feed before it is observed. The counter only stops the coarse march: its
+endpoint is a **bracket, never the measurement**. The existing retreat, fine approach, and
+single-step confirmation passes determine the final contact coordinate. This code path
+has simulated timing/failure coverage; live USB/GPIO validation is still required.
 
 **Coarse press and the slow zone (operator, 2026-09-05, job d8f6ec1b5c11).** Before the
 segmenting above, a coarse step was executed whole by the controller before the runner saw

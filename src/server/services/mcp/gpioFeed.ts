@@ -7,6 +7,7 @@ import { recordSensorLatency } from './diagnostics';
 import { PROBE_CHANNELS, ProbeChannel, ProbeTransport } from './probeTransport';
 import { EMPTY_PROGRESS, MonitorProgress, describeReadyTimeout } from './probeFeedHealth';
 import { BridgeResetResult, describeBridgeReset, resetStrandedBridges } from './usbBridgeReset';
+import { PROBE_PROGRESS_MS, ProbeProgress, ProbeProgressTracker } from './continuousProbe';
 
 const log = logger('service:mcp:gpio-feed');
 
@@ -23,7 +24,9 @@ const log = logger('service:mcp:gpio-feed');
 // The monitor emits a 'reading' line only when a pin CHANGES, plus a 1 Hz
 // heartbeat carrying every pin's current value. The heartbeat is both the
 // liveness watchdog (a silent monitor is killed and the service reconnects)
-// and a freshness refresh for the reading cache - unlike MQTT, "no message"
+// and a freshness refresh for the reading cache. A separate 100 ms progress
+// pulse proves polling-loop liveness for coarse probing without requiring an
+// unchanged pin to be sampled after each move. Unlike MQTT, "no message"
 // here never has to be trusted to mean "unchanged".
 
 interface FieldSpec {
@@ -185,7 +188,7 @@ export function resolveGpioFeedConfig(): GpioFeedConfig {
 // The monitor subprocess. Plain Python 3, stdlib + Blinka only, config as a
 // JSON argv - nothing here may contain a backtick or "${" (it lives in a TS
 // template literal). Protocol: one JSON object per stdout line, "t" field is
-// ready | reading | hb | fatal.
+// ready | reading | hb | poll | fatal.
 const MONITOR_SOURCE = `
 import json
 import sys
@@ -229,6 +232,8 @@ def main():
     hb_s = cfg['heartbeat_ms'] / 1000.0
     last = {}
     next_hb = 0.0
+    next_progress = 0.0
+    sequence = 0
     while True:
         try:
             values = {}
@@ -244,6 +249,10 @@ def main():
             if now >= next_hb:
                 next_hb = now + hb_s
                 emit({'t': 'hb', 'values': values, 'ts': time.time()})
+            if now >= next_progress:
+                next_progress = now + cfg['progress_ms'] / 1000.0
+                sequence += 1
+                emit({'t': 'poll', 'seq': sequence, 'ts': time.time()})
             time.sleep(poll_s)
         except Exception as err:
             emit({'t': 'fatal', 'error': 'read loop failed: %s' % err})
@@ -288,6 +297,8 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
 
     private ready = false;
 
+    private readonly continuousProgress = new ProbeProgressTracker();
+
     public constructor(cfg: GpioFeedConfig) {
         super();
         this.cfg = cfg;
@@ -326,6 +337,7 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
                 pins,
                 poll_ms: this.cfg.pollMs,
                 heartbeat_ms: HEARTBEAT_MS,
+                progress_ms: PROBE_PROGRESS_MS,
             });
 
             let child: ChildProcess;
@@ -467,7 +479,12 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
             lastBridgeReset: this.lastBridgeReset,
             monitorPid: this.child ? this.child.pid : null,
             configSources: this.cfg.sources,
+            continuousProgress: this.getContinuousProgress(),
         };
+    }
+
+    public getContinuousProgress(): ProbeProgress | null {
+        return this.isConnected() ? this.continuousProgress.snapshot() : null;
     }
 
     /** Channels with a pin configured, in the order the monitor walks them. */
@@ -525,6 +542,10 @@ export class GpioProbeTransport extends EventEmitter implements ProbeTransport {
                 }
                 this.emit('reading', channel, String(message.value), meta);
             }
+            return;
+        }
+        if (message.t === 'poll') {
+            this.continuousProgress.note(Number(message.seq), Number(message.ts) * 1000, Date.now(), this.cfg.pollMs);
             return;
         }
         if (message.t === 'hb') {
