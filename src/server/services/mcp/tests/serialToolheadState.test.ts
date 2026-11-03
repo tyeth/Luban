@@ -65,7 +65,7 @@ class SerialPort extends EventEmitter {
 }
 
 /** Real Marlin parser, write filter and transaction; inert serial transport and timers. */
-function machine(markerSuffix?: string): any {
+function machine(): any {
     const parser = load('shared/lib/gcodeParser.js');
     const interpret = load('server/lib/interpret.js', { '../../shared/lib/gcodeParser': parser });
     const Marlin = load('server/controllers/Marlin/Marlin.js');
@@ -81,7 +81,7 @@ function machine(markerSuffix?: string): any {
         '../../lib/Workflow': class extends EventEmitter { public state = 'idle'; },
         '../../lib/logger': () => ({ debug: noop, warn: noop, error: noop, info: noop, silly: noop }),
         '../constants': { WRITE_SOURCE_CLIENT: 'client', WRITE_SOURCE_QUERY: 'query', WORKFLOW_STATUS_RUNNING: 'running' },
-    }, markerSuffix ? { Math: Object.assign(Object.create(Math), { random: () => ({ toString: () => `0.${markerSuffix}` }) }) } : {});
+    });
     const Controller = module.default;
     const result = new Controller({ port: 'inert-test-port' });
     result.open();
@@ -115,16 +115,20 @@ async function start(controller: any, command = 'M3 P100'): Promise<void> {
 export const tests: Array<[string, () => void | Promise<void>]> = [
     ...['abm3p100cd', 'abm4s255cd', 'abm5cd'].map((suffix): [string, () => Promise<void>] => [
         `M118 synchronization text ${suffix} cannot fabricate spindle commands during a positioning-only transaction`, async () => {
-            const controller = machine(suffix);
+            const controller = machine();
             await start(controller);
             respond(controller);
             await controller.executeMcpGcode('M5', 1000);
             assert.strictEqual(controller.assess().state, 'off');
             const before = JSON.stringify(controller.serialToolhead.snapshot());
+            controller.writeln(`M118 E1 MCP_123_${suffix}`);
+            controller.receive('ok');
+            assert.strictEqual(controller.assess().state, 'off', `message text ${suffix}`);
+            assert.strictEqual(JSON.stringify(controller.serialToolhead.snapshot()), before, suffix);
             const sent: string[] = [];
             controller.serialport.on('written', (line: string) => sent.push(line));
             await controller.executeMcpGcode('G90\nG53;\nG1 Z327 F100;\nG54;', 1000);
-            assert.ok(sent[0].endsWith(`_${suffix}`), 'exercise the actual M118 transaction fence');
+            assert.match(sent[0], /^M118 E1 MCP_\d+_\d+$/, 'the actual transaction fence has a digits-only suffix');
             assert.strictEqual(controller.controller.state.headStatus, false, suffix);
             assert.strictEqual(controller.controller.state.headPower, 100, suffix);
             assert.strictEqual(controller.assess().state, 'off', suffix);

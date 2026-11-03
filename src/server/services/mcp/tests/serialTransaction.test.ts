@@ -14,6 +14,7 @@ function controller(): EventEmitter & Record<string, any> { // eslint-disable-li
     } }).outputText;
     const dependencies: Record<string, unknown> = {
         events: { EventEmitter },
+        crypto: require('crypto'), // eslint-disable-line global-require
         '../../lib/logger': () => ({ debug: () => undefined, warn: () => undefined, error: () => undefined }),
     };
     const pattern = /from ['"]([^'"]+)['"]/g;

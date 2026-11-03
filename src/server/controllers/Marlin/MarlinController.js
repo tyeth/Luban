@@ -1,3 +1,4 @@
+import { randomInt } from 'crypto';
 import { EventEmitter } from 'events';
 import includes from 'lodash/includes';
 import isEmpty from 'lodash/isEmpty';
@@ -1128,7 +1129,9 @@ class MarlinController extends EventEmitter {
             // history.writeSource was cleared by another ACK. The unique M118
             // echo establishes a boundary in firmware output order. Ignore
             // all ACKs until the firmware prints this marker and then ACKs it.
-            const marker = `MCP_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+            // Keep the unique suffix numeric so no G-code word can form inside
+            // a marker, even if another consumer scans the outgoing text.
+            const marker = `MCP_${Date.now()}_${randomInt(1_000_000_000_000)}`;
             await new Promise((resolve, reject) => {
                 const remaining = deadline - Date.now();
                 if (remaining <= 0) {
