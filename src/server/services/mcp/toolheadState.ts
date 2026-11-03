@@ -34,6 +34,8 @@ export interface ToolheadAssessment {
     head_power: number | null;
     head_status: boolean | string | null;
     basis: string;
+    /** Every positive input to the existing guard; an empty list never proves physical stop. */
+    on_signals: string[];
     /** The line MCP motion leads with on this machine (the Ray's M5), or null. */
     laser_off_lead: string | null;
     /** Text USB provenance, when available; retains the evidence behind the guard. */
@@ -67,6 +69,13 @@ export function assessToolhead(dialect: GcodeDialect, state: HeadReadings | null
     const idleSetpoint = serial?.source === 'text-serial' && serial.powerSource === 'command'
         && serial.offAcknowledged && !serialOn;
     const on = (power > 0 && !idleSetpoint) || status === true || status === 'on' || serialOn;
+    const onSignals = [
+        ...(power > 0 && !idleSetpoint ? ['headPower > 0'] : []),
+        ...(status === true || status === 'on' ? ['headStatus is on'] : []),
+        ...(serial?.commandedOn ? ['serial commandedOn'] : []),
+        ...(serial?.reportedStatus === true ? ['serial firmware status is on'] : []),
+        ...(Number(serial?.reportedPower) > 0 ? ['serial firmware power > 0'] : []),
+    ];
     const readback = dialect.toolhead.state;
     let reading: ToolheadReading = 'off';
     if (on) {
@@ -77,6 +86,7 @@ export function assessToolhead(dialect: GcodeDialect, state: HeadReadings | null
     return {
         state: reading,
         readback,
+        on_signals: onSignals,
         head_power: state && state.headPower !== undefined && state.headPower !== null && Number.isFinite(power) ? power : null,
         head_status: typeof status === 'boolean' || typeof status === 'string' ? status : null,
         basis: idleSetpoint
@@ -95,6 +105,13 @@ export function assessToolhead(dialect: GcodeDialect, state: HeadReadings | null
 export function toolheadOnRefusal(assessment: ToolheadAssessment, message: string): string | null {
     if (assessment.state !== 'on') {
         return null;
+    }
+    if (assessment.serial_toolhead) {
+        const { recent, ...serial } = assessment.serial_toolhead;
+        return `${message} (headPower ${assessment.head_power}, headStatus ${JSON.stringify(assessment.head_status)}; `
+            + `on signals: ${assessment.on_signals.join(', ')}; serial evidence: ${JSON.stringify(serial)}; `
+            + `last event: ${JSON.stringify(recent[recent.length - 1] || null)}. `
+            + 'Read get_mcp_diagnostics.toolhead for the bounded event history.)';
     }
     if (assessment.readback === 'unknown') {
         return `${message} (headPower ${assessment.head_power}, headStatus ${JSON.stringify(assessment.head_status)} - on a machine whose `
@@ -269,9 +286,8 @@ export function clearMcpLaserRecord(): void {
 }
 
 /**
- * What results and get_position / get_machine_profile carry where the
- * toolhead state is unknown; null where the machine reports (the A350's and
- * the Original's results stay unchanged).
+ * Results and get_position / get_machine_profile retain text USB evidence
+ * as well as the advisory note where the toolhead state is unknown.
  */
 export function toolheadNote(assessment: ToolheadAssessment, laser: McpLaserRecord, laserOffSent: string | null = null): {
     state: ToolheadReading;
@@ -279,9 +295,9 @@ export function toolheadNote(assessment: ToolheadAssessment, laser: McpLaserReco
     laser_off_lead: string | null;
     laser_off_sent: string | null;
     mcp_sent_laser: McpLaserRecord & { scope: string };
-} | null {
+} | ToolheadAssessment | null {
     if (assessment.readback !== 'unknown') {
-        return null;
+        return assessment.serial_toolhead ? assessment : null;
     }
     return {
         state: assessment.state,

@@ -1197,6 +1197,16 @@ These are agent release requirements, not new runtime checks in `validate_gcode`
   when the UI shows Off. New M3/M4 commands, positive reports, uncertain transactions
   and connection changes invalidate OFF evidence. This adds no commands or settling
   delay to the low-latency path; a firmware-positive refusal still requires diagnosis.
+  The Marlin write filter treats M117/M118 message bodies as text: random M118
+  synchronization suffixes containing `m3`, `m4` or `m5` must never change spindle
+  state or invalidate an acknowledged stop. `get_connection_status`, `get_position`
+  and `get_mcp_diagnostics` expose the text-serial `toolhead` assessment, including
+  every positive guard input (`on_signals`) and `serial_toolhead.recent`: the last
+  32 command/report/ACK/reset events with times, revisions and raw relevant lines.
+  `writeSource` is the write context at observation, not proof a report answered
+  that command. These events also appear as `USB toolhead` in the server log;
+  refusals include the input values and latest event. Preserve this evidence before
+  reconnecting. A prior refusal without these fields cannot identify its cause.
 - **Verified-settle contract**: motion tools block until the returned position verifiably
   matches the move (Z parsed from the executed gcode, ±0.15 mm; XY at target; home must
   leave its pre-G28 position at least once). `wait_until_moved: false` opts out and always

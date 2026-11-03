@@ -243,6 +243,7 @@ export const tests: Array<[string, () => void]> = [
         clearMcpLaserRecord();
         const note = toolheadNote(assessToolhead(RAY, { headPower: 0 }), getMcpLaserRecord('c'), 'M5');
         assert.ok(note);
+        assert.ok('mcp_sent_laser' in note);
         assert.equal(note.state, 'unknown');
         assert.equal(note.laser_off_sent, 'M5');
         assert.equal(note.mcp_sent_laser.laser, 'none');

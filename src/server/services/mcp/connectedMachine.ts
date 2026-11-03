@@ -150,9 +150,9 @@ export function connectedLaserRecord(): McpLaserRecord {
 
 /**
  * The `toolhead` block results, get_position and get_machine_profile carry on
- * a machine whose toolhead state is unknown (the Ray); null elsewhere, so the
- * A350's and the Original's results are unchanged. `laserOffSent` names the
- * laser-off line this call sent.
+ * text USB connection (guard inputs and provenance), or a machine whose
+ * toolhead state is unknown (the Ray); null elsewhere. `laserOffSent` names
+ * the laser-off line this call sent.
  */
 export function connectedToolheadNote(assessment: ToolheadAssessment = connectedToolhead(), laserOffSent: string | null = null) {
     return toolheadNote(assessment, connectedLaserRecord(), laserOffSent);

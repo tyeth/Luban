@@ -104,7 +104,7 @@ class MarlinController extends EventEmitter {
     // Marlin
     controller = null;
 
-    serialToolhead = new SerialToolheadState();
+    serialToolhead = new SerialToolheadState(event => log.info(`USB toolhead ${JSON.stringify(event)}`));
 
     ready = false;
 
@@ -393,7 +393,7 @@ class MarlinController extends EventEmitter {
             const established = this.ready || this.mcpTransactionActive || this.mcpTransactionPending;
             this.ready = false;
             this.controller.state = { ...this.controller.state, isHomed: false };
-            this.serialToolhead.reset();
+            this.serialToolhead.reset('firmware-start');
             this.query.type = null;
             if (established) {
                 this.mcpTransactionFault = 'USB firmware restarted; reconnect and reverify homing, position and workspace before motion';
@@ -462,7 +462,9 @@ class MarlinController extends EventEmitter {
             this.emit('originOffsetReport', res);
         });
         this.controller.on('headStatus', (res) => {
-            this.serialToolhead.reportStatus(res.headStatus);
+            this.serialToolhead.reportStatus(res.headStatus, {
+                line: res.raw, writeSource: this.history.writeSource, mcpTransaction: this.mcpTransactionActive
+            });
             // log.silly(`controller.on('originOffset'): source=${this.history.writeSource},
             //      line=${JSON.stringify(this.history.writeLine)}, res=${JSON.stringify(res)}`);
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
@@ -477,7 +479,9 @@ class MarlinController extends EventEmitter {
             }
         });
         this.controller.on('headPower', (res) => {
-            this.serialToolhead.reportPower(res.headPower);
+            this.serialToolhead.reportPower(res.headPower, {
+                line: res.raw, writeSource: this.history.writeSource, mcpTransaction: this.mcpTransactionActive
+            });
             // log.silly(`controller.on('originOffset'): source=${this.history.writeSource},
             //      line=${JSON.stringify(this.history.writeLine)}, res=${JSON.stringify(res)}`);
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
@@ -768,7 +772,7 @@ class MarlinController extends EventEmitter {
     }
 
     destroy() {
-        this.serialToolhead.reset();
+        this.serialToolhead.reset('controller-destroyed');
         this.connections = {};
 
         if (this.serialport) {
@@ -828,7 +832,7 @@ class MarlinController extends EventEmitter {
             return;
         }
 
-        this.serialToolhead.reset();
+        this.serialToolhead.reset('connection-open');
         this.serialport = new SerialConnection({
             ...this.options,
             isScreenProtocol: false,
@@ -847,7 +851,12 @@ class MarlinController extends EventEmitter {
                 }
                 this.history.writeLine = line;
 
-                if (!line) {
+                // Marlin treats M117/M118's remainder as message text. The
+                // generic interpreter scans words anywhere in a line: random
+                // M118 fence suffixes such as "abm5cd" must not invent an M5
+                // and revoke real OFF evidence (or invent M3/M4 and turn the
+                // UI/guard on). Preserve the bytes, without interpreting text.
+                if (!line || /^(?:N\d+[ \t]*)?M0*11[78](?![\d.])[^\r\n]*$/i.test(line)) {
                     return data;
                 }
 
@@ -856,7 +865,9 @@ class MarlinController extends EventEmitter {
                 let spindle = 0;
 
                 interpret(line, (cmd, params) => {
-                    this.serialToolhead.command(cmd, params.P !== undefined || params.S !== undefined);
+                    this.serialToolhead.command(cmd, params.P !== undefined || params.S !== undefined, {
+                        line, writeSource: this.history.writeSource, mcpTransaction: context?.mcpTransaction === true
+                    });
                     // motion
                     if (includes(['G0', 'G1'], cmd)) {
                         modal.motion = cmd;
