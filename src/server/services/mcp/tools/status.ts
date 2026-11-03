@@ -1,6 +1,6 @@
 import { connectionDiagnostics } from '../../machine/connectionDiagnostics';
 import { connectionManager } from '../../machine/ConnectionManager';
-import { connectedMachineCapability } from '../connectedMachine';
+import { connectedMachineCapability, connectedToolhead } from '../connectedMachine';
 import { diagnosticsSnapshot } from '../diagnostics';
 import { machineStore } from '../machineStore';
 import { getPositionOfRecord, getTrustedOffset } from '../positionOfRecord';
@@ -19,7 +19,8 @@ export function registerStatusTools(registry: ToolRegistry): void {
         description: 'Report whether Luban is connected to a machine, and over which channel: machineIdentifier, '
             + 'deviceSerial (SACP, or the M1005 product SN when the SACP one is a fill pattern; deviceSerialSource says which) / host (SSTP), '
             + 'machineKey (the per-machine record set that applies), dialect, firmware (what the controller reported on this '
-            + 'connection, in memory only), and applied_records (which stored records the MCP applies to this machine). Read-only; sends nothing to the machine.',
+            + 'connection, in memory only), toolhead (the guard inputs and text-serial provenance), and applied_records '
+            + '(which stored records the MCP applies to this machine). Read-only; sends nothing to the machine.',
         inputSchema: {
             type: 'object',
             properties: {},
@@ -36,6 +37,7 @@ export function registerStatusTools(registry: ToolRegistry): void {
                 dialect: status && status.connected ? connectedMachineCapability().dialect.id : null,
                 // The firmware read on this connection (tools/firmware.ts), in memory only; null when none.
                 firmware: status && status.connected ? firmwareView() : null,
+                toolhead: status && status.connected ? connectedToolhead() : null,
             };
         },
     });
@@ -69,7 +71,8 @@ export function registerStatusTools(registry: ToolRegistry): void {
             + 'machine heartbeat cadence/gaps/frame flips, direct-gcode pacing (exec and idle ms), sensor pipe '
             + 'latency, the probe feed status and the machine position of record (rejected beats by reason, resyncs, '
             + 'disconnects, the trusted offset), plus server/build identity, connection attempt/session IDs, heartbeat '
-            + 'worker lifecycle and snapshots captured before recovery. The same '
+            + 'worker lifecycle and snapshots captured before recovery. toolhead retains the guard inputs and text-serial '
+            + 'command/report/ACK history with timestamps and revisions. The same '
             + 'signals appear as job events (event_loop_stall, heartbeat_gap, heartbeat_frame_flip, slow_step, '
             + 'sense_overrun, position-estimated, and idleMs/execMs on gcode events) so read '
             + 'get_gcode_job_status first and use this for the totals.',
@@ -82,6 +85,7 @@ export function registerStatusTools(registry: ToolRegistry): void {
             return {
                 ...diagnosticsSnapshot(),
                 connection: connectionDiagnostics.snapshot(),
+                toolhead: connectionManager.getConnectionStatus().connected ? connectedToolhead() : null,
                 probeFeed: probeFeedService.status(),
                 positionOfRecord: getPositionOfRecord(currentGcodeSequence()),
                 machinePosition: { ...machinePositionDiagnostics(), trustedOffsetByEngine: getTrustedOffset() },

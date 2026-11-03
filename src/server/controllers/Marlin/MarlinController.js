@@ -1,3 +1,4 @@
+import { randomInt } from 'crypto';
 import { EventEmitter } from 'events';
 import includes from 'lodash/includes';
 import isEmpty from 'lodash/isEmpty';
@@ -49,6 +50,7 @@ import {
     WRITE_SOURCE_UNKNOWN
 } from '../constants';
 import Marlin from './Marlin';
+import { SerialToolheadState } from './SerialToolheadState';
 
 // % commands
 const WAIT = '%wait';
@@ -75,6 +77,9 @@ class MarlinController extends EventEmitter {
             if (this.controller.state.hexModeEnabled) {
                 this.emitAll('transfer:hex', { data: Buffer.from(data, 'utf-8') });
             }
+            if (this.mcpTransactionActive) {
+                this.emit('mcpRawLine', String(data).trim());
+            }
             // log.silly(`< ${data}`);
             this.controller.parse(String(data));
         },
@@ -88,6 +93,9 @@ class MarlinController extends EventEmitter {
         },
         error: (err) => {
             this.ready = false;
+            this.serialToolhead.invalidate();
+            this.mcpTransactionFault = `USB serial port error: ${err?.message || String(err)}`;
+            this.emit('mcpClosed');
             if (err) {
                 log.error(`Unexpected error while reading/writing serial port "${this.options.port}":`, err);
             }
@@ -96,6 +104,8 @@ class MarlinController extends EventEmitter {
 
     // Marlin
     controller = null;
+
+    serialToolhead = new SerialToolheadState(event => log.info(`USB toolhead ${JSON.stringify(event)}`));
 
     ready = false;
 
@@ -114,6 +124,14 @@ class MarlinController extends EventEmitter {
         writeSource: null,
         writeLine: ''
     };
+
+    // Direct MCP requests must not share the feeder's fire-and-forget reply
+    // path. Only one line may be outstanding while this lock is held.
+    mcpTransactionActive = false;
+
+    mcpTransactionPending = false;
+
+    mcpTransactionFault = null;
 
     // Event Trigger
     event = null;
@@ -138,7 +156,7 @@ class MarlinController extends EventEmitter {
         lastQueryTime: 0,
 
         issue: () => {
-            if (!this.query.type) {
+            if (!this.query.type || this.mcpTransactionActive) {
                 return;
             }
 
@@ -368,6 +386,26 @@ class MarlinController extends EventEmitter {
         // Marlin
         this.controller = new Marlin();
 
+        // A firmware restart can keep the host port open. It invalidates the
+        // selected frame, homing, pending replies and output evidence together.
+        // The initial boot banner is normal; a restart of an established or
+        // reserved session must remain faulted until an explicit reconnect.
+        this.controller.on('start', () => {
+            const established = this.ready || this.mcpTransactionActive || this.mcpTransactionPending;
+            this.ready = false;
+            this.controller.state = { ...this.controller.state, isHomed: false };
+            this.serialToolhead.reset('firmware-start');
+            this.query.type = null;
+            if (established) {
+                this.mcpTransactionFault = 'USB firmware restarted; reconnect and reverify homing, position and workspace before motion';
+                this.feeder?.clear();
+            }
+            this.emit('firmwareReset');
+            // Reject an outstanding fence or command immediately, before an
+            // old ACK can release a line in the firmware's new coordinate frame.
+            this.emit('mcpClosed');
+        });
+
         this.controller.on('firmware', (res) => {
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
                 this.emitAll('serialport:read', { data: res.raw });
@@ -425,6 +463,9 @@ class MarlinController extends EventEmitter {
             this.emit('originOffsetReport', res);
         });
         this.controller.on('headStatus', (res) => {
+            this.serialToolhead.reportStatus(res.headStatus, {
+                line: res.raw, writeSource: this.history.writeSource, mcpTransaction: this.mcpTransactionActive
+            });
             // log.silly(`controller.on('originOffset'): source=${this.history.writeSource},
             //      line=${JSON.stringify(this.history.writeLine)}, res=${JSON.stringify(res)}`);
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
@@ -439,6 +480,9 @@ class MarlinController extends EventEmitter {
             }
         });
         this.controller.on('headPower', (res) => {
+            this.serialToolhead.reportPower(res.headPower, {
+                line: res.raw, writeSource: this.history.writeSource, mcpTransaction: this.mcpTransactionActive
+            });
             // log.silly(`controller.on('originOffset'): source=${this.history.writeSource},
             //      line=${JSON.stringify(this.history.writeLine)}, res=${JSON.stringify(res)}`);
             if (includes([WRITE_SOURCE_CLIENT, WRITE_SOURCE_FEEDER], this.history.writeSource)) {
@@ -466,6 +510,9 @@ class MarlinController extends EventEmitter {
             // The M114 reply was just parsed: TextSerialChannel stamps its
             // machine state with THIS moment (not the query timer's tick).
             this.emit('positionReport', res);
+            if (this.mcpTransactionActive) {
+                this.emit('mcpPositionReport', res);
+            }
         });
         this.controller.on('temperature', (res) => {
             if (!this.seriesSize) {
@@ -551,6 +598,12 @@ class MarlinController extends EventEmitter {
 
 
         this.controller.on('ok', (res) => {
+            if (this.mcpTransactionActive) {
+                this.history.writeSource = null;
+                this.history.writeLine = null;
+                this.emit('mcpReply', { ok: true, raw: res?.raw || 'ok' });
+                return;
+            }
             // log.silly(`controller.on('ok'): source=${this.history.writeSource}, line=${JSON.stringify(this.history.writeLine)}, res=${JSON.stringify(res)}`);
             // Display info to console, if this is from user-input
             if (res) {
@@ -608,6 +661,12 @@ class MarlinController extends EventEmitter {
         });
 
         this.controller.on('error', (res) => {
+            if (this.mcpTransactionActive) {
+                this.history.writeSource = null;
+                this.history.writeLine = null;
+                this.emit('mcpReply', { ok: false, raw: res?.raw || 'Controller error' });
+                return;
+            }
             // Feeder
             this.feeder.next();
 
@@ -714,6 +773,7 @@ class MarlinController extends EventEmitter {
     }
 
     destroy() {
+        this.serialToolhead.reset('controller-destroyed');
         this.connections = {};
 
         if (this.serialport) {
@@ -773,6 +833,7 @@ class MarlinController extends EventEmitter {
             return;
         }
 
+        this.serialToolhead.reset('connection-open');
         this.serialport = new SerialConnection({
             ...this.options,
             isScreenProtocol: false,
@@ -791,7 +852,12 @@ class MarlinController extends EventEmitter {
                 }
                 this.history.writeLine = line;
 
-                if (!line) {
+                // Marlin treats M117/M118's remainder as message text. The
+                // generic interpreter scans words anywhere in a line: random
+                // M118 fence suffixes such as "abm5cd" must not invent an M5
+                // and revoke real OFF evidence (or invent M3/M4 and turn the
+                // UI/guard on). Preserve the bytes, without interpreting text.
+                if (!line || /^(?:N\d+[ \t]*)?M0*11[78](?![\d.])[^\r\n]*$/i.test(line)) {
                     return data;
                 }
 
@@ -800,6 +866,9 @@ class MarlinController extends EventEmitter {
                 let spindle = 0;
 
                 interpret(line, (cmd, params) => {
+                    this.serialToolhead.command(cmd, params.P !== undefined || params.S !== undefined, {
+                        line, writeSource: this.history.writeSource, mcpTransaction: context?.mcpTransaction === true
+                    });
                     // motion
                     if (includes(['G0', 'G1'], cmd)) {
                         modal.motion = cmd;
@@ -836,7 +905,7 @@ class MarlinController extends EventEmitter {
                     if (cmd === 'G1' && params.F) {
                         workSpeed = params.F;
                     }
-                    if (cmd === 'M3') {
+                    if (cmd === 'M3' || cmd === 'M4') {
                         headStatus = true;
                         if (params.P !== undefined) {
                             headPower = params.P;
@@ -947,6 +1016,7 @@ class MarlinController extends EventEmitter {
 
         // Stop status query
         this.ready = false;
+        this.emit('mcpClosed');
 
         // store.unset(`controllers["${port}"]`);
         store.unset(`controllers["${port}/${dataSource}"]`);
@@ -1001,6 +1071,214 @@ class MarlinController extends EventEmitter {
         return this.serialport && this.serialport.isOpen;
     }
 
+    /**
+     * Send an MCP command without the feeder. An ok for a G1 can mean only
+     * planner acceptance, so a final M400 and its ok are mandatory. M114
+     * then supplies the actual reply text and a fresh resting position.
+     * On any uncertain outcome, later MCP requests are refused on this
+     * connection rather than possibly overlapping a still-running move.
+     */
+    async executeMcpGcode(commands, timeoutMs = 30000) {
+        if (this.mcpTransactionFault) {
+            throw new Error(`USB serial transaction fault: ${this.mcpTransactionFault}`);
+        }
+        if (!this.isOpen() || !this.ready) {
+            throw new Error('USB serial controller is not ready');
+        }
+        if (this.mcpTransactionActive || this.mcpTransactionPending) {
+            throw new Error('Another USB serial transaction is in progress');
+        }
+        const lines = String(commands).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+        if (!lines.length) {
+            throw new Error('No G-code lines to send');
+        }
+        const deadline = Date.now() + timeoutMs;
+        this.mcpTransactionPending = true;
+        const idle = () => !this.history.writeSource && this.feeder.size() === 0 && !this.feeder.isPending()
+            && this.sender.state.sent === this.sender.state.received && this.workflow.state !== WORKFLOW_STATUS_RUNNING;
+        try {
+            while (!idle() && Date.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, 25));
+                if (this.mcpTransactionFault) {
+                    throw new Error(this.mcpTransactionFault);
+                }
+                if (!this.isOpen()) {
+                    throw new Error('USB serial connection closed before the transaction');
+                }
+            }
+            if (!idle()) {
+                throw new Error('USB serial controller did not become idle; no MCP command was sent');
+            }
+            if (this.mcpTransactionFault) {
+                throw new Error(this.mcpTransactionFault);
+            }
+            this.mcpTransactionActive = true;
+        } finally {
+            this.mcpTransactionPending = false;
+        }
+
+        const positionOnly = lines.length === 1 && /^M114\s*;?$/i.test(lines[0]);
+        const configurationOnly = lines.length === 1 && /^M503\s+S\s*;?$/i.test(lines[0]);
+        const sequence = positionOnly || configurationOnly ? lines : [...lines, 'M400', 'M114'];
+        let position = null;
+        let acknowledgedOff = null;
+        const configurationLines = [];
+        this.query.type = null;
+        try {
+            // A pre-existing query may have left an ACK in flight even when
+            // history.writeSource was cleared by another ACK. The unique M118
+            // echo establishes a boundary in firmware output order. Ignore
+            // all ACKs until the firmware prints this marker and then ACKs it.
+            // Keep the unique suffix numeric so no G-code word can form inside
+            // a marker, even if another consumer scans the outgoing text.
+            const marker = `MCP_${Date.now()}_${randomInt(1_000_000_000_000)}`;
+            await new Promise((resolve, reject) => {
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) {
+                    reject(new Error('Timed out before USB serial synchronization'));
+                    return;
+                }
+                let seen = false;
+                let timer;
+                let onRaw;
+                let onReply;
+                let onClosed;
+                const cleanup = () => {
+                    clearTimeout(timer);
+                    this.removeListener('mcpRawLine', onRaw);
+                    this.removeListener('mcpReply', onReply);
+                    this.removeListener('mcpClosed', onClosed);
+                };
+                onRaw = raw => { if (raw.trim() === `echo:${marker}`) { seen = true; } };
+                onReply = reply => {
+                    if (!reply.ok) {
+                        cleanup();
+                        reject(new Error(`USB serial synchronization failed: ${reply.raw}`));
+                    } else if (seen) {
+                        cleanup();
+                        resolve();
+                    }
+                };
+                onClosed = () => { cleanup(); reject(new Error('USB serial connection closed during synchronization')); };
+                this.on('mcpRawLine', onRaw);
+                this.on('mcpReply', onReply);
+                this.on('mcpClosed', onClosed);
+                timer = setTimeout(() => { cleanup(); reject(new Error('Timed out waiting for USB serial synchronization echo')); }, remaining);
+                if (!this.writeln(`M118 E1 ${marker}`, { source: WRITE_SOURCE_CLIENT, mcpTransaction: true })) {
+                    cleanup();
+                    reject(new Error('Could not write USB serial synchronization marker'));
+                }
+            });
+            for (const line of sequence) {
+                if (this.mcpTransactionFault) {
+                    throw new Error(this.mcpTransactionFault);
+                }
+                const needsPosition = /^M114\s*;?$/i.test(line);
+                let linePosition = null;
+                const onPosition = res => { linePosition = res?.raw || null; };
+                const onRawLine = raw => { if (configurationOnly) { configurationLines.push(raw); } };
+                if (configurationOnly) {
+                    this.on('mcpRawLine', onRawLine);
+                }
+                if (needsPosition) {
+                    this.on('mcpPositionReport', onPosition);
+                }
+                try {
+                    let toolheadRevision;
+                    const reply = await new Promise((resolve, reject) => {
+                        const remaining = deadline - Date.now();
+                        if (remaining <= 0) {
+                            reject(new Error(`Timed out before ${line} could be sent`));
+                            return;
+                        }
+                        let timer;
+                        let onReply;
+                        let onClosed;
+                        const cleanup = () => {
+                            clearTimeout(timer);
+                            this.removeListener('mcpReply', onReply);
+                            this.removeListener('mcpClosed', onClosed);
+                        };
+                        onReply = value => { cleanup(); resolve(value); };
+                        onClosed = () => { cleanup(); reject(new Error('USB serial connection closed during transaction')); };
+                        this.on('mcpReply', onReply);
+                        this.on('mcpClosed', onClosed);
+                        timer = setTimeout(() => { cleanup(); reject(new Error(`Timed out waiting for ${line} reply`)); }, remaining);
+                        if (!this.writeln(line, { source: WRITE_SOURCE_CLIENT, mcpTransaction: true })) {
+                            cleanup();
+                            reject(new Error(`Could not write ${line} to USB serial`));
+                        }
+                        toolheadRevision = this.serialToolhead.revision;
+                    });
+                    if (!reply.ok) {
+                        throw new Error(`${line} failed: ${reply.raw}`);
+                    }
+                    if (this.mcpTransactionFault) {
+                        throw new Error(this.mcpTransactionFault);
+                    }
+                    if (/^M0*5\s*(?:;[^\r\n]*)?$/i.test(line)) {
+                        acknowledgedOff = { line, revision: toolheadRevision };
+                    }
+                    if (needsPosition) {
+                        if (!linePosition || !/\bX:-?\d/.test(linePosition)
+                            || !/\bY:-?\d/.test(linePosition) || !/\bZ:-?\d/.test(linePosition)) {
+                            throw new Error(`M114 acknowledged without a complete position report: ${JSON.stringify(linePosition)}`);
+                        }
+                        position = linePosition;
+                    }
+                } finally {
+                    if (needsPosition) {
+                        this.removeListener('mcpPositionReport', onPosition);
+                    }
+                    if (configurationOnly) {
+                        this.removeListener('mcpRawLine', onRawLine);
+                    }
+                }
+            }
+            const configuration = configurationLines.filter(raw => raw && !/^ok\b/i.test(raw)).join('\n');
+            if (configurationOnly && !configuration) {
+                throw new Error('M503 acknowledged without configuration text');
+            }
+            // Promote OFF only after the whole fenced request, including
+            // M400/M114, succeeded. Later commands/reports still invalidate
+            // the captured revision; no transient OFF escapes a failed batch.
+            if (acknowledgedOff) {
+                this.serialToolhead.acknowledge(acknowledgedOff.line, acknowledgedOff.revision);
+            }
+            return { result: 0, text: configurationOnly ? configuration : position };
+        } catch (err) {
+            this.serialToolhead.invalidate();
+            this.mcpTransactionFault = err.message || String(err);
+            this.feeder?.clear();
+            throw err;
+        } finally {
+            this.mcpTransactionActive = false;
+        }
+    }
+
+    /** Best-effort quickstop; the caller must treat stopping as unverified. */
+    async requestMcpQuickstop() {
+        this.workflow?.stop();
+        this.sender?.unload();
+        this.feeder?.clear();
+        this.mcpTransactionFault = 'M410 quickstop requested; physical stop and position require verification';
+        if (!this.writeln('M410', { source: WRITE_SOURCE_CLIENT, mcpTransaction: true })) {
+            return false;
+        }
+        // Flush the host serial buffer before the crash guard closes USB.
+        // This only proves delivery to the OS/USB driver, never a firmware stop.
+        const port = this.serialport?.port;
+        if (!port || typeof port.drain !== 'function') {
+            return false;
+        }
+        return new Promise((resolve) => {
+            let timer;
+            const done = ok => { clearTimeout(timer); resolve(ok); };
+            timer = setTimeout(() => done(false), 2000);
+            port.drain(err => done(!err));
+        });
+    }
+
     addConnection(socket) {
         if (!socket) {
             log.error('The socket parameter is not specified');
@@ -1047,6 +1325,7 @@ class MarlinController extends EventEmitter {
 
     refresh(options) {
         const { isScreenProtocol } = options;
+        this.serialToolhead.reset();
         this.serialport.refresh(options);
         const nextState = {
             ...this.controller.state,
@@ -1086,6 +1365,16 @@ class MarlinController extends EventEmitter {
     }
 
     command(socket, cmd, ...args) {
+        if (this.mcpTransactionFault && !['reset', 'unlock', 'statusreport', 'gcode:stop'].includes(cmd)) {
+            log.warn(`Refused ${cmd}: USB serial transaction fault (${this.mcpTransactionFault})`);
+            this.emitAll('serialport:read', { data: `Refused ${cmd}: USB serial state is uncertain; reconnect after verifying the machine is stopped` });
+            return;
+        }
+        if (this.mcpTransactionActive && !['reset', 'unlock', 'gcode:stop'].includes(cmd)) {
+            log.warn(`Refused ${cmd} while an MCP serial transaction owns the command stream`);
+            this.emitAll('serialport:read', { data: `Refused ${cmd}: MCP serial transaction in progress` });
+            return;
+        }
         const handler = {
             'gcode:load': () => {
                 const [name, originalGcode, callback = noop] = args;
@@ -1168,6 +1457,10 @@ class MarlinController extends EventEmitter {
                 this.event.trigger('gcode:stop');
 
                 this.workflow.stop();
+                if (this.mcpTransactionActive || this.mcpTransactionPending || this.mcpTransactionFault) {
+                    this.mcpTransactionFault = 'Stop requested during or after an uncertain MCP serial transaction';
+                    this.requestMcpQuickstop().catch(err => log.error('MCP quickstop failed', err));
+                }
             },
             'feedhold': () => {
                 this.event.trigger('feedhold');
@@ -1323,7 +1616,23 @@ class MarlinController extends EventEmitter {
     writeln(data, context = {}) {
         if (!this.isOpen()) {
             log.error(`Serial port "${this.options.port}" is not accessible`);
-            return;
+            return false;
+        }
+
+        const command = data.trim();
+        const singleLine = !/[\r\n]/.test(command);
+        const emergencyReset = singleLine && /^M112\s*;?$/i.test(command);
+        const safeQueryOrStop = singleLine && /^(M114|M1007|M1010|M1011|M1012|M105|M410|M112)\s*;?$/i.test(command);
+        if (this.mcpTransactionFault && !safeQueryOrStop) {
+            log.warn(`Suppressed serial write after an uncertain MCP transaction: ${data}`);
+            return false;
+        }
+        if (this.mcpTransactionActive && !context?.mcpTransaction && !emergencyReset) {
+            log.warn(`Suppressed non-MCP serial write during an MCP transaction: ${data}`);
+            return false;
+        }
+        if (emergencyReset && this.mcpTransactionActive) {
+            this.mcpTransactionFault = 'M112 emergency reset requested during MCP transaction';
         }
 
         if (!data.endsWith('\n')) {
@@ -1340,6 +1649,7 @@ class MarlinController extends EventEmitter {
         // The only serial write: TextSerialChannel notes every line (homes,
         // G92 shifts, syncs, M114 queries) for the MCP's frame evidence.
         this.emit('lineWritten', data);
+        return true;
     }
 }
 

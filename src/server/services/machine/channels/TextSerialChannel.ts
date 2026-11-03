@@ -9,6 +9,7 @@ import { L20WLaserToolModule, L40WLaserToolModule } from '../../../../app/machin
 import { HEAD_LASER } from '../../../constants';
 import { gcodeLease } from '../gcodeLease';
 import { TextSerialMachineState, TextSerialMachineStateTracker } from './textSerialMachineState';
+import type { SerialToolheadEvidence } from '../../../controllers/Marlin/SerialToolheadState';
 
 const log = logger('machine:channels:TextSerialChannel');
 
@@ -32,7 +33,8 @@ class TextSerialChannel extends Channel implements
     // Bumped at every port open/close this channel performs. MarlinController
     // also closes the port on its own (serial 'close'), and every reopen
     // creates a new serial connection object, so a change in that object is
-    // counted as well when the generation is read.
+    // counted as well when the generation is read. A firmware restart on the
+    // same open port also starts a new generation.
     private connectionGeneration = 0;
 
     private observedPort: unknown = null;
@@ -71,6 +73,7 @@ class TextSerialChannel extends Channel implements
             isOpen?: () => boolean;
             controller?: { state?: { [key: string]: unknown } } | null;
             workflow?: { state?: unknown } | null;
+            serialToolhead?: { snapshot: () => SerialToolheadEvidence };
         } | null;
         if (!controller || typeof controller.isOpen !== 'function' || !controller.isOpen()) {
             this.machineState.clear();
@@ -83,6 +86,7 @@ class TextSerialChannel extends Channel implements
             headType: marlinState.headType,
             headStatus: marlinState.headStatus,
             headPower: marlinState.headPower,
+            serialToolhead: controller.serialToolhead?.snapshot(),
         });
     }
 
@@ -170,6 +174,10 @@ class TextSerialChannel extends Channel implements
 
             controller.on('Ready', (data) => {
                 this.emit(ChannelEvent.Ready, data);
+            });
+            controller.on('firmwareReset', () => {
+                this.connectionGeneration++;
+                this.machineState.clear();
             });
             controller.on('positionReport', (payload) => {
                 this.machineState.notePosition(payload, this.getConnectionGeneration());
@@ -261,14 +269,29 @@ class TextSerialChannel extends Channel implements
     public async executeGcode(gcode: string): Promise<ExecuteGcodeResult> {
         const refusal = gcodeLease.refusal(gcode);
         if (refusal) { return { result: -1, text: refusal }; }
-        const gcodeLines = gcode.split('\n');
-
         const controller = this.controller;
-        controller.command(null, 'gcode', gcodeLines);
+        if (!controller || !controller.isOpen()) {
+            return { result: -1, text: 'USB serial controller is disconnected; nothing was sent.' };
+        }
+        try {
+            return await controller.executeMcpGcode(gcode, gcodeLease.requestTimeoutMs(30000));
+        } catch (err) {
+            return { result: -1, text: `USB serial command not confirmed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+    }
 
+    /** M410 is sent outside the transaction queue, but is not a verified physical stop. */
+    public async stopGcodeJob(): Promise<{ ok: boolean; text: string }> {
+        const controller = this.controller;
+        if (!controller || !controller.isOpen()) {
+            return { ok: false, text: 'USB serial controller is disconnected; physical stop is unknown.' };
+        }
+        const sent = await controller.requestMcpQuickstop();
         return {
-            result: 0,
-            text: 'ok',
+            ok: false,
+            text: sent
+                ? 'M410 quickstop sent; physical stop and position are unverified. Re-home before further motion.'
+                : 'M410 quickstop could not be sent; physical stop is unknown.',
         };
     }
 

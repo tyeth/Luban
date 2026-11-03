@@ -28,6 +28,7 @@ import { ProcedureAbort, checkProcedureStop } from './procedureAbort';
 import { TRAVERSE_Z_TOLERANCE_MM, planRaiseToTop } from './traversePlan';
 import { ROTATE_FEED, judgeRotation } from './rotaryMotion';
 import { reliableForMotion } from './machinePosition';
+import { ContinuousCoarseProbe, continuousProbeHealthy, ProbeSynchronizationLost } from './continuousProbe';
 
 // The shared sensor-gated motion engine: settled single moves on the direct
 // path, contact/release sensing against a probe feed channel, and the
@@ -155,6 +156,8 @@ function parseEcho(text: string | undefined): NullableXyz | null {
  * overtravel latch is re-checked before the move and on every poll.
  */
 export interface MoveOptions {
+    /** The coarse USB fast path cannot use estimates or heartbeat fallback as completion evidence. */
+    requireUsbCompletion?: boolean;
     /**
      * Descent segments (operator law 2026-09-05): the controller's ok is
      * enough - never wait on the heartbeat when the echo is missing or
@@ -176,6 +179,13 @@ async function moveMachineSettledUnguarded(
     traceMark('engine-enter');
     probeFeedService.assertNoOvertravel();
     const channel = getDirectChannel();
+    // USB text serial now returns an M114 after M400. If that report cannot
+    // prove the target, never promote the commanded point to an arrival.
+    const serialMustProve = typeof connectionManager.getConnectionStatus === 'function'
+        && connectionManager.getConnectionStatus()?.channelName === 'text-serial';
+    if (options.requireUsbCompletion && !serialMustProve) {
+        throw new ProbeSynchronizationLost('the channel is no longer USB text serial');
+    }
     const words = [
         target.x !== undefined ? `X${target.x.toFixed(3)}` : '',
         target.y !== undefined ? `Y${target.y.toFixed(3)}` : '',
@@ -254,7 +264,11 @@ G54;`;
         traceMark('echo-absent');
     }
 
-    if (options.lenient) {
+    if (options.requireUsbCompletion) {
+        throw new ProbeSynchronizationLost('USB M400/M114 completion did not return a matching target position');
+    }
+
+    if (options.lenient && !serialMustProve) {
         const estimate = completeTarget(from, target);
         if (estimate) {
             setPositionOfRecord(estimate, 'estimated', executed.sequence, tool);
@@ -287,7 +301,7 @@ G54;`;
     });
     const settleStartedAt = Date.now();
     const deadline = issuedAt + SETTLE_TIMEOUT_MS;
-    let graceUntil: number | null = inchMove && !echoContradicts ? issuedAt + INCH_GRACE_MS : null;
+    let graceUntil: number | null = !serialMustProve && inchMove && !echoContradicts ? issuedAt + INCH_GRACE_MS : null;
     let previous: string | null = null;
     let previousReportTime: number | null = null;
     while (Date.now() < deadline) {
@@ -682,6 +696,44 @@ function noteSense(kind: 'contact' | 'release', windowMs: number, startedAt: num
     const endedAt = Date.now();
     lastSense = { kind, windowMs, elapsedMs: endedAt - startedAt, endedAt, contact };
     traceMark(`sense-end:${kind}${contact ? ':contact' : ''}`);
+}
+
+/**
+ * Point-probe coarse search only. USB executeMcpGcode already fences ACKs and
+ * ends with M400/M114. A matching echo plus continuous GPIO health permits an
+ * immediate level/counter check, without a fresh unchanged-pin sample or dwell.
+ */
+export function createUsbContinuousCoarseProbe(move: (s: number) => Promise<void>): ContinuousCoarseProbe | null {
+    const status = connectionManager.getConnectionStatus();
+    const initial = probeFeedService.getContinuousState('probe');
+    if (!status.connected || status.channelName !== 'text-serial' || !continuousProbeHealthy(initial, Date.now())) {
+        return null;
+    }
+    const connection = connectionManager.getConnectionGeneration();
+    const channel = getDirectChannel();
+    const read = () => {
+        const current = connectionManager.getConnectionStatus();
+        if (!current.connected || current.channelName !== 'text-serial'
+            || connectionManager.getConnectionGeneration() !== connection || connectionManager.getCurrentChannel() !== channel) {
+            throw new ProbeSynchronizationLost('USB connection changed');
+        }
+        return probeFeedService.getContinuousState('probe');
+    };
+    return new ContinuousCoarseProbe({
+        read,
+        now: Date.now,
+        checkStop: checkProcedureStop,
+        move: async (s) => {
+            const beforeSequence = currentGcodeSequence();
+            await move(s);
+            read();
+            const record = getPositionOfRecord(currentGcodeSequence());
+            if (!record || record.source !== 'echo' || record.sequence !== beforeSequence + 1) {
+                throw new ProbeSynchronizationLost('the physical segment has no current USB completion/position proof');
+            }
+        },
+        sensed: (contact) => noteSense('contact', 0, Date.now(), contact),
+    }, initial);
 }
 
 export async function senseAfter(

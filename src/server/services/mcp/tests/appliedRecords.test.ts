@@ -379,7 +379,10 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         const run = async (status: Record<string, unknown>, machineKey: string | null) => {
             const statusTools = inert('tools/status.ts', {
                 '../../machine/ConnectionManager': { connectionManager: { getConnectionStatus: () => status } },
-                '../connectedMachine': { connectedMachineCapability: () => ({ dialect: { id: 'ray-grbl' } }) },
+                '../connectedMachine': {
+                    connectedMachineCapability: () => ({ dialect: { id: 'ray-grbl' } }),
+                    connectedToolhead: () => ({ state: 'on', head_power: 100, head_status: false, on_signals: ['headPower > 0'] }),
+                },
                 '../machineStore': { machineStore: { currentMachine: () => ({ basis: machineKey ? 'connected' : 'selected', machineKey }) } },
                 '../registry': { McpToolError },
                 './firmware': { firmwareView: () => null },
@@ -390,9 +393,19 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
             return plain(await handlers.get_connection_status({}));
         };
         const ray = await run({ connected: true, machineIdentifier: 'Ray', deviceSerial: 'SN1', host: null }, 'Ray');
-        assert.deepEqual(ray, { connected: true, machineIdentifier: 'Ray', deviceSerial: 'SN1', host: null, machineKey: 'Ray', dialect: 'ray-grbl', firmware: null });
+        assert.deepEqual(ray, {
+            connected: true,
+            machineIdentifier: 'Ray',
+            deviceSerial: 'SN1',
+            host: null,
+            machineKey: 'Ray',
+            dialect: 'ray-grbl',
+            firmware: null,
+            toolhead: { state: 'on', head_power: 100, head_status: false, on_signals: ['headPower > 0'] },
+        });
         const none = await run({ connected: false, machineIdentifier: null }, null);
         assert.equal(none.machineKey, null);
         assert.equal(none.dialect, null);
+        assert.equal(none.toolhead, null);
     }],
 ];

@@ -7,6 +7,7 @@ import ts from 'typescript';
 import type { GpioProbeTransport } from '../gpioFeed';
 import * as health from '../probeFeedHealth';
 import * as transport from '../probeTransport';
+import * as continuous from '../continuousProbe';
 
 // Run the actual transport against a fake child and clock. Never import Blinka or touch USB.
 function fixture() {
@@ -31,6 +32,7 @@ function fixture() {
         './diagnostics': { recordSensorLatency: () => undefined },
         './probeTransport': transport,
         './probeFeedHealth': health,
+        './continuousProbe': continuous,
         './usbBridgeReset': {
             resetStrandedBridges: async () => {
                 assert.strictEqual(kills, 1, 'release the monitor USB claim before checking for a stranded bridge');
@@ -49,6 +51,7 @@ function fixture() {
     vm.runInNewContext(compiled.outputText, {
         exports,
         Buffer,
+        Date: { now: () => 1000 + now },
         process: { env: {}, platform: 'linux' },
         setTimeout: (callback: () => void | Promise<void>, delay: number) => {
             nextId++; timers.set(nextId, { at: now + delay, callback }); return nextId;
@@ -82,6 +85,22 @@ function fixture() {
 }
 
 export const tests: Array<[string, () => Promise<void>]> = [
+    ['continuous progress is separate from pin readings and tracks missed pulses', async () => {
+        const f = fixture();
+        f.send({ t: 'ready', board: 'KB2040_U2IF' });
+        await f.result;
+        let readings = 0;
+        f.feed.on('reading', () => { readings++; });
+        f.feed.on('refresh', () => { readings++; });
+        f.send({ t: 'poll', seq: 1, ts: 1 });
+        assert.strictEqual(f.feed.getContinuousProgress()?.discontinuities, 0);
+        await f.advance(100);
+        f.send({ t: 'poll', seq: 3, ts: 1.1 });
+        assert.strictEqual(f.feed.getContinuousProgress()?.discontinuities, 1);
+        assert.strictEqual(readings, 0, 'progress never fabricates an unchanged-pin reading');
+        f.feed.end();
+        assert.strictEqual(f.feed.getContinuousProgress(), null);
+    }],
     ['stuck first pin survives the heartbeat deadline and reaches USB recovery at 30 seconds', async () => {
         const f = fixture();
         f.send({ t: 'progress', stage: 'imported', board: 'KB2040_U2IF' });

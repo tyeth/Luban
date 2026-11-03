@@ -10,6 +10,9 @@ import path from 'path';
 import vm from 'vm';
 import ts from 'typescript';
 import { judgeBeat } from '../machinePosition';
+import { SerialToolheadState } from '../../../controllers/Marlin/SerialToolheadState';
+import { assessToolhead } from '../toolheadState';
+import { dialectById } from '../gcodeDialect';
 
 type Exports = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 
@@ -83,6 +86,8 @@ class FakeMarlinController extends EventEmitter {
 
     public controller = new Marlin();
 
+    public serialToolhead = new SerialToolheadState();
+
     public workflow = { state: 'idle' };
 
     public state = { headType: 'cnc' };
@@ -137,6 +142,23 @@ const ORIGINAL_M114 = 'X:10.00 Y:20.50 Z:5.00 E:0.00 Count X: 800 Y:1640 Z:2000'
 const SM2_M114 = 'X:-19.00 Y:4.00 Z:300.00 E:0.00 B:0.00 Count X:0 Y:0 Z:120000';
 
 export const tests: Array<[string, () => void | Promise<void>]> = [
+    ['channel carries fresh serial provenance alongside the unchanged UI power value', async () => {
+        const channel = textChannel();
+        await channel.connectionOpen({ port: 'COM3' });
+        const controller = channel.getController() as FakeMarlinController;
+        controller.receive(ORIGINAL_M114);
+        controller.controller.state.headPower = 100;
+        controller.serialToolhead.command('M3', true);
+        controller.serialToolhead.command('M5');
+        controller.serialToolhead.acknowledge('M5', controller.serialToolhead.revision);
+        const off = channel.getLatestMachineState();
+        assert.strictEqual(off.headPower, 100);
+        assert.strictEqual(assessToolhead(dialectById('sm2-marlin'), off).state, 'off');
+        controller.serialToolhead.command('M4');
+        assert.strictEqual(assessToolhead(dialectById('sm2-marlin'), channel.getLatestMachineState()).state, 'on',
+            'a fresh provenance snapshot is used even without another position report');
+        assert.strictEqual(off.serialToolhead.offAcknowledged, true, 'older returned snapshots are not mutated');
+    }],
     ['MarlinController re-emits the parsed M114 and M1007 replies the channel listens for', () => {
         const source = fs.readFileSync(path.join(SERVER_DIR, 'controllers/Marlin/MarlinController.js'), 'utf8');
         const posHandler = source.slice(source.indexOf('this.controller.on(\'pos\''), source.indexOf('this.controller.on(\'temperature\''));
@@ -285,5 +307,23 @@ export const tests: Array<[string, () => void | Promise<void>]> = [
         controller.receive(SM2_M114);
         assert.strictEqual(channel.getLatestMachineState().timestamp, 3000);
         assert.strictEqual(channel.getLatestMachineState().controllerOriginOffset, null);
+    }],
+    ['channel: firmware reset on an open port advances the session and discards coordinate evidence', async () => {
+        const channel = textChannel();
+        await channel.connectionOpen({ port: 'COM3' });
+        const controller = channel.getController() as FakeMarlinController;
+        controller.receive(ORIGINAL_M114);
+        controller.receive('Origin offset X: 12.5');
+        const port = controller.serialport;
+        const generation = channel.getConnectionGeneration();
+        assert.ok(channel.getLatestMachineState());
+        controller.emit('firmwareReset');
+        assert.strictEqual(controller.serialport, port, 'the USB port stays open');
+        assert.ok(channel.getConnectionGeneration() > generation);
+        assert.strictEqual(channel.getLatestMachineState(), null);
+        controller.receive(SM2_M114);
+        const fresh = channel.getLatestMachineState();
+        assert.strictEqual(fresh.controllerOriginOffset, null, 'old offsets do not cross the firmware session');
+        assert.strictEqual(fresh.reportAtRest, false, 'old planner synchronization does not cross the firmware session');
     }],
 ];

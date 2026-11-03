@@ -62,6 +62,8 @@
 //
 // Pure module: no server imports, unit-tested in mcp/tests/textSerialState.test.ts.
 
+import type { SerialToolheadEvidence } from '../../../controllers/Marlin/SerialToolheadState';
+
 export interface TextSerialPosition {
     x: number | null;
     y: number | null;
@@ -103,6 +105,7 @@ export interface TextSerialLiveFields {
     headType?: unknown;
     headStatus?: unknown;
     headPower?: unknown;
+    serialToolhead?: SerialToolheadEvidence;
 }
 
 /** One line written to the port that the frame evidence remembers. */
@@ -195,6 +198,7 @@ export interface TextSerialMachineState {
     headType: string | null;
     headStatus: boolean | null;
     headPower: number | null;
+    serialToolhead?: SerialToolheadEvidence;
     /** This reply's M114 was written after a planner sync that followed the last motion line: the head was at rest there. */
     reportAtRest: boolean;
     /** Write-path evidence about the logical frame (see the header). */
@@ -787,6 +791,7 @@ export class TextSerialMachineStateTracker {
             headType: typeof live.headType === 'string' && live.headType ? live.headType : null,
             headStatus: typeof live.headStatus === 'boolean' ? live.headStatus : null,
             headPower: finite(live.headPower),
+            ...(live.serialToolhead ? { serialToolhead: live.serialToolhead } : {}),
             reportAtRest: this.reportAtRest,
             frameEvidence: this.frameEvidence(),
         };

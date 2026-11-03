@@ -115,15 +115,21 @@ import { tests as sacpGcodeReplyTests } from './sacpGcodeReply.test';
 import { tests as firmwareQueryTests } from './firmwareQuery.test';
 import { tests as rayFirmwareLimitsTests } from './rayFirmwareLimits.test';
 import { tests as toolheadStateTests } from './toolheadState.test';
+import { tests as serialToolheadStateTests } from './serialToolheadState.test';
+import { tests as continuousProbeTests } from './continuousProbe.test';
+import { tests as pointProbeContinuousTests } from './pointProbeContinuous.test';
+import { tests as usbContinuousAdapterTests } from './usbContinuousAdapter.test';
 import { tests as stagingConfirmLinkTests } from './stagingConfirmLink.test';
 import { tests as motorPowerTests } from './motorPower.test';
 import { tests as startPositionTests } from './startPosition.test';
 import { tests as batchWithdrawTests } from './batchWithdraw.test';
 import { tests as motorPowerSwitchTests } from './motorPowerSwitch.test';
+import { tests as serialTransactionTests } from './serialTransaction.test';
 
 type TestCase = [string, () => void | Promise<void>];
 
 const suites: Array<[string, TestCase[]]> = [
+    ['serialTransaction', serialTransactionTests],
     ['connectionGeneration', connectionGenerationTests],
     ['sacpMachineState', sacpMachineStateTests],
     ['sacpConnection', sacpConnectionTests],
@@ -228,6 +234,10 @@ const suites: Array<[string, TestCase[]]> = [
     ['firmwareQuery', firmwareQueryTests],
     ['rayFirmwareLimits', rayFirmwareLimitsTests],
     ['toolheadState', toolheadStateTests],
+    ['serialToolheadState', serialToolheadStateTests],
+    ['continuousProbe', continuousProbeTests],
+    ['pointProbeContinuous', pointProbeContinuousTests],
+    ['usbContinuousAdapter', usbContinuousAdapterTests],
     ['stagingConfirmLink', stagingConfirmLinkTests],
     ['motorPower', motorPowerTests],
     ['startPosition', startPositionTests],

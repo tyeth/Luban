@@ -19,7 +19,10 @@ import {
     isProcedureAbort,
     abortRaiseToTop,
     knownMachinePosition,
+    createUsbContinuousCoarseProbe,
 } from './probing';
+import { ContinuousCoarseProbe, isProbeSynchronizationLost, ProbeSynchronizationLost } from './continuousProbe';
+import { isProcedureStopped } from './procedureAbort';
 import { McpToolError } from './registry';
 import { StylusReachVerdict, describeStylusReach } from './stylusReach';
 import { requireStylusReach } from './stylusReachGuard';
@@ -147,8 +150,10 @@ export function describeProbePlanAsGcode(plan: ProbePointPlan): string {
     const lines = [
         '; TOUCH PROBE POINT MEASUREMENT (server-driven, sensor-gated on the probe channel)',
         `; every move toward the work is sent as sensor-checked segments of <= ${MARCH_SEGMENT_MM} mm (the coarse step is the logical advance)`,
-        '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, the probe feed is checked',
-        '; before the next line. The march stops at first contact; running the full ladder',
+        '; EVERY LINE IS SENT INDIVIDUALLY: after each move settles, check the probe feed before the next line.',
+        '; Healthy continuous GPIO + verified USB completion: coarse search has no fixed sensor dwell.',
+        '; Lost synchronization holds position; coarse contact is a bracket, remeasured by the fine/confirm passes.',
+        '; The march stops at first contact; running the full ladder',
         `; without contact ABORTS at the travel limit ${word} ${plan.limitCoord.toFixed(3)}${plan.travelClippedBy
             ? ` (requested ${plan.maxTravelMm} mm: shortened by ${plan.travelClippedBy} - a face beyond it reads as no contact)` : ''}.`,
         `; anchored at machine (${plan.start.x.toFixed(2)}, ${plan.start.y.toFixed(2)}, ${plan.start.z.toFixed(2)})`
@@ -225,25 +230,49 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
     const startCoord = plan.start[plan.axis];
     const towards = (value: number) => (plan.direction === 1
         ? Math.min(value, plan.limitCoord) : Math.max(value, plan.limitCoord));
-    const move = async (tool: string, coord: number, feed: number) => {
-        await moveMachineSettled(tool, { [plan.axis]: coord } as { x?: number; y?: number; z?: number }, feed);
+    let continuous: ContinuousCoarseProbe | null = null;
+    const moveTarget = async (tool: string, target: { x?: number; y?: number; z?: number }, feed: number) => {
+        continuous?.assertSynchronized();
+        try {
+            await moveMachineSettled(tool, target, feed, { requireUsbCompletion: !!continuous });
+        } catch (err) {
+            if (!continuous || isProcedureStopped(err)) { throw err; }
+            throw new ProbeSynchronizationLost(err instanceof Error ? err.message : String(err));
+        }
+        continuous?.assertSynchronized();
+    };
+    const move = async (tool: string, coord: number, feed: number) => moveTarget(tool, { [plan.axis]: coord }, feed);
+    const hold = (err: ProbeSynchronizationLost): never => {
+        // A failed segment may have moved without a verified endpoint.
+        // Do not label the requested or previous coordinate as the hold.
+        const held = { phase: 'abort-held', coord: null, note: err.message };
+        mcpBroadcast('mcp:activity', { tool: 'probe_point', axis: plan.axis, ...held });
+        err.partial = { phases: [...phases, held], held: true, contactMachine: null, note: err.message };
+        throw err;
     };
 
     let current = startCoord;
     try {
+        continuous = createUsbContinuousCoarseProbe(async (v) => move('probe:coarse', v, COARSE_FEED));
+        announce('coarse-sensing', current, continuous
+            ? 'Continuous GPIO level/edge checks immediately after each verified USB segment; no fixed post-step dwell. Coarse endpoint is only a bracket.'
+            : `Standard ${plan.sensorDelayMs} ms sensor window; continuous GPIO/USB evidence unavailable.`);
         // Coarse march to first contact.
         let coarseContact: number | null = null;
         while (Math.abs(current - plan.limitCoord) > 1e-9) {
             // The coarse step is the logical advance; the physical moves are
             // <= MARCH_SEGMENT_MM, each sensor-checked (probing.ts).
-            const advance = await marchInSegments(
+            const next = towards(current + plan.direction * plan.coarseStepMm);
+            const advance = continuous ? await continuous.advance(current, next) : await marchInSegments(
                 async (v) => move('probe:coarse', v, COARSE_FEED),
-                current, towards(current + plan.direction * plan.coarseStepMm), 'probe', plan.sensorDelayMs
+                current, next, 'probe', plan.sensorDelayMs
             );
             current = advance.s;
             if (advance.sensed.contact) {
                 coarseContact = current;
-                announce('coarse-contact', current, `probe "${advance.sensed.reading?.value}"`);
+                announce('coarse-contact', current, continuous
+                    ? 'Contact level or edge detected; this endpoint is a coarse bracket only. Retreat and remeasure.'
+                    : `probe "${advance.sensed.reading?.value}"`);
                 break;
             }
         }
@@ -336,7 +365,7 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         announce('retreated', startCoord);
         const traverse = safeTraverseZ();
         if (plan.start.z < traverse) {
-            await moveMachineSettled('probe:raise', { z: traverse }, TRAVEL_FEED);
+            await moveTarget('probe:raise', { z: traverse }, TRAVEL_FEED);
             announce('raised', traverse, 'safe traverse height');
         }
 
@@ -362,6 +391,9 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
         };
         return result as unknown as object;
     } catch (err) {
+        if (isProbeSynchronizationLost(err)) {
+            hold(err);
+        }
         const isTrip = !!probeFeedService.getTrip();
         if (!isTrip) {
             try {
@@ -376,8 +408,11 @@ export async function runProbePointProcedure(plan: ProbePointPlan): Promise<obje
                 } else {
                     announce('abort-retreat-skipped', startCoord, 'the start coordinate is below the head - not descending on an abort');
                 }
+                continuous?.assertSynchronized();
                 await abortRaiseToTop('probe', (phase, z, note) => announce(phase, z ?? startCoord, note), { holdIfTriggered: 'probe' });
+                continuous?.assertSynchronized();
             } catch (retreatErr) {
+                if (isProbeSynchronizationLost(retreatErr)) { hold(retreatErr); }
                 // The abort itself already reports; retreat failure is logged
                 // by the activity stream.
             }

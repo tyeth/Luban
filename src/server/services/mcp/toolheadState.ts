@@ -5,8 +5,10 @@
 // (multi-machine overhaul tyeth/Luban#265; the Ray data map #315).
 //
 // Every motion path refuses while the toolhead reads ON (headPower > 0 or
-// headStatus on). On the Snapmaker 2.0 and the Original those readings are
-// real. On the Ray they never are: firmware V1.7.4 sets the laser power Luban
+// headStatus on). Text USB also carries optimistic command values: its
+// separate provenance distinguishes an acknowledged M5's retained setpoint
+// from positive firmware readback. On the Ray neither field reports output:
+// firmware V1.7.4 sets the laser power Luban
 // reads (SACP 0x12 0xa1 / 0x12 0x01) to 0 at init and never writes it again,
 // and nothing sets headStatus - so the guard always passed, whatever the laser
 // was doing. The dialect row (gcodeDialect.ts ToolheadReadback) now says which
@@ -21,6 +23,7 @@
 //
 // Pure: no server imports, unit-tested in tests/toolheadState.test.ts.
 import { GcodeDialect } from './gcodeDialect';
+import type { SerialToolheadEvidence } from '../../controllers/Marlin/SerialToolheadState';
 
 export type ToolheadReading = 'on' | 'off' | 'unknown';
 
@@ -31,21 +34,26 @@ export interface ToolheadAssessment {
     head_power: number | null;
     head_status: boolean | string | null;
     basis: string;
+    /** Every positive input to the existing guard; an empty list never proves physical stop. */
+    on_signals: string[];
     /** The line MCP motion leads with on this machine (the Ray's M5), or null. */
     laser_off_lead: string | null;
+    /** Text USB provenance, when available; retains the evidence behind the guard. */
+    serial_toolhead?: SerialToolheadEvidence;
 }
 
 /** headPower / headStatus as the channel state carries them (SACP, SSTP, text serial). */
 export interface HeadReadings {
     headPower?: unknown;
     headStatus?: unknown;
+    serialToolhead?: SerialToolheadEvidence;
 }
 
 /**
  * Judge the toolhead from the connection state and the dialect row. The ON
- * test is the one every guard used before (a headPower above 0, or
- * headStatus true / 'on'), so a machine that reports refuses exactly as it
- * always has. Where the row says nothing is reported, a non-zero reading still
+ * test retains positive headPower and headStatus true / 'on'. Text USB may
+ * exclude only a proven command setpoint after a correlated M5 ACK, never
+ * positive firmware readback. Where the row says nothing is reported, a non-zero reading still
  * refuses (the firmware never writes it, so one would be a real signal); an
  * absent or zero reading is 'unknown'.
  */
@@ -53,7 +61,21 @@ export function assessToolhead(dialect: GcodeDialect, state: HeadReadings | null
     const power = Number(state ? state.headPower : undefined);
     const status = state ? state.headStatus : undefined;
     // `power > 0` is false for NaN: the union of the old guards' tests (an infinite reading refuses).
-    const on = power > 0 || status === true || status === 'on';
+    const serial = state?.serialToolhead;
+    const serialOn = serial?.commandedOn || serial?.reportedStatus === true || Number(serial?.reportedPower) > 0;
+    // Text USB preserves M3/M4's requested speed after M5. Only provenance
+    // plus a correlated M5 ACK can distinguish that setting from live power.
+    // Firmware-positive readings always refuse, even if the UI says OFF.
+    const idleSetpoint = serial?.source === 'text-serial' && serial.powerSource === 'command'
+        && serial.offAcknowledged && !serialOn;
+    const on = (power > 0 && !idleSetpoint) || status === true || status === 'on' || serialOn;
+    const onSignals = [
+        ...(power > 0 && !idleSetpoint ? ['headPower > 0'] : []),
+        ...(status === true || status === 'on' ? ['headStatus is on'] : []),
+        ...(serial?.commandedOn ? ['serial commandedOn'] : []),
+        ...(serial?.reportedStatus === true ? ['serial firmware status is on'] : []),
+        ...(Number(serial?.reportedPower) > 0 ? ['serial firmware power > 0'] : []),
+    ];
     const readback = dialect.toolhead.state;
     let reading: ToolheadReading = 'off';
     if (on) {
@@ -64,10 +86,14 @@ export function assessToolhead(dialect: GcodeDialect, state: HeadReadings | null
     return {
         state: reading,
         readback,
+        on_signals: onSignals,
         head_power: state && state.headPower !== undefined && state.headPower !== null && Number.isFinite(power) ? power : null,
         head_status: typeof status === 'boolean' || typeof status === 'string' ? status : null,
-        basis: dialect.toolhead.basis,
+        basis: idleSetpoint
+            ? 'Text serial: acknowledged M5; headPower is the retained command setpoint, with no positive firmware readback'
+            : dialect.toolhead.basis,
         laser_off_lead: readback === 'unknown' ? dialect.toolhead.laserOff : null,
+        ...(serial ? { serial_toolhead: serial } : {}),
     };
 }
 
@@ -79,6 +105,13 @@ export function assessToolhead(dialect: GcodeDialect, state: HeadReadings | null
 export function toolheadOnRefusal(assessment: ToolheadAssessment, message: string): string | null {
     if (assessment.state !== 'on') {
         return null;
+    }
+    if (assessment.serial_toolhead) {
+        const { recent, ...serial } = assessment.serial_toolhead;
+        return `${message} (headPower ${assessment.head_power}, headStatus ${JSON.stringify(assessment.head_status)}; `
+            + `on signals: ${assessment.on_signals.join(', ')}; serial evidence: ${JSON.stringify(serial)}; `
+            + `last event: ${JSON.stringify(recent[recent.length - 1] || null)}. `
+            + 'Read get_mcp_diagnostics.toolhead for the bounded event history.)';
     }
     if (assessment.readback === 'unknown') {
         return `${message} (headPower ${assessment.head_power}, headStatus ${JSON.stringify(assessment.head_status)} - on a machine whose `
@@ -253,9 +286,8 @@ export function clearMcpLaserRecord(): void {
 }
 
 /**
- * What results and get_position / get_machine_profile carry where the
- * toolhead state is unknown; null where the machine reports (the A350's and
- * the Original's results stay unchanged).
+ * Results and get_position / get_machine_profile retain text USB evidence
+ * as well as the advisory note where the toolhead state is unknown.
  */
 export function toolheadNote(assessment: ToolheadAssessment, laser: McpLaserRecord, laserOffSent: string | null = null): {
     state: ToolheadReading;
@@ -263,9 +295,9 @@ export function toolheadNote(assessment: ToolheadAssessment, laser: McpLaserReco
     laser_off_lead: string | null;
     laser_off_sent: string | null;
     mcp_sent_laser: McpLaserRecord & { scope: string };
-} | null {
+} | ToolheadAssessment | null {
     if (assessment.readback !== 'unknown') {
-        return null;
+        return assessment.serial_toolhead ? assessment : null;
     }
     return {
         state: assessment.state,
